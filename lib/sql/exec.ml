@@ -9495,8 +9495,35 @@ and stream_hash_join
         (* Uncorrelated subqueries in the ON predicate are resolved once, as
            [stream_filter] does.  A correlated one cannot be resolved here, and
            could not be resolved by the filter this replaces either — that
-           filter's [get_outer_scan_meta] answers [None] over a join. *)
+           filter's [get_outer_scan_meta] answers [None] over a join.
+
+           #566: refuse it rather than answer.  A [P_subquery] that survives
+           [pre_eval_subquery] is correlated, and [eval_expr] answers
+           [Row.V_null] for it — so [matches] is false for every pair, [any] is
+           never set, and an outer join null-extends {i every} left row.  That
+           is a complete result set of the right cardinality with the ON
+           predicate silently unevaluated: indistinguishable from the correct
+           answer for the uncorrelated case, which [pre_eval_subquery] has
+           already resolved by this point and which stays correct.  Supporting
+           it needs per-row re-evaluation with a correlation source
+           [get_outer_scan_meta] cannot resolve over a join node (#566 option
+           2); until then a visible error beats a quiet wrong answer.
+
+           #592: this covers the OUTER case only, because [on_pred] is [Some]
+           only for [`Left] — [general_on_join] puts an INNER join's ON predicate
+           in an [Op_filter] above the join instead.  That path has the same
+           defect and reaches [stream_filter], whose [get_outer_scan_meta]
+           answers [None] over a join and drops every row: the INNER spelling of
+           this query returns nothing where SQLite returns a row.  It is wrong on
+           [main] too and is not made worse here, but "inner joins are untouched"
+           should not be read as "inner joins are fine". *)
         let* p = pre_eval_subquery clock store params cat p in
+        if plan_expr_has_subquery p
+        then
+          failwith
+            "Exec: a correlated subquery in an outer join's ON predicate is not \
+             supported — its correlation source cannot be resolved over a join (#566). \
+             Rewrite it as a WHERE-clause subquery or an uncorrelated one.";
         Lwt.return (Some p)
     in
     let matches joined =

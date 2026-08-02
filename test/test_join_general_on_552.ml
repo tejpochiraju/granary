@@ -1,4 +1,5 @@
-(** #552 / #539 / #551: two join-planning defects that produce wrong answers.
+(** #552 / #539 / #551 / #565 / #566: join-planning defects that produce wrong
+    answers.
 
     {1 #552 and #539 — a LEFT JOIN with a general ON loses its null-extended rows}
 
@@ -34,7 +35,25 @@
     row count {b below} [nlj_min_driving_rows] to be reached at all: above the
     floor the cost model lands on the hash join, which is why #531's
     [cte_shadowing_a_real_table_still_scans] (1,200 driving rows) does not
-    catch it. Every case here seeds 10. *)
+    catch it. Every case here seeds 10.
+
+    {1 #565 — the same defect on the BASE SCAN, with no join at all}
+
+    #551 and #531 guarded two of the three sites that reach the catalog by name.
+    The third is [access_path_for_eqs], which [plan_base], [choose_access_path]
+    and [plan_dml_seek] all pass through: a CTE shadowing a real table, with a
+    WHERE equality on a leading prefix of that table's index, planned an
+    [Op_index_lookup] whose [table_tree] was the CTE's sentinel [-1] and returned
+    nothing. #565 moved the guard into that one chokepoint and deleted
+    [build_side]'s inline copy — two copies of one guard is what let #551 exist
+    unnoticed.
+
+    {1 #566 — a correlated subquery in an outer join's ON predicate}
+
+    [pre_eval_subquery] resolves only the uncorrelated case. A correlated
+    [P_subquery] survives into [eval_expr], which answers [Row.V_null] for it, so
+    an outer join's ON predicate is false for every pair and every left row
+    null-extends. #566 chose to refuse the query rather than return that. *)
 
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
@@ -550,6 +569,238 @@ let the_real_table_still_joins_correctly () =
       (rows_of db "SELECT qty FROM line JOIN stock ON si = i_id WHERE w = 1 AND sw = 1"))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #565: the BASE-SCAN seek against a shadowed table                    *)
+(* ------------------------------------------------------------------ *)
+
+(* #551 (above) was [best_probe] reaching the catalog by name. #531 had already
+   guarded [build_side]. Neither covered the third site, and it needs no join at
+   all: [plan_base] -> [choose_access_path] -> [access_path_for_eqs] ->
+   [find_index_for_eqs], which resolves the shadowed table's indexes and hands
+   [seek_op] a [table_tree] of -1 taken from the CTE's synthesized meta.
+
+   The trigger is a WHERE equality on a column that happens to be a leading
+   index prefix OF THE SHADOWED TABLE. The CTE's own shape is irrelevant; only
+   the name collides. The three spellings below are the issue's repro: no WHERE
+   (no access path is chosen, so it was always right), a prefix equality (the
+   bug), and an equality on a non-prefix column (nothing is seekable, so it was
+   always right too). Keeping all three is what shows the guard did not simply
+   disable the WHERE clause.
+
+   #565 put the guard at the top of [access_path_for_eqs] rather than at its
+   index branch. The issue's reason was that [Seek_rowid] is reachable through
+   the same function; #594 established that arm cannot actually leak a shadowed
+   identity, since [Cat.rowid_alias_col] reads the meta's own columns rather than
+   the catalog — see [cte_shadowing_a_rowid_alias_table_scans]. The placement
+   stands on the cheaper argument: one guard at the entry covers every arm the
+   function grows, and the alternative is remembering to add one per arm. *)
+let cte = "WITH stock AS (SELECT 1 AS sw, 3 AS si, 999 AS qty) "
+
+let cte_shadowing_a_real_table_is_not_seeked_by_a_base_scan () =
+  with_db (fun db ->
+    seed_shadowable db;
+    check_rows
+      ~label:"no WHERE clause: no access path is chosen"
+      [ [ "999" ] ]
+      (rows_of db (cte ^ "SELECT qty FROM stock"));
+    check_rows
+      ~label:"a WHERE equality on a SHADOWED leading prefix (the #565 bug)"
+      [ [ "999" ] ]
+      (rows_of db (cte ^ "SELECT qty FROM stock WHERE sw = 1"));
+    check_rows
+      ~label:"and one on a column that is no index prefix at all"
+      [ [ "999" ] ]
+      (rows_of db (cte ^ "SELECT qty FROM stock WHERE qty = 999"));
+    (* The whole composite key pinned reaches the same chooser by a longer
+       prefix; it must be declined for the same reason. *)
+    check_rows
+      ~label:"the whole shadowed key pinned"
+      [ [ "999" ] ]
+      (rows_of db (cte ^ "SELECT qty FROM stock WHERE sw = 1 AND si = 3")))
+;;
+
+(* #594: a CONTROL, not a regression pin — this passes on `main` too, and the
+   PR that added it said otherwise.
+
+   The reasoning it was added on was wrong: [Cat.rowid_alias_col] is computed
+   from the meta's OWN columns, not by a catalog lookup by name, so a CTE's
+   synthesized meta answers [None] and the [Seek_rowid] arm is never reached with
+   a shadowed table's identity. Unlike [find_index_for_eqs], which does reach the
+   catalog by name, there is nothing here to leak.
+
+   The guard's PLACEMENT is still right — putting it at the top of
+   [access_path_for_eqs] rather than at the index branch costs nothing and
+   removes a class of question — but it is defensive there, not load-bearing, and
+   this case documents the boundary rather than pinning a fix. *)
+let cte_shadowing_a_rowid_alias_table_scans () =
+  with_db (fun db ->
+    exec db "CREATE TABLE item (it_id INTEGER PRIMARY KEY, qty INTEGER)";
+    exec db "INSERT INTO item VALUES (7, 70)";
+    check_rows
+      ~label:"the CTE's own row, not a rowid seek into the real table"
+      [ [ "999" ] ]
+      (rows_of
+         db
+         "WITH item AS (SELECT 7 AS it_id, 999 AS qty) SELECT qty FROM item WHERE it_id \
+          = 7");
+    check_rows
+      ~label:"and a rowid that the real table has but the CTE does not"
+      []
+      (rows_of
+         db
+         "WITH item AS (SELECT 7 AS it_id, 999 AS qty) SELECT qty FROM item WHERE it_id \
+          = 8"))
+;;
+
+(* [plan_dml_seek] reaches the same chooser, so DELETE and UPDATE inherit the
+   fix. A CTE is not a writable target, so the shape that exercises this is a
+   DML statement whose WHERE clause pins a prefix — the assertion is that the
+   guard did not break the seek it protects. Both the seeked and unseekable
+   spellings must affect the same rows. *)
+let dml_seek_still_seeks_a_real_table () =
+  with_db (fun db ->
+    seed_shadowable db;
+    exec db "DELETE FROM stock WHERE sw = 1 AND si = 2";
+    check_rows
+      ~label:"DELETE through the seek removed exactly its row"
+      [ [ "1"; "1" ]; [ "1"; "3" ]; [ "1"; "4" ] ]
+      (rows_of db "SELECT sw, si FROM stock WHERE sw = 1");
+    exec db "UPDATE stock SET qty = 555 WHERE sw = 2 AND si = 2";
+    check_rows
+      ~label:"UPDATE through the seek touched exactly its row"
+      [ [ "201" ]; [ "555" ]; [ "203" ]; [ "204" ] ]
+      (rows_of db "SELECT qty FROM stock WHERE sw = 2");
+    (* The unrecognisable spelling of the same predicate, as the control. *)
+    exec db "DELETE FROM stock WHERE sw + 0 = 1 AND si = 3";
+    check_rows
+      ~label:"and the unseekable spelling agrees"
+      [ [ "1"; "1" ]; [ "1"; "4" ] ]
+      (rows_of db "SELECT sw, si FROM stock WHERE sw = 1"))
+;;
+
+(* The control that proves the guard keys on the synthesized [tree_id] and not
+   on a name collision: an identically-shaped CTE under a name no table uses
+   must behave the same, and the REAL table's own seek must still work. *)
+let base_scan_seek_still_works_on_the_real_table () =
+  with_db (fun db ->
+    seed_shadowable db;
+    check_rows
+      ~label:"a CTE under its own name"
+      [ [ "999" ] ]
+      (rows_of
+         db
+         "WITH c AS (SELECT 1 AS cw, 3 AS ci, 999 AS cq) SELECT cq FROM c WHERE cw = 1");
+    check_rows
+      ~label:"and the unshadowed table still seeks its prefix"
+      [ [ "101" ]; [ "102" ]; [ "103" ]; [ "104" ] ]
+      (rows_of db "SELECT qty FROM stock WHERE sw = 1"))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #566: a correlated subquery in an outer join's ON predicate          *)
+(* ------------------------------------------------------------------ *)
+
+(* [pre_eval_subquery] resolves an UNCORRELATED subquery once, before the pairing
+   loop. A CORRELATED one survives it, and [eval_expr] answers [Row.V_null] for
+   any [P_subquery] that reaches it — so the ON predicate is false for every
+   pair, [any] is never set, and the join null-extends EVERY left row.
+
+   That is a complete result set of the right cardinality with the ON predicate
+   silently unevaluated, which reads from outside exactly like the correct
+   answer. #566 chose to refuse it: [stream_hash_join] raises when a subquery
+   survives [pre_eval_subquery] on the cartesian arm. Supporting it needs per-row
+   re-evaluation against a correlation source [get_outer_scan_meta] cannot
+   resolve over a join node — the same blocker the [Op_filter] path has. *)
+let seed_correlated db =
+  exec db "CREATE TABLE l (a INTEGER)";
+  exec db "CREATE TABLE r (b INTEGER)";
+  exec db "CREATE TABLE k (v INTEGER)";
+  exec db "INSERT INTO l VALUES (1),(9)";
+  exec db "INSERT INTO r VALUES (5)";
+  exec db "INSERT INTO k VALUES (4)"
+;;
+
+let err_of db sql =
+  match run (Db.query db sql) with
+  | Error e -> Format.asprintf "%a" Db.pp_error e
+  | Ok stream ->
+    (try
+       ignore (run (Lwt_stream.to_list stream));
+       ""
+     with
+     | Failure m -> m
+     | e -> Printexc.to_string e)
+;;
+
+let correlated_on_subquery_is_refused () =
+  with_db (fun db ->
+    seed_correlated db;
+    let msg =
+      err_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < a)"
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "the query is refused, not answered (got %S)" msg)
+      true
+      (msg <> "");
+    (* The message has to name the shape, or a caller cannot act on it. *)
+    Alcotest.(check bool)
+      (Printf.sprintf "and the message names the cause (got %S)" msg)
+      true
+      (let has needle =
+         let n = String.length needle
+         and m = String.length msg in
+         let rec go i = i + n <= m && (String.sub msg i n = needle || go (i + 1)) in
+         go 0
+       in
+       has "correlated subquery" && has "#566"))
+;;
+
+(* The uncorrelated spelling was already correct and must stay correct — it is
+   what makes the wrong answer above invisible from outside, so a refusal that
+   swallowed this too would be no better. SQLite 3.45.1 answers [1|5], [9|5]. *)
+let uncorrelated_on_subquery_still_works () =
+  with_db (fun db ->
+    seed_correlated db;
+    check_rows
+      ~label:"an uncorrelated ON subquery is resolved once and matches"
+      [ [ "1"; "5" ]; [ "9"; "5" ] ]
+      (rows_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k)");
+    (* And one that matches nothing still null-extends rather than raising. *)
+    check_rows
+      ~label:"an uncorrelated ON subquery that matches nothing null-extends"
+      [ [ "1"; "NULL" ]; [ "9"; "NULL" ] ]
+      (rows_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v > 99)"))
+;;
+
+(* #592: the INNER spelling of the refused query. It is NOT refused, because
+   [general_on_join] gives an INNER join's ON predicate to an [Op_filter] above
+   the join rather than to [on_pred]. It is also not correct: [stream_filter]'s
+   [get_outer_scan_meta] answers [None] over a join and drops every row, so this
+   returns nothing where sqlite3 3.45.1 returns [9|5].
+
+   Pinned as-is, wrong answer and all, so that #592 has a case to flip and so
+   that "#566 left inner joins untouched" is not mistaken for "inner joins are
+   fine". *)
+let inner_correlated_on_subquery_is_still_wrong_592 () =
+  with_db (fun db ->
+    seed_correlated db;
+    check_rows
+      ~label:"#592: INNER returns nothing; sqlite3 returns 9|5"
+      []
+      (rows_of db "SELECT a, b FROM l INNER JOIN r ON b > (SELECT v FROM k WHERE v < a)"))
+;;
+
+(* An outer join whose ON predicate has no subquery at all is untouched: the
+   refusal must key on a surviving [P_subquery], not on the general-ON arm. *)
+let plain_general_on_is_untouched_by_the_refusal () =
+  with_db (fun db ->
+    seed_correlated db;
+    check_rows
+      ~label:"the #539 shape still null-extends"
+      [ [ "1"; "5" ]; [ "9"; "NULL" ] ]
+      (rows_of db "SELECT a, b FROM l LEFT JOIN r ON b > a"))
+;;
+
 let () =
   Alcotest.run
     "join_general_on_552"
@@ -613,6 +864,42 @@ let () =
             "the real table still joins correctly"
             `Quick
             the_real_table_still_joins_correctly
+        ] )
+    ; ( "base-scan seek against a shadowed table (#565)"
+      , [ Alcotest.test_case
+            "CTE shadowing a real table is not seeked by a base scan"
+            `Quick
+            cte_shadowing_a_real_table_is_not_seeked_by_a_base_scan
+        ; Alcotest.test_case
+            "CTE shadowing a rowid-alias table scans"
+            `Quick
+            cte_shadowing_a_rowid_alias_table_scans
+        ; Alcotest.test_case
+            "DML seek still seeks a real table"
+            `Quick
+            dml_seek_still_seeks_a_real_table
+        ; Alcotest.test_case
+            "base-scan seek still works on the real table"
+            `Quick
+            base_scan_seek_still_works_on_the_real_table
+        ] )
+    ; ( "correlated ON subquery is refused (#566)"
+      , [ Alcotest.test_case
+            "a correlated ON subquery is refused"
+            `Quick
+            correlated_on_subquery_is_refused
+        ; Alcotest.test_case
+            "an uncorrelated ON subquery still works"
+            `Quick
+            uncorrelated_on_subquery_still_works
+        ; Alcotest.test_case
+            "INNER correlated ON subquery is still wrong (#592)"
+            `Quick
+            inner_correlated_on_subquery_is_still_wrong_592
+        ; Alcotest.test_case
+            "a plain general ON is untouched by the refusal"
+            `Quick
+            plain_general_on_is_untouched_by_the_refusal
         ] )
     ]
 ;;

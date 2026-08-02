@@ -45,6 +45,7 @@
       B546_LINE        driving rows                (default 30000)
       B546_REPS        warm repeats, best-of       (default 3)
       B546_CHECKPOINT  checkpoint after seeding    (default 1)
+      B546_EXTRA       extra WHERE conjunct, both  (default none; see #575 below)
     Also honours the engine's own GRANARY_PAGE_CACHE (pager capacity, 4 KB
     pages; the engine's own default is 1024).
 
@@ -62,7 +63,46 @@
     it fetches, where the sequential walk it replaces costs about 0.008, and it
     only reaches read-parity near 1% selectivity. [rows_examined] reports 130,000
     for both plans in the 100% row — see [index_entries] (#546 part 3, landed)
-    for the counter that does not. *)
+    for the counter that does not.
+
+    {b #575 acted on this and the table above is now history.} The decision was
+    option B: take the build-side seek only where it reaches at most one row (a
+    rowid alias, or a UNIQUE index with every key column pinned), or where a #532
+    range has BOTH ends as integer literals and [range_rows_estimate] puts the
+    window below the table's size. [WHERE sw = 1] is a bare prefix pin of
+    [stock]'s key, so every row of the table above is now declined — [seek_sql]
+    and [scan_sql] below are the same plan, and the ratio columns should read
+    1.00x.
+
+    That makes this file a REGRESSION HARNESS rather than a comparison: run it to
+    confirm the pessimisation is gone, and to re-measure if #576 (per-index
+    leading-column cardinality) ever restores a conditional seek. The
+    [index_entries] column, added for that purpose, is the one that says which
+    plan was actually taken — it reads 30,000 (the driving side alone) for both
+    spellings today, and would read 130,000 for the seeked one if the guard were
+    removed. [rows_examined] cannot tell them apart, which is the whole point of
+    the counter.
+
+    {b [B546_EXTRA] is how the shapes the gate LETS THROUGH get measured}, and it
+    was added because the first version of the #575 gate admitted any range at
+    all and nothing here could express that. Three runs pin the gate's three
+    outcomes (row 1, the 100% population; 100,000 stock / 30,000 driving for the
+    first, 10,000 / 3,000 for the others):
+
+    {v
+      B546_EXTRA                seek reads  idxent | scan reads  idxent | verdict
+      (unset)                       93,067  30,000 |     93,067  30,000 | declined
+      si >= 0                       93,067  30,000 |     93,067  30,000 | declined
+      si BETWEEN 20 AND 40           6,146   3,021 |      6,299   3,000 | SEEKED, 0.51x
+      si BETWEEN 0 AND 1000000       6,299   3,000 |      6,299   3,000 | declined
+    v}
+
+    Row 2 is the one that matters: [si >= 0] is a tautology, and before the gate
+    was corrected it turned the declined pin into a one-ended seek costing
+    393,980 reads and 3.6x the scan's wall time — a worse regression than the one
+    #575 was written to remove, reachable by appending a no-op to a WHERE clause.
+    Row 3 shows #532's narrow-window win is still taken; row 4 shows a window
+    the estimator can read but which covers the table is declined anyway. *)
 
 open Granary
 
@@ -188,7 +228,7 @@ let once db sql =
   in
   let ms = (Unix.gettimeofday () -. t0) *. 1000. in
   Db.set_event_callback db None;
-  ms, !reads, !wal, st.Db.rows_examined, n
+  ms, !reads, !wal, st.Db.rows_examined, st.Db.index_entries, n
 ;;
 
 (* Cold reads from a freshly opened handle, then best-of-[reps] warm wall time
@@ -197,20 +237,37 @@ let once db sql =
    warm time is CPU and is the only figure a loaded host can move. *)
 let measure path sql =
   let db = open_at path in
-  let cold_ms, reads, wal, examined, rows = once db sql in
+  let cold_ms, reads, wal, examined, entries, rows = once db sql in
   let best = ref cold_ms in
   for _ = 1 to reps do
-    let ms, _, _, _, _ = once db sql in
+    let ms, _, _, _, _, _ = once db sql in
     if ms < !best then best := ms
   done;
   close db;
-  cold_ms, !best, reads, wal, examined, rows
+  cold_ms, !best, reads, wal, examined, entries, rows
 ;;
 
-let seek_sql = "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 1"
+(* #575: an extra conjunct appended to BOTH predicates, so the seeked and
+   unseekable spellings stay the same query.  Empty by default.
+
+   This exists because the first #575 gate admitted any range, and the shape that
+   broke it — [B546_EXTRA='si >= 0'], a tautology that turns the pin into a
+   one-ended range — had to be constructed by hand to be measured.  A harness
+   that can only express the shape a decision was made on cannot check the shapes
+   the decision lets through. *)
+let extra_pred =
+  match Sys.getenv_opt "B546_EXTRA" with
+  | Some s when String.trim s <> "" -> " AND " ^ s
+  | _ -> ""
+;;
+
+let seek_sql =
+  "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 1" ^ extra_pred
+;;
 
 let scan_sql =
   "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw + 0 = 1"
+  ^ extra_pred
 ;;
 
 let scenario ~label ~n_w ~correlated ~overlap =
@@ -218,23 +275,26 @@ let scenario ~label ~n_w ~correlated ~overlap =
     let db = open_at path in
     seed db ~n_w ~correlated ~overlap;
     close db;
-    let scold, swarm, sreads, swal, sex, srows = measure path seek_sql in
-    let fcold, fwarm, freads, fwal, fex, frows = measure path scan_sql in
+    let scold, swarm, sreads, swal, sex, sent, srows = measure path seek_sql in
+    let fcold, fwarm, freads, fwal, fex, fent, frows = measure path scan_sql in
     if srows <> frows
     then failwith (Printf.sprintf "%s: seek returned %d rows, scan %d" label srows frows);
     Printf.printf
-      "%-32s | %7d %6d %7.0f %7.0f %7d | %7d %6d %7.0f %7.0f %7d | %5.2fx %5.2fx\n%!"
+      "%-32s | %7d %6d %7.0f %7.0f %7d %7d | %7d %6d %7.0f %7.0f %7d %7d | %5.2fx %5.2fx\n\
+       %!"
       label
       sreads
       swal
       scold
       swarm
       sex
+      sent
       freads
       fwal
       fcold
       fwarm
       fex
+      fent
       (scold /. fcold)
       (swarm /. fwarm))
 ;;
@@ -249,18 +309,20 @@ let () =
     checkpoint_after_seed
     reps;
   Printf.printf
-    "%-32s | %7s %6s %7s %7s %7s | %7s %6s %7s %7s %7s | %s\n"
+    "%-32s | %7s %6s %7s %7s %7s %7s | %7s %6s %7s %7s %7s %7s | %s\n"
     "population"
     "S:reads"
     "wal"
     "cold ms"
     "warm"
     "exam"
+    "idxent"
     "F:reads"
     "wal"
     "cold ms"
     "warm"
     "exam"
+    "idxent"
     "cold/warm ratio";
   (* [si] ranges overlap between warehouses, as TPC-C's do — every warehouse
      stocks the same items.  That means the SCANNED build side hashes n_w rows

@@ -91,47 +91,76 @@ let a_scan_walks_no_index_entries () =
     Alcotest.(check int) "and walks no index" 0 st.Db.index_entries)
 ;;
 
-(* The counter this issue needs. Both plans read the same 1,200 driving rows
-   through [line]'s primary key, so both walk 1,200 index entries for that. The
-   seeked build side walks 500 more — one per stock row it fetches — and the
-   scanned one walks none.
+(* #575 chose option B: a BARE prefix pin no longer takes the build-side seek,
+   because nothing in the catalog can tell a prefix that selects 1% of the table
+   from one that selects 100%, and on disk the second costs 2.6-3.5x the scan it
+   replaces. So [sw = 1] and its unrecognisable foil now plan identically.
 
-   [rows_examined] moves the other way (1,700 against 3,200), which is exactly
-   why it cannot stand in for this: it says the seek did half the work, and says
-   nothing at all about the 500 tree descents that made it, on disk, the slower
-   plan. *)
-let a_seeked_build_side_walks_one_entry_per_row () =
+   This case is the reason [index_entries] was added. [rows_examined] reports
+   3,200 for BOTH plans here and would report 3,200 for both if the seek were
+   still taken — it counts table rows pulled, and the seek pulls warehouse 1's
+   500 where the scan pulls 2,000 but then discards 1,500 above the join. The
+   only counter that distinguishes "declined the seek" from "took it" is the one
+   that counts the tree descents: 1,200 (the driving side alone) against the
+   1,700 the seek would have walked. *)
+let a_bare_prefix_pin_no_longer_seeks () =
   with_db (fun db ->
     seed db;
-    let _, seek = stats_of db (q "sw = 1") in
-    let _, scan = stats_of db (q "sw + 0 = 1") in
+    let _, pinned = stats_of db (q "sw = 1") in
+    let _, foil = stats_of db (q "sw + 0 = 1") in
     Alcotest.(check int)
-      "seek: the driving side's entries plus one per build row"
-      (n_line + n_per_w)
-      seek.Db.index_entries;
-    Alcotest.(check int)
-      "scan: the driving side's entries only"
+      "the pinned prefix walks the driving side's entries and no more"
       n_line
-      scan.Db.index_entries;
+      pinned.Db.index_entries;
     Alcotest.(check int)
-      "seek: rows examined fall"
-      (n_line + n_per_w)
-      seek.Db.rows_examined;
-    Alcotest.(check int)
-      "scan: rows examined are the whole of stock"
-      (n_line + n_stock)
-      scan.Db.rows_examined;
+      "the unrecognisable foil walks the same"
+      n_line
+      foil.Db.index_entries;
+    (* The number a taken seek would have shown, spelled out so a regression
+       reads as "1700 <> 1200" rather than as an opaque mismatch. *)
     Alcotest.(check bool)
-      "rows examined say the seek is cheaper while it walks MORE index entries"
+      "and neither walks the 500 extra entries a #528 seek would have"
       true
-      (seek.Db.rows_examined < scan.Db.rows_examined
-       && seek.Db.index_entries > scan.Db.index_entries))
+      (pinned.Db.index_entries < n_line + n_per_w);
+    Alcotest.(check int)
+      "both read the whole of stock"
+      (n_line + n_stock)
+      pinned.Db.rows_examined;
+    Alcotest.(check int)
+      "rows_examined cannot tell the two apart — that is why this file exists"
+      foil.Db.rows_examined
+      pinned.Db.rows_examined)
+;;
+
+(* The converse of the case above, and the half of #528 that #575 KEPT: a pin
+   covering a unique index's whole key reaches at most one row, so it is
+   unambiguously better than a scan whatever the value distribution is. Here
+   [stock]'s primary key is [(sw, si)] and both are pinned. *)
+let a_full_unique_key_pin_still_seeks () =
+  with_db (fun db ->
+    seed db;
+    let _, seek = stats_of db (q "sw = 1 AND si = 20") in
+    let _, foil = stats_of db (q "sw + 0 = 1 AND si = 20") in
+    Alcotest.(check int)
+      "the driving side's entries plus the one the point seek walks"
+      (n_line + 1)
+      seek.Db.index_entries;
+    Alcotest.(check int) "the foil walks no build-side entry" n_line foil.Db.index_entries;
+    Alcotest.(check int)
+      "and it fetches exactly one stock row"
+      (n_line + 1)
+      seek.Db.rows_examined)
 ;;
 
 (* #532's range bound cuts the entries walked, not just the rows fetched — the
    walk stops at the upper bound rather than running to the end of the pinned
    prefix. Without the counter this narrowing and a filter that discarded the
-   same rows after fetching them would look identical. *)
+   same rows after fetching them would look identical.
+
+   #575 kept this case: a range-bounded seek is not the open-ended prefix walk
+   the decision declined, and it is the one shape with a span estimate the
+   planner can read. Its foil is now a plain scan rather than a prefix walk,
+   because the foil's unrecognisable range leaves a bare prefix pin. *)
 let a_range_bound_cuts_the_entries_walked () =
   with_db (fun db ->
     seed db;
@@ -142,8 +171,8 @@ let a_range_bound_cuts_the_entries_walked () =
       (n_line + 21)
       bounded.Db.index_entries;
     Alcotest.(check int)
-      "unbounded: the driving side plus the whole pinned prefix"
-      (n_line + n_per_w)
+      "unbounded: a #575-declined bare prefix, so the driving side alone"
+      n_line
       unbounded.Db.index_entries)
 ;;
 
@@ -165,9 +194,13 @@ let () =
             `Quick
             a_scan_walks_no_index_entries
         ; Alcotest.test_case
-            "a seeked build side walks one entry per row"
+            "a bare prefix pin no longer seeks (#575)"
             `Quick
-            a_seeked_build_side_walks_one_entry_per_row
+            a_bare_prefix_pin_no_longer_seeks
+        ; Alcotest.test_case
+            "a full unique-key pin still seeks (#575)"
+            `Quick
+            a_full_unique_key_pin_still_seeks
         ; Alcotest.test_case
             "a range bound cuts the entries walked"
             `Quick

@@ -90,6 +90,25 @@ let examined db sql =
   st.Granary.Db.rows_examined
 ;;
 
+(* #595: the parameterised counterpart of [examined]. A bound parameter reaches
+   [range_for_index] exactly as a literal does, so the only way to observe that
+   #575 declines it is to prepare and bind rather than to interpolate. *)
+let examined_with db sql params =
+  unwrap
+    (run
+       (let open Lwt.Syntax in
+        let* s = Db.prepare db sql in
+        match s with
+        | Error e -> Lwt.return (Error e)
+        | Ok stmt ->
+          let* r = Db.iter_with_stats stmt ~params in
+          (match r with
+           | Error e -> Lwt.return (Error e)
+           | Ok (stream, stats) ->
+             let* _ = Lwt_stream.to_list stream in
+             Lwt.return (Ok stats.Granary.Db.rows_examined))))
+;;
+
 let same_rows db ~label ~seek ~foil =
   Alcotest.(check (list (list string))) label (rows_of db foil) (rows_of db seek)
 ;;
@@ -169,9 +188,14 @@ let between_bounds_the_build_side () =
       "unpinned: the driving side plus every warehouse's stock"
       (n_line + n_stock)
       (examined db scan);
+    (* #575: a BARE prefix pin no longer seeks — the decision declined every
+       open-ended prefix walk, which is what this foil now is.  So it costs the
+       same full scan the unpinned one does, and the two upper rows of the
+       comparison have collapsed into each other.  The gap this case is really
+       about is the one below it: prefix+range against everything else. *)
     Alcotest.(check int)
-      "prefix only (#528): the driving side plus warehouse 1"
-      (n_line + n_per_w)
+      "prefix only, #575-declined: the same full scan as the unpinned foil"
+      (n_line + n_stock)
       (examined db foil);
     Alcotest.(check int)
       "prefix + range (#532): the driving side plus the 21-row window"
@@ -207,9 +231,27 @@ let inequalities_bound_the_build_side () =
       ])
 ;;
 
-(* One end only. The lower bound moves the start key forward, the upper bound
-   stops the walk early; neither needs the other. *)
-let one_ended_ranges_bound_the_build_side () =
+(* One end only — DECLINED since #575, and this case is the reason the #575 gate
+   is written the way it is.
+
+   #532 admitted these because "a range stops the walk at a bound". A one-ended
+   range does not: [range_for_index] answers [Some] when EITHER end is present,
+   so [si >= 20] starts the walk 19 keys in and then runs to the end of the
+   pinned prefix — 481 of warehouse 1's 500 rows, which is the number this case
+   asserted while green. That is #546's open-ended prefix walk with a decoration
+   on the front, and it was measured on #546's own 100,000-row population at
+   3.6x slower than the scan (1.00-1.06 s against 0.28 s) — worse than the
+   2.6-3.5x #575 exists to remove, and reachable by appending a tautology
+   ([si >= 0]) to a WHERE clause.
+
+   The second half of the #532 argument fails here too: [range_rows_estimate]
+   needs BOTH ends to be integer literals and answers the flat
+   [range_seek_rows = 100] otherwise, so a one-ended range has no estimate to
+   consult either.
+
+   The rows must still agree with the foil — that is the invariant #576 needs
+   intact — so those assertions are unchanged. *)
+let one_ended_ranges_are_declined_575 () =
   with_db (fun db ->
     seed db;
     let upper = q (Printf.sprintf "sw = 1 AND si <= %d" hi) in
@@ -225,30 +267,154 @@ let one_ended_ranges_bound_the_build_side () =
       ~seek:lower
       ~foil:(q (Printf.sprintf "sw = 1 AND si + 0 >= %d" lo));
     Alcotest.(check int)
-      "upper bound: reads si in 1..40"
-      (n_line + hi)
+      "upper bound: no seek, so the whole of stock"
+      (n_line + n_stock)
       (examined db upper);
     Alcotest.(check int)
-      "lower bound: reads si in 20..500"
-      (n_line + (n_per_w - lo + 1))
+      "lower bound: no seek, so the whole of stock"
+      (n_line + n_stock)
       (examined db lower))
+;;
+
+(* The other half of the same gate: a range whose ends ARE both integer literals
+   but whose window covers the table is the same open-ended walk in a different
+   spelling, so [range_rows_estimate] being able to read it is not enough — the
+   estimate has to come back smaller than the table. *)
+let a_table_wide_literal_window_is_declined_575 () =
+  with_db (fun db ->
+    seed db;
+    let seek = q (Printf.sprintf "sw = 1 AND si BETWEEN 0 AND %d" (n_stock * 100)) in
+    same_rows
+      db
+      ~label:"a table-wide window agrees with its foil"
+      ~seek
+      ~foil:(q (Printf.sprintf "sw = 1 AND si + 0 BETWEEN 0 AND %d" (n_stock * 100)));
+    Alcotest.(check int)
+      "and reads the whole of stock rather than seeking"
+      (n_line + n_stock)
+      (examined db seek))
+;;
+
+(* A range on a NON-UNIQUE index, which the #575 gate must also decline.
+
+   [range_rows_estimate] counts distinct KEY VALUES; [table_rows_estimate] counts
+   ROWS. Comparing the two is only meaningful when one key value is one row, i.e.
+   when the index is unique — [range_rows_estimate]'s own doc says so: "a span
+   counts distinct key VALUES, and a non-unique index may hold many rows per
+   value, so this can under-state the row count."
+
+   Here [cat] takes 10 values across 500 rows per warehouse, so
+   [cat BETWEEN 0 AND 9] estimates 10 rows (floored to [range_seek_rows] = 100)
+   for a window that actually holds the entire pinned prefix. Measured on disk at
+   100,000 rows this is 4.2x slower than the scan it replaces — the same failure
+   mode as the one-ended hole, one level down: an estimate consulted about a
+   question it cannot answer. *)
+let n_cat = 10
+
+let seed_non_unique db =
+  exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
+  exec db "CREATE TABLE cats (sw INTEGER, cat INTEGER, qty INTEGER)";
+  exec db "CREATE INDEX cats_ix ON cats (sw, cat)";
+  exec db "BEGIN";
+  for o = 1 to n_line do
+    exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, %d)" o (o mod n_cat))
+  done;
+  for w = 1 to n_w do
+    for i = 1 to n_per_w do
+      exec
+        db
+        (Printf.sprintf
+           "INSERT INTO cats VALUES (%d, %d, %d)"
+           w
+           (i mod n_cat)
+           ((w * 1000) + i))
+    done
+  done;
+  exec db "COMMIT"
+;;
+
+let a_non_unique_index_range_is_declined_575 () =
+  with_db (fun db ->
+    seed_non_unique db;
+    let seek =
+      Printf.sprintf
+        "SELECT qty FROM line INNER JOIN cats ON cat = i_id WHERE w = 1 AND sw = 1 AND \
+         cat BETWEEN 0 AND %d"
+        (n_cat - 1)
+    in
+    let foil =
+      Printf.sprintf
+        "SELECT qty FROM line INNER JOIN cats ON cat = i_id WHERE w = 1 AND sw + 0 = 1 \
+         AND cat BETWEEN 0 AND %d"
+        (n_cat - 1)
+    in
+    same_rows db ~label:"a non-unique range agrees with its foil" ~seek ~foil;
+    Alcotest.(check int)
+      "a span of 10 key VALUES over 500 rows is not a window the estimator can size"
+      (n_line + n_stock)
+      (examined db seek))
+;;
+
+(* #595: a PARAMETERISED bound, in both directions, which nothing in this repo
+   covered before — which is precisely why the one-ended hole above shipped
+   through a full armed suite undetected.
+
+   [range_value] accepts [BE_param], so a bound parameter reaches
+   [range_for_index] and produces a [Plan.range] exactly as a literal does. What
+   it cannot produce is an estimate: [range_rows_estimate] requires
+   [P_lit (L_int _)] at both ends and falls to the flat [range_seek_rows]
+   otherwise. So a parameterised window is declined however narrow the value
+   passed at run time turns out to be — the planner cannot see it, and #575
+   declines what it cannot see. *)
+let parameterised_ranges_are_declined_575 () =
+  with_db (fun db ->
+    seed db;
+    List.iter
+      (fun (pred, params, label) ->
+         Alcotest.(check int)
+           (label ^ ": no estimate, so no seek")
+           (n_line + n_stock)
+           (examined_with db (q ("sw = 1 AND " ^ pred)) params))
+      [ ( "si BETWEEN ? AND ?"
+        , [ Db.V_int (Int64.of_int lo); Db.V_int (Int64.of_int hi) ]
+        , "both ends parameterised" )
+      ; ( Printf.sprintf "si >= ? AND si <= %d" hi
+        , [ Db.V_int (Int64.of_int lo) ]
+        , "lower end parameterised" )
+      ; ( Printf.sprintf "si >= %d AND si <= ?" lo
+        , [ Db.V_int (Int64.of_int hi) ]
+        , "upper end parameterised" )
+      ])
 ;;
 
 (* #523: several conjuncts may constrain the same end, and the seek must take
    the extremum rather than the first one it meets. The re-emitted conjuncts go
-   through the same fold, so this holds on the build side too. *)
+   through the same fold, so this holds on the build side too.
+
+   #575: a lower bound is added, because the two redundant upper bounds alone
+   make this a one-ended range and #575 declines those — see
+   [one_ended_ranges_are_declined_575]. The fold under test is unchanged: it is
+   still two conjuncts constraining the upper end, and the assertion is still
+   that the tighter of them is the one that stops the walk. *)
 let the_tighter_of_two_bounds_wins () =
   with_db (fun db ->
     seed db;
-    let seek = q (Printf.sprintf "sw = 1 AND si <= 400 AND si <= %d" hi) in
+    let seek =
+      q (Printf.sprintf "sw = 1 AND si >= %d AND si <= 400 AND si <= %d" lo hi)
+    in
     same_rows
       db
       ~label:"redundant upper bounds agree with the unbounded foil"
       ~seek
-      ~foil:(q (Printf.sprintf "sw = 1 AND si + 0 <= 400 AND si + 0 <= %d" hi));
+      ~foil:
+        (q
+           (Printf.sprintf
+              "sw = 1 AND si + 0 >= %d AND si + 0 <= 400 AND si + 0 <= %d"
+              lo
+              hi));
     Alcotest.(check int)
       "the tighter of the two bounds is the one that stops the walk"
-      (n_line + hi)
+      (n_line + n_window)
       (examined db seek))
 ;;
 
@@ -292,9 +458,13 @@ let a_left_table_range_bounds_nothing () =
       "and the agreement is not between two empty lists"
       true
       (rows_of db seek <> []);
+    (* #575: with no range to bound it this is a bare prefix pin, which the
+       decision declines — so the build side now scans rather than walking the
+       pinned prefix.  Either way the left-table range contributed nothing,
+       which is what this case is for. *)
     Alcotest.(check int)
-      "the build side still walks the whole pinned prefix"
-      (n_line + n_per_w)
+      "the build side scans: no range survived re-basing to bound a seek"
+      (n_line + n_stock)
       (examined db seek))
 ;;
 
@@ -311,9 +481,11 @@ let a_range_off_the_index_bounds_nothing () =
       ~label:"an off-index range changes no answer"
       ~seek
       ~foil:(q "sw = 1 AND qty + 0 < 1100");
+    (* #575: as above — an off-index range leaves a bare prefix pin, which is
+       declined and scans. *)
     Alcotest.(check int)
-      "the build side still walks the whole pinned prefix"
-      (n_line + n_per_w)
+      "the build side scans: an off-index range bounds no seek"
+      (n_line + n_stock)
       (examined db seek))
 ;;
 
@@ -478,7 +650,25 @@ let a_window_as_wide_as_the_table_keeps_the_probe () =
    how wide the window is, so the estimate keeps the flat constant and the plan
    is exactly the one it was before #532 touched the estimator — here, the hash
    join a 100-row R chooses, even though the parameters happen to describe the
-   whole table. Deliberate: the alternative is guessing. *)
+   whole table. Deliberate: the alternative is guessing.
+
+   #575 takes that reasoning one step further: if the estimate is a flat constant
+   then there is nothing to consult, so the build side does not seek either — and
+   THAT MOVES THE STRATEGY, which is worth stating plainly because it is the
+   direction [build_side]'s doc warns reads backwards.
+
+   [estimate_rows] takes R from the build-side op. A seeked build side carrying a
+   range answered [range_seek_rows] = 100, and [probe_is_worth_it] takes the
+   probe iff [driving_rows <= right_rows / 8] — so R = 100 made 1,200 driving
+   rows fail 1200 <= 12 and the plan was a hash join. Declining the seek makes
+   the build side an [Op_seq_scan], R becomes the table's 20,001, and 1200 <=
+   2500 now HOLDS: this query is a nested-loop probe again, exactly as it was
+   before #532 touched the estimator.
+
+   That is the better plan by #520's own measurements — 2,400 rows examined
+   against the hash join's 21,200 — but it is a plan change, not just an access
+   path change, and #575's issue text did not anticipate it. Recorded here rather
+   than left for someone to trip over. *)
 let a_parameterised_window_keeps_the_flat_estimate () =
   with_db (fun db ->
     seed_big db;
@@ -508,8 +698,8 @@ let a_parameterised_window_keeps_the_flat_estimate () =
     in
     Alcotest.(check int) "every driving row still joins" n_big_line rows;
     Alcotest.(check int)
-      "a hash join over the whole bounded span, from the flat estimate"
-      (n_big_line + (n_big_stock - lo + 1))
+      "#575 declines the seek, R rises to the table, and the probe wins again"
+      (n_big_line * 2)
       st.Granary.Db.rows_examined)
 ;;
 
@@ -575,9 +765,21 @@ let () =
             `Quick
             inequalities_bound_the_build_side
         ; Alcotest.test_case
-            "one-ended ranges bound the build side"
+            "one-ended ranges are declined (#575)"
             `Quick
-            one_ended_ranges_bound_the_build_side
+            one_ended_ranges_are_declined_575
+        ; Alcotest.test_case
+            "a table-wide literal window is declined (#575)"
+            `Quick
+            a_table_wide_literal_window_is_declined_575
+        ; Alcotest.test_case
+            "a non-unique index range is declined (#575)"
+            `Quick
+            a_non_unique_index_range_is_declined_575
+        ; Alcotest.test_case
+            "parameterised ranges are declined (#575, #595)"
+            `Quick
+            parameterised_ranges_are_declined_575
         ; Alcotest.test_case
             "the tighter of two bounds wins"
             `Quick

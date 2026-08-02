@@ -539,121 +539,55 @@ let seek_op (table_meta : Cat.table_meta) = function
    conjuncts a #517 range bound may be read out of; pass [[]] for a caller that
    has none to offer.
 
-   Returns the chosen path with the conjunct positions it consumed. *)
+   Returns the chosen path with the conjunct positions it consumed.
+
+   #565: gated on {!meta_is_btree_backed}.  This is the single chokepoint
+   [plan_base], [choose_access_path] and [plan_dml_seek] all reach, so one guard
+   at the entry covers every arm the function has or grows — cheaper than
+   remembering to add one per arm.
+
+   #594 corrects the reason #565 gave for the placement.  It said [Seek_rowid]
+   was a second leak, reachable via [Cat.rowid_alias_col]; that arm cannot
+   actually leak, because [rowid_alias_col] reads the meta's OWN columns rather
+   than the catalog, so a CTE's synthesized meta answers [None] there.  The one
+   real leak is the index branch: a CTE shadowing a real table picks up that
+   table's indexes —
+   [find_index_for_eqs] resolves them by name, and [Cat.register_ephemeral]
+   replaces only the table entry — and [seek_op] builds an [Op_index_lookup]
+   whose [table_tree] is the CTE's sentinel [tree_id = -1].  The result is
+   silently empty.  #551 fixed the probe-side instance of exactly this and #531
+   the build-side one; this is the third and last site. *)
 let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts =
-  let alias_eq =
-    List.find_opt
-      (fun (_, col_idx, _) -> Cat.rowid_alias_col table_meta = Some col_idx)
-      eqs
-  in
-  match alias_eq with
-  | Some (pos, _, lit_expr) ->
-    (* #243 (T1): the alias column IS the table key — a single rowid seek, no
-       index. *)
-    Some (Plan.Seek_rowid (plan_expr lit_expr), [ pos ])
-  | None ->
-    if eqs = []
-    then None
-    else (
-      match find_index_for_eqs cat table_meta eqs with
-      | None -> None
-      | Some (idx, prefix, consumed) ->
-        let keys =
-          List.map
-            (fun (col_idx, v) ->
-               col_idx, (List.nth table_meta.Cat.columns col_idx).Row.ty, plan_expr v)
-            prefix
-        in
-        let range =
-          range_for_index table_meta idx ~n_eq:(List.length prefix) range_conjuncts
-        in
-        Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed))
-;;
-
-(** #528: the plan op a join's right table is read through when it is the {i
-    build} side of a hash join.
-
-    [make_scan] was unconditional here, so a hash join always read the whole
-    right table even when the WHERE clause pinned a leading prefix of one of its
-    indexes — the TPC-C StockLevel shape, where [s_w_id = ?] makes one
-    warehouse's [stock] directly seekable out of 100,000 rows across every
-    warehouse.  [right_eqs] is the same re-based equality list {!best_probe}
-    consumes, so the two strategies now narrow the right table from the same
-    facts.
-
-    Soundness is the invariant #513 and #516 already rest on: [chain_joins]
-    applies the whole WHERE clause to the joined row, so restricting what the
-    build side reads cannot change which joined rows survive.  This holds for
-    LEFT JOIN for the reason #516 settled on — a narrowed build side null-extends
-    left rows a full scan would have matched, those rows carry NULL in the very
-    column the narrowing conjunct tests, [col = value] is never true of NULL, and
-    the post-join filter drops them exactly as it dropped the wider rows they
-    replaced.
-
-    #532: [right_ranges] is the range half of the same re-basing, from
-    {!right_table_ranges}.  It was empty when this function landed, so a build
-    side whose prefix was pinned by equalities still walked to the end of that
-    prefix even when the WHERE clause bounded the {i next} index column — the
-    [sw = 1 AND si BETWEEN 20 AND 40] shape, which seeked warehouse 1 and then
-    read all of it.  Feeding it through {!access_path_for_eqs} stops the walk at
-    the upper bound.
-
-    That feeds back into the strategy choice, {b in the direction that costs a
-    probe rather than the one that buys one}.  {!estimate_rows} answers
-    {!range_seek_rows} for a seek carrying a range where it answered
-    [table_rows_estimate] for a bare prefix pin, so R shrinks — and
-    {!probe_is_worth_it} takes the probe iff [driving_rows <= right_rows / 8], so
-    a {i smaller} R makes the probe {i harder} to justify.  A join above
-    {!nlj_min_driving_rows} whose right table holds N rows therefore moves from
-    nested-loop probe to hash join across the whole band D <= N/8 (12,500 for
-    N = 100,000), because R/8 falls from 12,500 to 12.
-
-    Which way the flip goes is worth stating once more because it reads
-    backwards: shrinking R moves joins towards the {i hash join}, taking probes
-    away.  Whether that is an improvement depends entirely on how wide the window
-    is, and a flat {!range_seek_rows} cannot tell — measured on disk, it was
-    right for a 21-row window (4.2x faster) and 9x WRONG for a 20,000-row one.
-    {!range_rows_estimate} reads the span off literal bounds for that reason;
-    its doc carries the measurements and the one band still left mis-costed.
-
-    The seek is taken unconditionally whenever a prefix is pinned, because there
-    is no selectivity estimate to consult.  Where the prefix selects nearly the
-    whole table this trades one ordered leaf walk for an index traversal plus a
-    row fetch per entry, which in-memory measurement cannot see — #546, still
-    open, and {b measured on disk}: at 100,000 build-side rows,
-    [test/bench_build_side_seek_546.ml] puts an unselective seek at 393,980 pager
-    reads and 2.6-3.5x the wall time of the scan it replaces (93,067 reads), the
-    two drawing level near 1% selectivity.  Roughly, the seek costs ~3 pager
-    resolutions per row fetched against the sequential walk's ~0.008, and that
-    figure barely moves when index order is scrambled against rowid order — so
-    the cost is the per-entry descent itself and the ordered-fetch remedy #541
-    landed for the DML drain would not recover it.  No guard is applied here
-    because none can be built from what the planner knows: distinguishing the
-    100% case from the 1% one needs a column-cardinality statistic this engine
-    does not keep (#550 carries the same gap for the driving side).
-    {!Granary_sql.Exec.query_stats}'s [index_entries] was added so a future guard
-    has something to assert on.
-
-    Synthesized right tables — CTEs, [sqlite_master], [sqlite_sequence], marked
-    by a negative [tree_id] — and columnar tables have no B-tree to seek and are
-    left to {!make_scan}.  For a CTE the guard is load-bearing, not defensive:
-    {!access_path_for_eqs} reaches the catalog {i by name}, so a CTE that
-    shadows a real table would otherwise pick up that table's indexes and plan
-    an [Op_index_lookup] against a tree it has nothing to do with — a wrong
-    answer, pinned by [cte_shadowing_a_real_table_still_scans]. *)
-let build_side cat (right_meta : Cat.table_meta) ~right_eqs ~right_ranges =
-  let seekable =
-    match right_meta.Cat.storage with
-    | Cat.Row { tree_id; _ } -> tree_id >= 0
-    | Cat.Columnar _ -> false
-  in
-  if not seekable
-  then make_scan right_meta
+  if not (meta_is_btree_backed table_meta)
+  then None
   else (
-    let eqs = List.mapi (fun pos (col_idx, v) -> pos, col_idx, v) right_eqs in
-    match access_path_for_eqs cat right_meta ~eqs ~range_conjuncts:right_ranges with
-    | None -> make_scan right_meta
-    | Some (seek, _consumed) -> seek_op right_meta seek)
+    let alias_eq =
+      List.find_opt
+        (fun (_, col_idx, _) -> Cat.rowid_alias_col table_meta = Some col_idx)
+        eqs
+    in
+    match alias_eq with
+    | Some (pos, _, lit_expr) ->
+      (* #243 (T1): the alias column IS the table key — a single rowid seek, no
+         index. *)
+      Some (Plan.Seek_rowid (plan_expr lit_expr), [ pos ])
+    | None ->
+      if eqs = []
+      then None
+      else (
+        match find_index_for_eqs cat table_meta eqs with
+        | None -> None
+        | Some (idx, prefix, consumed) ->
+          let keys =
+            List.map
+              (fun (col_idx, v) ->
+                 col_idx, (List.nth table_meta.Cat.columns col_idx).Row.ty, plan_expr v)
+              prefix
+          in
+          let range =
+            range_for_index table_meta idx ~n_eq:(List.length prefix) range_conjuncts
+          in
+          Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed)))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -785,14 +719,27 @@ let range_seek_rows = 100
     Under-stating R biases towards the hash join and under-stating D biases
     towards the probe, which is what the flat constant already did — this only
     stops it doing so by two orders of magnitude.  Callers cap the result with
-    [table_rows_estimate], which is the only real number available. *)
-let range_rows_estimate (r : Plan.range) =
+    [table_rows_estimate], which is the only real number available.
+
+    #575: the [Some lo, Some hi] arm is the {i only} one that reads anything off
+    the query.  Every other shape — a one-ended range, a parameterised bound, a
+    non-integer literal — falls to the flat [range_seek_rows], which is a made-up
+    constant and not an estimate of anything.  {!range_int_literal_span} is that
+    distinction named, so a caller can ask whether this function has something to
+    say before believing what it says. *)
+let range_int_literal_span (r : Plan.range) =
   let int_lit = function
     | Some (Plan.P_lit (Ast.L_int n)) -> Some n
     | _ -> None
   in
   match int_lit r.Plan.r_lo, int_lit r.Plan.r_hi with
-  | Some lo, Some hi ->
+  | Some lo, Some hi -> Some (lo, hi)
+  | _ -> None
+;;
+
+let range_rows_estimate (r : Plan.range) =
+  match range_int_literal_span r with
+  | Some (lo, hi) ->
     let span = Int64.sub hi lo in
     (* [hi < lo] is an empty window; a [span] that came out negative for the
        other reason — [hi - lo] overflowing int64 — is as unbounded as a range
@@ -802,7 +749,7 @@ let range_rows_estimate (r : Plan.range) =
     else if Int64.compare span (Int64.of_int unbounded_rows) >= 0
     then unbounded_rows
     else max range_seek_rows (Int64.to_int span + 1)
-  | _ -> range_seek_rows
+  | None -> range_seek_rows
 ;;
 
 (** #520: how many rows [meta]'s table can hold, from the only real number the
@@ -827,6 +774,43 @@ let table_rows_estimate (meta : Cat.table_meta) =
     if Int64.compare next_rowid (Int64.of_int unbounded_rows) >= 0
     then unbounded_rows
     else max 0 (Int64.to_int next_rowid - 1)
+;;
+
+(** #593: [meta]'s index living in tree [idx_tree], if it has one.
+
+    The catalog is keyed by table name and answers a list, so every question
+    about "the index this seek reads" starts by finding it.  Three callers ask
+    different questions of the same answer — {!seek_is_unique_point},
+    {!index_is_unique} and {!build_side_seek_is_unambiguous} — and the lookup is
+    shared rather than open-coded three times, which is how the second of those
+    call sites came to disagree with the first. *)
+let index_by_tree cat (meta : Cat.table_meta) ~idx_tree =
+  Cat.indexes_for_table cat ~table:meta.Cat.name
+  |> List.find_opt (fun (i : Cat.index_info) -> i.Cat.idx_tree_id = idx_tree)
+;;
+
+(** #575: is the index [idx_tree] holds a UNIQUE one?
+
+    Weaker than {!seek_is_unique_point} on purpose, and the two are not
+    interchangeable — see that function's [all_not_null] discussion.  This is the
+    precondition for reading a {!range_rows_estimate} as a row count at all: that
+    estimate counts distinct KEY VALUES, so comparing it against
+    {!table_rows_estimate}'s ROW count is only meaningful when one key value is
+    one row. *)
+let index_is_unique cat (meta : Cat.table_meta) ~idx_tree =
+  match index_by_tree cat meta ~idx_tree with
+  | Some i -> i.Cat.idx_unique
+  | None -> false
+;;
+
+(** #575: is every column of [idx_tree]'s UNIQUE index pinned by [keys]?
+
+    {!seek_is_unique_point} without its [all_not_null] test, which is deliberate
+    and is the whole reason this exists separately — see that function. *)
+let index_full_unique_pin cat (meta : Cat.table_meta) ~idx_tree ~keys =
+  match index_by_tree cat meta ~idx_tree with
+  | Some i -> i.Cat.idx_unique && List.length i.Cat.idx_columns = List.length keys
+  | None -> false
 ;;
 
 (** #520: does [idx_tree] belong to a UNIQUE index of [meta] whose every column
@@ -870,12 +854,7 @@ let seek_is_unique_point cat (meta : Cat.table_meta) ~idx_tree ~keys =
       (fun (col_idx, _, _) -> (List.nth meta.Cat.columns col_idx).Row.not_null)
       keys
   in
-  Cat.indexes_for_table cat ~table:meta.Cat.name
-  |> List.exists (fun (i : Cat.index_info) ->
-    i.Cat.idx_tree_id = idx_tree
-    && i.Cat.idx_unique
-    && List.length i.Cat.idx_columns = List.length keys
-    && all_not_null)
+  index_full_unique_pin cat meta ~idx_tree ~keys && all_not_null
 ;;
 
 (** #520: estimate how many rows [op] produces, statically.
@@ -925,6 +904,257 @@ let estimate_rows cat (op : Plan.op) =
     min seek (table_rows_estimate table_meta)
   | Plan.Op_seq_scan { table_meta } -> table_rows_estimate table_meta
   | _ -> unbounded_rows
+;;
+
+(** #575: is [seek]'s reach something the planner can actually see?
+
+    The whole of {!build_side}'s guard, factored out so its cases can be read
+    next to each other.  Three qualify:
+
+    - [Seek_rowid] — the rowid alias is the table key, so this addresses exactly
+      one row.
+    - [Seek_index] on a UNIQUE index with {i every} key column pinned — one
+      entry, one row.  A strict prefix of a unique index does {b not} qualify:
+      that is precisely the shape [bench_build_side_seek_546] measured at
+      2.6-3.5x slower when it selects the whole table, and nothing in the catalog
+      distinguishes that from the 1% case (#576).  Nor does a full pin of a
+      non-unique index, which reaches an unbounded run of duplicates.
+
+      This asks {!index_full_unique_pin}, which is {!seek_is_unique_point} {i
+      without} its [all_not_null] test, and the omission is deliberate (#593).
+      Folding this arm into [seek_is_unique_point] outright — as an intermediate
+      version did — imports a check calibrated for a different question and
+      declines a full-key pin of a UNIQUE index over NULLABLE columns, turning a
+      one-[rh_get] point seek into a full table scan.  That is an ordinary
+      schema ([CREATE UNIQUE INDEX ix ON t (a, b)]) and it was a regression
+      against pre-#575 behaviour, invisible to every test in
+      [test_hash_join_build_seek_528.ml] because they all pin a PRIMARY KEY,
+      whose columns are implicitly NOT NULL since #530.
+      [nullable_unique_key_pin_still_seeks] is the case that now covers it.
+
+      Why the omission is right: [seek_is_unique_point]'s own doc says
+      [all_not_null] is there to stop the {i cardinality estimate} answering 1
+      anti-conservatively, and explains in the same breath that reachability does
+      not need it — a key is only ever pinned by [col = value], never true of
+      NULL, so a NULL-keyed seek returns no rows.  NULLs cannot make a seek reach
+      {i more} than one row, and "at most one row" is the only thing this gate
+      asks.  The two functions share {!index_by_tree} so they cannot drift on the
+      part they do agree about.
+    - [Seek_index] carrying a #532 range bound {b whose window the estimator can
+      read and says is smaller than the table}.  A range is a strict prefix, so
+      it needs an argument the bare prefix does not have, and that argument is
+      the estimate: #546's table measures the {i open-ended} prefix walk, and a
+      range that really stops short of the end of the prefix is a different
+      access path — measured separately on disk by
+      [test/bench_build_side_strategy_532.ml] at 4.2x faster for a 21-row window.
+
+      {b Both halves of that have to be tested, and the first version of this
+      function tested neither.}  It admitted any [range = Some _], on the
+      strength of the sentence above rather than of anything the code checked:
+
+      - "a range stops that walk at a bound" is false for a {b one-ended} range.
+        {!range_for_index} answers [Some] when {i either} end is present, so
+        [sw = 1 AND si >= 0] yields [{r_lo = Some 0; r_hi = None}] and walks from
+        the start of the pinned prefix to the end of it.  That is #546's
+        open-ended walk exactly, and it was measured on #546's own 100,000-row
+        population at {b 3.6x slower} than the scan (1.00-1.06 s against 0.28 s)
+        — worse than the 2.6-3.5x #575 exists to remove, reachable by appending a
+        tautology to a WHERE clause.
+      - "it has an estimate the planner can consult" is false for {b anything but
+        two integer literals}.  {!range_rows_estimate} answers the flat
+        {!range_seek_rows} for a one-ended or parameterised bound, which is a
+        made-up constant; consulting it there is consulting nothing.
+
+      So the gate asks three things, and all three are load-bearing:
+
+      + {!index_is_unique} — {b without it the other two are incommensurable}.
+        {!range_rows_estimate} counts distinct KEY VALUES; {!table_rows_estimate}
+        counts ROWS.  Comparing them means something only when one value is one
+        row.  On a non-unique [INDEX (sw, cat)] with [cat] taking ten values
+        across 500 rows per warehouse, [cat BETWEEN 0 AND 9] estimates ten and
+        reaches five hundred — measured on disk at 100,000 rows as {b 4.2x}
+        slower than the scan.  An intermediate version of this gate asked
+        [seek_is_unique_point] here instead, which is {i dead code} in this arm:
+        a range exists only when [range_for_index] found an index column at
+        position [n_eq], i.e. [length idx_columns > length keys], and
+        [seek_is_unique_point] requires them equal.  It read as a uniqueness
+        check and was not one.
+      + {!range_int_literal_span} — whether the estimator can read the window at
+        all, rather than falling back to its flat constant.
+      + [range_rows_estimate r < table_rows_estimate meta] — whether it says the
+        window is smaller than the table.  A both-ends-literal range spanning the
+        whole table ([si BETWEEN 0 AND 1000000] over 100,000 rows) is the same
+        open-ended walk in a different spelling.
+
+      That threshold is "smaller than the table", so selectivity approaching 100%
+      still seeks on a unique index; #606 carries the residual, because closing it
+      honestly needs a factor of ~390 and that is the fudge #576 forbids.
+
+      A justification naming a property, attached to a gate that does not test
+      for it, is the fudge-factor wedge #561 and #576 warn about.  This function
+      has now been wrong that way twice — once admitting any range at all, once
+      appearing to check uniqueness through a call that could never be true — so
+      each conjunct above names the measurement that would fire without it. *)
+let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
+  | Plan.Seek_rowid _ -> true
+  | Plan.Seek_index { idx_tree; keys; range = None } ->
+    index_full_unique_pin cat meta ~idx_tree ~keys
+  | Plan.Seek_index { idx_tree; keys = _; range = Some r } ->
+    index_is_unique cat meta ~idx_tree
+    && Option.is_some (range_int_literal_span r)
+    && range_rows_estimate r < table_rows_estimate meta
+;;
+
+(** #528: the plan op a join's right table is read through when it is the {i
+    build} side of a hash join.
+
+    [make_scan] was unconditional here, so a hash join always read the whole
+    right table even when the WHERE clause pinned a leading prefix of one of its
+    indexes — the TPC-C StockLevel shape, where [s_w_id = ?] makes one
+    warehouse's [stock] directly seekable out of 100,000 rows across every
+    warehouse.  [right_eqs] is the same re-based equality list {!best_probe}
+    consumes, so the two strategies now narrow the right table from the same
+    facts.
+
+    Soundness is the invariant #513 and #516 already rest on: [chain_joins]
+    applies the whole WHERE clause to the joined row, so restricting what the
+    build side reads cannot change which joined rows survive.  This holds for
+    LEFT JOIN for the reason #516 settled on — a narrowed build side null-extends
+    left rows a full scan would have matched, those rows carry NULL in the very
+    column the narrowing conjunct tests, [col = value] is never true of NULL, and
+    the post-join filter drops them exactly as it dropped the wider rows they
+    replaced.
+
+    #532: [right_ranges] is the range half of the same re-basing, from
+    {!right_table_ranges}.  It was empty when this function landed, so a build
+    side whose prefix was pinned by equalities still walked to the end of that
+    prefix even when the WHERE clause bounded the {i next} index column — the
+    [sw = 1 AND si BETWEEN 20 AND 40] shape, which seeked warehouse 1 and then
+    read all of it.  Feeding it through {!access_path_for_eqs} stops the walk at
+    the upper bound.
+
+    That feeds back into the strategy choice, {b in the direction that costs a
+    probe rather than the one that buys one}.  {!estimate_rows} answers
+    {!range_seek_rows} for a seek carrying a range where it answered
+    [table_rows_estimate] for a bare prefix pin, so R shrinks — and
+    {!probe_is_worth_it} takes the probe iff [driving_rows <= right_rows / 8], so
+    a {i smaller} R makes the probe {i harder} to justify.  A join above
+    {!nlj_min_driving_rows} whose right table holds N rows therefore moves from
+    nested-loop probe to hash join across the whole band D <= N/8 (12,500 for
+    N = 100,000), because R/8 falls from 12,500 to 12.
+
+    Which way the flip goes is worth stating once more because it reads
+    backwards: shrinking R moves joins towards the {i hash join}, taking probes
+    away.  Whether that is an improvement depends entirely on how wide the window
+    is, and a flat {!range_seek_rows} cannot tell — measured on disk, it was
+    right for a 21-row window (4.2x faster) and 9x WRONG for a 20,000-row one.
+    {!range_rows_estimate} reads the span off literal bounds for that reason;
+    its doc carries the measurements and the one band still left mis-costed.
+
+    #575 runs that mechanism {i in reverse}, and it is easy to miss.  Declining a
+    seek makes the build side an [Op_seq_scan], so R rises from
+    {!range_seek_rows} (or from 1) to [table_rows_estimate] — and a {i larger} R
+    makes the probe {i easier} to justify.  Some joins therefore move from hash
+    join back to nested-loop probe, not merely from a seeked build side to a
+    scanned one.  [a_parameterised_window_keeps_the_flat_estimate] in
+    [test/test_build_side_range_532.ml] is that case: 1,200 driving rows against
+    20,000 stock rows go from a 21,200-row hash join to a 2,400-row probe, which
+    is the plan #520's measurements prefer.  The strategy change is a consequence
+    of the access-path change, and #575's issue text did not anticipate it.
+
+    {2 #575: the seek is conditional}
+
+    #528 took the seek unconditionally whenever a prefix was pinned, because
+    there is no selectivity estimate to consult.  Where the prefix selects nearly
+    the whole table that trades one ordered leaf walk for an index traversal plus
+    a row fetch per entry, which in-memory measurement cannot see — {b measured
+    on disk} by [test/bench_build_side_seek_546.ml] at 100,000 build-side rows:
+
+    {v
+      pinned prefix selects   seek reads   scan reads   cold
+      100% (TPC-C W=1)           393,980       93,067   2.6-3.5x SLOWER
+       25%                       166,691       93,03x   1.06-1.37x slower
+        6%                       109,869       93,049   0.72x faster
+        1%                        93,960       93,103   0.6-1.1x
+    v}
+
+    The seek costs ~3 pager resolutions per row fetched against the sequential
+    walk's ~0.008, so break-even is around 1/390 of the table.  That figure
+    barely moves when index order is scrambled against rowid order — the cost is
+    the per-entry descent itself, so the ordered-fetch remedy #541 landed for the
+    DML drain would not recover it.
+
+    #575 decided what to do about that {i now}, rather than waiting for the
+    per-index leading-column cardinality statistic (#576) that could tell the
+    100% row from the 1% one — those two are the same plan shape over the same
+    sized table with the same [table_rows_estimate], differing only in a value
+    distribution nothing in the catalog records.  The decision was {b option B}:
+    take the seek only where it is unambiguously right and decline the
+    unmeasurable middle, which is what {!build_side_seek_is_unambiguous} tests.
+
+    Three access paths qualify.  The first two reach {b at most one row}:
+
+    - [Seek_rowid] — the rowid alias IS the table key, so the seek addresses one
+      row and cannot lose to a scan.
+    - [Seek_index] on a {b unique} index whose {b every} key column is pinned by
+      an equality.  One entry, one [rh_get].
+
+    The third is bounded rather than a point:
+
+    - [Seek_index] carrying a #532 range bound.  Not a point, but not part of
+      what #546 measured either: the table above is the {i open-ended} prefix
+      walk, and a range stops it at a bound.  It is also the one case with a
+      selectivity estimate to consult ({!range_rows_estimate}), so #575's premise
+      — "no selectivity estimate" — does not hold for it.
+
+    Everything else — a strict prefix of a unique index, any prefix of a
+    non-unique one — is declined and scans.  That is every row of the table
+    above, so it deliberately gives up the 6% and 1% wins to avoid the 2.6-3.5x
+    regression at 100%: the engine targets MirageOS on disk, the penalty is
+    measured and the wins are the ones the planner cannot currently identify.
+    It is a trade, not a strict improvement, and #576 is what would let the
+    middle band be judged rather than declined.
+
+    {b What this does NOT cost: TPC-C StockLevel.}  That query is the one #528
+    and the table above are written around, so the natural reading is that #575
+    gives it up.  It does not, because StockLevel never reaches this function:
+    it plans as [NestedLoopJoin(stock)] over [IndexLookup(order_line)], not as a
+    hash join, and it does so identically before and after #575.
+    {!probe_is_worth_it} short-circuits on {!nlj_min_driving_rows} — the driving
+    [order_line] seek carries a range and estimates {!range_seek_rows} = 100,
+    [100 <= 1000], so the probe wins unconditionally.  StockLevel's 20-order
+    window can never push the driving side over that floor.  #513's own
+    resolution agrees: stock_level went 1,580 ms to 19.8 ms on #516's probe, not
+    on #528's build side.
+
+    So the cost of #575 is the 6% and 1% rows of the table above, and nothing
+    else.  Verified by EXPLAIN on the real W=1 schema rather than argued from the
+    shape of the SQL, because the shape of the SQL is exactly what makes the
+    wrong reading tempting.
+
+    {!Granary_sql.Exec.query_stats}'s [index_entries] is what makes this
+    testable: [rows_examined] reports 130,000 for {i both} plans in the 100%
+    case, so no assertion on it could tell a declined seek from a taken one.
+
+    Synthesized right tables — CTEs, [sqlite_master], [sqlite_sequence], marked
+    by a negative [tree_id] — and columnar tables have no B-tree to seek and are
+    left to {!make_scan}.  For a CTE the guard is load-bearing, not defensive:
+    {!access_path_for_eqs} reaches the catalog {i by name}, so a CTE that
+    shadows a real table would otherwise pick up that table's indexes and plan
+    an [Op_index_lookup] against a tree it has nothing to do with — a wrong
+    answer, pinned by [cte_shadowing_a_real_table_still_scans].
+
+    #565: that guard used to live here as an inline copy of
+    {!meta_is_btree_backed}'s two-line test.  It now lives inside
+    {!access_path_for_eqs} itself, which covers this caller and the base-scan and
+    DML-seek ones at once.  Two independent copies of the same guard is precisely
+    what let #551 exist unnoticed while this one was correct. *)
+let build_side cat (right_meta : Cat.table_meta) ~right_eqs ~right_ranges =
+  let eqs = List.mapi (fun pos (col_idx, v) -> pos, col_idx, v) right_eqs in
+  match access_path_for_eqs cat right_meta ~eqs ~range_conjuncts:right_ranges with
+  | Some (seek, _consumed) when build_side_seek_is_unambiguous cat right_meta seek ->
+    seek_op right_meta seek
+  | Some _ | None -> make_scan right_meta
 ;;
 
 (** #520: is a nested-loop probe worth it, given [driving_rows] estimated left

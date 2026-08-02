@@ -26,7 +26,40 @@
 
     [rows_examined] is the load-bearing assertion. In-memory databases emit no
     page events, and a seeked build side is told from a scanned one by counting
-    the base rows the executor pulled. *)
+    the base rows the executor pulled.
+
+    {2 #575: half of the above no longer holds}
+
+    #561 measured this optimisation on disk and found the premise wrong for the
+    shape it was written for. At 100,000 build-side rows a seek whose pinned
+    prefix selects the whole table costs 393,980 pager reads against the scan's
+    93,067 and 2.6-3.5x the wall time, breaking even only near 1% selectivity —
+    and the 100% and 1% cases are the SAME PLAN over the same-sized table, with
+    the same [table_rows_estimate], differing only in a value distribution the
+    catalog does not record (#576 is the statistic that would). [rows_examined]
+    reports 130,000 for both, so the number this file leans on cannot see the
+    cost at all.
+
+    #575 decided option B: take the build-side seek only where it reaches at most
+    one row — a rowid alias, or a UNIQUE index with every key column pinned — or
+    where a #532 range bound has BOTH ends as integer literals and the estimator
+    says the window is smaller than the table. Every bare prefix pin is declined
+    and scans. That gives up the measured 6% and 1% wins to avoid the measured
+    2.6-3.5x regression at 100%.
+
+    It does NOT give up TPC-C StockLevel, contrary to what the first version of
+    this header said. That query plans as [NestedLoopJoin(stock)] over
+    [IndexLookup(order_line)] and never reaches [build_side] at all — its driving
+    seek estimates 100 rows, which is below [nlj_min_driving_rows] = 1000, so
+    [probe_is_worth_it] short-circuits and the probe always wins. Checked by
+    EXPLAIN on the real schema, identical before and after #575. The 1,580 ms to
+    19.8 ms StockLevel win belongs to #516's probe (#513), not to #528.
+
+    So the cases below split in two. The CORRECTNESS cases are untouched in
+    substance — the soundness argument above still has to hold, both because the
+    surviving seeks rely on it and because #576 is expected to bring the declined
+    band back. The COST cases now assert that the seek and its foil are the same
+    plan, and say which measurement retired them. *)
 
 module Db = Granary.Db
 
@@ -138,14 +171,31 @@ let foil_sql =
 (* The narrowing                                                        *)
 (* ------------------------------------------------------------------ *)
 
-(* The headline case. The foil reads all [n_stock] rows of stock; the seek reads
-   only warehouse 1's [n_per_w]. Both read the same [n_line] driving rows. *)
-let build_side_seeks_the_pinned_prefix () =
+(* #575 (option B): the headline case, INVERTED.
+
+   #528 narrowed this build side to warehouse 1's [n_per_w] rows, and that was
+   the number this case asserted. #561 then measured the same shape on disk at
+   100,000 rows and found the narrowing costs 2.6-3.5x the scan it replaces when
+   the pinned prefix selects the whole table, breaking even only near 1%
+   selectivity — and nothing in the catalog distinguishes those two, since they
+   are the same plan over the same-sized table with the same
+   [table_rows_estimate].
+
+   #575 chose to decline the whole band rather than keep a known 2.6-3.5x
+   pessimisation on a query anyone can write ([WHERE tenant_id = 1] on a
+   single-tenant-heavy table). So a bare prefix pin scans, and this case now
+   pins THAT: the seek and its foil are the same plan.
+
+   What survives is the pair of cases below — a rowid alias and a full unique-key
+   pin — which reach at most one row and cannot lose to a scan whatever the
+   distribution. #576 is the statistic that would let the middle band be judged
+   rather than declined. *)
+let bare_prefix_pin_is_declined_575 () =
   with_db (fun db ->
     seed db ();
     same_rows
       db
-      ~label:"seeked and scanned build sides agree"
+      ~label:"declined and scanned build sides agree"
       ~seek:seek_sql
       ~foil:foil_sql;
     Alcotest.(check int)
@@ -157,9 +207,122 @@ let build_side_seeks_the_pinned_prefix () =
       (n_line + n_stock)
       (examined db foil_sql);
     Alcotest.(check int)
-      "the seek reads only warehouse 1's stock"
-      (n_line + n_per_w)
+      "and so does the pinned prefix, because #575 declines it"
+      (n_line + n_stock)
       (examined db seek_sql))
+;;
+
+(* The half of #528 #575 kept, on the composite-key shape: pin the WHOLE of
+   [stock]'s unique primary key and the build side reads exactly one row. It is a
+   point, so it is right whatever the data looks like.
+
+   [si = 5] pins the join column too, which is what makes it a full-key pin. A
+   join whose right table has its whole key pinned is a narrow shape — but it is
+   the one that is unambiguously right, and it is what option B keeps. *)
+let full_unique_key_pin_still_seeks () =
+  with_db (fun db ->
+    seed db ();
+    let seek =
+      "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 1 AND si \
+       = 5"
+    in
+    let foil =
+      "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw + 0 = 1 AND \
+       si = 5"
+    in
+    same_rows db ~label:"point seek and scan agree" ~seek ~foil;
+    Alcotest.(check bool)
+      "and the agreement is not between two empty lists"
+      true
+      (rows_of db seek <> []);
+    Alcotest.(check int)
+      "the build side reads exactly the one addressed stock row"
+      (n_line + 1)
+      (examined db seek))
+;;
+
+(* #593: the same point seek on a UNIQUE index over NULLABLE columns.
+
+   [CREATE UNIQUE INDEX ix ON t (a, b)] with no NOT NULL is an ordinary schema,
+   and a full pin of it still reaches at most one row — so it must seek, exactly
+   as the PRIMARY KEY spelling above does.
+
+   This case exists because folding this gate into [seek_is_unique_point]
+   silently imported that function's [all_not_null] test and turned this seek
+   into a full scan — a regression against `main`, invisible to every other case
+   in this file because they all pin [stock]'s PRIMARY KEY, whose columns are
+   implicitly NOT NULL since #530.
+
+   [all_not_null] is calibrated for a different question. Its own doc says it is
+   there to stop the CARDINALITY ESTIMATE answering 1 anti-conservatively, and
+   explains in the same breath why reachability does not need it: a key is only
+   ever pinned by [col = value], which is never true of NULL, so a NULL-keyed
+   seek returns no rows at all. NULLs cannot make a seek reach MORE than one
+   row, which is the only thing this gate asks. *)
+let nullable_unique_key_pin_still_seeks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
+    (* Deliberately no NOT NULL, and deliberately not a PRIMARY KEY. *)
+    exec db "CREATE TABLE un (uw INTEGER, us INTEGER, qty INTEGER)";
+    exec db "CREATE UNIQUE INDEX un_ix ON un (uw, us)";
+    exec db "BEGIN";
+    for o = 1 to n_line do
+      exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, %d)" o ((o mod 500) + 1))
+    done;
+    for w = 1 to n_w do
+      for us = 1 to n_per_w do
+        exec
+          db
+          (Printf.sprintf "INSERT INTO un VALUES (%d, %d, %d)" w us ((w * 1000) + us))
+      done
+    done;
+    exec db "COMMIT";
+    let seek =
+      "SELECT qty FROM line INNER JOIN un ON us = i_id WHERE w = 1 AND uw = 1 AND us = 5"
+    and foil =
+      "SELECT qty FROM line INNER JOIN un ON us = i_id WHERE w = 1 AND uw + 0 = 1 AND us \
+       = 5"
+    in
+    same_rows db ~label:"nullable unique point seek agrees with its scan" ~seek ~foil;
+    Alcotest.(check bool)
+      "and the agreement is not between two empty lists"
+      true
+      (rows_of db seek <> []);
+    Alcotest.(check int)
+      "a UNIQUE index on nullable columns still seeks its full-key pin"
+      (n_line + 1)
+      (examined db seek))
+;;
+
+(* A NON-unique index gets no such exemption even when its every column is
+   pinned: the pin reaches a run of duplicates of unbounded length, which is the
+   same unknown-selectivity problem in a different spelling. *)
+let full_non_unique_key_pin_is_declined_575 () =
+  with_db (fun db ->
+    exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
+    exec db "CREATE TABLE stock (sw INTEGER, si INTEGER, qty INTEGER)";
+    exec db "CREATE INDEX stock_sw ON stock (sw)";
+    exec db "BEGIN";
+    for o = 1 to n_line do
+      exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, %d)" o ((o mod 500) + 1))
+    done;
+    for w = 1 to n_w do
+      for si = 1 to n_per_w do
+        exec
+          db
+          (Printf.sprintf "INSERT INTO stock VALUES (%d, %d, %d)" w si ((w * 1000) + si))
+      done
+    done;
+    exec db "COMMIT";
+    let seek = "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 1"
+    and foil =
+      "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw + 0 = 1"
+    in
+    same_rows db ~label:"non-unique full pin agrees with its scan" ~seek ~foil;
+    Alcotest.(check int)
+      "a full pin of a non-unique index still scans"
+      (examined db foil)
+      (examined db seek))
 ;;
 
 (* The headline number this issue is named after, given a home in the repo.
@@ -174,19 +337,26 @@ let build_side_seeks_the_pinned_prefix () =
    (3,000 + 10,000 = 13,000 examined before, 3,000 + 2,500 = 5,500 after) while
    keeping the seeding inside a unit test's budget. The ratio still sends it to
    the hash join: 3,000 driving rows against a right table of 10,000 fails
-   [3000 <= 10000/8]. *)
-let headline_520_shape_halves_rows_examined () =
+   [3000 <= 10000/8].
+
+   #575 GAVE THIS BACK. The 5,500 was 55% of the rows for 2,500 extra tree
+   descents, and #561's on-disk measurement of exactly this shape at full scale
+   put it at 2.6-3.5x SLOWER than the 13,000-row plan it replaced — the
+   [rows_examined] halving was never the cost. So both spellings read 13,000
+   again, and this case is kept, renamed, as the record of a headline number that
+   measured the wrong thing. *)
+let headline_520_shape_is_declined_575 () =
   with_db (fun db ->
     seed db ~n_line:3_000 ~n_w:4 ~n_per_w:2_500 ();
     Alcotest.(check int)
-      "before: the driving side plus every warehouse's stock"
+      "the unrecognisable foil: the driving side plus every warehouse's stock"
       13_000
       (examined
          db
          "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw + 0 = 1");
     Alcotest.(check int)
-      "after: the driving side plus warehouse 1 only"
-      5_500
+      "the pinned prefix: the same, because #575 declines the seek"
+      13_000
       (examined
          db
          "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 1"))
@@ -242,9 +412,11 @@ let non_leading_equality_still_scans () =
 ;;
 
 (* The general-ON path builds a cartesian hash join wrapped in a filter, and its
-   build side was scanned for the same reason. The soundness argument does not
-   depend on the ON predicate's shape, so it narrows too. *)
-let general_on_predicate_build_side_seeks () =
+   build side reaches the same chooser. #575 declines the bare prefix pin here
+   too — the ON predicate's shape was never what the decision turned on — so the
+   surviving assertion is that the two plans agree on rows, which is what makes
+   a later re-narrowing safe to attempt. *)
+let general_on_predicate_build_side_is_declined_575 () =
   with_db (fun db ->
     seed db ~n_line:20 ~n_per_w:20 ();
     let seek = "SELECT qty FROM line INNER JOIN stock ON si > i_id WHERE sw = 1" in
@@ -258,10 +430,10 @@ let general_on_predicate_build_side_seeks () =
        cost a second execution of each. *)
     let n_seek = examined db seek
     and n_foil = examined db foil in
-    Alcotest.(check bool)
-      (Printf.sprintf "examined %d is below a full scan of stock (%d)" n_seek n_foil)
-      true
-      (n_seek < n_foil))
+    Alcotest.(check int)
+      (Printf.sprintf "examined %d equals the declined foil's %d" n_seek n_foil)
+      n_foil
+      n_seek)
 ;;
 
 (* The general-ON path crossed with LEFT — the combination this PR newly widened,
@@ -328,12 +500,16 @@ let general_on_predicate_left_join_agrees () =
            (Printf.sprintf "ON %S: rows are%s empty" on (if nonempty then " not" else ""))
            nonempty
            (rows_of db seek <> []);
+         (* #575: the narrowing is declined for a bare prefix pin, so the two
+            plans cost the same. The agreement above is the assertion that
+            matters here — the LEFT-plus-general-ON crossing is about which rows
+            survive, not about how many are read. *)
          let n_seek = examined db seek
          and n_foil = examined db foil in
-         Alcotest.(check bool)
-           (Printf.sprintf "ON %S: examined %d < foil %d" on n_seek n_foil)
-           true
-           (n_seek < n_foil))
+         Alcotest.(check int)
+           (Printf.sprintf "ON %S: examined %d equals foil %d" on n_seek n_foil)
+           n_foil
+           n_seek)
       (* [si > i_id] is the ordinary general ON; [si IS NULL] is the one that is
          true of a null-extended row, so it is the case an ON filter placed
          above the join cannot handle at all (#552). *)
@@ -428,7 +604,12 @@ let columnar_right_table_still_scans () =
 (* Every other narrowing case joins one table, so [right_col_offset] is the
    driving table's width. Here [stock] is the SECOND join, and [right_table_eqs]
    must re-base [sw]'s combined-row ordinal across both preceding tables. A
-   wrong offset would seek the wrong column and the foil would disagree. *)
+   wrong offset would seek the wrong column and the foil would disagree.
+
+   #575: the pin has to be the WHOLE of stock's key for the seek to be taken at
+   all now, so the query pins [si] as well as [sw]. That still exercises the
+   re-basing — both ordinals are re-based across the same two preceding tables,
+   and a wrong offset would seek the wrong column and disagree with the foil. *)
 let build_side_seeks_as_the_second_join_in_a_chain () =
   with_db (fun db ->
     seed db ~n_per_w:20 ~i_mod:20 ();
@@ -440,13 +621,13 @@ let build_side_seeks_as_the_second_join_in_a_chain () =
          i_id WHERE w = 1 AND %s"
         pred
     in
-    let seek = q "sw = 1"
-    and foil = q "sw + 0 = 1" in
+    let seek = q "sw = 1 AND si = 5"
+    and foil = q "sw + 0 = 1 AND si = 5" in
     same_rows db ~label:"chained build side agrees with its scan" ~seek ~foil;
-    Alcotest.(check int)
-      "one joined row per driving row"
-      n_line
-      (List.length (rows_of db seek));
+    Alcotest.(check bool)
+      "and the agreement is not between two empty lists"
+      true
+      (rows_of db seek <> []);
     Alcotest.(check bool)
       "and the narrowing fired across the offset"
       true
@@ -548,12 +729,16 @@ let left_join_with_a_narrowing_constant () =
     (* Bound once each: the label must not cost a second execution. *)
     let n_seek = examined db seek
     and n_foil = examined db foil in
-    (* Not vacuous: the narrowing really fired. *)
-    Alcotest.(check bool)
-      (Printf.sprintf "examined %d < foil %d" n_seek n_foil)
-      true
-      (n_seek < n_foil);
-    (* And it really did suppress matches: warehouse 2's 777 rows are gone. *)
+    (* #575 declines this bare prefix pin, so the two plans cost the same. The
+       soundness argument the case exists for is unaffected — it is about which
+       rows survive a narrowed build side, and it has to keep holding for the
+       day #576 lets the narrowing come back. *)
+    Alcotest.(check int)
+      (Printf.sprintf "examined %d equals the declined foil's %d" n_seek n_foil)
+      n_foil
+      n_seek;
+    (* And warehouse 2's 777 rows are still gone — dropped by the post-join
+       [sw = 1] rather than by the narrowing. *)
     Alcotest.(check bool)
       "no warehouse-2 quantity survives"
       false
@@ -613,31 +798,42 @@ let left_join_null_key_null_extends () =
     let seek = "SELECT o, qty FROM line LEFT JOIN stock ON si = i_id WHERE sw = 1" in
     let foil = "SELECT o, qty FROM line LEFT JOIN stock ON si = i_id WHERE sw + 0 = 1" in
     same_rows db ~label:"NULL keys against a seeked build side" ~seek ~foil;
+    (* #575: declined, so equal rather than smaller — see
+       [left_join_with_a_narrowing_constant]. *)
     let n_seek = examined db seek
     and n_foil = examined db foil in
-    Alcotest.(check bool)
-      (Printf.sprintf "the narrowing fired: examined %d < foil %d" n_seek n_foil)
-      true
-      (n_seek < n_foil))
+    Alcotest.(check int)
+      (Printf.sprintf "examined %d equals the declined foil's %d" n_seek n_foil)
+      n_foil
+      n_seek)
 ;;
 
-(* A pinned prefix that matches nothing must yield no rows, not the index's NULL
-   entries and not a wrongly-truncated prefix. *)
+(* A pin that matches nothing must yield no rows, not the index's NULL entries
+   and not a wrongly-truncated prefix.
+
+   #575: spelled as a FULL key pin, because that is the shape that still seeks —
+   a bare [sw = 9] now scans and would prove nothing about the seek. The
+   empty-result half is asserted for both spellings; only the taken seek can
+   assert what the build side read. *)
 let constant_matching_nothing_yields_nothing () =
   with_db (fun db ->
     seed db ();
+    let bare =
+      "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 9"
+    in
+    let full =
+      "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 9 AND si \
+       = 5"
+    in
+    Alcotest.(check (list (list string))) "no warehouse 9" [] (rows_of db bare);
     Alcotest.(check (list (list string)))
-      "no warehouse 9"
+      "and none with si pinned too"
       []
-      (rows_of
-         db
-         "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 9");
+      (rows_of db full);
     Alcotest.(check int)
-      "and the build side read nothing beyond the driving rows"
+      "the taken point seek read nothing beyond the driving rows"
       n_line
-      (examined
-         db
-         "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 9"))
+      (examined db full))
 ;;
 
 (* Two equalities on the same right-table column: only the one the seek uses is
@@ -696,8 +892,8 @@ let prop_build_seek_matches_foil =
   QCheck.Test.make
     ~count:20
     ~name:"hash-join build-side seek agrees with unoptimizable foil"
-    QCheck.(triple (int_range 1 2) (int_range 2 12) bool)
-    (fun (sw, i_hi, left) ->
+    QCheck.(quad (int_range 1 2) (int_range 2 12) (int_range 1 8) bool)
+    (fun (sw, i_hi, si_pin, left) ->
        with_db (fun db ->
          exec
            db
@@ -729,11 +925,28 @@ let prop_build_seek_matches_foil =
              kind
              pred
          in
-         let seek = sql (Printf.sprintf "sw = %d AND i_id < %d" sw i_hi)
-         and foil = sql (Printf.sprintf "sw + 0 = %d AND i_id < %d" sw i_hi) in
-         let rows = rows_of db seek in
+         (* #575 splits this into two regimes, and the property covers both.
+
+            BARE — a prefix pin of stock's key, which the decision declines: the
+            rows must still agree with the foil (the invariant that lets the
+            narrowing come back under #576) and the two plans must now cost the
+            same, which is the decision itself.
+
+            FULL — the whole of the unique key pinned, which is still taken: the
+            rows agree AND the seek really reads less. *)
+         let bare = sql (Printf.sprintf "sw = %d AND i_id < %d" sw i_hi)
+         and bare_foil = sql (Printf.sprintf "sw + 0 = %d AND i_id < %d" sw i_hi) in
+         let full = sql (Printf.sprintf "sw = %d AND si = %d" sw si_pin)
+         and full_foil = sql (Printf.sprintf "sw + 0 = %d AND si = %d" sw si_pin) in
+         let bare_rows = rows_of db bare
+         and full_rows = rows_of db full in
          (* Non-vacuity, checked per case rather than argued from the ranges. *)
-         rows <> [] && examined db seek < examined db foil && rows = rows_of db foil))
+         bare_rows <> []
+         && full_rows <> []
+         && bare_rows = rows_of db bare_foil
+         && full_rows = rows_of db full_foil
+         && examined db bare = examined db bare_foil
+         && examined db full < examined db full_foil))
 ;;
 
 let () =
@@ -741,9 +954,21 @@ let () =
     "hash_join_build_seek_528"
     [ ( "narrowing"
       , [ Alcotest.test_case
-            "build side seeks the pinned prefix"
+            "bare prefix pin is declined (#575)"
             `Quick
-            build_side_seeks_the_pinned_prefix
+            bare_prefix_pin_is_declined_575
+        ; Alcotest.test_case
+            "full unique-key pin still seeks (#575)"
+            `Quick
+            full_unique_key_pin_still_seeks
+        ; Alcotest.test_case
+            "nullable unique-key pin still seeks (#593)"
+            `Quick
+            nullable_unique_key_pin_still_seeks
+        ; Alcotest.test_case
+            "full non-unique-key pin is declined (#575)"
+            `Quick
+            full_non_unique_key_pin_is_declined_575
         ; Alcotest.test_case
             "build side seeks a rowid alias"
             `Quick
@@ -757,17 +982,17 @@ let () =
             `Quick
             non_leading_equality_still_scans
         ; Alcotest.test_case
-            "general ON predicate build side seeks"
+            "general ON predicate build side is declined (#575)"
             `Quick
-            general_on_predicate_build_side_seeks
+            general_on_predicate_build_side_is_declined_575
         ; Alcotest.test_case
             "general ON predicate LEFT JOIN agrees"
             `Quick
             general_on_predicate_left_join_agrees
         ; Alcotest.test_case
-            "#520's headline shape halves rows examined"
+            "#520's headline shape is declined (#575)"
             `Quick
-            headline_520_shape_halves_rows_examined
+            headline_520_shape_is_declined_575
         ; Alcotest.test_case
             "build side seeks as the second join in a chain"
             `Quick
