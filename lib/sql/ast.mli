@@ -536,7 +536,12 @@ val binop_to_sql : binop -> string
 val func_to_sql : scalar_func -> string
 
 (** #572: every word the lexer turns into a keyword token rather than an
-    identifier, upper-cased. Mirrors the keyword table in [lexer.mll]. *)
+    identifier, upper-cased. Mirrors the keyword table in [lexer.mll].
+
+    Since #577 the rule and its keyword table live in
+    {!Granary_encoding.Sql_ident}, so that [Granary_catalog] — which sits below
+    the parser and rewrites the same stored SQL text on RENAME COLUMN — shares
+    one implementation with the emitters here. These four values are aliases. *)
 val sql_keywords : string list
 
 (** [is_sql_keyword s] is whether [s] — compared case-insensitively, as the

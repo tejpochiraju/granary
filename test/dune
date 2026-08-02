@@ -1132,3 +1132,22 @@
   lwt
   lwt.unix
   unix))
+
+; #577: RENAME COLUMN to a reserved word corrupted the stored CHECK /
+; GENERATED / index SQL.
+
+(test
+ (name test_rename_reserved_577)
+ (modules test_rename_reserved_577)
+ (libraries
+  granary
+  granary.unix
+  granary.sql
+  granary.catalog
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt
+  lwt.unix
+  unix))

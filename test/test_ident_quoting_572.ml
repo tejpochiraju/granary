@@ -380,10 +380,10 @@ let test_rename_column_delimited () =
    The rewriter used to substitute [new_name] verbatim, so this produced the
    same un-parseable [(my col > 0)] at ALTER time.
 
-   Renaming to a RESERVED WORD is the one case still open — a keyword is a
-   plain word, and the catalog cannot see the lexer's keyword table from below
-   the parser.  That is #577; deliberately not tested here, since a test would
-   only pin the broken behaviour. *)
+   Renaming to a RESERVED WORD was the one case left open here — a keyword is a
+   plain word, and the catalog could not see the lexer's keyword table from
+   below the parser.  #577 closed it by hoisting the rule into
+   [Granary_encoding.Sql_ident]; [test_rename_reserved_577.ml] covers it. *)
 let test_rename_column_to_delimited () =
   with_db (fun db ->
     exec db "CREATE TABLE r (a INTEGER, b INTEGER CHECK (a > 0))";

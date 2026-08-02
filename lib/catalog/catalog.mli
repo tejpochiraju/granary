@@ -422,11 +422,13 @@ val add_column
     CREATE time, with no ALTER involved. That emitter now delimits, so the
     delimited-identifier branch above is live and covered end to end.
 
-    [new_name] is written delimited when it is not a plain
-    [[A-Za-z_][A-Za-z0-9_]*] word, so renaming into a bare position cannot
-    produce text that no longer parses. Renaming to a {e reserved word} is the
-    one case still broken (#577): this module sits below the parser and has no
-    keyword table to consult. *)
+    [new_name] is written delimited whenever
+    {!Granary_encoding.Sql_ident.ident_needs_quoting} says it must be — it is
+    not a plain [[A-Za-z_][A-Za-z0-9_]*] word, or it is a reserved word — so
+    renaming into a bare position cannot produce text that no longer parses.
+    #577 moved that rule down into [granary.encoding] precisely so this module,
+    which sits below the parser, shares it with the emitters in
+    [granary.sql] instead of carrying a keyword-blind copy. *)
 val rewrite_ident_in_sql : old_name:string -> new_name:string -> string -> string
 
 (** Rename a table.
