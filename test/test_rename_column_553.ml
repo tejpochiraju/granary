@@ -425,6 +425,60 @@ let rename_table_updates_child_fk_parent_table () =
       (contains ~needle:"REFERENCES parent(" sql))
 ;;
 
+(* The one FK shape the child sweep cannot reach: a table that references
+   ITSELF.  Its FK is in its own record, not in any other table's, so a rename
+   that only re-points children leaves it naming a parent table that no longer
+   exists — and the table becomes permanently un-insertable, because the FK
+   check looks the parent up by name. *)
+let rename_table_updates_its_own_self_reference () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = ON";
+    exec db "CREATE TABLE e (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES e(id))";
+    exec db "INSERT INTO e (id, mgr) VALUES (1, NULL)";
+    exec db "ALTER TABLE e RENAME TO emp";
+    let sql = ddl_of db "emp" in
+    Alcotest.(check bool)
+      (Printf.sprintf "the self-reference follows the table (%s)" sql)
+      true
+      (contains ~needle:"REFERENCES emp(" sql);
+    (* and the constraint is live in both directions on the new name *)
+    exec db "INSERT INTO emp (id, mgr) VALUES (2, 1)";
+    match run (Db.execute db "INSERT INTO emp (id, mgr) VALUES (3, 99)") with
+    | Ok () -> Alcotest.fail "the self-referencing FK stopped being enforced"
+    | Error _ -> ())
+;;
+
+let rename_table_self_reference_survives_reopen () =
+  let path = Filename.temp_file "granary_553_self_" ".db" in
+  Sys.remove path;
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let open_it () =
+         match run (Granary_unix.open_file ~path ()) with
+         | Ok db -> db
+         | Error e -> Alcotest.failf "open %s: %a" path Db.pp_error e
+       in
+       let db = open_it () in
+       exec db "CREATE TABLE e (id INTEGER PRIMARY KEY, mgr INTEGER REFERENCES e(id))";
+       exec db "ALTER TABLE e RENAME TO emp";
+       let before = ddl_of db "emp" in
+       (try run (Db.close db) with
+        | _ -> ());
+       let db = open_it () in
+       Fun.protect
+         ~finally:(fun () ->
+           try run (Db.close db) with
+           | _ -> ())
+         (fun () ->
+            Alcotest.(check string)
+              "the re-pointed self-reference is durable"
+              before
+              (ddl_of db "emp")))
+;;
+
 let rename_table_keeps_its_own_fks_across_reopen () =
   let path = Filename.temp_file "granary_553_" ".db" in
   Sys.remove path;
@@ -641,6 +695,11 @@ let rewriter_examples () =
   (* delimited identifiers are references and are renamed in place *)
   case ~old_name:"a" ~new_name:"z" "(\"a\" > 0)" "(\"z\" > 0)";
   case ~old_name:"a" ~new_name:"z" "(`a` > 0)" "(`z` > 0)";
+  (* ... and obey the same position rules as a bare word: a delimited QUALIFIER
+     names a table, so ("t"."a") must keep its "t" when renaming a column t *)
+  case ~old_name:"t" ~new_name:"z" "(\"t\".\"a\" > 0)" "(\"t\".\"a\" > 0)";
+  case ~old_name:"a" ~new_name:"z" "(\"t\".\"a\" > 0)" "(\"t\".\"z\" > 0)";
+  case ~old_name:"abs" ~new_name:"z" "(\"abs\"(a) > 0)" "(\"abs\"(a) > 0)";
   (* a longer word that merely starts with the name is a different identifier *)
   case ~old_name:"a" ~new_name:"z" "(a1 > a)" "(a1 > z)";
   case ~old_name:"a" ~new_name:"z" "(ab > a)" "(ab > z)"
@@ -658,6 +717,7 @@ let fragments =
   ; "\"a\""
   ; "`b`"
   ; "t.a"
+  ; "\"t\".\"a\""
   ; " + "
   ; " > "
   ; "1"
@@ -781,6 +841,10 @@ let suite =
         [ "local cols", fk_local_cols_follow_the_rename
         ; "parent cols", fk_parent_cols_follow_the_rename
         ; "rename table updates child", rename_table_updates_child_fk_parent_table
+        ; ( "rename table updates its self-reference"
+          , rename_table_updates_its_own_self_reference )
+        ; ( "the self-reference survives a reopen"
+          , rename_table_self_reference_survives_reopen )
         ; "rename table keeps own fks", rename_table_keeps_its_own_fks_across_reopen
         ] )
   ; ( "553-durability"

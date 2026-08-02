@@ -183,7 +183,10 @@ let full_dump_is_refused_with_a_specific_diagnostic () =
              (Printf.sprintf "the diagnostic mentions %S (got %S)" needle msg)
              true
              (contains ~needle msg))
-        [ "stock"; "si"; "NOT NULL"; "#548"; "DELETE FROM" ])
+        (* Both repairs are named.  Refusing exists to stop information being
+           destroyed silently, so a message that offers only the destructive
+           repair works against its own reason for existing. *)
+        [ "stock"; "si"; "NOT NULL"; "#548"; "UPDATE stock SET si"; "DELETE FROM stock" ])
 ;;
 
 (* The escape hatch: the data can still be got out of an unrepaired file. *)

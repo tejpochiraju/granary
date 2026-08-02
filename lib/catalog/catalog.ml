@@ -2788,8 +2788,24 @@ let copy_sql_string sql buf i =
   go (i + 1)
 ;;
 
+(* Is the identifier ENDING at [j] a column reference, and so renameable?  Only
+   the character that follows can say otherwise: '(' makes it a function name,
+   '\'' makes it a literal prefix ([x'6a'] is a BLOB, not a column), and '.'
+   makes it a qualifier (a table, not a column).
+
+   Shared by the bare and the delimited scanner so the two cannot drift: ["t"."a"]
+   must keep its qualifier for the same reason [t.a] does. *)
+let is_column_ref_at sql j =
+  j >= String.length sql
+  ||
+  match sql.[j] with
+  | '(' | '\'' | '.' -> false
+  | _ -> true
+;;
+
 (* A delimited identifier ("x" or `x`) starting at [i]: renamed when its body
-   matches, re-emitted with the same delimiter either way. *)
+   matches AND it stands in a column position, re-emitted with the same
+   delimiter either way. *)
 let copy_quoted_ident sql buf i ~old_name ~new_name =
   let n = String.length sql in
   let q = sql.[i] in
@@ -2814,7 +2830,9 @@ let copy_quoted_ident sql buf i ~old_name ~new_name =
     i + 1
   | Some stop ->
     let text = Buffer.contents body in
-    let text = if String.equal text old_name then new_name else text in
+    let text =
+      if String.equal text old_name && is_column_ref_at sql stop then new_name else text
+    in
     Buffer.add_char buf q;
     String.iter
       (fun c ->
@@ -2825,25 +2843,15 @@ let copy_quoted_ident sql buf i ~old_name ~new_name =
     stop
 ;;
 
-(* A bare word starting at [i].  It is a column reference — and so renameable —
-   unless the character that follows says otherwise: '(' makes it a function
-   name, '\'' makes it a literal prefix ([x'6a'] is a BLOB, not a column), and
-   '.' makes it a qualifier (a table, not a column). *)
+(* A bare word starting at [i], renamed when it stands in a column position. *)
 let copy_bare_ident sql buf i ~old_name ~new_name =
   let n = String.length sql in
   let rec stop k = if k < n && is_ident_char sql.[k] then stop (k + 1) else k in
   let j = stop i in
   let word = String.sub sql i (j - i) in
-  let is_column_ref =
-    j >= n
-    ||
-    match sql.[j] with
-    | '(' | '\'' | '.' -> false
-    | _ -> true
-  in
   Buffer.add_string
     buf
-    (if is_column_ref && String.equal word old_name then new_name else word);
+    (if String.equal word old_name && is_column_ref_at sql j then new_name else word);
   j
 ;;
 
@@ -2889,14 +2897,29 @@ let rewrite_ident_in_sql ~old_name ~new_name sql =
    an expression column and the partial WHERE by the lexical rewrite above. *)
 let rename_col_in_index ~old_col ~new_col (info : index_info) =
   let rw = rewrite_ident_in_sql ~old_name:old_col ~new_name:new_col in
-  let cols =
-    List.map2
-      (fun col is_expr ->
-         if is_expr then rw col else if String.equal col old_col then new_col else col)
-      info.idx_columns
-      info.idx_expr_flags
+  let one is_expr col =
+    if is_expr then rw col else if String.equal col old_col then new_col else col
   in
-  { info with idx_columns = cols; idx_where_sql = Option.map rw info.idx_where_sql }
+  (* [zip], not [List.map2].  The two lists are one-per-column on every path that
+     can produce an [index_info] today — [create_index] rejects a mismatch with
+     its own [List.combine], and [decode_index_ext_fields] pairs them — but the
+     FK index picker above still defends against an empty [idx_expr_flags], and
+     the only way to reach a divergence here is a record decoded from a damaged
+     file, which no API can construct and so no test can pin.  What must not
+     happen then is an [Invalid_argument] escaping past the
+     [(unit, string) result] every other failure in this rename is reported
+     through.  A missing flag means "plain column" — the pre-expression-index
+     shape the flags were added to. *)
+  let rec zip cols flags =
+    match cols, flags with
+    | [], _ -> []
+    | col :: cols, [] -> one false col :: zip cols []
+    | col :: cols, is_expr :: flags -> one is_expr col :: zip cols flags
+  in
+  { info with
+    idx_columns = zip info.idx_columns info.idx_expr_flags
+  ; idx_where_sql = Option.map rw info.idx_where_sql
+  }
 ;;
 
 (* A stored column record with [old_col] renamed: its own name, plus any CHECK
@@ -2937,7 +2960,8 @@ let put_fks_tx tx ~table ~fks =
 ;;
 
 (* Every table whose FK constraints mention [table] as a PARENT, excluding
-   [table] itself (its own record is rewritten by the caller in one piece). *)
+   [table] itself — a self-reference moves with the table's own record, so the
+   callers handle it there rather than through this list. *)
 let child_tables_of t ~table =
   Schema_cache.fold_tables
     (fun name (m : table_meta) acc ->
@@ -2949,6 +2973,22 @@ let child_tables_of t ~table =
        else acc)
     t.sc
     []
+;;
+
+(* Re-point every FK whose parent is [old_name] at [new_name].  Applied to the
+   renamed table's OWN record as well as to its children: a self-referential
+   [REFERENCES e(id)] on table [e] is a parent reference like any other, and it
+   is the one shape [child_tables_of] cannot reach. *)
+let repoint_fk_parent ~old_name ~new_name (m : table_meta) =
+  { m with
+    fk_constraints =
+      List.map
+        (fun fk ->
+           if String.equal fk.fk_parent_table old_name
+           then { fk with fk_parent_table = new_name }
+           else fk)
+        m.fk_constraints
+  }
 ;;
 
 (* [~txn] (#282): [Some] when the surrounding rename is borrowing an ambient
@@ -2967,23 +3007,18 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
   in
   (* #553: the primary FK record is keyed by the table name, so it has to move
      with it — otherwise the constraints load as absent on the next open and the
-     renamed table silently stops enforcing them.  Children pointing AT the old
-     name are re-pointed in the same txn. *)
+     renamed table silently stops enforcing them.  Every FK pointing AT the old
+     name is re-pointed in the same txn: those of other tables, AND the renamed
+     table's own self-references, which are not in [child_tables_of] and which
+     nothing else here would touch (a self-referential table came out of a
+     RENAME TO permanently un-insertable, its FK naming a parent table that no
+     longer exists). *)
+  let renamed = repoint_fk_parent ~old_name ~new_name { meta with name = new_name } in
   let%lwt () = put_fks_tx tx ~table:old_name ~fks:[] in
-  let%lwt () = put_fks_tx tx ~table:new_name ~fks:meta.fk_constraints in
-  let children = child_tables_of t ~table:old_name in
-  let repoint (m : table_meta) =
-    { m with
-      fk_constraints =
-        List.map
-          (fun fk ->
-             if String.equal fk.fk_parent_table old_name
-             then { fk with fk_parent_table = new_name }
-             else fk)
-          m.fk_constraints
-    }
+  let%lwt () = put_fks_tx tx ~table:new_name ~fks:renamed.fk_constraints in
+  let children =
+    List.map (repoint_fk_parent ~old_name ~new_name) (child_tables_of t ~table:old_name)
   in
-  let children = List.map repoint children in
   let%lwt () =
     Lwt_list.iter_s
       (fun (m : table_meta) ->
@@ -2993,7 +3028,7 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
   in
   (* Refresh the mirror entry (keyed by the unchanged tree_id) with the new
      name; the schema shape — hence the fingerprint — is unchanged. *)
-  let%lwt () = put_mirror_tx tx { meta with name = new_name } in
+  let%lwt () = put_mirror_tx tx renamed in
   let%lwt () =
     match txn with
     | Some _ -> Lwt.return_unit
@@ -3012,7 +3047,7 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
   (match txn with
    | Some _ ->
      Schema_cache.remove_table t.sc ~name:old_name;
-     Schema_cache.put_table t.sc ~name:new_name { meta with name = new_name };
+     Schema_cache.put_table t.sc ~name:new_name renamed;
      List.iter
        (fun (k, v) -> Schema_cache.put_index t.sc ~name:k { v with idx_table = new_name })
        to_update;
@@ -3021,7 +3056,7 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
        children
    | None ->
      Schema_cache.remove_table_durable t.sc ~name:old_name;
-     Schema_cache.put_table_durable t.sc ~name:new_name { meta with name = new_name };
+     Schema_cache.put_table_durable t.sc ~name:new_name renamed;
      List.iter
        (fun (k, v) ->
           Schema_cache.put_index_durable t.sc ~name:k { v with idx_table = new_name })

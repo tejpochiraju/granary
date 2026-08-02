@@ -409,12 +409,17 @@ val add_column
     #553: lexical rather than parse-and-reprint, because the catalog sits below
     the parser in the dependency graph and because a reprint would rewrite text
     the user wrote that has no need to change. Renamed: a bare identifier, and a
-    delimited one ([lname] or backticked) whose body matches. Left alone:
-    anything inside a string literal, and any identifier immediately followed by
-    ['('] (a function name), by ['\''] (the [x'..'] blob-literal prefix) or by
-    ['.'] (a qualifier — a table, not a column). Matching is case-sensitive, as
-    every other column lookup in this module is. Every byte it does not rename is
-    preserved exactly. *)
+    double-quoted or backtick-delimited one, whose body matches. Left alone:
+    anything inside a string literal, and — bare or delimited alike — any
+    identifier immediately followed by ['('] (a function name), by ['\''] (the
+    [x'..'] blob-literal prefix) or by ['.'] (a qualifier — a table, not a
+    column). Matching is case-sensitive, as every other column lookup in this
+    module is. Every byte it does not rename is preserved exactly.
+
+    Note that a column whose name needs quoting cannot currently reach this
+    function at all: {!Granary_sql.Ast.expr_to_sql} emits identifiers unquoted,
+    so such a column already poisons its own CHECK / GENERATED expression at
+    CREATE time, with no ALTER involved (#572). *)
 val rewrite_ident_in_sql : old_name:string -> new_name:string -> string -> string
 
 (** Rename a table.

@@ -435,8 +435,9 @@ val query_columns : t -> string -> (string list, error) result Lwt.t
     [PRIMARY KEY (a, b)], or a column added by [ALTER TABLE ... ADD COLUMN ...
     PRIMARY KEY]. Rendering the current declaration and then emitting those rows
     produces a script that dies on the first offending row. Rather than emit it,
-    [dump] fails with [Error (Runtime msg)] naming the table and column and the
-    [DELETE] that repairs it. The alternative — silently emitting the column
+    [dump] fails with [Error (Runtime msg)] naming the table, the column, and both
+    repairs — the [UPDATE] that keeps the rows and the [DELETE] that drops them.
+    The alternative — silently emitting the column
     without its NOT NULL — would restore, but by downgrading the schema without
     saying so. Detection rides along with the row stream, so a healthy database
     pays no extra read; a refused dump has already emitted [BEGIN] and is closed

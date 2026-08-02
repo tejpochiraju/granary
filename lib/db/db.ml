@@ -2403,11 +2403,14 @@ let not_null_violation_message ~table ~column =
   Printf.sprintf
     "dump %s: column %s is declared NOT NULL but a stored row holds NULL, so the emitted \
      schema contradicts the emitted rows and the script would fail to replay (#548).  \
-     This database predates #530 (every PRIMARY KEY column implies NOT NULL); repair it \
-     first with DELETE FROM %s WHERE %s IS NULL, or dump the rows alone with \
-     ~data_only:true."
+     This database predates #530 (every PRIMARY KEY column implies NOT NULL).  Repair it \
+     first — UPDATE %s SET %s = <value> WHERE %s IS NULL keeps the rows, DELETE FROM %s \
+     WHERE %s IS NULL drops them — or dump the rows alone with ~data_only:true."
     table
     column
+    (Sql.Exec.quote_ident table)
+    (Sql.Exec.quote_ident column)
+    (Sql.Exec.quote_ident column)
     (Sql.Exec.quote_ident table)
     (Sql.Exec.quote_ident column)
 ;;
