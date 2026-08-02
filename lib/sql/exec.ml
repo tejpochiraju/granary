@@ -2666,6 +2666,115 @@ let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list 
   go [] vs
 ;;
 
+(* [2^63] as a float — exactly representable, and one past [Int64.max_int].  A
+   float strictly inside [[-2^63, 2^63)] converts to an int64 without
+   overflowing; [Int64.of_float] is unspecified outside it.
+
+   #527: [Granary_sql.Planner.classify_range_bound] spells this same literal
+   inline, because this module depends on [Planner] and not the other way round,
+   so sharing it would mean moving an [Int64.of_float]-domain constant into the
+   planner's [.mli] for one use.  The two MUST stay equal: the documented
+   disagreement between classification and {!range_bound_key} is then exactly
+   the one ULP the [pred]/[succ] widening moves, and nothing more.  Change one
+   and you must change the other. *)
+let two_pow_63 = 9.2233720368547758e18
+
+(** #527: the index-key value that bounds [which] end of a range at [v], for a
+    column of type [ty].  Unlike {!index_lookup_values} — which answers an
+    {i equality} question and so must decline every type mismatch — a bound of
+    the other numeric type is a perfectly good bound even though it is not a
+    key, and declining it costs the whole narrowing (the entire equality prefix
+    is scanned instead).
+
+    The promotion rounds {b OUTWARD}: a lower bound up, an upper bound down.
+    Rounding the other way would silently drop the endpoint row.  Both ends are
+    read inclusively anyway (see {!range_seek_bounds}) and the predicate still
+    runs on every yielded row, so no strictness has to be tracked.
+
+    On an integer column the rounding is {b widened by one float step first}
+    ([ceil (pred f)], [floor (succ f)]), and that step is load-bearing.  Plain
+    [ceil]/[floor] would be exact under {i exact} int-vs-real comparison — but
+    that is not the semantics the residual predicate uses.  [compare_values]
+    compares [V_int a] against [V_real b] as [Float.compare (Int64.to_float a)
+    b], so it admits every int64 whose {i rounded} float value satisfies the
+    bound.  Above 2^53, where a float ULP exceeds 1, many integers strictly
+    below a lower bound [f] round up onto [f] and so qualify; [ceil f] would
+    seek past all of them and drop those rows (256 of them at 2^62, ~1024 near
+    2^63).  One [pred]/[succ] step covers the whole gap, because it moves the
+    bound by exactly one ULP — the same grid spacing that creates it — while
+    below 2^53 it moves by less than 1 and so changes nothing after the
+    [ceil]/[floor]: [ceil (pred 100.5) = 101], [ceil (pred 280.0) = 280],
+    [floor (succ 119.5) = 119], [floor (succ 280.0) = 280].  The seek is thus a
+    superset of the predicate under the predicate's own semantics, at a cost of
+    at most one extra key below 2^53.  Above it the widening admits up to a
+    whole ULP of extra keys (512 at 2^62), but those are not waste: they are
+    exactly the keys the predicate accepts, which is why the widening exists.
+
+    The result must be an [IK_int] on an integer column, not the real as given:
+    {!Granary_encoding.Index_key.encode_value} emits a distinct leading type tag
+    per type ([0x01] integer, [0x02] real), so an [IK_real] bound sorts into the
+    reals' region and never meets the stored integer keys at all — encoding it
+    as-is would be worse than declining.
+
+    Declined ([None]) cases leave that end unbounded, which is always sound:
+
+    - a value whose {i widened} rounding is out of int64 range, or an infinity,
+      has no integer to round to.  Producing a key here would mean trusting
+      [Int64.of_float] outside its specified domain, and a wrong key drops rows.
+      Declining at the very edge costs nothing: a lower bound of -2^63 (whose
+      widening steps below the range) admits every row anyway.
+    - a non-numeric bound on a numeric column, and vice versa, exactly as
+      {!index_lookup_values} decides.
+
+    A NaN is deliberately {i not} declined: it goes through as [IK_real nan],
+    which {!Granary_encoding.Index_key.encode_value} writes as the single [0x00]
+    NULL/NaN byte sorting below every other key.  That matches the residual
+    predicate, whose [Float.compare] also orders NaN below every number, and is
+    the existing behaviour for a same-type NaN bound — see [range_seek_bounds]. *)
+let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
+  : Index_key.value option
+  =
+  match v, ty with
+  | Row.V_real f, Row.Integer ->
+    if Float.is_nan f
+    then Some (Index_key.IK_real f)
+    else (
+      let g =
+        match which with
+        | `Lo -> Float.ceil (Float.pred f)
+        | `Hi -> Float.floor (Float.succ f)
+      in
+      if g >= -.two_pow_63 && g < two_pow_63
+      then Some (Index_key.IK_int (Int64.of_float g))
+      else None)
+  | Row.V_int n, Row.Real ->
+    (* [Int64.to_float] rounds to nearest, which for |n| > 2^53 can land on the
+       wrong side of [n].  One step of [pred]/[succ] is enough to push it back
+       outward, the error being at most half a ULP. *)
+    let f = Int64.to_float n in
+    let cmp =
+      (* [f] is integral with |f| <= 2^63, so this comparison is exact. *)
+      if f >= two_pow_63 then 1 else Int64.compare (Int64.of_float f) n
+    in
+    Some
+      (Index_key.IK_real
+         (match which with
+          | `Lo -> if cmp > 0 then Float.pred f else f
+          | `Hi -> if cmp < 0 then Float.succ f else f))
+  | _, _ ->
+    (* Everything that is not a numeric cross-type pair — a same-type bound, a
+       NULL, text or a blob — is deliberately delegated to the equality path's
+       strictness, which for these cases is also the right answer for a bound.
+       The delegation is a shorthand for that agreement, NOT an assumption that
+       the two questions always coincide: the numeric arms above exist precisely
+       because they do not.  If [index_lookup_values] ever changes which of
+       these it accepts, re-check that the new answer is still a sound bound
+       rather than assuming it carries over. *)
+    (match index_lookup_values [ v, ty ] with
+     | Some [ iv ] -> Some iv
+     | Some _ | None -> None)
+;;
+
 (** #517: the seek start key and stop test implied by an equality [prefix] and
     an optional [range] over the column right after it.
 
@@ -2691,7 +2800,13 @@ let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list 
 
     The mirror case is a NaN {i bound}, which encodes to that same one byte and
     so makes [past_end] fire on the very first key: the seek returns nothing,
-    which is the right answer because no comparison against NaN is ever true.
+    which agrees with the residual predicate, whose [Float.compare] also orders
+    NaN below every number.
+
+    #527: an end whose type is not the column's is not simply dropped — a
+    numeric one is promoted across the int/real boundary by {!range_bound_key},
+    which rounds outward so the bound can only widen.  Its result is always the
+    column type's own key, so the fixed-width reasoning above is unaffected.
 
     Byte order is column order throughout, because the encoding is
     order-preserving by construction. *)
@@ -2699,18 +2814,18 @@ let range_seek_bounds clock params ~prefix ~plen (range : Plan.range option) =
   match range with
   | None -> Bytes.cat prefix (Rowid.encode Int64.min_int), fun _ -> false
   | Some { Plan.r_ty; r_lo; r_hi } ->
-    let encode_end e =
-      match index_lookup_values [ eval_expr clock params [||] e, r_ty ] with
-      | Some [ iv ] -> Some (Index_key.encode_value iv)
-      | Some _ | None -> None (* NULL or type mismatch: leave that end unbounded *)
+    let encode_end which e =
+      match range_bound_key ~which (eval_expr clock params [||] e) r_ty with
+      | Some iv -> Some (Index_key.encode_value iv)
+      | None -> None (* NULL, or nothing sound to round to: leave that end open *)
     in
     let start =
-      match Option.bind r_lo encode_end with
+      match Option.bind r_lo (encode_end `Lo) with
       | None -> Bytes.cat prefix (Rowid.encode Int64.min_int)
       | Some lo -> Bytes.cat (Bytes.cat prefix lo) (Rowid.encode Int64.min_int)
     in
     let past_end =
-      match Option.bind r_hi encode_end with
+      match Option.bind r_hi (encode_end `Hi) with
       | None -> fun _ -> false
       | Some hi ->
         let w = Bytes.length hi in
