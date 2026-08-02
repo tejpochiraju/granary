@@ -203,6 +203,14 @@ val dirty_changes : dirty_tables_acc -> (string * row_change list) list
     statement's peak memory is dominated by the match list (a decoded row each),
     which is O(affected rows) by design and not what these counters measure.
 
+    So in the current shape [dss_peak_buffered] is redundant: no fetch happens
+    until the walk ends, the backlog is monotone, and the peak is always exactly
+    [dss_candidates].  It is kept anyway, because that redundancy IS the
+    assertion — it is the only counter that distinguishes "buffered everything,
+    then fetched" from "buffered and fetched in step", and those two have the
+    same [(dss_candidates, dss_fetched)] pair and a 20x page-read gap.  The day
+    it stops equalling [dss_candidates] is the day the drain changed shape.
+
     All three are cumulative over the enclosing {!with_dml_seek_stats} scope,
     not per statement: an FK [CASCADE] delete or a trigger firing nested DML
     re-enters the drain and adds to the same record, so the counts are a sum

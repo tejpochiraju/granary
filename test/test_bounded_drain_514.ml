@@ -11,12 +11,15 @@
     It buffers.  Reading in index-key order is random access against the table
     for any index uncorrelated with rowid, and the pager cache is a bounded FIFO
     ({!Granary_storage.Pager}), so a table larger than the cache re-reads a page
-    per row.  Measured here by {!prefix_delete_reads_each_table_page_about_once}:
-    on disk, with the cache squeezed and index order scrambled against rowid
-    order, sorting first reads ~1 page per 20 rows where fetching as it walks
-    reads more than 1 page {e per row}.  What #514 actually bought is a cheaper
-    buffer — an [int64 array] rather than an [int64 list], 32 live bytes per
-    candidate instead of 48 — not a bound.  The bound would be streaming the
+    per row.  {!prefix_delete_reads_each_table_page_about_once} is the run that
+    settled it: on disk, with the cache squeezed and index order scrambled
+    against rowid order, sorting first reads ~1 page per 20 rows where fetching
+    as it walks reads more than 1 page {e per row}.  The numbers themselves live
+    in one place, [Granary_sql.Exec]'s [rowid_buf] comment, next to the code they
+    justify.
+
+    What #514 actually bought is a cheaper buffer — a flat [Bigarray] of rowids
+    rather than an [int64 list] — not a bound.  The bound would be streaming the
     mutations, which the callers' shape forbids, and the {e other} half of #514,
     the selectivity guard, is not addressed here either.
 
@@ -76,7 +79,15 @@ let with_file_db ?page_cache f =
       fun () ->
         (match prev with
          | Some v -> Unix.putenv "GRANARY_PAGE_CACHE" v
-         | None -> Unix.putenv "GRANARY_PAGE_CACHE" "");
+         | None ->
+           (* [Unix] has no [unsetenv], so an absent variable is emulated by
+              setting it empty: {!Granary_storage.Pager.cache_capacity_from_env}
+              reads [int_of_string_opt ""] as [None] and falls back to the
+              default, which is the behaviour that matters here.  It is a parse
+              fallback standing in for absence, not absence — anything testing
+              PRESENCE rather than value (e.g. [bench_scan_probe]'s banner)
+              would see an empty string where it expected "unset". *)
+           Unix.putenv "GRANARY_PAGE_CACHE" "");
         ()
   in
   let db =
@@ -308,10 +319,12 @@ let seed_scrambled db ~n_w ~n =
    the index walk produces them instead is random access against the table, and
    the pager cache is a bounded FIFO, so it costs about a page read per row.
 
-   Measured both ways on this exact workload (20 000 matching rows, 64-page
-   cache): 957 reads sorted against 21 685 unsorted, a 22.7x amplification.  The
-   bound below sits an order of magnitude above the first and well below the
-   second.
+   The [4 000] bound below is the live copy of that measurement: it sits an
+   order of magnitude above what a sorted drain reads on this workload and well
+   below what an unsorted one does.  Both figures, and the chunked variants that
+   were tried and rejected, are tabulated once in [Granary_sql.Exec]'s [rowid_buf]
+   comment; they are deliberately not restated here, so that the assertion and
+   the prose cannot drift apart.
 
    Two things about the shape are load-bearing and easy to get wrong: the
    scramble (a descending [i] is still sequential, and measures ~1 000 reads
@@ -565,6 +578,53 @@ let prop_seeked_update_matches_foil =
          survivors db "seeked" = survivors db "foil" && vals "seeked" = vals "foil"))
 ;;
 
+(* The drain's sort is hand-rolled (a Bigarray has no [Array.sort]), so it wants
+   a property rather than the handful of fixed orders the cases above happen to
+   produce.  [LIMIT k] takes a PREFIX of the drain, so it reads the sort out
+   directly: the seeked path must delete the k lowest rowids among the matches,
+   which is exactly what the foil's table-scan drain does by construction.  [i]
+   goes in as a permutation so index-key order and rowid order disagree — the
+   heap actually has to move things — and the survivor sets can only agree for
+   every k if the sort is right. *)
+let seed_permuted_pair db ~n =
+  List.iter
+    (fun name ->
+       exec
+         db
+         (Printf.sprintf
+            "CREATE TABLE %s (w INTEGER, i INTEGER, v INTEGER, PRIMARY KEY (w, i))"
+            name);
+       exec db "BEGIN";
+       for w = 1 to 2 do
+         for j = 0 to n - 1 do
+           let i = (j * 7919 mod n) + 1 in
+           exec
+             db
+             (Printf.sprintf
+                "INSERT INTO %s VALUES (%d, %d, %d)"
+                name
+                w
+                i
+                ((w * 1000) + i))
+         done
+       done;
+       exec db "COMMIT")
+    [ "seeked"; "foil" ]
+;;
+
+let prop_seeked_delete_limit_drains_in_rowid_order =
+  QCheck.Test.make
+    ~count:60
+    ~name:"seeked DELETE .. LIMIT k takes the same rows the scan foil does"
+    QCheck.(pair (int_range 1 48) (int_range 0 49))
+    (fun (n, k) ->
+       with_db (fun db ->
+         seed_permuted_pair db ~n;
+         exec db (Printf.sprintf "DELETE FROM seeked WHERE w = 1 LIMIT %d" k);
+         exec db (Printf.sprintf "DELETE FROM foil WHERE w + 0 = 1 LIMIT %d" k);
+         survivors db "seeked" = survivors db "foil"))
+;;
+
 let () =
   Alcotest.run
     "bounded_drain_514"
@@ -593,7 +653,9 @@ let () =
     ; ( "drain order"
       , [ Alcotest.test_case
             "a prefix DELETE reads each table page about once"
-            `Quick
+            (* ~7s: it seeds 60 000 rows, and both the scramble and the size are
+               load-bearing (see the docstring), so it cannot be shrunk. *)
+            `Slow
             prefix_delete_reads_each_table_page_about_once
         ] )
     ; ( "mutation during iteration"
@@ -625,6 +687,9 @@ let () =
     ; ( "properties"
       , List.map
           QCheck_alcotest.to_alcotest
-          [ prop_seeked_delete_matches_foil; prop_seeked_update_matches_foil ] )
+          [ prop_seeked_delete_matches_foil
+          ; prop_seeked_update_matches_foil
+          ; prop_seeked_delete_limit_drains_in_rowid_order
+          ] )
     ]
 ;;

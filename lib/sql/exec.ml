@@ -5021,7 +5021,9 @@ let seek_candidates tx clock params (seek : Plan.seek) ~stats ~emit : unit Lwt.t
     seek_index_candidates tx clock params ~idx_tree ~keys ~range ~stats ~emit
 ;;
 
-(* #514: a growable, unboxed buffer of candidate rowids.
+(* #514: a growable, flat buffer of candidate rowids.  THE measurement table
+   for this PR lives here; the mli and the tests point at it rather than
+   restating it.
 
    The DML seek must hand the table tree its [get]s in ASCENDING ROWID order,
    which means collecting every candidate the index walk produces before
@@ -5035,8 +5037,12 @@ let seek_candidates tx clock params (seek : Plan.seek) ~stats ~emit : unit Lwt.t
    scrambled against rowid order, one prefix DELETE:
 
      rows    sorted-then-fetch    fetch-as-you-walk
-     20 000              957                21 706   (23x)
-     60 000            2 365                67 648   (29x)
+     20 000              957                21 685   (22.7x)
+
+   [test_bounded_drain_514]'s [prefix_delete_reads_each_table_page_about_once]
+   is that exact run, and its threshold (4 000) is the only copy of these
+   numbers with teeth.  A 60 000-row run measured 2 365 against 67 648, but
+   nothing asserts it, so it is recorded here and nowhere else.
 
    Chunking (buffer K, sort, fetch, repeat) does not escape that either: it
    holds locality only while K stays comparable to the match count, degrading
@@ -5045,44 +5051,103 @@ let seek_candidates tx clock params (seek : Plan.seek) ~stats ~emit : unit Lwt.t
    K = 1 024: 5 150, 5.4x).  A bound that costs a page read per row exactly when
    it starts to bind is not a bound worth having.
 
-   So the buffer stays whole and its per-candidate cost is cut instead: an
-   [int64 array] grown by doubling holds a rowid in an 8-byte slot plus its box,
-   where the [int64 list] it replaces spent a cons cell as well — measured at 32
-   vs 48 live bytes per candidate, so a 1M-row DELETE buffers 32 MB rather than
-   48 MB.  That is a constant factor, not a bound: the match list the callers
+   So the buffer stays whole and its per-candidate cost is cut instead.  The
+   representation is a [Bigarray.Array1] of [int64], grown by doubling, rather
+   than the [int64 list] this replaced or the [int64 array] the first pass at it
+   used.  Note that an [int64 array] is NOT flat: OCaml unboxes only [float
+   array], so it stores a pointer per slot to a 24-byte custom block — 32 bytes
+   a rowid, and a [caml_modify] write barrier on every push.  A [Bigarray]
+   stores the 8 bytes themselves, off-heap, in one block the major GC never
+   scans element-wise.  Resident set after buffering 1M candidates, each
+   representation in a fresh process, [Gc.compact]ed:
+
+     int64 list      49.3 MB     cons (3 words) + box (3 words)
+     int64 array     34.2 MB     8-byte slot + 24-byte box
+     Bigarray         8.3 MB     8-byte slot
+
+   Peak matters more than steady state here, because doubling means up to [2N]
+   slots are live when the buffer is largest.  The [int64 array] version also
+   compacted with [Array.sub] before sorting, so [2N] slots, [N] boxes and an
+   [N]-slot copy overlapped; the heapsort below is in place over the filled
+   prefix, so nothing is copied and the peak is just the two buffers a doubling
+   straddles.  For 1M candidates: ~48 MB against ~13 MB.
+
+   The price is that [Array.sort] does not apply to a [Bigarray], so the sort is
+   hand-rolled ([rowid_buf_sort]).  Heapsort, because it is in place, has no
+   recursion depth to blow on an adversarial input, and needs no scratch — the
+   three properties this buffer exists for.  It is pinned end to end by a
+   QCheck property in [test_bounded_drain_514] that runs a seeked
+   [DELETE .. LIMIT k] over a random rowid permutation against a scan foil:
+   LIMIT takes a prefix of the drain, so it reads out the sort.
+
+   All of this is a constant factor, not a bound: the match list the callers
    need in full is a decoded row per match and remains the larger term.  Capping
    THAT means streaming the mutations, which the callers' shape forbids (see
    [drain_matching_rows_in_tx]). *)
 type rowid_buf =
-  { mutable ids : int64 array
+  { mutable ids : (int64, Bigarray.int64_elt, Bigarray.c_layout) Bigarray.Array1.t
   ; mutable len : int
   }
 
-let rowid_buf_create () = { ids = [||]; len = 0 }
+let rowid_buf_alloc n = Bigarray.Array1.create Bigarray.Int64 Bigarray.c_layout n
+let rowid_buf_create () = { ids = rowid_buf_alloc 0; len = 0 }
 
 let rowid_buf_push b rowid =
-  let cap = Array.length b.ids in
+  let cap = Bigarray.Array1.dim b.ids in
   if b.len = cap
   then (
-    let bigger = Array.make (if cap = 0 then 16 else 2 * cap) 0L in
-    Array.blit b.ids 0 bigger 0 b.len;
+    let bigger = rowid_buf_alloc (if cap = 0 then 16 else 2 * cap) in
+    Bigarray.Array1.blit b.ids (Bigarray.Array1.sub bigger 0 b.len);
     b.ids <- bigger);
-  b.ids.(b.len) <- rowid;
+  Bigarray.Array1.set b.ids b.len rowid;
   b.len <- b.len + 1
 ;;
 
-(* Ascending rowid, in place, over just the filled prefix. *)
+let rowid_buf_swap a i j =
+  let t = Bigarray.Array1.get a i in
+  Bigarray.Array1.set a i (Bigarray.Array1.get a j);
+  Bigarray.Array1.set a j t
+;;
+
+(* Sift [root] down a max-heap occupying [0, limit) of [a]. *)
+let rec rowid_buf_sift a root limit =
+  let l = (2 * root) + 1 in
+  let r = l + 1 in
+  if l < limit
+  then (
+    let child =
+      if
+        r < limit && Int64.compare (Bigarray.Array1.get a r) (Bigarray.Array1.get a l) > 0
+      then r
+      else l
+    in
+    if Int64.compare (Bigarray.Array1.get a child) (Bigarray.Array1.get a root) > 0
+    then (
+      rowid_buf_swap a root child;
+      rowid_buf_sift a child limit))
+;;
+
+(* Ascending rowid, in place, over just the filled prefix — no scratch array, so
+   the buffer's peak is its capacity and nothing more (see [rowid_buf]). *)
 let rowid_buf_sort b =
-  let used = Array.sub b.ids 0 b.len in
-  Array.sort Int64.compare used;
-  b.ids <- used
+  let a = b.ids in
+  let n = b.len in
+  for i = (n / 2) - 1 downto 0 do
+    rowid_buf_sift a i n
+  done;
+  for last = n - 1 downto 1 do
+    rowid_buf_swap a 0 last;
+    rowid_buf_sift a 0 last
+  done
 ;;
 
 (* Sequential Lwt iteration over the filled prefix, without going through a
    list (which would re-spend the allocation the buffer exists to avoid). *)
 let rowid_buf_iter_s f b =
   let rec go i =
-    if i >= b.len then Lwt.return_unit else Lwt.bind (f b.ids.(i)) (fun () -> go (i + 1))
+    if i >= b.len
+    then Lwt.return_unit
+    else Lwt.bind (f (Bigarray.Array1.get b.ids i)) (fun () -> go (i + 1))
   in
   go 0
 ;;
