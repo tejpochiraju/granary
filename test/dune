@@ -901,7 +901,15 @@
 (test
  (name test_rename_column_553)
  (modules test_rename_column_553)
- (libraries granary granary.unix granary.catalog alcotest lwt.unix unix))
+ (libraries
+  granary
+  granary.unix
+  granary.catalog
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
 
 ; #513: join must not discard the driving table's access path.
 

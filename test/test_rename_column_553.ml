@@ -600,8 +600,155 @@ let catalog_index_columns_are_remapped () =
       idxs)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* The SQL-text rewriter itself                                         *)
+(* ------------------------------------------------------------------ *)
+
+let rw ~old_name ~new_name s = Cat.rewrite_ident_in_sql ~old_name ~new_name s
+
+(* The positions a bare word can occupy that are NOT a column reference, and
+   the two delimiter forms that are one.  Each of these was a way to corrupt an
+   expression while renaming it. *)
+let rewriter_examples () =
+  let case ~old_name ~new_name input want =
+    Alcotest.(check string)
+      (Printf.sprintf "%s [%s -> %s]" input old_name new_name)
+      want
+      (rw ~old_name ~new_name input)
+  in
+  case ~old_name:"a" ~new_name:"b" "(a > 0)" "(b > 0)";
+  (* a function name is not a column, even when a column shares its name *)
+  case ~old_name:"abs" ~new_name:"z" "(abs(a) > 0)" "(abs(a) > 0)";
+  (* ... but the argument still is *)
+  case ~old_name:"a" ~new_name:"z" "(abs(a) > 0)" "(abs(z) > 0)";
+  (* string literals are data, not identifiers *)
+  case ~old_name:"a" ~new_name:"z" "(x <> 'a')" "(x <> 'a')";
+  case ~old_name:"x" ~new_name:"z" "(x <> 'x')" "(z <> 'x')";
+  (* x'..' is a BLOB literal, not the column x *)
+  case ~old_name:"x" ~new_name:"z" "(y <> x'6a')" "(y <> x'6a')";
+  (* a qualifier names a table, the part after the dot names the column *)
+  case ~old_name:"t" ~new_name:"z" "(t.a > 0)" "(t.a > 0)";
+  case ~old_name:"a" ~new_name:"z" "(t.a > 0)" "(t.z > 0)";
+  (* delimited identifiers are references and are renamed in place *)
+  case ~old_name:"a" ~new_name:"z" "(\"a\" > 0)" "(\"z\" > 0)";
+  case ~old_name:"a" ~new_name:"z" "(`a` > 0)" "(`z` > 0)";
+  (* a longer word that merely starts with the name is a different identifier *)
+  case ~old_name:"a" ~new_name:"z" "(a1 > a)" "(a1 > z)";
+  case ~old_name:"a" ~new_name:"z" "(ab > a)" "(ab > z)"
+;;
+
+let fragments =
+  [ "a"
+  ; "b"
+  ; "ab"
+  ; "a1"
+  ; "_a"
+  ; "abs("
+  ; "x'6a'"
+  ; "'a'"
+  ; "\"a\""
+  ; "`b`"
+  ; "t.a"
+  ; " + "
+  ; " > "
+  ; "1"
+  ; "("
+  ; ")"
+  ; " AND "
+  ; " NOT "
+  ; ""
+  ]
+;;
+
+let gen_sql =
+  let open QCheck2.Gen in
+  let+ parts = list_size (int_range 0 12) (oneof_list fragments) in
+  String.concat "" parts
+;;
+
+(* Every string literal of [s], in order.  The rewriter must never touch one. *)
+let string_literals s =
+  let n = String.length s in
+  let out = ref [] in
+  let buf = Buffer.create 16 in
+  let rec go i in_str =
+    if i >= n
+    then ()
+    else if s.[i] <> '\''
+    then (
+      if in_str then Buffer.add_char buf s.[i];
+      go (i + 1) in_str)
+    else if in_str
+    then (
+      out := Buffer.contents buf :: !out;
+      Buffer.clear buf;
+      go (i + 1) false)
+    else go (i + 1) true
+  in
+  go 0 false;
+  List.rev !out
+;;
+
+let prop_absent_name_is_a_no_op =
+  QCheck2.Test.make
+    ~count:500
+    ~name:"a name that does not occur is a no-op"
+    gen_sql
+    (fun sql -> String.equal sql (rw ~old_name:"zzq" ~new_name:"other" sql))
+;;
+
+let prop_rename_to_self_is_identity =
+  QCheck2.Test.make
+    ~count:500
+    ~name:"renaming a name to itself is the identity"
+    gen_sql
+    (fun sql -> String.equal sql (rw ~old_name:"a" ~new_name:"a" sql))
+;;
+
+(* The property that matters for a rename: nothing is lost.  Renaming to a name
+   that does not occur, then back, must reproduce the input byte for byte — so
+   the rewriter can neither drop a reference nor invent one. *)
+let prop_round_trips_through_a_fresh_name =
+  QCheck2.Test.make
+    ~count:1000
+    ~name:"a -> fresh -> a is the identity"
+    gen_sql
+    (fun sql ->
+       let there = rw ~old_name:"a" ~new_name:"zzq" sql in
+       String.equal sql (rw ~old_name:"zzq" ~new_name:"a" there))
+;;
+
+let prop_string_literals_are_preserved =
+  QCheck2.Test.make
+    ~count:1000
+    ~name:"string literals survive the rewrite unchanged"
+    gen_sql
+    (fun sql ->
+       string_literals sql = string_literals (rw ~old_name:"a" ~new_name:"zzq" sql))
+;;
+
+let prop_is_idempotent =
+  QCheck2.Test.make
+    ~count:500
+    ~name:"rewriting twice is rewriting once"
+    gen_sql
+    (fun sql ->
+       let once = rw ~old_name:"a" ~new_name:"zzq" sql in
+       String.equal once (rw ~old_name:"a" ~new_name:"zzq" once))
+;;
+
 let suite =
-  [ ( "553-idx-columns"
+  [ ( "553-rewriter"
+    , Alcotest.test_case "examples" `Quick rewriter_examples
+      :: List.map
+           (QCheck_alcotest.to_alcotest ~verbose:false)
+           [ prop_absent_name_is_a_no_op
+           ; prop_rename_to_self_is_identity
+           ; prop_round_trips_through_a_fresh_name
+           ; prop_string_literals_are_preserved
+           ; prop_is_idempotent
+           ] )
+  ; ( "553-idx-columns"
     , List.map
         (fun (n, f) -> Alcotest.test_case n `Quick f)
         [ "implicit pk index", implicit_pk_index_follows_the_rename
