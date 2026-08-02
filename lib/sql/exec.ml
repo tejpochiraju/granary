@@ -6334,10 +6334,15 @@ let op_name = function
   | Plan.Op_limit { limit; offset; _ } ->
     Printf.sprintf "Limit(%d offset %d)" limit offset
   | Plan.Op_aggregate _ -> "Aggregate"
-  | Plan.Op_hash_join { join_kind; _ } ->
+  | Plan.Op_hash_join { join_kind; on_pred; _ } ->
+    (* #552: a general ON predicate on an outer join lives inside the join
+       rather than in an [Op_filter] above it, so without this suffix the
+       predicate disappears from EXPLAIN entirely and the [`Inner] and [`Left]
+       spellings of the same query explain differently for no visible reason. *)
+    let on = if Option.is_some on_pred then "(ON)" else "" in
     (match join_kind with
-     | `Inner -> "HashJoin"
-     | `Left -> "LeftHashJoin")
+     | `Inner -> "HashJoin" ^ on
+     | `Left -> "LeftHashJoin" ^ on)
   | Plan.Op_nested_loop_join { join_kind; right_meta; _ } ->
     (match join_kind with
      | `Inner -> "NestedLoopJoin(" ^ right_meta.Cat.name ^ ")"
@@ -9355,6 +9360,15 @@ and stream_hash_join
       join_kind
       n_right_cols
   =
+  (* [on_pred] is only ever consulted by the cartesian arm below, so a keyed
+     join carrying one would drop its match test silently.  [Op_hash_join] is a
+     public constructor — the planner honouring that invariant is not enough to
+     enforce it, and the failure mode is a wrong answer, not a crash. *)
+  if left_key >= 0 && right_key >= 0 && Option.is_some on_pred
+  then
+    invalid_arg
+      "Exec.stream_hash_join: on_pred is only meaningful on the cartesian arm (left_key \
+       < 0 || right_key < 0)";
   let* left_stream = to_stream clock params store ~mode ~cat left in
   let* right_stream = to_stream clock params store ~mode ~cat right in
   let* right_rows = Lwt_stream.to_list right_stream in

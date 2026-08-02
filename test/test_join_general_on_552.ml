@@ -45,6 +45,7 @@ module Parser = Granary_sql.Parser
 module Lexer = Granary_sql.Lexer
 module Planner = Granary_sql.Planner
 module Exec = Granary_sql.Exec
+module Plan = Granary_sql.Plan
 
 let run = Lwt_main.run
 
@@ -289,6 +290,171 @@ let general_on_as_the_second_join_in_a_chain () =
       (rows_of db "SELECT a, d, b FROM l JOIN m ON c = a LEFT JOIN r ON b > d"))
 ;;
 
+(* Moving the ON predicate inside the join removed the [Op_filter] node that
+   used to represent it in EXPLAIN, so the plan text has to name it instead —
+   otherwise the predicate is invisible and the INNER and LEFT spellings of one
+   query explain differently for no visible reason. *)
+let explain_names_the_general_on () =
+  with_db (fun db ->
+    exec db "CREATE TABLE l (a INTEGER)";
+    exec db "CREATE TABLE r (b INTEGER)";
+    let plan sql = String.concat "\n" (List.map (String.concat " ") (rows_of db sql)) in
+    let left = plan "EXPLAIN SELECT a, b FROM l LEFT JOIN r ON b > a" in
+    let inner = plan "EXPLAIN SELECT a, b FROM l INNER JOIN r ON b > a" in
+    let equi = plan "EXPLAIN SELECT a, b FROM l LEFT JOIN r ON b = a" in
+    let contains needle s =
+      let n = String.length needle in
+      let rec go i =
+        i + n <= String.length s && (String.sub s i n = needle || go (i + 1))
+      in
+      go 0
+    in
+    Alcotest.(check bool)
+      "the general-ON LEFT join names its ON predicate"
+      true
+      (contains "LeftHashJoin(ON)" left);
+    Alcotest.(check bool)
+      "the INNER spelling keeps its Filter node instead"
+      true
+      (contains "HashJoin" inner && contains "Filter" inner);
+    Alcotest.(check bool)
+      "a keyed LEFT join carries no ON predicate to name"
+      true
+      (contains "LeftHashJoin" equi && not (contains "LeftHashJoin(ON)" equi)))
+;;
+
+(* [on_pred] is read only by the cartesian arm, so a keyed join carrying one
+   would drop its match test and answer wrongly.  [Op_hash_join] is public, so
+   the invariant is enforced rather than merely documented. *)
+let keyed_join_rejects_an_on_pred () =
+  let store = Store.create () in
+  let cat = run (Cat.open_ store) in
+  let parse sql = Parser.stmt_eof Lexer.token (Lexing.from_string sql) in
+  let bound =
+    match run (Sema.bind cat (parse "CREATE TABLE t (x INTEGER)")) with
+    | Ok b -> b
+    | Error e -> Alcotest.failf "bind: %a" Sema.pp_error e
+  in
+  ignore (run (Exec.execute store cat (Planner.plan ~cat bound)));
+  let meta =
+    match run (Cat.find_table cat ~name:"t") with
+    | Some m -> m
+    | None -> Alcotest.fail "table t was not created"
+  in
+  let scan = Plan.Op_seq_scan { table_meta = meta } in
+  let op =
+    Plan.Op_hash_join
+      { left = scan
+      ; right = scan
+      ; left_key = 0
+      ; right_key = 0
+      ; on_pred = Some (Plan.P_lit (Granary_sql.Ast.L_int 1L))
+      ; join_kind = `Left
+      ; right_col_offset = 1
+      ; n_right_cols = 1
+      }
+  in
+  Alcotest.check_raises
+    "a keyed hash join with an on_pred is rejected"
+    (Invalid_argument
+       "Exec.stream_hash_join: on_pred is only meaningful on the cartesian arm (left_key \
+        < 0 || right_key < 0)")
+    (fun () -> ignore (run (Exec.query store cat op)))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* The invariant the cases above enumerate by example                   *)
+(* ------------------------------------------------------------------ *)
+
+(* The eight cases above are eight points; this is the rule they are points of,
+   stated once and checked against a model rather than against hand-written
+   expectations:
+
+     a LEFT JOIN under a general ON emits, for each left row, one joined row per
+     right row satisfying the ON — and exactly one null-extended row when there
+     are none.
+
+   The model is the definition, evaluated in OCaml over the same populations.
+   Written before the fix it fails on any population with an unmatched left row,
+   which is most of them; the enumerated cases would each have had to be thought
+   of.
+
+   NULLs are generated on both sides because the ON predicates are comparisons
+   and three-valued logic is where "no match" and "null extension" meet: a NULL
+   on either side makes [b > a] NULL, which is not a match, so a left row with
+   [a = NULL] must null-extend under every operator here. *)
+let cmp_of_op op (a : int option) (b : int option) =
+  match a, b with
+  (* NULL on either side: the comparison is NULL, which is not a match. *)
+  | None, _ | _, None -> false
+  | Some a, Some b ->
+    (match op with
+     | ">" -> b > a
+     | "<" -> b < a
+     | ">=" -> b >= a
+     | "<=" -> b <= a
+     | "<>" -> b <> a
+     | _ -> Alcotest.failf "unknown operator %S" op)
+;;
+
+let sql_of = function
+  | None -> "NULL"
+  | Some n -> string_of_int n
+;;
+
+(* [SELECT a, b FROM l LEFT JOIN r ON b <op> a], by definition. *)
+let model_left_join op ls rs =
+  List.concat_map
+    (fun a ->
+       match List.filter (fun b -> cmp_of_op op a b) rs with
+       | [] -> [ [ sql_of a; "NULL" ] ]
+       | ms -> List.map (fun b -> [ sql_of a; sql_of b ]) ms)
+    ls
+;;
+
+(* The same model minus every null extension: the INNER answer, and the property
+   that made filtering above the join look correct — it holds, which is exactly
+   why it is not sufficient. *)
+let model_inner_join op ls rs =
+  List.concat_map
+    (fun a ->
+       List.filter_map
+         (fun b -> if cmp_of_op op a b then Some [ sql_of a; sql_of b ] else None)
+         rs)
+    ls
+;;
+
+let ops = [ ">"; "<"; ">="; "<="; "<>" ]
+
+(* A small value domain, so matches and non-matches both occur often. *)
+let gen_side = QCheck.(list_size (Gen.int_range 0 4) (option (int_range 0 4)))
+
+let insert_all db tbl col vs =
+  List.iter
+    (fun v ->
+       exec db (Printf.sprintf "INSERT INTO %s (%s) VALUES (%s)" tbl col (sql_of v)))
+    vs
+;;
+
+let prop_left_join_general_on_matches_the_model =
+  QCheck.Test.make
+    ~count:80
+    ~name:"LEFT JOIN under a general ON agrees with the model on every operator"
+    QCheck.(triple gen_side gen_side (int_range 0 (List.length ops - 1)))
+    (fun (ls, rs, op_i) ->
+       let op = List.nth ops op_i in
+       with_db (fun db ->
+         exec db "CREATE TABLE l (a INTEGER)";
+         exec db "CREATE TABLE r (b INTEGER)";
+         insert_all db "l" "a" ls;
+         insert_all db "r" "b" rs;
+         let answer kind =
+           rows_of db (Printf.sprintf "SELECT a, b FROM l %s JOIN r ON b %s a" kind op)
+         in
+         answer "LEFT" = List.sort compare (model_left_join op ls rs)
+         && answer "INNER" = List.sort compare (model_inner_join op ls rs)))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* #551: the nested-loop probe against a shadowed table                 *)
 (* ------------------------------------------------------------------ *)
@@ -417,7 +583,19 @@ let () =
             "general ON as the second join in a chain"
             `Quick
             general_on_as_the_second_join_in_a_chain
+        ; Alcotest.test_case
+            "EXPLAIN names the general ON predicate"
+            `Quick
+            explain_names_the_general_on
+        ; Alcotest.test_case
+            "a keyed hash join rejects an on_pred"
+            `Quick
+            keyed_join_rejects_an_on_pred
         ] )
+    ; ( "property"
+      , List.map
+          QCheck_alcotest.to_alcotest
+          [ prop_left_join_general_on_matches_the_model ] )
     ; ( "probe against a shadowed table (#551)"
       , [ Alcotest.test_case
             "CTE shadowing a real table is not probed"
