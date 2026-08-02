@@ -211,6 +211,8 @@ type op =
       ; right_meta : Cat.table_meta (** right table for row decode *)
       ; idx_tree : int (** right-side index tree id *)
       ; probe : probe_part list (** probe key, in index-column order *)
+      ; probe_range : range option
+        (** #570: a #532 range bound on the index column after the probe key *)
       ; join_kind : [ `Inner | `Left ]
       ; right_col_offset : int (** = n_left_cols *)
       ; n_right_cols : int

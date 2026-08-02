@@ -270,6 +270,19 @@ type op =
             [idx_tree]'s columns.  Always contains at least one
             {!Probe_from_left}, or the join would not be driven by the left
             input at all. *)
+      ; probe_range : range option
+        (** #570: a range bound on the index column {i after} the probe key's
+            last pinned column, re-based to the right table's ordinals by the
+            same {!Planner} pass that feeds the hash join's build side (#532).
+
+            The probe key stops at the first index column pinned by neither the
+            left row nor a WHERE equality; before #570 a range on that column
+            contributed nothing, so whether it narrowed the read depended on
+            which strategy the cost model happened to pick.  It is applied per
+            driving row exactly as [Op_index_lookup]'s [range] is applied to a
+            seek, and is sound for the same reason: [chain_joins] applies the
+            whole WHERE clause to the joined row, so narrowing what a probe
+            reads cannot change which joined rows survive. *)
       ; join_kind : [ `Inner | `Left ]
       ; right_col_offset : int (** = n_left_cols *)
       ; n_right_cols : int

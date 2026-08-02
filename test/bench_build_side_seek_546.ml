@@ -46,6 +46,7 @@
       B546_REPS        warm repeats, best-of       (default 3)
       B546_CHECKPOINT  checkpoint after seeding    (default 1)
       B546_EXTRA       extra WHERE conjunct, both  (default none; see #575 below)
+      B546_PARAMS      ints bound to B546_EXTRA's ?  (default none; see #595)
     Also honours the engine's own GRANARY_PAGE_CACHE (pager capacity, 4 KB
     pages; the engine's own default is 1024).
 
@@ -102,7 +103,50 @@
     393,980 reads and 3.6x the scan's wall time — a worse regression than the one
     #575 was written to remove, reachable by appending a no-op to a WHERE clause.
     Row 3 shows #532's narrow-window win is still taken; row 4 shows a window
-    the estimator can read but which covers the table is declined anyway. *)
+    the estimator can read but which covers the table is declined anyway.
+
+    {b [B546_PARAMS] is #595's half}, and it exists for the same reason
+    [B546_EXTRA] does: this harness could only ever issue a literal, so the
+    spelling every prepared-statement application produces — a bound parameter —
+    had no on-disk measurement at all. Set it to a comma-separated list of
+    integers and the queries are prepared and bound rather than interpolated,
+    with the values filling [B546_EXTRA]'s [?] placeholders left to right:
+
+    {v
+      B546_EXTRA='si BETWEEN ? AND ?' B546_PARAMS='20,40'
+    v}
+
+    [range_rows_estimate] requires [P_lit (L_int _)] at both ends, so that run
+    must report the SAME reads and the SAME [idxent] as the declined rows above,
+    while [B546_EXTRA='si BETWEEN 20 AND 40'] seeks — the two runs differ only in
+    how the same two numbers reach the planner. Measured at 10,000 stock / 3,000
+    driving, 100% population:
+
+    {v
+      spelling                         | S:reads  idxent | verdict
+      si BETWEEN 20 AND 40 (literal)   |    6146    3021 | SEEKED
+      si BETWEEN ? AND ?   (bound)     |    6299    3000 | declined
+    v}
+
+    {b #606 tightened what the literal row means.} The gate now admits a window
+    only below [table_rows / build_side_seek_break_even_ratio] — 50 keys at
+    10,000 rows — where it used to admit anything under the row count. The
+    windows that changed side are measurable here directly:
+
+    {v
+      B546_EXTRA                    | S:reads  idxent | F:reads  idxent | pre-#606
+      'si BETWEEN 0 AND 24'         |    6152    3024 |    6299    3000 | seeked, kept
+      'si BETWEEN 0 AND 99'         |    6304    3099 |    6299    3000 | seeked, NOW DECLINED
+      'si BETWEEN 0 AND 999'        |    8132    3999 |    6299    3000 | seeked, NOW DECLINED
+      'si BETWEEN 0 AND 4999'       |   16253    7999 |    6299    3000 | seeked, NOW DECLINED
+      'si BETWEEN 0 AND 9998'       |   26401   12998 |    6299    3000 | seeked, NOW DECLINED
+    v}
+
+    The [S:reads] column there is the PRE-#606 measurement — run the same
+    windows on this branch and every row from [0 AND 99] down reads 6,299 and
+    walks 3,000 entries, i.e. it has joined the declined rows. Read the last row
+    as the headline: 26,401 reads against the scan's 6,299 is the 4.19x #606
+    was filed for. *)
 
 open Granary
 
@@ -205,6 +249,22 @@ let seed db ~n_w ~correlated ~overlap =
   if checkpoint_after_seed then exec db "PRAGMA wal_checkpoint"
 ;;
 
+(* #595: [B546_PARAMS] turns every query into a prepared statement, so the
+   bounds in [B546_EXTRA] reach the planner as [BE_param] rather than as
+   literals.  Empty means the old path (interpolated SQL, [Db.query_with_stats]);
+   the two must be compared on the same population, which is why this is a
+   run-time switch rather than a second scenario list. *)
+let extra_params =
+  match Sys.getenv_opt "B546_PARAMS" with
+  | Some s when String.trim s <> "" ->
+    String.split_on_char ',' s
+    |> List.filter_map (fun t ->
+      match int_of_string_opt (String.trim t) with
+      | Some n -> Some (Db.V_int (Int64.of_int n))
+      | None -> None)
+  | _ -> []
+;;
+
 (* One full execution, drained, with page reads and rows examined collected. *)
 let once db sql =
   let reads = ref 0
@@ -222,7 +282,13 @@ let once db sql =
   let n, st =
     run
       (let open Lwt.Syntax in
-       let* stream, stats = Lwt.map unwrap (Db.query_with_stats db sql) in
+       let* stream, stats =
+         match extra_params with
+         | [] -> Lwt.map unwrap (Db.query_with_stats db sql)
+         | params ->
+           let* stmt = Lwt.map unwrap (Db.prepare db sql) in
+           Lwt.map unwrap (Db.iter_with_stats stmt ~params)
+       in
        let* rows = Lwt_stream.to_list stream in
        Lwt.return (List.length rows, stats))
   in
@@ -302,12 +368,14 @@ let scenario ~label ~n_w ~correlated ~overlap =
 let () =
   Printf.printf
     "#546: hash-join build side, on disk (%d stock rows, %d driving rows, \
-     GRANARY_PAGE_CACHE=%s, checkpointed=%b, best of %d)\n"
+     GRANARY_PAGE_CACHE=%s, checkpointed=%b, best of %d, extra=%S, params=%d)\n"
     n_stock
     n_line
     (Option.value ~default:"unset (1024)" (Sys.getenv_opt "GRANARY_PAGE_CACHE"))
     checkpoint_after_seed
-    reps;
+    reps
+    extra_pred
+    (List.length extra_params);
   Printf.printf
     "%-32s | %7s %6s %7s %7s %7s %7s | %7s %6s %7s %7s %7s %7s | %s\n"
     "population"

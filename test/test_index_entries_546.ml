@@ -160,15 +160,31 @@ let a_full_unique_key_pin_still_seeks () =
    #575 kept this case: a range-bounded seek is not the open-ended prefix walk
    the decision declined, and it is the one shape with a span estimate the
    planner can read. Its foil is now a plain scan rather than a prefix walk,
-   because the foil's unrecognisable range leaves a bare prefix pin. *)
+   because the foil's unrecognisable range leaves a bare prefix pin.
+
+   #606 shrank the window from 21 keys to 6. The gate now admits a literal
+   window only below the MEASURED break-even —
+   [table_rows / build_side_seek_break_even_ratio], i.e. 2,000 / 200 = 10 keys on
+   this population — where before it admitted anything numerically smaller than
+   the table. 21 keys over 2,000 rows is 1/95 of the table, which the measurement
+   behind that constant puts on the losing side, so the planner declines it and
+   this case has to ask for a window that is genuinely small relative to its own
+   population. The narrowing under test is unchanged; only its width is. *)
+let n_window = 6
+
 let a_range_bound_cuts_the_entries_walked () =
   with_db (fun db ->
     seed db;
-    let _, bounded = stats_of db (q "sw = 1 AND si BETWEEN 20 AND 40") in
-    let _, unbounded = stats_of db (q "sw = 1 AND si + 0 BETWEEN 20 AND 40") in
+    let hi = 20 + n_window - 1 in
+    let _, bounded =
+      stats_of db (q (Printf.sprintf "sw = 1 AND si BETWEEN 20 AND %d" hi))
+    in
+    let _, unbounded =
+      stats_of db (q (Printf.sprintf "sw = 1 AND si + 0 BETWEEN 20 AND %d" hi))
+    in
     Alcotest.(check int)
-      "bounded: the driving side plus the 21-key window"
-      (n_line + 21)
+      "bounded: the driving side plus the 6-key window"
+      (n_line + n_window)
       bounded.Db.index_entries;
     Alcotest.(check int)
       "unbounded: a #575-declined bare prefix, so the driving side alone"

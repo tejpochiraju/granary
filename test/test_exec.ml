@@ -3555,6 +3555,7 @@ let query_nlj_raises_in_execute () =
                 ; right_meta = m
                 ; idx_tree = 99
                 ; probe = [ Plan.Probe_from_left 0 ]
+                ; probe_range = None
                 ; join_kind = `Inner
                 ; right_col_offset = 2
                 ; n_right_cols = 2

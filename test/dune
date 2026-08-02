@@ -958,6 +958,21 @@
   lwt.unix
   unix))
 
+; #570: the nested-loop probe must take the same range bound the build side
+; does.
+
+(test
+ (name test_probe_range_570)
+ (modules test_probe_range_570)
+ (libraries
+  granary
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #528: hash-join build side must seek a WHERE-pinned index prefix.
 
 (test

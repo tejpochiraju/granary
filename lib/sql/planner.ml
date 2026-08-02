@@ -752,6 +752,38 @@ let range_rows_estimate (r : Plan.range) =
   | None -> range_seek_rows
 ;;
 
+(** #606: the {i unfloored} key count a both-ends-integer-literal range spans,
+    or [None] when the window cannot be sized at all.
+
+    {!range_rows_estimate} answers the same question for the {b cost model}, and
+    deliberately never goes below {!range_seek_rows} = 100 — under-stating R
+    biases the strategy choice towards the nested-loop probe, and the floor is
+    the slack that covers a made-up constant (see {!nlj_min_driving_rows}).
+
+    {b That floor is exactly wrong for a break-even test.}  #606's gate asks
+    whether a window is below [table_rows / K] for a measured K in the hundreds,
+    so on any table under [100 * K] rows a floored estimate answers "no" for
+    every window including a one-key one, and the seek becomes unreachable.  The
+    two questions want the same span and opposite treatment of the floor, so
+    they are two functions over one {!range_int_literal_span} rather than one
+    function with a flag.
+
+    [Some 0] is an empty window (the caller's [hi < lo]); [None] is "the
+    estimator has nothing to say", which is both a non-literal bound and an
+    [hi - lo] that overflows int64. *)
+let range_literal_window_rows (r : Plan.range) =
+  match range_int_literal_span r with
+  | None -> None
+  | Some (lo, hi) ->
+    if Int64.compare hi lo < 0
+    then Some 0
+    else (
+      let span = Int64.sub hi lo in
+      if Int64.compare span 0L < 0 || Int64.compare span (Int64.of_int max_int) >= 0
+      then None
+      else Some (Int64.to_int span + 1))
+;;
+
 (** #520: how many rows [meta]'s table can hold, from the only real number the
     catalog carries: a rowid table's [next_rowid] high-water mark, which is
     [max(rowid) + 1] over everything ever inserted.
@@ -775,6 +807,120 @@ let table_rows_estimate (meta : Cat.table_meta) =
     then unbounded_rows
     else max 0 (Int64.to_int next_rowid - 1)
 ;;
+
+(** #606/#546: how much smaller than the whole table a build-side window has to
+    be before seeking it beats scanning the table.
+
+    #575 shipped the range carve-out gated on
+    [range_rows_estimate r < table_rows_estimate meta] — "the window is smaller
+    than the table" — which admits everything from 0% to 99.999% selectivity.
+    #606 is that residual: [si BETWEEN 0 AND 9998] over 10,000 rows passed the
+    gate and cost 4.19x the pager reads of the scan it replaced, while
+    [si BETWEEN 0 AND 1000000] — one literal further out — was declined.  The
+    cliff sat at the table's row count, nowhere near break-even.
+
+    {b The break-even is a ratio of two per-row costs, and both were measured
+    directly} with [test/bench_build_side_seek_546.ml], 100% population,
+    [B546_EXTRA='si BETWEEN 0 AND <hi>'], cold pager reads.  Reads are the
+    load-bearing figure — they are what a MirageOS target pays and they are
+    near-deterministic, reproducing {i to the digit} across hosts; the wall-clock
+    column moves with whatever else the box is doing and is quoted only where it
+    agrees.
+
+    {v
+      10,000 stock / 3,000 driving — scanned build side reads 6,299
+        window      1     50    100    150    200    500   1,000  5,000   9,999
+        S:reads  6103   6202   6304   6406   6508   7116   8132  16253   26401
+        marginal    -   2.02   2.04   2.04   2.04   2.03   2.03   2.03    2.03
+
+      100,000 stock / 30,000 driving — scanned build side reads 93,067
+        window    200    500  1,000
+        S:reads 91533  92441  93957      marginal 3.03 reads per entry
+    v}
+
+    The [window = 1] cell is the seek's own intercept, 6,103 — {i not} the
+    scan's 6,299, which is a different plan and appears only in the header line.
+    Confusing the two is the one substitution that would make the marginal column
+    look non-linear, in a table whose whole authority is that it is not.
+
+    Read those two blocks as a pair of straight lines and the constant falls out
+    of them:
+
+    - a {b seeked} entry costs 2.04 pager reads at 10,000 rows and 3.03 at
+      100,000 — the per-entry descent from the index root, so it grows with tree
+      depth, i.e. with log N;
+    - a {b scanned} row costs 0.020 reads at 10,000 (2.04 x 97.5 read-parity
+      window / 10,000) and 0.021 at 100,000 (3.03 x ~706 / 100,000) — one page
+      per ~47 rows, flat in N as a sequential leaf walk must be.
+
+    Read-parity — the window where the two lines cross — is therefore {b 1/103
+    of the table at 10,000 rows and 1/141 at 100,000} (interpolating 93,067
+    between the 500- and 1,000-key rows gives 707), and it tightens with N
+    because only the seek's side of the ratio grows.  Extrapolating one more
+    decade of tree depth puts 1,000,000 rows near 1/190.
+
+    {b Reads and wall-clock cross over at very different windows, and the gate
+    follows the reads deliberately.}  Measured on the same runs:
+
+    {v
+                        read parity   wall parity   gate cuts at
+      10,000 rows            97          ~4,000          50
+      100,000 rows          705       ~20,000-50,000    500
+    v}
+
+    Wall time agrees with the reads only at the far end — the 9,999-key window is
+    2.66-2.77x slower than the scan it replaced, reproducing #546's 2.6-3.5x and
+    #606's 2.63x — and disagrees across everything below it.  A 5,000-key window
+    reads 2.58x more and {i is} 1.42x cold / 1.30x warm slower, so that one
+    agrees too; the genuine disagreement runs from about 1/100 of the table down
+    to about 1/2.5 of it, where a seeked build side is faster in wall time
+    despite reading more, because a declined build side has to hash every row of
+    the table.
+
+    So {b the gate declines the entire disagreement band, and that costs up to
+    ~2.2x in wall time on this harness under the plan it now picks}.  That is
+    accepted knowingly, not overlooked.  The reason is that this bench is
+    page-cache-warm: a "read" here is a [Wal_read] resolved from memory and costs
+    almost nothing, so wall time is measuring CPU — the hashing — with the I/O
+    term set to zero.  On any real block device the I/O term dominates and the
+    ordering inverts, and a real block device is the MirageOS target this engine
+    exists for.  Choosing the counter that survives that change of hardware is
+    the point; do not "fix" the gate by re-tuning it against this file's wall
+    clock.
+
+    [200] is the round number just past that extrapolation.  The bias it carries
+    is deliberate and asymmetric: over-stating the ratio {i declines} windows
+    that would have won, costing the wall-clock band described below, while
+    under-stating it {i admits} windows that cost up to the 4.19x of pager reads
+    #606 measured.  #575's option B already made that trade once — decline the
+    unmeasurable, keep only what is unambiguous — and this is the same trade with
+    a measured number instead of a table-sized one.
+
+    {b It stops being the conservative direction somewhere above ~1.1M rows.}
+    True parity tightens as log N while the constant does not, so the two cross:
+    at 10,000,000 rows parity is near 1/240 and the gate still admits up to
+    1/200, i.e. it would then be admitting windows measurably on the losing side
+    rather than declining ones on the winning side.  Nothing in the tree is near
+    that scale, and the honest fix at that point is a ratio that grows with the
+    index's depth rather than a larger constant — but a future reader raising
+    this number to buy back the wall-clock band should know the error already
+    changes sign in the other direction.
+
+    {b This is not the statistic #576 is about and does not close it.}  It is a
+    per-row cost ratio measured on one engine, not a selectivity estimate: it
+    can only be consulted where the window is {i literally} readable off the
+    query and the index is unique, which is why {!build_side_seek_is_unambiguous}
+    still asks {!index_is_unique} and {!range_literal_window_rows} first.  A
+    parameterised bound still has no window to compare and is still declined.
+
+    {b Correction to #546's published figure.}  That issue derived break-even
+    "near 1/390" from a scanned-row cost of 0.008 reads — an estimate of one page
+    per ~130 rows, never measured.  The direct measurement above is 0.021, one
+    page per ~47 rows, on the same harness and the same populations, at two
+    scales that agree.  1/390 is the tighter and therefore safe direction, but it
+    is not what the engine does, and a threshold of 390 would decline a band this
+    branch measures as a win. *)
+let build_side_seek_break_even_ratio = 200
 
 (** #593: [meta]'s index living in tree [idx_tree], if it has one.
 
@@ -941,7 +1087,8 @@ let estimate_rows cat (op : Plan.op) =
       asks.  The two functions share {!index_by_tree} so they cannot drift on the
       part they do agree about.
     - [Seek_index] carrying a #532 range bound {b whose window the estimator can
-      read and says is smaller than the table}.  A range is a strict prefix, so
+      read and puts below the measured break-even} (#606).  A range is a strict
+      prefix, so
       it needs an argument the bare prefix does not have, and that argument is
       the estimate: #546's table measures the {i open-ended} prefix walk, and a
       range that really stops short of the end of the prefix is a different
@@ -979,30 +1126,171 @@ let estimate_rows cat (op : Plan.op) =
         position [n_eq], i.e. [length idx_columns > length keys], and
         [seek_is_unique_point] requires them equal.  It read as a uniqueness
         check and was not one.
-      + {!range_int_literal_span} — whether the estimator can read the window at
-        all, rather than falling back to its flat constant.
-      + [range_rows_estimate r < table_rows_estimate meta] — whether it says the
-        window is smaller than the table.  A both-ends-literal range spanning the
-        whole table ([si BETWEEN 0 AND 1000000] over 100,000 rows) is the same
-        open-ended walk in a different spelling.
+      + [length idx_columns = length keys + 1] — whether the bounded column is
+        the {b last} one in the index.  {b Without it the window is not a bound
+        on anything.}  {!range_literal_window_rows} counts distinct values of the
+        BOUNDED column; the gate below compares that against a count of ROWS, and
+        the two are commensurable only when one bounded value is one entry.
+        {!index_is_unique} makes the {i whole} key unique, not the prefix through
+        position [n_eq], and {!range_for_index} places the range at index column
+        [n_eq] with nothing requiring it to be last — so on a three-or-more-column
+        key every column {i after} the bounded one multiplies the entries a
+        window reaches, invisibly to the estimate.  Measured:
 
-      That threshold is "smaller than the table", so selectivity approaching 100%
-      still seeks on a unique index; #606 carries the residual, because closing it
-      honestly needs a factor of ~390 and that is the fudge #576 forbids.
+        {v
+          stock (sw, si, sub, qty)  PRIMARY KEY (sw, si, sub)
+          4,000 rows, si 1..20, sub 1..200
+          ... JOIN stock ON sub = i_id WHERE w = 1 AND sw = 1
+                        AND si BETWEEN 1 AND 20
+
+          gate budget = 4000/200 = 20 ; window = 20  ->  ADMITTED
+            seek : rows_examined 5100   index_entries 5100   (all 4,000 entries)
+            foil : rows_examined 5100   index_entries 1100
+        v}
+
+        A window the estimate sized at 20 reached the entire table — 200x, 100%
+        selectivity, exactly what #606 was filed to stop, and [rows_examined]
+        reports the same 5,100 either way, which is #546's whole point.  The
+        shape is not exotic: TPC-C's [order_line] key is
+        [(ol_w_id, ol_d_id, ol_o_id, ol_number)].
+
+        Requiring the bounded column to be last is what turns the {i assumption}
+        "entries per bounded value = 1" into a checked fact, and with it the
+        "#576 is untouched" argument below becomes a consequence rather than a
+        claim.  It costs nothing on any shape in the tree, because a range is
+        only ever read off the column after the pinned prefix and every existing
+        case has that column last.
+      + [r_ty = Row.Integer] — whether the bounded column is an INTEGER.  {b The
+        window is a count of integers; only an integer column makes that a count
+        of entries.}  {!range_int_literal_span} inspects the two BOUNDS and never
+        consults [r_ty], while {!bounded_type} admits [Row.Real] — so on a REAL
+        last column the estimate counts the integers in [lo, hi] and the seek
+        walks the distinct REALS in it, which is unbounded.  Measured:
+
+        {v
+          stock (sw INTEGER, sr REAL, qty INTEGER)  PRIMARY KEY (sw, sr)
+          4,000 rows, sr spread strictly inside (0,1)
+          ... WHERE sw = 1 AND sr BETWEEN 0 AND 1
+
+          budget = 4000/200 = 20 ; window computed = 2  ->  ADMITTED (pre-#606 B2)
+            seek : rows_examined 5200   index_entries 5200   (all 4,000 entries)
+            foil : rows_examined 5200   index_entries 1200
+        v}
+
+        2,000x the budget at 100% selectivity — #606's headline pathology and
+        #546's counter split, verbatim, one {i type} away from the position
+        premise above.  A REAL trailing key column is the canonical time-series
+        shape ([PRIMARY KEY (sensor, ts)], [ts BETWEEN <day> AND <day+1>]), not a
+        corner.
+
+        {b This restricts one decision, not the feature.}  This function gates
+        {!build_side} alone — the hash join's build side.  A REAL range bound
+        still narrows a base scan, a DML seek and (since #570) a nested-loop
+        probe, none of which route through here, because none of them replaces a
+        sequential scan of the whole table and so none of them needs the window
+        to bound anything.  What is declined is the {i build-side seek} on a REAL
+        column, and only because that is the one place a mis-sized window costs
+        more than it saves.
+
+        {b With this conjunct the bound stops being an assumption and becomes a
+        theorem.}  [Index_key.encode_value] tags NULL and NaN [0x00], integers
+        [0x01] and reals [0x02], so NULL/NaN entries sort strictly below any
+        integer lower bound and cannot inflate the walk; a unique full key means
+        one key value is one entry; the bounded column being last means no
+        further column multiplies it; and an integer column means the window's
+        unit and the walk's unit are the same.  Take away any one of the four and
+        the comparison is between two different quantities again.
+      + {!range_literal_window_rows} — whether the estimator can read the window
+        at all, rather than falling back to its flat constant.
+      + [window * build_side_seek_break_even_ratio <= table_rows_estimate meta] —
+        whether the window is below the {b measured break-even}.
+
+      {2 #606: the third conjunct used to be "smaller than the table"}
+
+      It read [range_rows_estimate r < table_rows_estimate meta], and that
+      declined only windows numerically {i larger} than the whole table, so
+      0%-99.999% selectivity still seeked.  [si BETWEEN 0 AND 9998] over 10,000
+      rows passed it and cost 4.19x the scan's pager reads, while
+      [si BETWEEN 0 AND 1000000] — one literal further out — was declined: the
+      cliff sat at the row count, not at break-even.  #606 recorded that residual
+      and expected closing it to need #576's per-index cardinality statistic.
+
+      It does not, because {b this particular question is not a selectivity
+      question}.  The window's size is already known exactly — it is read off two
+      integer literals — so what is missing is not a distribution but the price
+      of a seeked entry against a scanned row, and that is a property of the
+      engine's own read path, measurable to two significant figures without any
+      stored statistic.  {!build_side_seek_break_even_ratio} carries the
+      measurement (two scales, agreeing) and the reason 200 rather than #546's
+      published 390.
+
+      That distinction is the whole reason this is not the fudge #576 forbids: a
+      constant standing in for a distribution the engine cannot see is a fudge; a
+      constant measured directly, twice, over the quantity it actually names is a
+      calibration.  Everything that still needs a {i distribution} — a
+      parameterised bound, a non-integer literal, any prefix of a non-unique
+      index — is still declined, unchanged.
+
+      Two edges the ratio brings with it:
+
+      - [table_rows_estimate] answers {!unbounded_rows} for a WITHOUT ROWID or
+        columnar table, i.e. "no row count".  Dividing that by the ratio would
+        admit any window at all on exactly the tables whose size is unknown, so
+        an unbounded row count declines instead — the same "decline what cannot
+        be judged" that #575 settled on, applied to the other operand.
+      - the comparison is written as a division rather than a multiplication
+        because [window * 200] overflows for a window near [max_int], and it
+        would overflow towards {i admitting}.
 
       A justification naming a property, attached to a gate that does not test
       for it, is the fudge-factor wedge #561 and #576 warn about.  This function
-      has now been wrong that way twice — once admitting any range at all, once
-      appearing to check uniqueness through a call that could never be true — so
-      each conjunct above names the measurement that would fire without it. *)
+      has now been wrong that way {b five} times:
+
+      + admitting any range at all;
+      + appearing to check uniqueness through a call that could never be true;
+      + calling a table-sized threshold a break-even;
+      + sizing a window in key VALUES while comparing it against ROWS — the
+        {i position} premise, unstated;
+      + and doing the same one type over — the {i type} premise, unstated, which
+        survived the fix for the fourth because that fix argued position at
+        length and left type implicit.
+
+      So each conjunct above now names the measurement that would fire without
+      it, and the four premises are listed together where the theorem is stated,
+      rather than being discoverable one defect at a time.
+
+      The last two are the instructive ones.  In both cases the sentence that
+      predicted the defect was already in this comment when it shipped past —
+      {!index_is_unique}'s own doc states the invariant the fourth broke — and in
+      both cases the fix for one premise read as a fix for the class.  {b Reading
+      a warning is not testing for the thing it warns about, and closing one
+      instance of a class is not closing the class.} *)
 let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
   | Plan.Seek_rowid _ -> true
   | Plan.Seek_index { idx_tree; keys; range = None } ->
     index_full_unique_pin cat meta ~idx_tree ~keys
-  | Plan.Seek_index { idx_tree; keys = _; range = Some r } ->
+  | Plan.Seek_index { idx_tree; keys; range = Some r } ->
     index_is_unique cat meta ~idx_tree
-    && Option.is_some (range_int_literal_span r)
-    && range_rows_estimate r < table_rows_estimate meta
+    && (match index_by_tree cat meta ~idx_tree with
+        (* [None] is unreachable: [index_is_unique] just called [index_by_tree]
+           with these arguments and answered [false] on [None], so the [&&] has
+           already short-circuited.  Kept because the alternative is an
+           [assert false] or a partial match on a lookup that is fallible by
+           type; do not write a test for this arm, there is no query that
+           reaches it. *)
+        | Some i -> List.length i.Cat.idx_columns = List.length keys + 1
+        | None -> false)
+    && (match r.Plan.r_ty with
+        (* The window is a count of INTEGERS; only an integer column makes that
+           a count of entries.  See the doc's third conjunct. *)
+        | Row.Integer -> true
+        | Row.Real | Row.Text | Row.Blob -> false)
+    &&
+      (match range_literal_window_rows r with
+      | None -> false
+      | Some window ->
+        let rows = table_rows_estimate meta in
+        rows < unbounded_rows && window <= rows / build_side_seek_break_even_ratio)
 ;;
 
 (** #528: the plan op a join's right table is read through when it is the {i
@@ -1261,8 +1549,11 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
   let right_offset = bj.right_col_offset in
   let n_right_cols = List.length bj.right_meta.Cat.columns in
   let right_eqs = right_table_eqs ~right_offset ~n_right_cols where_conjuncts in
-  (* #532: the range half of the same re-basing.  Only [build_side] takes it —
-     a nested-loop probe key is built from equalities alone. *)
+  (* #532: the range half of the same re-basing.  #570: BOTH strategies take it
+     — the build side through [build_side], the nested-loop probe through
+     [range_for_index] at the probe key's length.  Until #570 only the former
+     did, so the same range on the same table narrowed the read or not depending
+     on which strategy the cost model happened to pick. *)
   let right_ranges = right_table_ranges ~right_offset ~n_right_cols where_conjuncts in
   (* #528: the build side of a hash join, narrowed by the same WHERE equalities
      that would complete a probe key.  It does not depend on the strategy chosen
@@ -1304,11 +1595,29 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
     in
     match probe with
     | Some (idx, probe) ->
+      (* #570: the probe key covers a leading prefix of [idx]'s columns and
+         stops at the first column pinned by neither the left row nor a WHERE
+         equality.  That is precisely [range_for_index]'s [~n_eq] position, so
+         the range half of the re-basing narrows the probe by the same call the
+         build side already makes — no new recogniser and no new spelling to
+         keep in step.
+
+         Unlike the build side this needs no #575/#606 gate.  Those exist
+         because a build-side seek REPLACES a sequential scan of the whole
+         table, so a wide window can cost more than what it displaced.  A probe
+         is a seek either way: the range only moves its start key forward and
+         stops it early, so the worst case is the pre-#570 probe exactly and
+         there is nothing to decline.  It also does not feed the cost model —
+         the strategy is already chosen by the time this runs. *)
+      let probe_range =
+        range_for_index bj.right_meta idx ~n_eq:(List.length probe) right_ranges
+      in
       Plan.Op_nested_loop_join
         { left = left_op
         ; right_meta = bj.right_meta
         ; idx_tree = idx.Cat.idx_tree_id
         ; probe
+        ; probe_range
         ; join_kind
         ; right_col_offset = right_offset
         ; n_right_cols

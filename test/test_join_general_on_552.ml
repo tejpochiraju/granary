@@ -876,8 +876,12 @@ let () =
             "CTE shadowing a real table is not seeked by a base scan"
             `Quick
             cte_shadowing_a_real_table_is_not_seeked_by_a_base_scan
+          (* #594: named a CONTROL in the runner's own output, not only in the
+             comment above the case. It passes on `main` too — the [Seek_rowid]
+             arm cannot leak a shadowed identity — so a reader scanning the test
+             list should not take it for a regression pin. *)
         ; Alcotest.test_case
-            "CTE shadowing a rowid-alias table scans"
+            "CONTROL: CTE shadowing a rowid-alias table scans (#594)"
             `Quick
             cte_shadowing_a_rowid_alias_table_scans
         ; Alcotest.test_case

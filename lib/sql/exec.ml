@@ -9625,6 +9625,7 @@ and nlj_probe_left
       (right_meta : Cat.table_meta)
       idx_tree
       (probe : Plan.probe_part list)
+      (probe_range : Plan.range option)
       join_kind
       n_right_cols
       out
@@ -9640,7 +9641,13 @@ and nlj_probe_left
     let prefix, plen =
       encode_index_key_prefix (List.map row_value_to_index_value key_values)
     in
-    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    (* #570: the probe key covers a leading prefix of the index, so a WHERE
+       range on the column AFTER it narrows this walk exactly as it narrows
+       [stream_index_lookup]'s — same two helpers, so the two paths cannot
+       disagree about which entries a bound covers.  It is a pure narrowing of
+       what is READ: [chain_joins] still applies the whole WHERE clause to the
+       joined row. *)
+    let seek_key, past_end = range_seek_bounds clock params ~prefix ~plen probe_range in
     (* O(log n) native seek per probe — avoids draining the whole index per
        left row, which made indexed nested-loop joins O(n^2) (#228/#229). *)
     let* cur = rh_seek_ge rh idx_tree seek_key in
@@ -9649,8 +9656,11 @@ and nlj_probe_left
       match%lwt S.seek_next cur with
       | None -> Lwt.return_unit
       | Some (ikey, _) ->
-        if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        if index_key_in_range ~prefix ~plen ~past_end ikey
         then (
+          (* #546/#595: an index entry walked is the counter that tells a probe
+             from a scan; [rows_examined] cannot. *)
+          incr_index_entries s_opt;
           let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
           let rowid = Rowid.decode rowid_bytes in
           let table_key = Rowid.encode rowid in
@@ -9684,6 +9694,7 @@ and stream_nested_loop_join
       (right_meta : Cat.table_meta)
       idx_tree
       (probe : Plan.probe_part list)
+      (probe_range : Plan.range option)
       join_kind
       n_right_cols
   =
@@ -9707,6 +9718,7 @@ and stream_nested_loop_join
          right_meta
          idx_tree
          probe
+         probe_range
          join_kind
          n_right_cols
          out)
@@ -11425,8 +11437,15 @@ and to_stream
   | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
     stream_rowid_lookup clock params store mode lookup_val table_meta
   | Plan.Op_nested_loop_join
-      { left; right_meta; idx_tree; probe; join_kind; right_col_offset = _; n_right_cols }
-    ->
+      { left
+      ; right_meta
+      ; idx_tree
+      ; probe
+      ; probe_range
+      ; join_kind
+      ; right_col_offset = _
+      ; n_right_cols
+      } ->
     stream_nested_loop_join
       clock
       params
@@ -11437,6 +11456,7 @@ and to_stream
       right_meta
       idx_tree
       probe
+      probe_range
       join_kind
       n_right_cols
   | Plan.Op_hash_join
