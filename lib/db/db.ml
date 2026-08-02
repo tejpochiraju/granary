@@ -2347,30 +2347,26 @@ let dump_table_order (tables : Cat.table_meta list) =
 ;;
 
 (* True for an implicit index that replaying the [CREATE TABLE] already
-   recreates: a single-column auto-created PRIMARY KEY index whose column carries
-   a column-level PRIMARY KEY (our executor rebuilds it from that clause).  Every
-   other index — user indexes, UNIQUE-constraint indexes, and multi-column PK
-   indexes backing composite/table-level keys — encodes a constraint the table
-   DDL omits and so must be emitted, or restoring would silently drop it.
+   recreates.  Every other index — user indexes and UNIQUE-constraint indexes —
+   encodes a constraint the table DDL omits and so must be emitted, or restoring
+   would silently drop it.
 
-   A multi-column (composite / table-level) PRIMARY KEY therefore round-trips as
-   a plain [CREATE UNIQUE INDEX]: faithful to this engine's internal
-   representation (so the data round-trips), but the restored schema reports no
-   PRIMARY KEY and permits NULLs — an intentional downgrade.
+   #533: this question used to be answered here, independently of what
+   [ddl_of_table] actually rendered, and the two drifted: a table with two
+   PRIMARY KEY declarations had the inline suffix suppressed on both columns
+   while this still called their indexes implied, so the dump carried neither
+   the key nor the index and a restore silently accepted duplicates.  It now
+   delegates to [Exec.ddl_implies_index], which shares the renderer's own
+   predicate.  As part of that, a composite/table-level PRIMARY KEY is rendered
+   into the [CREATE TABLE] (recovered from its implicit index, the only record
+   of the key's column order) instead of being downgraded to a bare
+   [CREATE UNIQUE INDEX].
 
    The check keys on [idx_origin] (#273), set when the index is created, not on
    the [__pk_] name prefix [sema.ml] assigns: a user index deliberately named
    [__pk_*] on a PK column is [`User] origin and so is correctly still emitted. *)
-let dump_index_is_implied (meta : Cat.table_meta) (idx : Cat.index_info) =
-  match idx.Cat.idx_origin with
-  | `Implicit_unique | `User -> false
-  | `Implicit_pk ->
-    (match idx.Cat.idx_columns with
-     | [ col ] ->
-       List.exists
-         (fun (c : Row.column) -> c.Row.name = col && c.Row.primary_key)
-         meta.Cat.columns
-     | _ -> false)
+let dump_index_is_implied (meta : Cat.table_meta) ~indexes (idx : Cat.index_info) =
+  Sql.Exec.ddl_implies_index meta ~indexes idx
 ;;
 
 (* Emit [INSERT] statements for every row of table/FTS-table [name] by selecting
@@ -2593,7 +2589,11 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                    let* () =
                      if data_only
                      then Lwt.return_unit
-                     else stmt (Sql.Exec.ddl_of_table meta)
+                     else
+                       stmt
+                         (Sql.Exec.ddl_of_table
+                            ~indexes:(Cat.indexes_for_table cat ~table:meta.Cat.name)
+                            meta)
                    in
                    if schema_only
                    then Lwt.return_unit
@@ -2624,12 +2624,13 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                 let* () =
                   Lwt_list.iter_s
                     (fun (meta : Cat.table_meta) ->
+                       let indexes = Cat.indexes_for_table cat ~table:meta.Cat.name in
                        Lwt_list.iter_s
                          (fun idx ->
-                            if dump_index_is_implied meta idx
+                            if dump_index_is_implied meta ~indexes idx
                             then Lwt.return_unit
                             else stmt (Sql.Exec.ddl_of_index idx))
-                         (Cat.indexes_for_table cat ~table:meta.Cat.name))
+                         indexes)
                     tables
                 in
                 (* #322/#323/#329: view & trigger DDL read through the same txn as

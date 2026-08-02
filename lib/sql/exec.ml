@@ -355,13 +355,83 @@ let format_pk_suffix ~autoinc_idx i (col : Row.column) buf =
   if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT"
 ;;
 
-let format_column ~autoinc_idx i (col : Row.column) =
+(* #530: a composite PRIMARY KEY marks every one of its columns, so the inline
+   [PRIMARY KEY] suffix cannot be emitted per column — that would render
+   [PRIMARY KEY (k, j)] as two separate single-column keys, a different table.
+
+   #533: the suppressed set is derived from the KEY ITSELF — the `Implicit_pk
+   index, whose [idx_columns] names exactly the members of one table-level
+   [PRIMARY KEY (...)], in key order.  Counting marked columns globally (the
+   first cut of #530) is wrong, because this engine accepts more than one
+   [PRIMARY KEY] declaration on a table (SQLite rejects it; we don't).  A count
+   of 2 then dropped BOTH single-column keys out of the rendered DDL — and
+   [ddl_implies_index] still called their indexes implied, so [Db.dump] emitted
+   a table with no primary key and no unique index at all.
+
+   That index is also what supplies the key ORDINAL that [Row.column] lacks, so
+   the table-level form is now reconstructed faithfully instead of dropped: a
+   composite PK survives [Db.dump] as a PRIMARY KEY rather than being downgraded
+   to a bare UNIQUE index. *)
+
+(* How the PRIMARY KEY of one table is rendered: which columns must NOT carry
+   the inline suffix, and which table-level [PRIMARY KEY (...)] clauses to emit.
+   One value, computed once, read by both the renderer and [ddl_implies_index],
+   so the two cannot answer the question independently and drift. *)
+type pk_layout =
+  { pk_inline_suppressed : string list
+  ; pk_table_level : string list list
+  }
+
+(* #533: a `Implicit_pk index can name a column the table no longer has —
+   [ALTER TABLE ... RENAME COLUMN] renames the column but not [idx_columns], so
+   [__pk_c_k_j_0 ON c (k, j)] outlives [j].  Trusting it then emits
+   [PRIMARY KEY (k, j)] inside the CREATE TABLE, naming a column that does not
+   exist, and [ddl_implies_index] suppresses the CREATE INDEX that would
+   otherwise have carried (and failed on) the staleness — so the TABLE fails to
+   restore and every row in it is lost, where before only the index was lost.
+
+   When any implicit PK index of the table is stale, fall all the way back to
+   the pre-#533 shape: render no key at all and let the [CREATE UNIQUE INDEX]
+   be emitted.  The dump then loses a constraint, which is the degradation this
+   whole area is allowed; it does not lose the table.  The stale index itself is
+   a catalog bug (#553) — this only keeps its blast radius at the index. *)
+let pk_layout (meta : Cat.table_meta) (indexes : Cat.index_info list) =
+  let names = List.map (fun (c : Row.column) -> c.Row.name) meta.Cat.columns in
+  let implicit =
+    List.filter (fun (i : Cat.index_info) -> i.Cat.idx_origin = `Implicit_pk) indexes
+  in
+  let stale =
+    List.exists
+      (fun (i : Cat.index_info) ->
+         List.exists (fun c -> not (List.mem c names)) i.Cat.idx_columns)
+      implicit
+  in
+  if stale
+  then { pk_inline_suppressed = names; pk_table_level = [] }
+  else (
+    let composite =
+      List.filter_map
+        (fun (i : Cat.index_info) ->
+           match i.Cat.idx_columns with
+           | _ :: _ :: _ as cols -> Some cols
+           | _ -> None)
+        implicit
+    in
+    { pk_inline_suppressed = List.concat composite; pk_table_level = composite })
+;;
+
+(* Does [ddl_of_table] emit the inline [PRIMARY KEY] suffix on [col]? *)
+let inline_pk_emitted ~layout (col : Row.column) =
+  col.Row.primary_key && not (List.mem col.Row.name layout.pk_inline_suppressed)
+;;
+
+let format_column ~autoinc_idx ~layout i (col : Row.column) =
   let buf = Buffer.create 64 in
   Buffer.add_string buf (quote_ident col.Row.name);
   Buffer.add_char buf ' ';
   Buffer.add_string buf (sql_of_row_type col.Row.ty);
   if col.Row.not_null then Buffer.add_string buf " NOT NULL";
-  if col.Row.primary_key then format_pk_suffix ~autoinc_idx i col buf;
+  if inline_pk_emitted ~layout col then format_pk_suffix ~autoinc_idx i col buf;
   (match col.Row.default with
    | None -> ()
    | Some dv ->
@@ -383,7 +453,7 @@ let format_column ~autoinc_idx i (col : Row.column) =
   Buffer.contents buf
 ;;
 
-let ddl_of_table (meta : Cat.table_meta) =
+let ddl_of_table ~(indexes : Cat.index_info list) (meta : Cat.table_meta) =
   let without_rowid, autoincrement =
     match meta.Cat.storage with
     | Cat.Row { without_rowid; autoincrement; _ } -> without_rowid, autoincrement
@@ -394,7 +464,16 @@ let ddl_of_table (meta : Cat.table_meta) =
     then Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid
     else None
   in
-  let col_parts = List.mapi (format_column ~autoinc_idx) meta.Cat.columns in
+  let layout = pk_layout meta indexes in
+  let col_parts = List.mapi (format_column ~autoinc_idx ~layout) meta.Cat.columns in
+  let pk_parts =
+    List.map
+      (fun cols ->
+         Printf.sprintf
+           "PRIMARY KEY (%s)"
+           (String.concat ", " (List.map quote_ident cols)))
+      layout.pk_table_level
+  in
   let fk_parts =
     List.map
       (fun (fk : Cat.fk_constraint) ->
@@ -410,9 +489,29 @@ let ddl_of_table (meta : Cat.table_meta) =
   Printf.sprintf
     "CREATE TABLE %s (%s)%s%s"
     (quote_ident meta.Cat.name)
-    (String.concat ", " (col_parts @ fk_parts))
+    (String.concat ", " (col_parts @ pk_parts @ fk_parts))
     (if without_rowid then " WITHOUT ROWID" else "")
     (if Cat.is_columnar meta then " USING COLUMNSTORE" else "")
+;;
+
+(* #533: is [idx] already implied by the DDL [ddl_of_table] renders for its
+   table, so [Db.dump] can skip its CREATE INDEX?  Answered from
+   [inline_pk_emitted]/[pk_layout] — the SAME predicates the renderer used —
+   because the two used to answer it independently, and that is exactly how a
+   suppressed inline PRIMARY KEY ended up paired with a suppressed index and a
+   dump that silently accepted duplicates on restore. *)
+let ddl_implies_index (meta : Cat.table_meta) ~indexes (idx : Cat.index_info) =
+  match idx.Cat.idx_origin with
+  | `Implicit_unique | `User -> false
+  | `Implicit_pk ->
+    let layout = pk_layout meta indexes in
+    (match idx.Cat.idx_columns with
+     | [ col ] ->
+       List.exists
+         (fun (c : Row.column) ->
+            String.equal c.Row.name col && inline_pk_emitted ~layout c)
+         meta.Cat.columns
+     | cols -> List.mem cols layout.pk_table_level)
 ;;
 
 (** Extract the ON <table> target from a CREATE TRIGGER statement.
@@ -6907,7 +7006,14 @@ let clear_table_expr_caches table_name =
   clear generated_expr_cache
 ;;
 
-(* Convert an AST column definition into a catalog [Row.column]. *)
+(* Convert an AST column definition into a catalog [Row.column].
+
+   #530/#533: [not_null] is derived as [not_null || primary_key], the same
+   derivation [Sema.column_of_def] makes on the CREATE TABLE path — the two are
+   siblings and had drifted, so an ALTER-added PRIMARY KEY column came out
+   nullable.  [Sema.bind_add_column] now refuses to add a PRIMARY KEY column at
+   all, so this is belt-and-braces; it is kept so the two converters cannot
+   disagree again if that guard ever moves. *)
 let column_of_col_def col_def : Row.column =
   { Row.name = col_def.Ast.name
   ; Row.ty =
@@ -6916,7 +7022,7 @@ let column_of_col_def col_def : Row.column =
        | Ast.Ty_text -> Row.Text
        | Ast.Ty_real -> Row.Real
        | Ast.Ty_blob -> Row.Blob)
-  ; Row.not_null = col_def.Ast.not_null
+  ; Row.not_null = col_def.Ast.not_null || col_def.Ast.primary_key
   ; Row.primary_key = col_def.Ast.primary_key
   ; Row.pk_desc = col_def.Ast.pk_desc
   ; Row.default =
@@ -6954,9 +7060,12 @@ let alter_add_column ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) col_def :
            match Cat.find_table_cached cat ~name:parent_table with
            | None -> parent_col
            | Some pm ->
-             (match
-                List.find_opt (fun (c : Row.column) -> c.primary_key) pm.Cat.columns
-              with
+             (* #533: the exactly-one question, like every other parent-PK
+                inference site — [List.find_opt] would silently infer a
+                single-column reference to the FIRST column of a composite key.
+                Unreachable while [Sema.bind_add_column] refuses first, but the
+                two must not be able to disagree. *)
+             (match Sema.sole_pk_column pm.Cat.columns with
               | None -> parent_col
               | Some pk -> pk.Row.name))
          else parent_col
@@ -7012,6 +7121,36 @@ let alter_drop_column tx (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name :
   in
   (* #283: each [Cat.drop_index] above self-registers its own cache undo, so the
      dropped dependent indexes are restored on ROLLBACK without an external block. *)
+  (* #533: dropping a member of a composite PRIMARY KEY drops the `Implicit_pk
+     index with it, so the key stops being enforced — but the SURVIVING members
+     kept their [primary_key] flag.  Since #530 that flag is what the DDL
+     renderer reads, so [Db.dump] emitted e.g. [k TEXT NOT NULL PRIMARY KEY] for
+     a table that accepts duplicate [k] and already holds them: the dump would
+     not restore.  Clear the flag on the survivors before the column goes, the
+     exact inverse of the [Catalog.open_] re-derivation.  Runs through [tx], so
+     ROLLBACK reverts it with everything else. *)
+  let* () =
+    let surviving =
+      List.filter_map
+        (fun (idx : Cat.index_info) ->
+           match idx.Cat.idx_origin with
+           | `Implicit_pk ->
+             Some
+               (List.filter (fun c -> not (String.equal c col_name)) idx.Cat.idx_columns)
+           | `Implicit_unique | `User -> None)
+        idxs_on_col
+      |> List.concat
+    in
+    if surviving = []
+    then Lwt.return_unit
+    else
+      let* r = Cat.clear_pk_flags ~txn:tx cat ~table_name ~cols:surviving in
+      match r with
+      | Error msg -> Lwt.fail_with msg
+      | Ok () -> Lwt.return_unit
+  in
+  (* [Cat.drop_column] below re-reads the table from the schema cache, so it
+     sees the cleared flags. *)
   (* Drain every row through [tx] (read-your-own-writes) before rewriting, so the
      cursor is closed before we put back the reshaped rows into the same tree. *)
   let alt_tree_id, _, _, _ = Cat.row_storage table_meta in
@@ -9961,7 +10100,10 @@ and stream_sqlite_master store cat =
           ; Row.V_text meta.Cat.name
           ; Row.V_text meta.Cat.name
           ; Row.V_int (Int64.of_int sm_tree_id)
-          ; Row.V_text (ddl_of_table meta)
+          ; Row.V_text
+              (ddl_of_table
+                 ~indexes:(Cat.indexes_for_table cat_val ~table:meta.Cat.name)
+                 meta)
          |])
       tables
   in

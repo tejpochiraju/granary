@@ -422,9 +422,12 @@ val query_columns : t -> string -> (string list, error) result Lwt.t
     preserves rather than re-packing, matching how [sqlite3 .dump] round-trips an
     FTS table.
 
-    Composite / table-level PRIMARY KEYs round-trip as plain [UNIQUE] indexes
-    (this engine's internal representation): the data is preserved, but the
-    restored schema reports no PRIMARY KEY and permits NULLs in those columns.
+    {b Composite / table-level PRIMARY KEYs round-trip as PRIMARY KEYs (#533).}
+    They used to be downgraded to a plain [UNIQUE] index — the data survived but
+    the restored schema reported no PRIMARY KEY and permitted NULLs. The key's
+    column order is recovered from its implicit index (the only place it is
+    recorded), so the [CREATE TABLE] carries a real [PRIMARY KEY (a, b)] and its
+    index is not emitted separately.
 
     [schema_only] omits all [INSERT]s; [data_only] omits all DDL (leaving only
     the row [INSERT]s). Both modes carry the same [BEGIN]/[COMMIT] wrapper as a
