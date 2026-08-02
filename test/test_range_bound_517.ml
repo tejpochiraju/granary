@@ -854,6 +854,78 @@ let real_bound_narrows_an_integer_column () =
       ~expect_examined:21)
 ;;
 
+(* The regime the 1..300 cases above cannot reach: integer keys above 2^53,
+   where a float ULP exceeds 1 and [Int64.to_float] stops being injective.
+
+   The residual predicate does NOT compare an integer column against a real
+   bound exactly — [compare_values] promotes the integer with [Int64.to_float]
+   — so it admits every key whose ROUNDED value satisfies the bound, including
+   keys strictly on the wrong side of it.  A seek built with plain
+   [ceil]/[floor] sorts past exactly those keys and drops their rows, which is
+   a regression against the declined-bound scan.  The promotion therefore
+   widens by one float step first, and these cases are what pin that: each has
+   at least one row the naive rounding excludes and the foil returns.
+
+   The grid values, all chosen so that the stored key and its float image
+   straddle the bound:
+     9007199254740992 = 2^53           -> itself
+     9007199254740993 = 2^53 + 1       -> 2^53          (ties to even, DOWN)
+     9007199254740995 = 2^53 + 3       -> 2^53 + 4      (ties to even, UP)
+     4611686018427387804 = 2^62 - 100  -> 2^62          (ULP 512, UP)
+     4611686018427388004 = 2^62 + 100  -> 2^62          (ULP 1024, DOWN) *)
+let real_bound_on_a_huge_integer_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE g (w INTEGER, o INTEGER, v INTEGER, PRIMARY KEY (w, o))";
+    exec db "BEGIN";
+    List.iteri
+      (fun i o -> exec db (Printf.sprintf "INSERT INTO g VALUES (1, %s, %d)" o i))
+      [ "9007199254740992"
+      ; "9007199254740993"
+      ; "9007199254740995"
+      ; "4611686018427387804"
+      ; "4611686018427388004"
+      ];
+    exec db "COMMIT";
+    let check ~bounded ~foil ~expect_examined =
+      Alcotest.(check (list (list string)))
+        (bounded ^ " : agrees with the unoptimizable foil")
+        (rows_of db foil)
+        (rows_of db bounded);
+      Alcotest.(check int) (bounded ^ " : examined") expect_examined (examined db bounded)
+    in
+    (* Lower bound at 2^62.  2^62 - 100 rounds UP onto the bound, so the
+       predicate admits it; [ceil 2^62] would seek past it. *)
+    check
+      ~bounded:"SELECT v FROM g WHERE w = 1 AND o >= 4611686018427387904.0"
+      ~foil:"SELECT v FROM g WHERE w = 1 AND o + 0 >= 4611686018427387904.0"
+      ~expect_examined:2;
+    (* Upper bound at 2^62.  2^62 + 100 rounds DOWN onto it; [floor 2^62] would
+       stop the walk one key early. *)
+    check
+      ~bounded:"SELECT v FROM g WHERE w = 1 AND o <= 4611686018427387904.0"
+      ~foil:"SELECT v FROM g WHERE w = 1 AND o + 0 <= 4611686018427387904.0"
+      ~expect_examined:5;
+    (* Upper bound at 2^53: 2^53 + 1 is above it but rounds down onto it. *)
+    check
+      ~bounded:"SELECT v FROM g WHERE w = 1 AND o <= 9007199254740992.0"
+      ~foil:"SELECT v FROM g WHERE w = 1 AND o + 0 <= 9007199254740992.0"
+      ~expect_examined:2;
+    (* Lower bound at 2^53 + 4: 2^53 + 3 is below it but rounds up onto it. *)
+    check
+      ~bounded:"SELECT v FROM g WHERE w = 1 AND o >= 9007199254740996.0"
+      ~foil:"SELECT v FROM g WHERE w = 1 AND o + 0 >= 9007199254740996.0"
+      ~expect_examined:3;
+    (* Both ends at once, spanning the whole grid. *)
+    check
+      ~bounded:
+        "SELECT v FROM g WHERE w = 1 AND o BETWEEN 9007199254740992.0 AND \
+         4611686018427387904.0"
+      ~foil:
+        "SELECT v FROM g WHERE w = 1 AND o + 0 BETWEEN 9007199254740992.0 AND \
+         4611686018427387904.0"
+      ~expect_examined:5)
+;;
+
 (* The mirror direction: an integer bound on a REAL column. Every integer here
    is exactly representable, so both ends land on the value itself. *)
 let integer_bound_narrows_a_real_column () =
@@ -917,7 +989,8 @@ let integer_bound_narrows_a_real_column () =
    bound stops the walk on the first key. The expectations below are the foil's,
    not SQLite's: SQLite has no NaN at all (it stores one as NULL, which would
    make both ends match nothing), and that divergence is the comparison stack's
-   business, not the seek's. *)
+   business, not the seek's. It is tracked as #536 — these cases pin the
+   current behaviour, not a decision that it is the right one. *)
 let nan_and_infinite_bounds_are_sound () =
   with_db (fun db ->
     seed db;
@@ -1250,6 +1323,10 @@ let () =
             "integer bound narrows a real column"
             `Quick
             integer_bound_narrows_a_real_column
+        ; Alcotest.test_case
+            "real bound on a huge integer column"
+            `Quick
+            real_bound_on_a_huge_integer_column
         ] )
     ; ( "correctness"
       , [ Alcotest.test_case

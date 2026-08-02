@@ -2678,12 +2678,27 @@ let two_pow_63 = 9.2233720368547758e18
     key, and declining it costs the whole narrowing (the entire equality prefix
     is scanned instead).
 
-    The promotion rounds {b OUTWARD}: a lower bound up, an upper bound down.  On
-    an integer column that is exact rather than merely safe — [o >= 100.5] is
-    [o >= 101] and [o <= 119.5] is [o <= 119] — and rounding the other way would
-    silently drop the endpoint row.  Both ends are read inclusively anyway (see
-    {!range_seek_bounds}) and the predicate still runs on every yielded row, so
-    no strictness has to be tracked.
+    The promotion rounds {b OUTWARD}: a lower bound up, an upper bound down.
+    Rounding the other way would silently drop the endpoint row.  Both ends are
+    read inclusively anyway (see {!range_seek_bounds}) and the predicate still
+    runs on every yielded row, so no strictness has to be tracked.
+
+    On an integer column the rounding is {b widened by one float step first}
+    ([ceil (pred f)], [floor (succ f)]), and that step is load-bearing.  Plain
+    [ceil]/[floor] would be exact under {i exact} int-vs-real comparison — but
+    that is not the semantics the residual predicate uses.  [compare_values]
+    compares [V_int a] against [V_real b] as [Float.compare (Int64.to_float a)
+    b], so it admits every int64 whose {i rounded} float value satisfies the
+    bound.  Above 2^53, where a float ULP exceeds 1, many integers strictly
+    below a lower bound [f] round up onto [f] and so qualify; [ceil f] would
+    seek past all of them and drop those rows (256 of them at 2^62, ~1024 near
+    2^63).  One [pred]/[succ] step covers the whole gap, because it moves the
+    bound by exactly one ULP — the same grid spacing that creates it — while
+    below 2^53 it moves by less than 1 and so changes nothing after the
+    [ceil]/[floor]: [ceil (pred 100.5) = 101], [ceil (pred 280.0) = 280],
+    [floor (succ 119.5) = 119], [floor (succ 280.0) = 280].  The seek is thus a
+    superset of the predicate under the predicate's own semantics, at a cost of
+    at most one extra key on the common path.
 
     The result must be an [IK_int] on an integer column, not the real as given:
     {!Granary_encoding.Index_key.encode_value} emits a distinct leading type tag
@@ -2693,9 +2708,11 @@ let two_pow_63 = 9.2233720368547758e18
 
     Declined ([None]) cases leave that end unbounded, which is always sound:
 
-    - a value out of int64 range, or an infinity, has no integer to round to.
-      Producing a key here would mean trusting [Int64.of_float] outside its
-      specified domain, and a wrong key drops rows.
+    - a value whose {i widened} rounding is out of int64 range, or an infinity,
+      has no integer to round to.  Producing a key here would mean trusting
+      [Int64.of_float] outside its specified domain, and a wrong key drops rows.
+      Declining at the very edge costs nothing: a lower bound of -2^63 (whose
+      widening steps below the range) admits every row anyway.
     - a non-numeric bound on a numeric column, and vice versa, exactly as
       {!index_lookup_values} decides.
 
@@ -2714,8 +2731,8 @@ let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
     else (
       let g =
         match which with
-        | `Lo -> Float.ceil f
-        | `Hi -> Float.floor f
+        | `Lo -> Float.ceil (Float.pred f)
+        | `Hi -> Float.floor (Float.succ f)
       in
       if g >= -.two_pow_63 && g < two_pow_63
       then Some (Index_key.IK_int (Int64.of_float g))
@@ -2735,6 +2752,14 @@ let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
           | `Lo -> if cmp > 0 then Float.pred f else f
           | `Hi -> if cmp < 0 then Float.succ f else f))
   | _, _ ->
+    (* Everything that is not a numeric cross-type pair — a same-type bound, a
+       NULL, text or a blob — is deliberately delegated to the equality path's
+       strictness, which for these cases is also the right answer for a bound.
+       The delegation is a shorthand for that agreement, NOT an assumption that
+       the two questions always coincide: the numeric arms above exist precisely
+       because they do not.  If [index_lookup_values] ever changes which of
+       these it accepts, re-check that the new answer is still a sound bound
+       rather than assuming it carries over. *)
     (match index_lookup_values [ v, ty ] with
      | Some [ iv ] -> Some iv
      | Some _ | None -> None)

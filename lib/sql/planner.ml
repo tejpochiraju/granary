@@ -297,18 +297,22 @@ let bounded_type = function
       discard it for a literal it cannot compare it against.
     - [`Useless] — a literal that can never bound anything, because
       [range_seek_bounds] has nothing sound to turn it into and leaves that end
-      unbounded: a text or blob literal on a numeric column, or an infinity on
-      an integer one.  A fold should drop it in favour of any other candidate.
+      unbounded: a text or blob literal on a numeric column, or a real outside
+      int64 range (an infinity included) on an integer one.  A fold should drop
+      it in favour of any other candidate.
 
     A NaN is deliberately [`Unknown] rather than [`Orderable]: it encodes as
     NULL, whose behaviour as a bound is a special case of its own (see
     [range_seek_bounds]).  Keeping it out of the ordering leaves that case
     exactly as it was.
 
-    An out-of-int64-range real on an integer column is [`Orderable] even though
-    [range_bound_key] declines it — misclassifying it costs at most a narrowing
-    the fold would otherwise have kept, never a row, since every candidate is
-    individually a sound bound and the predicate runs on every yielded row. *)
+    The int64-range test mirrors {!Granary_sql.Exec.range_bound_key}'s own, so
+    the two agree on every value but the last ULP below ±2^63, where that
+    function widens by one float step and can decline one end of a value
+    classified here as [`Orderable] (it has no [`Lo]/[`Hi] to condition on).
+    A residual disagreement there costs at most a narrowing the fold would
+    otherwise have kept, never a row: every candidate is individually a sound
+    bound and the predicate runs on every yielded row. *)
 let classify_range_bound (ty : Row.ty) = function
   | Sema.BE_lit (Ast.L_int _) when ty = Row.Integer || ty = Row.Real -> `Orderable
   | Sema.BE_lit (Ast.L_real f) when ty = Row.Real ->
@@ -316,7 +320,7 @@ let classify_range_bound (ty : Row.ty) = function
   | Sema.BE_lit (Ast.L_real f) when ty = Row.Integer ->
     if Float.is_nan f
     then `Unknown
-    else if Float.is_finite f
+    else if Float.abs f < 9.2233720368547758e18 (* exactly 2^63 *)
     then `Orderable
     else `Useless
   | Sema.BE_lit _ -> `Useless
@@ -327,8 +331,11 @@ let classify_range_bound (ty : Row.ty) = function
     same total order {!Granary_sql.Exec.compare_values} applies in the residual
     predicate and {!Granary_encoding.Index_key.encode_value} encodes, so the
     fold can never pick a bound the predicate and the key order disagree
-    about.  #527: a mixed int/real pair is ordered by the same int-to-float
-    promotion the residual comparison uses. *)
+    about.  #527: a mixed int/real pair is ordered through [Int64.to_float],
+    which above 2^53 can name the wrong one "tightest".  That is a perf
+    question, not a soundness one — the fold only ever picks between candidates
+    that are each individually a sound bound, and no conjunct is marked
+    consumed, so a wrong pick loses a narrowing and never a row. *)
 let compare_range_bounds a b =
   match a, b with
   | Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_int y) -> Some (Int64.compare x y)
