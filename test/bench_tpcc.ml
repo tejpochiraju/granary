@@ -40,6 +40,39 @@ module Ref_sqlite = struct
 
   let name = "sqlite"
 
+  (* #571 — the crash this exists to prevent.
+
+     The bindings' statement finalizer and database closer do not register
+     their argument as a local root, and they read the wrapper struct after
+     releasing the runtime system.  Finalizing a statement is the last thing
+     anyone does with it, so during that window the custom block is
+     unreachable from every OCaml root: the GC may collect it, run its own
+     finaliser — which finalizes the statement and frees the wrapper — and
+     leave the stub reading freed memory and passing the garbage to C SQLite.
+     The process takes SIGSEGV with no exception and no message (exit 139),
+     after the pre-run consistency check and before any output, which reads as
+     a hung benchmark rather than a crash.
+
+     Passing the value to a function the optimizer may not see through, after
+     the call, keeps it live in this frame across the window.  That is the
+     entire fix.  Measured at 4 terminals x 40 s: 5/6 runs crashed without
+     it, 0/6 with it, and 0/6 with a locally patched binding that adds the
+     missing root registration.  Tpc_keepalive_lint keeps the discipline from
+     decaying; docs/benchmarks/BENCHMARKS-TPCC.md records the whole chain. *)
+  let[@inline never] keep_alive x = ignore (Sys.opaque_identity x)
+
+  let finalize_stmt stmt =
+    let rc = Sqlite3.finalize stmt in
+    keep_alive stmt;
+    rc
+  ;;
+
+  let close_db db =
+    let closed = Sqlite3.db_close db in
+    keep_alive db;
+    closed
+  ;;
+
   let ok rc =
     match rc with
     | Sqlite3.Rc.OK | Sqlite3.Rc.DONE | Sqlite3.Rc.ROW -> ()
@@ -87,11 +120,11 @@ module Ref_sqlite = struct
       | r -> failwith ("sqlite3 step: " ^ Sqlite3.Rc.to_string r)
     in
     loop ();
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     List.rev !acc
   ;;
 
-  let close t = if not (Sqlite3.db_close t.db) then failwith "sqlite3: db_close failed"
+  let close t = if not (close_db t.db) then failwith "sqlite3: db_close failed"
 
   (* Blocking calls wrapped in resolved promises.  Safe inside the driver
      precisely because they contain no Lwt_main.run — the reason

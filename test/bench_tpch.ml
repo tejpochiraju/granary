@@ -29,6 +29,30 @@ module Ref_sqlite : BR.ENGINE = struct
     | r -> failwith ("sqlite3: " ^ Sqlite3.Rc.to_string r)
   ;;
 
+  (* #571 — the bindings' statement finalizer and database closer do not
+     register their argument as a local root and read the wrapper struct after
+     releasing the runtime system, so at a call site where the argument is
+     dead — which finalizing always is — the GC may collect the custom block
+     inside that window, run its own finaliser, and leave the stub reading
+     freed memory.  The result is a SIGSEGV with no exception and no message.
+     Mentioning the value again after the call, through a function the
+     optimizer may not see through, keeps it live across the window.  Pinned
+     by Tpc_keepalive_lint; the evidence chain is in test/bench_tpcc.ml and
+     docs/benchmarks/BENCHMARKS-TPCC.md. *)
+  let[@inline never] keep_alive x = ignore (Sys.opaque_identity x)
+
+  let finalize_stmt stmt =
+    let rc = Sqlite3.finalize stmt in
+    keep_alive stmt;
+    rc
+  ;;
+
+  let close_db db =
+    let closed = Sqlite3.db_close db in
+    keep_alive db;
+    closed
+  ;;
+
   let exec t sql = ok (Sqlite3.exec t.db sql)
 
   let open_db ~dir =
@@ -71,11 +95,11 @@ module Ref_sqlite : BR.ENGINE = struct
       | r -> failwith ("sqlite3 step: " ^ Sqlite3.Rc.to_string r)
     in
     loop ();
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     List.rev !acc
   ;;
 
-  let close t = if not (Sqlite3.db_close t.db) then failwith "sqlite3: db_close failed"
+  let close t = if not (close_db t.db) then failwith "sqlite3: db_close failed"
 end
 
 (* ── disk-space guard ─────────────────────────────────────────────────────── *)

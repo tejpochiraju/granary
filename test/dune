@@ -775,6 +775,16 @@
  (modules test_tpc_sql_lint)
  (libraries granary_tpc alcotest))
 
+; #571: the keep-alive lint over the comparison benchmarks' sources.  It reads
+; them as text and does NOT link the sqlite3 bindings, so it runs (and must
+; run) on checkouts where those `(optional)` benchmarks are not built.
+
+(test
+ (name test_sqlite_keepalive_571)
+ (modules test_sqlite_keepalive_571)
+ (deps bench_tpcc.ml bench_tpch.ml bench_compare.ml)
+ (libraries granary_tpc alcotest))
+
 (test
  (name test_tpch_check)
  (modules test_tpch_check)

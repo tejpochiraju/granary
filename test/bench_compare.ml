@@ -326,6 +326,30 @@ module Ref_sqlite : ENGINE = struct
     | r -> failwith ("sqlite3: " ^ Sqlite3.Rc.to_string r)
   ;;
 
+  (* #571 — the bindings' statement finalizer and database closer do not
+     register their argument as a local root and read the wrapper struct after
+     releasing the runtime system, so at a call site where the argument is
+     dead — which finalizing always is — the GC may collect the custom block
+     inside that window, run its own finaliser, and leave the stub reading
+     freed memory.  The result is a SIGSEGV with no exception and no message.
+     Mentioning the value again after the call, through a function the
+     optimizer may not see through, keeps it live across the window.  Pinned
+     by Tpc_keepalive_lint; the evidence chain is in test/bench_tpcc.ml and
+     docs/benchmarks/BENCHMARKS-TPCC.md. *)
+  let[@inline never] keep_alive x = ignore (Sys.opaque_identity x)
+
+  let finalize_stmt stmt =
+    let rc = Sqlite3.finalize stmt in
+    keep_alive stmt;
+    rc
+  ;;
+
+  let close_db db =
+    let closed = Sqlite3.db_close db in
+    keep_alive db;
+    closed
+  ;;
+
   let exec t sql = ok (Sqlite3.exec t.db sql)
 
   let open_db ~dir ~key =
@@ -357,7 +381,7 @@ module Ref_sqlite : ENGINE = struct
       ok (Sqlite3.bind_text stmt 3 (Printf.sprintf "payload-row-%d" i));
       ok (Sqlite3.step stmt)
     done;
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     exec t "COMMIT"
   ;;
 
@@ -383,7 +407,7 @@ module Ref_sqlite : ENGINE = struct
          ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int pk));
          ignore (drain stmt))
       keys;
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     Array.length keys
   ;;
 
@@ -392,7 +416,7 @@ module Ref_sqlite : ENGINE = struct
     for _ = 1 to repeats do
       let stmt = Sqlite3.prepare t.db "SELECT COUNT(*), SUM(k) FROM t" in
       n := !n + drain stmt;
-      ok (Sqlite3.finalize stmt)
+      ok (finalize_stmt stmt)
     done;
     !n
   ;;
@@ -407,7 +431,7 @@ module Ref_sqlite : ENGINE = struct
       ok (Sqlite3.bind_text stmt 3 (Printf.sprintf "ins-%d" id));
       ok (Sqlite3.step stmt)
     done;
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     n
   ;;
 
@@ -422,7 +446,7 @@ module Ref_sqlite : ENGINE = struct
       ok (Sqlite3.bind_text stmt 3 (Printf.sprintf "batch-%d" id));
       ok (Sqlite3.step stmt)
     done;
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     exec t "COMMIT";
     rows
   ;;
@@ -439,7 +463,7 @@ module Ref_sqlite : ENGINE = struct
       ok (Sqlite3.step stmt);
       exec t "COMMIT"
     done;
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     n
   ;;
 
@@ -453,7 +477,7 @@ module Ref_sqlite : ENGINE = struct
          | d -> Sqlite3.Data.to_string_coerce d)
       | _ -> "NULL"
     in
-    ok (Sqlite3.finalize stmt);
+    ok (finalize_stmt stmt);
     v
   ;;
 
@@ -465,7 +489,7 @@ module Ref_sqlite : ENGINE = struct
       (scalar_str t "SELECT payload FROM t WHERE id = 0")
   ;;
 
-  let close t = ignore (Sqlite3.db_close t.db)
+  let close t = ignore (close_db t.db)
 end
 
 (* ── timing harness ───────────────────────────────────────────────────────── *)

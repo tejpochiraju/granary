@@ -132,21 +132,49 @@ podman run --rm --user 0 -v "$(pwd):/workspace:z" -w /workspace \
 The W=1 load costs roughly 45 s per engine and dominates a short run; that cost
 is untimed and reported separately on stderr.
 
-## A known crash on the SQLite side: #571
+## The crash on the SQLite side, and what it was: #571
 
-`bench_tpcc` takes **SIGSEGV (exit 139)** during the reference-SQLite
-measurement interval once the run is long enough, with **two or more
-terminals**. It is not transaction volume (a one-terminal run completed 34,623
-transactions cleanly) and it is not the stack (it reproduces under a 256 MB
-`ulimit`). Filed as **#571** with the bisection table.
+`bench_tpcc` used to take **SIGSEGV (exit 139)** during the reference-SQLite
+measurement interval, with no exception and no message, after the pre-run
+consistency check and before any output — which reads as a hung benchmark
+rather than a crash. It is fixed; the mechanism is worth recording, because
+the fix is one invisible line per call site and the failure is probabilistic.
 
-Practical consequence: `GRANARY_TPCC_SECONDS` defaults to 10 and the recorded
-comparison below was taken at 5 s per engine, in **separate processes**, which
-completes reliably. Running both engines in one process is where it is most
-likely to bite, since the crash threshold appears to be per-process rather than
-per-engine. Prefer `GRANARY_TPCC_ENGINES=granary` and
-`GRANARY_TPCC_ENGINES=sqlite` as two invocations until #571 is closed — which
-also removes the page-cache asymmetry noted above.
+**Root cause.** Two of the OCaml `sqlite3` bindings' C stubs — the statement
+finalizer and the database closer (`sqlite3_stubs.c:900` and `:552` in
+sqlite3-ocaml 5.4.1) — do not register their argument as a local root, and
+they read the wrapper struct *after* `caml_release_runtime_system()`.
+Finalizing a statement is the last thing the caller does with it, so for the
+duration of that window the custom block is unreachable from every OCaml root.
+The pending GC work the blocking section runs is then free to collect it and
+call its own finaliser, which finalizes the statement and `caml_stat_free`s the
+wrapper — and the stub resumes by reading the freed struct and handing what it
+finds to C SQLite.
+
+**Evidence.** Under `gdb` the fault is inside `sqlite3_finalize`, called from
+`caml_sqlite3_stmt_finalize`, with `pStmt` = `0x605397255167` and `si_addr` the
+same: an *odd* word, so not a pointer any allocator returned — it is an OCaml
+immediate sitting in memory the wrapper used to occupy. `info threads` shows a
+single thread, ruling out a concurrent-use explanation. Three variants over
+six runs each at 4 terminals x 40 s: the shipped code crashed **5/6**; adding a
+keep-alive after the call crashed **0/6**; and the *unmodified* code against a
+locally rebuilt binding that adds the missing `CAMLparam1` crashed **0/6**.
+
+**Two things the original bisection got wrong**, both from reading a
+probabilistic crash as a deterministic one: it is not specific to two or more
+terminals (one terminal at 60 s crashes), and it is not a transaction-count
+threshold. Terminals and duration only buy more attempts at the same window.
+
+**The fix**, in `test/bench_tpcc.ml`, `test/bench_tpch.ml` and
+`test/bench_compare.ml`: route every such call through a small wrapper that
+mentions the value again afterwards, via a `keep_alive` the optimizer may not
+see through, so the caller's frame holds it live across the window.
+`Tpc_keepalive_lint` (`test/tpc/`, exercised by
+`test/test_sqlite_keepalive_571.ml`) keeps that from being tidied away.
+
+Long reference runs are no longer bounded by this. Running each engine in its
+own process is still preferable, but for the page-cache reason noted above, not
+for stability.
 
 ## Recorded results
 
