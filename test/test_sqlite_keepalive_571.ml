@@ -173,6 +173,156 @@ let test_code_after_a_comment_is_still_code () =
   Alcotest.(check string) "call" "finalize" f.L.call
 ;;
 
+(* --- strings are data, not calls (#602) -------------------------------- *)
+
+(* [mask_non_code] handled "..." and '.' from the start; it did not know OCaml's
+   quoted-string literals, so a single {|...|} containing an unbalanced paren-star
+   — which the SQL in these benchmarks has, in COUNT of star-in-parens — opened a
+   comment that nothing closed and masked the whole remainder of the file.  The
+   lint then reported nothing at all, which is the one outcome a lint must never
+   reach quietly.  Proven live during the #602 review: adding such a line to
+   bench_tpcc.ml made the lint pass EVEN WITH the keep-alive deleted. *)
+
+let test_quoted_string_does_not_swallow_the_file () =
+  let s =
+    Printf.sprintf
+      "let q = {|SELECT COUNT(*) FROM foo|}\nlet go s = %s.finalize s\n"
+      L.binding_module
+  in
+  let f = one_finding ~file:"x.ml" s in
+  Alcotest.(check int) "line" 2 f.L.line
+;;
+
+let test_quoted_string_body_is_not_code () =
+  let s =
+    Printf.sprintf "let q = {|call %s.finalize s here|}\nlet x = 1\n" L.binding_module
+  in
+  Alcotest.(check int) "no findings" 0 (List.length (L.check ~file:"x.ml" s))
+;;
+
+let test_quoted_string_with_a_delimiter_id () =
+  let s =
+    Printf.sprintf
+      "let q = {sql|COUNT(*) and %s.finalize s|sql}\nlet go s = %s.finalize s\n"
+      L.binding_module
+      L.binding_module
+  in
+  let f = one_finding ~file:"x.ml" s in
+  Alcotest.(check int) "line" 2 f.L.line
+;;
+
+let test_a_bare_pipe_brace_does_not_close_a_named_delimiter () =
+  (* Inside {sql|...|sql} a bare |} is ordinary text.  Closing on it would end
+     the literal early and expose the rest of the SQL as code. *)
+  let s =
+    Printf.sprintf "let q = {sql|a |} b %s.finalize s|sql}\nlet x = 1\n" L.binding_module
+  in
+  Alcotest.(check int) "no findings" 0 (List.length (L.check ~file:"x.ml" s))
+;;
+
+let test_a_record_literal_is_still_code () =
+  (* `{` only opens a quoted string when an identifier and a `|` follow it
+     immediately; a record must not be mistaken for one and mask the file. *)
+  let s =
+    Printf.sprintf "let r = { a = 1 }\nlet go s = %s.finalize s\n" L.binding_module
+  in
+  let f = one_finding ~file:"x.ml" s in
+  Alcotest.(check int) "line" 2 f.L.line
+;;
+
+let test_a_digit_cannot_lead_the_delimiter_id () =
+  (* OCaml's delimiter identifier is [a-z_][a-z0-9_]*, so [{1|] opens nothing.
+     Accepting it would mask real code from there on. *)
+  let s = Printf.sprintf "let x = {1|\nlet go s = %s.finalize s\n" L.binding_module in
+  Alcotest.(check int) "line" 2 (one_finding ~file:"x.ml" s).L.line
+;;
+
+let test_quoted_string_preserves_offsets () =
+  let s =
+    Printf.sprintf "let q = {|a\nb (* c|}\nlet go s = %s.finalize s\n" L.binding_module
+  in
+  Alcotest.(check int)
+    "length preserved"
+    (String.length s)
+    (String.length (L.mask_non_code s));
+  Alcotest.(check int) "line" 3 (one_finding ~file:"x.ml" s).L.line
+;;
+
+let test_unterminated_ordinary_string_does_not_raise () =
+  (* A file ending in an open string literal whose last byte is a backslash
+     walked [skip_string] past the end of the buffer and raised Invalid_argument
+     from [Bytes.set].  "Masks to end of file" was true of the quoted form only.
+     A lint that CRASHES on a malformed input is no better than one that passes
+     it.  (The offending text is built below rather than written into this
+     comment, because OCaml's own lexer reads string literals inside comments and
+     would refuse to terminate this one.) *)
+  let s = "let s = \"abc\\" in
+  Alcotest.(check int) "no findings" 0 (List.length (L.check ~file:"x.ml" s));
+  Alcotest.(check int)
+    "length preserved"
+    (String.length s)
+    (String.length (L.mask_non_code s))
+;;
+
+let test_unterminated_quoted_string_masks_to_end () =
+  (* Fail-safe rather than fail-open is not available here — an unterminated
+     literal is not valid OCaml — but it must not crash the lint either. *)
+  let s = Printf.sprintf "let q = {|%s.finalize s\n" L.binding_module in
+  Alcotest.(check int) "no findings" 0 (List.length (L.check ~file:"x.ml" s))
+;;
+
+(* --- #605: the name is one literal, in the SOURCE ---------------------- *)
+
+let test_binding_module_value () =
+  Alcotest.(check string) "module name" "Sqlite3" L.binding_module
+;;
+
+let test_binding_module_is_unsplit_in_the_source () =
+  (* The value test above is not enough and must never be mistaken for enough:
+     ["Sqlite" ^ "3"] evaluates to exactly the same string, so it passes while
+     the evasion #605 exists to remove is back in the tree.  The property is
+     about the SOURCE TEXT, so read the source.
+
+     Match a WHOLE LINE, not a substring.  A [contains] test is satisfied by the
+     search string appearing anywhere at all, including in a comment — so
+
+       (* the old spelling was: let binding_module = "Sqlite3" *)
+       let binding_module =
+         "Sqlite" ^ "3"
+
+     passed this test AND the policy script's tree-wide guard (whose pattern is
+     line-oriented, and the line break separates the binding from the
+     concatenation).  Verified live before this line was tightened.  The decoy
+     half is what the whole-line test kills.
+
+     What this does and does not cover: it pins the CURRENT file's binding line
+     and nothing else.  The complementary guard — SPLIT_LITERAL_PATTERN in
+     scripts/check-sqlite-policy.sh — is tree-wide, and is what stops a NEW file
+     assembling the name to dodge the module guard.  Neither subsumes the other,
+     and neither survives someone deleting it: unlike #605's original evasion,
+     which needed no accomplice because the prose it hid behind was in the file
+     for honest reasons, defeating this pair takes deliberate work at the site. *)
+  let src = L.read_source "tpc/tpc_keepalive_lint.ml" in
+  let lines = String.split_on_char '\n' src in
+  if not (List.exists (String.equal "let binding_module = \"Sqlite3\"") lines)
+  then
+    Alcotest.fail
+      "tpc_keepalive_lint.ml no longer has the unsplit binding as a line of its own \
+       (`let binding_module = \"Sqlite3\"`). If the name is being assembled from pieces \
+       again, don't: the #370 exemption is an entry in SQLITE3_NAMES_ONLY_ALLOWLIST \
+       (#605)."
+;;
+
+let test_comparison_sources_is_not_empty () =
+  (* #601's cross-check in the policy script is TEXTUAL, so text the compiler
+     never sees satisfies it — a list commented out, a shadowing rebinding, a
+     [List.filter (fun _ -> false)].  Every test above iterates
+     [comparison_sources], so an empty list satisfies all of them vacuously:
+     that is #601's own failure mode one level in.  The count is the backstop,
+     and it is deliberately exact rather than [> 0]. *)
+  Alcotest.(check int) "three comparison sources" 3 (List.length L.comparison_sources)
+;;
+
 let () =
   Alcotest.run
     "sqlite_keepalive_571"
@@ -216,6 +366,49 @@ let () =
             "code after a comment"
             `Quick
             test_code_after_a_comment_is_still_code
+        ] )
+    ; ( "quoted strings"
+      , [ Alcotest.test_case
+            "does not swallow the file"
+            `Quick
+            test_quoted_string_does_not_swallow_the_file
+        ; Alcotest.test_case "body is not code" `Quick test_quoted_string_body_is_not_code
+        ; Alcotest.test_case "delimiter id" `Quick test_quoted_string_with_a_delimiter_id
+        ; Alcotest.test_case
+            "bare |} inside a named delimiter"
+            `Quick
+            test_a_bare_pipe_brace_does_not_close_a_named_delimiter
+        ; Alcotest.test_case
+            "record literal is code"
+            `Quick
+            test_a_record_literal_is_still_code
+        ; Alcotest.test_case
+            "a digit cannot lead the delimiter id"
+            `Quick
+            test_a_digit_cannot_lead_the_delimiter_id
+        ; Alcotest.test_case
+            "offsets preserved"
+            `Quick
+            test_quoted_string_preserves_offsets
+        ; Alcotest.test_case
+            "unterminated quoted"
+            `Quick
+            test_unterminated_quoted_string_masks_to_end
+        ; Alcotest.test_case
+            "unterminated ordinary"
+            `Quick
+            test_unterminated_ordinary_string_does_not_raise
+        ] )
+    ; ( "the lint's own source"
+      , [ Alcotest.test_case "binding module value" `Quick test_binding_module_value
+        ; Alcotest.test_case
+            "binding module is unsplit in the source"
+            `Quick
+            test_binding_module_is_unsplit_in_the_source
+        ; Alcotest.test_case
+            "comparison_sources is not empty"
+            `Quick
+            test_comparison_sources_is_not_empty
         ] )
     ]
 ;;

@@ -25,6 +25,12 @@
     Delete it when the bindings root their arguments; the keep-alive lines go
     with it. *)
 
+(* sqlite3-policy: names-only — this interface NAMES Sqlite3.finalize and
+   Sqlite3.db_close in its documentation; neither it nor its implementation
+   links the module. Allowlisted in scripts/check-sqlite-policy.sh; see #605.
+   (The marker sits below the module doc comment rather than above it because
+   merlint requires an .mli to OPEN with one.) *)
+
 (** One call to a guarded binding function with no keep-alive after it. *)
 type finding =
   { file : string (** the source file the call was found in *)
@@ -37,9 +43,9 @@ type finding =
 val pp_finding : Format.formatter -> finding -> unit
 
 (** The bindings' module name, which a guarded call must be qualified by —
-    granary's own [Db.finalize] is not this bug. Built from two pieces in the
-    implementation because the #370 policy check forbids that name outside the
-    designated comparison benchmarks. *)
+    granary's own [Db.finalize] is not this bug. Written as the plain literal
+    since #605; the #370 policy exemption is a recorded entry in
+    [SQLITE3_NAMES_ONLY_ALLOWLIST] rather than a split string literal. *)
 val binding_module : string
 
 (** The binding functions that free their own argument. *)
@@ -51,16 +57,33 @@ val keep_alive_token : string
 (** How many lines after a guarded call the keep-alive may appear in. *)
 val window : int
 
-(** The benchmark sources that use the bindings directly, as basenames
-    relative to the test directory. *)
+(** The benchmark sources that use the bindings directly, as basenames relative
+    to the test directory. Cross-checked against [SQLITE3_COMPARISON_ALLOWLIST]
+    in [scripts/check-sqlite-policy.sh], which fails if the two lists diverge in
+    either direction (#601) — that allowlist is the source of truth. *)
 val comparison_sources : string list
 
 (** [mask_non_code src] is [src] with every character that is not code —
-    comment bodies and string literal bodies — replaced by a space, preserving
-    newlines and every byte offset so line numbers are unchanged. Comments
-    nest, as OCaml's do; string literals are skipped, because the SQL in these
-    benchmarks counts star-in-parens and that opened a comment nothing
-    closed. *)
+    comment bodies and string-literal bodies — replaced by a space, preserving
+    newlines and every byte offset so line numbers are unchanged.
+
+    Comments nest, as OCaml's do. Both of OCaml's string forms are skipped
+    rather than scanned: ordinary ["..."] with its backslash escapes, and
+    quoted strings [{|...|}] and [{id|...|id}], where only the matching
+    [|id}] closes. Char literals are skipped too, without mistaking a type
+    variable for one. Everything else is treated as code — a [{] not followed
+    by an optional lowercase identifier and a [|] is a record, not a literal.
+
+    Skipping strings is not a nicety. The SQL in these benchmarks counts
+    star-in-parens, whose paren-star opened a comment that nothing closed, and
+    the whole rest of the file was masked; the quoted-string form was the same
+    bug a second time (#602).
+
+    {b Known limit}: string literals are recognised in code but not {e inside}
+    comments, where every byte is blanked without interpretation. OCaml's own
+    lexer does read them there, so [(* "*)" *)] is valid and this masks the rest
+    of the file — #625. Rare, and [test_removing_the_keep_alive_is_caught] turns
+    whole-file masking into a loud failure rather than a silent pass. *)
 val mask_non_code : string -> string
 
 (** [contains hay needle] is whether [needle] occurs in [hay]. Exposed because
