@@ -26,6 +26,32 @@ Worktrees live in `.worktrees/` which is gitignored. After the branch is created
 chmod 777 .worktrees/<short-name>
 ```
 
+**Never use `git stash`.** `refs/stash` is one repo-wide stack, not per-worktree, and several agents work in sibling worktrees at once — a `pop` in one worktree can apply another's changes and silently empty its tree (2026-08-01, #527 and #514).
+
+To measure before/after numbers, use one of the three alternatives below — they are a menu, not a sequence. `SP` is your session scratchpad directory and `529` stands for your worktree; set both to your own:
+
+```sh
+SP=<your session scratchpad>; WT=529   # prefix every scratch file with $WT
+
+# 1. WIP commit — preferred: no shared namespace to collide in
+git commit -m wip
+git checkout HEAD~1 -- lib/        # old code
+git checkout HEAD   -- lib/        # back to WIP
+
+# 2. or: patch aside
+git add -N .                       # so new files are seen
+git diff HEAD > "$SP/$WT-wip.patch"
+
+# 3. or: copy aside
+cp lib/sql/exec.ml "$SP/$WT-exec.ml.good"
+```
+
+**Name every scratch file after your worktree** — `$SP/529-exec.ml.good`, never `$SP/exec.ml.good`. The session scratchpad is shared by *all* agents in the session, not one per worktree. On 2026-08-01 two agents each saved `exec.ml.good` there; the second overwrote the first, and the first restored the other's `exec.ml` into its own tree. A generic filename in a shared directory is a stash by another name — `refs/stash` was one instance of the pattern, not the pattern.
+
+Plain `git diff` captures neither staged nor untracked changes — use `git diff HEAD` after `git add -N`. `git checkout HEAD~1 -- lib/` also will not delete files that exist only in the WIP commit; remove those by hand. Commit early on your own branch regardless: an uncommitted tree is the only thing at risk.
+
+After any recovery, verify with `md5sum` against a known-good source rather than assuming — both incidents were caught that way, and in both the timestamps looked innocent.
+
 ### Building and testing
 
 Never call `dune` directly on the host. All OCaml build commands run inside the dev container:
@@ -159,7 +185,9 @@ EOF
 
 - Target 100% line coverage on every module.
 - Add QCheck property tests for every non-trivial function (see existing tests for patterns).
-- Tests that require real SQLite are gated by the `GRANARY_TEST_SQLITE` env var (see `test/compare_sqlite/`).
+- Tests that require real SQLite live in `test/test_sqlite_compare.ml`; they skip gracefully via `sqlite3_available ()` (`:18`) when `sqlite3` is not in `PATH`, and its header comment has the exact `podman run` invocation that mounts the host `sqlite3` and its libs into the container. **There is no `test/compare_sqlite/` directory** — that path was in this file for a while and sent agents looking for a harness they concluded did not exist.
+- Nothing in the tree reads `GRANARY_TEST_SQLITE`; it is a phantom invented by the same stale sentence. The SQLite comparison tests gate on `sqlite3` in `PATH`; the slow TPC-C smoke run gates on `GRANARY_TPCC_SMOKE` (`test/test_tpcc_smoke.ml:238`).
+- Granary is **inspired by** SQLite, not a port of it. When pinning a behaviour that differs from SQLite, record the divergence deliberately rather than assuming parity is the goal — e.g. the decided direction for #530 is that every PRIMARY KEY column implies NOT NULL (PR #533, not yet merged), where SQLite leaves PK columns nullable on *rowid* tables (its legacy behaviour; it does enforce PK NOT NULL on `WITHOUT ROWID` tables, which this engine also supports).
 
 ## Repository structure
 

@@ -251,7 +251,7 @@ let gate = "GRANARY_TPCC_SMOKE"
    transaction per profile still costs ~40 s of load plus ~40 s of
    transactions, and it would spend the coverage that is the entire point of
    this test. The whole case therefore sits behind an env var — the convention
-   CLAUDE.md documents for GRANARY_TEST_SQLITE — and keeps all five profiles
+   this repo uses for slow opt-in suites — and keeps all five profiles
    and all four consistency conditions intact whenever it is set. When the
    composite-key seek lands, revisit this: the run should get cheap enough to
    ungate. *)
