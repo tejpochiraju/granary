@@ -429,9 +429,26 @@ val query_columns : t -> string -> (string list, error) result Lwt.t
     recorded), so the [CREATE TABLE] carries a real [PRIMARY KEY (a, b)] and its
     index is not emitted separately.
 
+    {b A database whose rows contradict its own schema is refused (#548).} A file
+    written before #530 can hold NULL in a column the engine now declares NOT
+    NULL — a table-level [PRIMARY KEY (k)], every column of a composite
+    [PRIMARY KEY (a, b)], or a column added by [ALTER TABLE ... ADD COLUMN ...
+    PRIMARY KEY]. Rendering the current declaration and then emitting those rows
+    produces a script that dies on the first offending row. Rather than emit it,
+    [dump] fails with [Error (Runtime msg)] naming the table and column and the
+    [DELETE] that repairs it. The alternative — silently emitting the column
+    without its NOT NULL — would restore, but by downgrading the schema without
+    saying so. Detection rides along with the row stream, so a healthy database
+    pays no extra read; a refused dump has already emitted [BEGIN] and is closed
+    with [ROLLBACK], so a streaming sink is left with a script that undoes itself
+    rather than one that half-applies.
+
     [schema_only] omits all [INSERT]s; [data_only] omits all DDL (leaving only
     the row [INSERT]s). Both modes carry the same [BEGIN]/[COMMIT] wrapper as a
-    full dump. Passing both yields an essentially empty dump. *)
+    full dump. Passing both yields an essentially empty dump. Neither can trip
+    the #548 refusal: [schema_only] emits no rows, and [data_only] emits no
+    schema for them to contradict — so [data_only] remains the escape hatch for
+    getting the data out of an unrepaired file. *)
 val dump
   :  t
   -> ?schema_only:bool

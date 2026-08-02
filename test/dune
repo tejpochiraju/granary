@@ -896,6 +896,20 @@
   lwt.unix
   unix))
 
+; #548: Db.dump must not emit a NOT NULL its own rows violate.
+
+(test
+ (name test_dump_null_pk_548)
+ (modules test_dump_null_pk_548)
+ (libraries
+  granary
+  granary.unix
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
 ; #553: ALTER TABLE ... RENAME COLUMN must remap every stored reference.
 
 (test
