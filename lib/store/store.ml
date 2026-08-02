@@ -1715,10 +1715,18 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
             frames and bumps the epoch, so wait for any in-flight ship to finish
             reading first.  The ship runs without [t.lock] (it only reads
             frames), so it makes progress while this fiber holds the lock and
-            parks here.  The check-then-reset is yield-free, so no ship
-            dispatched after the count reaches 0 can slip in before reset. *)
+            parks here.  [Wal.reset] itself now yields (#562: it fsyncs the
+            rotated generation marker), but only a commit can dispatch a ship
+            and this fiber holds the writer lock, so nothing can slip in
+            between the count reaching 0 and the reset landing. *)
            let* () = wait_until st (fun () -> st.sink_ships_in_flight = 0) in
-           Wal.reset wal;
+           let* rr = Wal.reset wal in
+           let () =
+             match rr with
+             | Ok () -> ()
+             | Error e ->
+               failwith (Format.asprintf "checkpoint wal reset: %a" Wal.pp_error e)
+           in
            (* #382: WAL is reset to a fresh epoch and the migration is done.
               Read [Wal.epoch] AFTER reset for the new epoch. *)
            emit_event st (Store_event.Wal_reset { epoch = Wal.epoch wal });

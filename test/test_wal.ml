@@ -235,12 +235,12 @@ let test_epoch () =
      let* _ = Wal.append_commit w [ 9L, page_with 'B' ] in
      Alcotest.(check int64) "epoch unchanged after 2nd commit" 0L (Wal.epoch w);
      (* Epoch bumps after reset. *)
-     Wal.reset w;
+     let* _ = Wal.reset w in
      Alcotest.(check int64) "epoch bumped to 1" 1L (Wal.epoch w);
      (* Multiple resets keep bumping. *)
-     Wal.reset w;
+     let* _ = Wal.reset w in
      Alcotest.(check int64) "epoch bumped to 2" 2L (Wal.epoch w);
-     Wal.reset w;
+     let* _ = Wal.reset w in
      Alcotest.(check int64) "epoch bumped to 3" 3L (Wal.epoch w);
      (* Append after reset does not bump epoch. *)
      let* _ = Wal.append_commit w [ 5L, page_with 'C' ] in
@@ -252,7 +252,7 @@ let test_reset_clears_index () =
   Lwt_main.run
     (let* _, w = fresh_wal () in
      let* _ = Wal.append_commit w [ 7L, page_with 'A' ] in
-     Wal.reset w;
+     let* _ = Wal.reset w in
      Alcotest.(check int) "reset to 0 frames" 0 (Wal.committed_frames w);
      Alcotest.(check (option int)) "page absent after reset" None (Wal.find_page w 7L);
      Lwt.return_unit)
@@ -262,7 +262,7 @@ let test_append_overwrites_after_reset () =
   Lwt_main.run
     (let* _, w = fresh_wal () in
      let* _ = Wal.append_commit w [ 1L, page_with 'A' ] in
-     Wal.reset w;
+     let* _ = Wal.reset w in
      let* _ = Wal.append_commit w [ 2L, page_with 'B' ] in
      Alcotest.(check int) "1 frame after re-append" 1 (Wal.committed_frames w);
      Alcotest.(check (option int)) "page 1 gone" None (Wal.find_page w 1L);

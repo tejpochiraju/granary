@@ -838,6 +838,15 @@ let test_apply_exception_does_not_wedge_promote () =
      (match r with
       | Error (`Apply_error _) -> ()
       | Ok () -> Alcotest.fail "expected apply to surface the device exception");
+     (* Stop injecting before promote.  #562/#636: the failed apply issued frame
+        writes that may have reached the device, so [promote]'s checkpoint now
+        legitimately rotates the WAL generation marker — a real device write.
+        Against a device that raises forever that write raises too, which is
+        correct and is not what this test is about: the assertion below is
+        mutex hygiene (a leaked apply mutex would deadlock here), not
+        device-error propagation through [promote], which has no error channel
+        to propagate through. *)
+     raise_now := false;
      (* If the apply mutex had leaked, this promote would deadlock. *)
      let* () = Standby.promote st in
      Alcotest.(check bool)

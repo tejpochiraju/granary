@@ -169,41 +169,49 @@ let rebase t segments =
            superseded state and must be DISCARDED — not drained, which would
            corrupt the fresh base.  [Wal.reset] drops the index and bumps the
            local WAL epoch. *)
-        Wal.reset t.wal;
-        t.last_epoch <- Wal.epoch t.wal;
-        t.last_frame_idx <- -1;
-        (* Replay the object-store WAL segments in order through the
+        let* rr = Wal.reset t.wal in
+        (match rr with
+         | Error e ->
+           Lwt.return
+             (Error
+                (`Apply_error
+                    (Format.asprintf "Standby.rebase: wal reset: %a" Wal.pp_error e)))
+         | Ok () ->
+           t.last_epoch <- Wal.epoch t.wal;
+           t.last_frame_idx <- -1;
+           (* Replay the object-store WAL segments in order through the
            epoch-aware apply primitive, threading the position forward.  The
            segments may span several master epochs; [apply_frames_epoch_aware]
            checkpoints the local WAL at each transition (#209), so on
            completion the main DB holds the base plus all-but-the-last epoch
            and the WAL holds the live tail's epoch — exactly the steady-state
            a following standby maintains. *)
-        let rec loop () =
-          let* next = Lwt_stream.get segments in
-          match next with
-          | None -> Lwt.return (Ok { epoch = t.last_epoch; frame_idx = t.last_frame_idx })
-          | Some frames ->
-            let* r =
-              Replication.apply_frames_epoch_aware
-                ~wal:t.wal
-                ~pager:t.pager
-                ~last_epoch:t.last_epoch
-                ~last_idx:t.last_frame_idx
-                ~reader_gate:t.reader_gate
-                frames
-            in
-            (match r with
-             | Error _ as e -> Lwt.return e
-             | Ok (epoch, idx) ->
-               t.last_epoch <- epoch;
-               t.last_frame_idx <- idx;
-               let acked = Wal.committed_frames t.wal in
-               Store.set_follower_ack_position t.store ~frames:acked;
-               (match t.on_standby_ack with
-                | Some cb -> cb acked
-                | None -> ());
-               loop ())
-        in
-        loop ())
+           let rec loop () =
+             let* next = Lwt_stream.get segments in
+             match next with
+             | None ->
+               Lwt.return (Ok { epoch = t.last_epoch; frame_idx = t.last_frame_idx })
+             | Some frames ->
+               let* r =
+                 Replication.apply_frames_epoch_aware
+                   ~wal:t.wal
+                   ~pager:t.pager
+                   ~last_epoch:t.last_epoch
+                   ~last_idx:t.last_frame_idx
+                   ~reader_gate:t.reader_gate
+                   frames
+               in
+               (match r with
+                | Error _ as e -> Lwt.return e
+                | Ok (epoch, idx) ->
+                  t.last_epoch <- epoch;
+                  t.last_frame_idx <- idx;
+                  let acked = Wal.committed_frames t.wal in
+                  Store.set_follower_ack_position t.store ~frames:acked;
+                  (match t.on_standby_ack with
+                   | Some cb -> cb acked
+                   | None -> ());
+                  loop ())
+           in
+           loop ()))
 ;;

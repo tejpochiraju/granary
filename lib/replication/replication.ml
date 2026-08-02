@@ -217,8 +217,12 @@ let checkpoint_wal_to_main ~wal ~pager ~reader_gate =
          (`Apply_error (Format.asprintf "checkpoint sync: %a" Pager.pp_error e))
      | Ok () ->
        let* () = reader_gate ~target:(Wal.committed_frames wal) in
-       Wal.reset wal;
-       Lwt.return_ok ())
+       let* rr = Wal.reset wal in
+       (match rr with
+        | Error e ->
+          Lwt.return_error
+            (`Apply_error (Format.asprintf "checkpoint wal reset: %a" Wal.pp_error e))
+        | Ok () -> Lwt.return_ok ()))
 ;;
 
 (** Split a frame list into maximal runs of consecutive same-epoch frames,

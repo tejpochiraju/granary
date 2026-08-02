@@ -143,12 +143,42 @@ val append_commit_no_sync : t -> (int64 * Cstruct.t) list -> (unit, error) resul
 val flush_sync : t -> (unit, error) result Lwt.t
 
 (** Reset the WAL: discards all committed frames and the in-memory index.
-    Used by checkpointing to truncate the log after migrating its
-    contents to the main DB. The on-disk WAL is not physically truncated;
-    later appends overwrite from the beginning.  Bumps {!epoch} so that
-    replication consumers can detect that their snapshot has been
-    invalidated. *)
-val reset : t -> unit
+    Used by checkpointing to truncate the log after migrating its contents to
+    the main DB.  Bumps {!epoch} so that replication consumers can detect that
+    their snapshot has been invalidated.
+
+    {b #562: this also rotates the header's generation marker on disk and
+    fsyncs it, which is why it is now an Lwt operation that can fail.}  The
+    file is still not physically truncated — later appends overwrite from the
+    beginning — but the previous generation's frames no longer verify, so
+    recovery stops at the new generation's tail instead of replaying them.
+    Before #562 they did replay, which (a) made a checkpoint invisible across a
+    reopen, so every page kept resolving through the WAL overlay forever, and
+    (b) silently resurrected pre-checkpoint page contents whenever the new
+    generation was shorter than the old one.
+
+    The caller MUST hold the writer lock across this call: it yields on the
+    header fsync, and an append landing in that window would be written under
+    the old marker.
+
+    {b On failure the WAL is POISONED (#636).}  If the header write or its
+    fsync fails, which marker the device holds is unknown, and neither answer
+    is safe to append under: had the new one landed, every later commit would
+    be written and fsynced under a marker recovery rejects, and the application
+    would be told those commits are durable.  So every subsequent append is
+    refused with an error until the database is reopened.  Reads are
+    unaffected.  Callers must therefore SURFACE this error rather than swallow
+    it — see {!is_poisoned}.
+
+    A [reset] over a WAL that has had nothing written to it since the last
+    rotation is a no-op that touches no device: there is nothing to
+    invalidate. *)
+val reset : t -> (unit, error) result Lwt.t
+
+(** [true] once a {!reset} has failed with its generation marker's durability
+    unknown.  Every append is refused from that point until the database is
+    reopened; reads are unaffected.  See {!reset}. *)
+val is_poisoned : t -> bool
 
 (** WAL generation counter — bumped every time [reset] is called (i.e. after
     each checkpoint).  Starts at 0 on open.  Replication can use this to

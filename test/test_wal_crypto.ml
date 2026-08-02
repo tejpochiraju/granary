@@ -236,7 +236,7 @@ let test_frame_cache_reset_invalidates _ () =
   let* () = commit pa in
   let* a = read0 () in
   Alcotest.(check bool) "pre-reset reads A" true (Cstruct.equal pa a);
-  Wal.reset w;
+  let* _ = Wal.reset w in
   let* () = commit pb in
   let before = C.decrypt_frame_count () in
   let* b = read0 () in

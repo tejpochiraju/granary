@@ -1211,3 +1211,34 @@
  (name test_attach_active_txn_598)
  (modules test_attach_active_txn_598)
  (libraries granary granary.unix alcotest lwt.unix))
+
+; #562: where do an on-disk query's pager resolutions go — main file, WAL
+; overlay, or the WAL's own frame cache?  A measurement tool, not a gate.
+
+(executable
+ (name bench_wal_resolve_562)
+ (modules bench_wal_resolve_562)
+ (libraries granary granary.unix lwt.unix unix))
+
+; #562: a checkpoint must invalidate the previous WAL generation on disk, not
+; just in memory — otherwise recovery replays it (perf) and can replay it OVER
+; a shorter successor generation (correctness).
+
+(test
+ (name test_wal_generation_562)
+ (modules test_wal_generation_562)
+ (libraries
+  granary.storage
+  alcotest
+  lwt.unix
+  unix
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+; #562: end-to-end — a PRAGMA wal_checkpoint must still be a checkpoint after
+; the handle is closed and reopened.
+
+(test
+ (name test_checkpoint_reopen_562)
+ (modules test_checkpoint_reopen_562)
+ (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))

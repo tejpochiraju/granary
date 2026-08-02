@@ -41,8 +41,14 @@ type t =
   ; (* Tracks the high-water mark of the WAL device — initialised to the
      size at open, grows as we append frames so subsequent reads know
      which frames are addressable. *)
-    salt : int64
-  ; seed : int64
+    mutable salt : int64
+  ; mutable seed : int64
+    (* #562: the (salt, seed) pair in the WAL header is the file's GENERATION
+       MARKER, not just checksum entropy.  Every frame's checksum is computed
+       over it, so rotating the pair at [reset] makes every frame written by the
+       previous generation fail recovery's checksum — which is exactly what a
+       checkpoint means on disk.  Mutable for that reason alone; nothing else
+       changes them after open. *)
   ; mutable committed_frames : int
   ; index : (int64, int list) Hashtbl.t
   ; (* page_id -> frame indexes (newest-first). Each commit's new frames are
@@ -71,6 +77,32 @@ type t =
     frame_cache_fifo : int Queue.t (* insertion order for bounded FIFO eviction *)
   ; frame_cache_capacity : int
     (* max cached frames; 0 disables.  See [default_frame_cache_capacity]. *)
+  ; mutable wrote_since_rotation : bool
+    (** #562/#636 (B2): has any frame byte been ISSUED to the device under the
+        current generation marker?  Set before the write in [write_pages_at],
+        not after it — a write that failed part-way may still have landed, and
+        the whole point of the flag is to record uncertainty.  Cleared only by
+        a successful rotation in [reset], which is what makes every such frame
+        unverifiable again.
+
+        [committed_frames = 0] is NOT a substitute.  [append_commit] writes
+        every frame — including the one carrying the commit flag — before
+        [flush_sync], and bumps [committed_frames] only after; so a batch whose
+        frames reached the device but whose sync failed leaves valid,
+        commit-flagged frames on disk with [committed_frames] still 0.  Skipping
+        the rotation there would let recovery resurrect them over a shorter
+        successor generation — exactly the bug #636 is about, reached through
+        the fast path meant to be free. *)
+  ; mutable poisoned : string option
+    (** #562/#636 (B1): set when [reset]'s header write or fsync failed, so it
+        is UNKNOWN whether the device holds the old marker or the new one.
+        Neither answer is safe to append under: if the new marker is durable,
+        every frame written under the in-memory (old) one fails recovery, so an
+        acked, fsynced commit is silently lost on reopen.  While poisoned, every
+        append is refused with an error the caller must surface; reads are
+        unaffected (they never re-verify checksums).  Terminal for this handle
+        — reopening the file re-reads whichever header actually landed and
+        recovers from it. *)
   }
 
 (* #246: default bound on the decrypted-frame cache.  One full WAL generation's
@@ -175,9 +207,10 @@ let frame_checksum ~salt ~seed ~page_id ~flags ~page =
 (* Header read/write                                                   *)
 (* ----------------------------------------------------------------- *)
 
-let init_header ~write_at ~sync =
-  let salt = Random.int64 Int64.max_int in
-  let seed = Random.int64 Int64.max_int in
+(* #562: write the 24-byte WAL header and make it durable.  Shared by
+   [init_header] (file creation) and [reset] (checkpoint), which differ only in
+   where the (salt, seed) pair comes from. *)
+let write_header ~write_at ~sync ~salt ~seed =
   let hdr = Cstruct.create header_size_bytes in
   Cstruct.BE.set_uint64 hdr 0 wal_magic;
   Cstruct.BE.set_uint64 hdr 8 salt;
@@ -189,7 +222,16 @@ let init_header ~write_at ~sync =
     let* s = sync () in
     (match s with
      | Error s -> Lwt.return_error (Block_error s)
-     | Ok () -> Lwt.return_ok (salt, seed))
+     | Ok () -> Lwt.return_ok ())
+;;
+
+let init_header ~write_at ~sync =
+  let salt = Random.int64 Int64.max_int in
+  let seed = Random.int64 Int64.max_int in
+  let* r = write_header ~write_at ~sync ~salt ~seed in
+  match r with
+  | Error e -> Lwt.return_error e
+  | Ok () -> Lwt.return_ok (salt, seed)
 ;;
 
 let read_header ~read_at =
@@ -362,6 +404,11 @@ let open_
         ; frame_cache = Hashtbl.create 64
         ; frame_cache_fifo = Queue.create ()
         ; frame_cache_capacity
+        ; (* The device is too small to hold even a header, so it cannot hold
+             a frame either: this is the one branch that is PROVABLY fresh, and
+             the only one that may start with the flag clear. *)
+          wrote_since_rotation = false
+        ; poisoned = None
         }
   else
     let* hr = read_header ~read_at in
@@ -391,6 +438,23 @@ let open_
            ; frame_cache = Hashtbl.create 64
            ; frame_cache_fifo = Queue.create ()
            ; frame_cache_capacity
+           ; (* #636: NOT provably fresh, despite having just written a header.
+                [Ok None] means there WERE bytes on the device and the magic did
+                not match — a torn 24-byte header write that left the salt/seed
+                words intact is exactly this, and the frames it was protecting
+                are still there.  [init_header] then re-draws from an
+                un-self-init'd [Random] (#613), so a freshly-started process
+                draws the SAME (salt, seed) the original creator drew and those
+                old frames verify under the supposedly-new marker.  The first
+                [reset] would take the fast path, skip the rotation, and let
+                recovery resurrect them over a shorter successor generation.
+
+                Same epistemic position as the recovered branch below: we cannot
+                enumerate what is on the device, so assume the worst.  Costs one
+                header write + fsync on the first checkpoint after opening a
+                header-damaged or pre-allocated zero-filled WAL. *)
+             wrote_since_rotation = true
+           ; poisoned = None
            })
     | Ok (Some (salt, seed)) ->
       let t =
@@ -411,6 +475,12 @@ let open_
         ; frame_cache = Hashtbl.create 64
         ; frame_cache_fifo = Queue.create ()
         ; frame_cache_capacity
+        ; (* #636 (B2): an existing file may hold frames written under this
+             marker that recovery does not count — a batch whose frames landed
+             but whose sync failed leaves [committed_frames = 0] with valid
+             frames on disk.  Assume the worst so the first [reset] rotates. *)
+          wrote_since_rotation = true
+        ; poisoned = None
         }
       in
       let* r = recover_index t in
@@ -523,6 +593,10 @@ let write_frame t ~idx ~page_id ~is_commit ~page =
 let write_pages_at t ~base pages =
   let n = List.length pages in
   let last = n - 1 in
+  (* #636 (B2): record BEFORE issuing any byte.  A write that fails part-way
+     may still have reached the device, and [committed_frames] will not move,
+     so this flag is the only thing that remembers the frames are there. *)
+  t.wrote_since_rotation <- true;
   let rec write_all i = function
     | [] -> Lwt.return_ok n
     | (page_id, page) :: rest ->
@@ -562,49 +636,179 @@ let flush_sync t =
     Lwt.return_ok ()
 ;;
 
+(* #636 (B1): refuse to append while the generation marker's durability is
+   unknown.  Returning an error here is what turns a silent loss (an acked
+   commit that vanishes on reopen) into a failure the caller can surface. *)
+let is_poisoned t = t.poisoned <> None
+
+let poison_error t =
+  match t.poisoned with
+  | None -> None
+  | Some why ->
+    Some
+      (Block_error
+         (Printf.sprintf
+            "WAL is poisoned: the generation marker's durability is unknown (%s); reopen \
+             the database"
+            why))
+;;
+
 let append_commit_no_sync t pages =
-  match pages with
-  | [] -> Lwt.return_ok ()
-  | _ ->
-    let base = t.committed_frames in
-    let* r = write_pages_at t ~base pages in
-    (match r with
-     | Error e -> Lwt.return_error e
-     | Ok _ ->
-       (* Publish so subsequent writers (still under [rw_mutex]) and any
+  match poison_error t with
+  | Some e -> Lwt.return_error e
+  | None ->
+    (match pages with
+     | [] -> Lwt.return_ok ()
+     | _ ->
+       let base = t.committed_frames in
+       let* r = write_pages_at t ~base pages in
+       (match r with
+        | Error e -> Lwt.return_error e
+        | Ok _ ->
+          (* Publish so subsequent writers (still under [rw_mutex]) and any
          in-flight reads can locate the new frames.  Durability is
          deferred to a later [flush_sync] by the group-commit coordinator;
          a sync failure is treated as fatal by callers. *)
-       publish_pages t ~base pages;
-       Lwt.return_ok ())
-;;
-
-let append_commit t pages =
-  match pages with
-  | [] -> Lwt.return_ok ()
-  | _ ->
-    let base = t.committed_frames in
-    let* r = write_pages_at t ~base pages in
-    (match r with
-     | Error e -> Lwt.return_error e
-     | Ok _ ->
-       let* sr = flush_sync t in
-       (match sr with
-        | Error e -> Lwt.return_error e
-        | Ok () ->
           publish_pages t ~base pages;
           Lwt.return_ok ()))
 ;;
 
+let append_commit t pages =
+  match poison_error t with
+  | Some e -> Lwt.return_error e
+  | None ->
+    (match pages with
+     | [] -> Lwt.return_ok ()
+     | _ ->
+       let base = t.committed_frames in
+       let* r = write_pages_at t ~base pages in
+       (match r with
+        | Error e -> Lwt.return_error e
+        | Ok _ ->
+          let* sr = flush_sync t in
+          (match sr with
+           | Error e -> Lwt.return_error e
+           | Ok () ->
+             publish_pages t ~base pages;
+             Lwt.return_ok ())))
+;;
+
+(* #562: derive the next generation's [(salt, seed)] by hashing the current
+   one — a chain, not a fresh draw.
+
+   [Random] is the obvious choice and is wrong here: nothing in this tree calls
+   [Random.self_init], so every process walks the SAME sequence (#613).  A
+   database created by one process and checkpointed by a freshly-started one
+   would draw exactly the pair [init_header] drew, i.e. rotate the marker to
+   the value it already had — leaving the previous generation's frames
+   verifying, which is the whole bug.  Chaining off the current marker cannot do that: the output
+   depends on the input, and a repeat would require an FNV collision rather
+   than a PRNG restart.
+
+   Mixing in [epoch] and [committed_frames] also separates two resets that
+   happen to start from the same marker. *)
+let next_generation_marker t =
+  let mix tag =
+    let h = fnv64_update_int64 fnv64_offset tag in
+    let h = fnv64_update_int64 h t.salt in
+    let h = fnv64_update_int64 h t.seed in
+    let h = fnv64_update_int64 h t.epoch in
+    fnv64_update_int64 h (Int64.of_int t.committed_frames)
+  in
+  (* [frame_checksum] is FNV over [salt] then [seed], so keep the two derived
+     words independent by tagging them differently. *)
+  let salt =
+    mix 0x5741_4C5F_5341_4C54L
+    (* "WAL_SALT" *)
+  in
+  let seed =
+    mix 0x5741_4C5F_5345_4544L
+    (* "WAL_SEED" *)
+  in
+  if Int64.equal salt t.salt && Int64.equal seed t.seed
+  then (* Astronomically improbable; perturb rather than loop forever. *)
+    Int64.succ salt, seed
+  else salt, seed
+;;
+
 let reset t =
-  Hashtbl.reset t.index;
-  (* #246: a checkpoint recycles frame indices, so every cached (idx -> bytes)
-     entry now refers to a frame slot that will be overwritten by the next
-     generation.  Drop them all; failing to do so would serve a stale page. *)
-  Hashtbl.reset t.frame_cache;
-  Queue.clear t.frame_cache_fifo;
-  t.committed_frames <- 0;
-  t.epoch <- Int64.succ t.epoch
+  (* #562: nothing to invalidate when nothing has been written under the
+     current marker.  The invariant the rotation maintains is "no frame on the
+     device verifies under the current marker except the ones this generation
+     committed" — so the rotation is only needed once a frame has been ISSUED
+     since the last one.
+
+     #636 (B2): the condition is [wrote_since_rotation], NOT
+     [committed_frames = 0].  [append_commit] writes every frame — the
+     commit-flagged one included — before [flush_sync] and only then bumps
+     [committed_frames], so a batch whose bytes landed and whose sync failed
+     leaves valid, commit-flagged frames on disk with [committed_frames] still
+     0.  Skipping the rotation there let recovery resurrect them over a shorter
+     successor generation: the very bug this code exists to prevent, reached
+     through the fast path.  The flag is set before the write, so it is true in
+     exactly that case.
+
+     What remains free is the genuinely untouched WAL — a fresh file, or one
+     that was already rotated and not appended to since (a no-op
+     autocheckpoint, a [Standby.promote] over an empty WAL). *)
+  if not t.wrote_since_rotation
+  then (
+    Hashtbl.reset t.index;
+    Hashtbl.reset t.frame_cache;
+    Queue.clear t.frame_cache_fifo;
+    t.committed_frames <- 0;
+    t.epoch <- Int64.succ t.epoch;
+    Lwt.return_ok ())
+  else (
+    let salt, seed = next_generation_marker t in
+    (* #562: rotate the on-disk generation marker BEFORE dropping the in-memory
+       state, and make it durable.  Crash-safe in this direction only:
+
+       - crash before the header is durable: the old [(salt, seed)] survives,
+         the old frames still verify, and recovery replays them.  Harmless —
+         the caller has already migrated and fsynced exactly those pages to the
+         main DB, so the replay reinstates identical bytes.
+       - crash after: the old frames fail recovery's checksum, so the WAL reads
+         as empty and the main DB (already fsynced) is the truth.
+
+       Clearing the in-memory state first is what is NOT safe: an append could
+       then land at frame 0 under the OLD marker while the caller believes the
+       generation has rotated.  Callers must hold the writer lock across this
+       call so no append can interleave with the fsync's yield. *)
+    let* r = write_header ~write_at:t.write_at ~sync:t.sync ~salt ~seed in
+    match r with
+    | Error e ->
+      (* #636 (B1): the write or the fsync failed, so which marker is on the
+         device is UNKNOWN.  Keeping the old one in memory is not the
+         conservative choice it looks like: if the new one did land, every
+         subsequent commit is written and fsynced under a marker recovery will
+         reject, and the application is told those commits are durable.  Adopting
+         the new one is no better — if it did NOT land, this generation's frames
+         become unreadable.  The only safe move is to stop appending.  Reads are
+         left alone: they never re-verify a checksum. *)
+      t.poisoned <- Some (Format.asprintf "%a" pp_error e);
+      Lwt.return_error e
+    | Ok () ->
+      t.salt <- salt;
+      t.seed <- seed;
+      t.wrote_since_rotation <- false;
+      Hashtbl.reset t.index;
+      (* #246: a checkpoint recycles frame indices, so every cached
+         (idx -> bytes) entry now refers to a frame slot that the next
+         generation will overwrite.  Drop them all; keeping them would serve a
+         stale page. *)
+      Hashtbl.reset t.frame_cache;
+      Queue.clear t.frame_cache_fifo;
+      t.committed_frames <- 0;
+      (* #562: the previous generation's frames are still physically present
+         past the new generation's tail.  They no longer verify, so recovery
+         stops at the first of them — but [size_bytes] must keep covering them
+         or [read_frame_raw]'s bounds check would reject a frame the next
+         generation legitimately reuses.  Leave it alone — the space is reused,
+         never reclaimed, because the WAL file is never physically truncated
+         (#612). *)
+      t.epoch <- Int64.succ t.epoch;
+      Lwt.return_ok ())
 ;;
 
 [@@@ai_disclosure "ai-generated"]
