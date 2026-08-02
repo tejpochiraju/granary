@@ -805,6 +805,14 @@
  (modules test_tpcc_load)
  (libraries granary_tpc alcotest unix))
 
+; TPC-C saturation driver (#500).  Fast by construction: every case drives
+; the driver against fake workers, so nothing here loads a database.
+
+(test
+ (name test_tpcc_driver)
+ (modules test_tpcc_driver)
+ (libraries granary_tpc alcotest lwt lwt.unix unix))
+
 ; TPC-C profile smoke run (#500).  The expensive case is gated behind
 ; GRANARY_TPCC_SMOKE; see the header comment in test_tpcc_smoke.ml.
 
@@ -821,6 +829,15 @@
  (optional)
  (modules bench_tpch)
  (libraries granary_tpc sqlite3 unix))
+
+; TPC-C-derived benchmark (#500).  `(optional)` for the same reason as
+; bench_tpch: builds where `sqlite3` is absent skip it rather than fail.
+
+(executable
+ (name bench_tpcc)
+ (optional)
+ (modules bench_tpcc)
+ (libraries granary_tpc sqlite3 lwt lwt.unix unix))
 
 ; #517: range bound after an access path's equality prefix.
 
