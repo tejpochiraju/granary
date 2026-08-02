@@ -264,7 +264,28 @@ let rec attempt pool rec_ r ~config ~profile ~tries =
       attempt pool rec_ r ~config ~profile ~tries:(tries + 1))
 ;;
 
+(* The [Lwt.pause] is not a politeness; the loop is incorrect without it, in
+   two independent ways, both of which bite exactly when the engine under
+   test never awaits anything real.
+
+   The reference SQLite bindings are blocking calls wrapped in
+   [Lwt.return], so a whole transaction resolves without ever reaching the
+   scheduler. Then (a) [Lwt.bind] on an already-resolved promise runs its
+   continuation immediately, so this recursion grows the native stack once
+   per transaction until the process takes SIGSEGV — no exception, no
+   message, exit 139 — which is what killed the first cross-engine run,
+   between its pre-run consistency check and any output; and (b) the first
+   terminal would keep the
+   CPU for the whole interval and the other terminals would never start, so
+   a run at N terminals would in truth be a run at one.
+
+   [Lwt.pause] returns to the event loop between transactions, which
+   trampolines the recursion and round-robins the terminals. It costs one
+   scheduler tick per transaction — noise beside a transaction, and it is
+   inside neither the wait nor the service window, which are timed around
+   the pool acquisition below. *)
 let rec terminal_loop pool rec_ r ~config ~profiles ~deadline =
+  let* () = Lwt.pause () in
   if now () >= deadline
   then Lwt.return_unit
   else (

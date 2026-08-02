@@ -12,7 +12,7 @@
    times, and there is no audit or pricing disclosure.
 
    Both engines are driven through a ONE-worker pool.  For granary that is a
-   hard constraint — a Db.t holds one explicit-transaction slot, so two
+   hard constraint (#555) — a Db.t holds one explicit-transaction slot, so two
    terminals sharing it would let one COMMIT the other's half-done work (see
    Tpcc_driver's module header).  For reference SQLite it is a deliberate
    choice: these bindings are blocking calls from a single-domain Lwt

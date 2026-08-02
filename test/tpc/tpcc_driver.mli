@@ -15,8 +15,8 @@
     ([Db.begin_txn] answers ["transaction already active"] to a second
     [BEGIN]). Two terminals interleaving [BEGIN]/[COMMIT] on one handle would
     not merely error — the second terminal's [COMMIT] would commit the
-    first's half-finished work. So a worker must never run two transactions
-    at once, and this driver guarantees that: {!run} takes a {e list} of
+    first's half-finished work ({b #555}). So a worker must never run two
+    transactions at once, and this driver guarantees that: {!run} takes a {e list} of
     workers and serializes each one, handing a terminal a free worker for the
     duration of one transaction.
 

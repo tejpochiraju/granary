@@ -50,7 +50,7 @@ two transactions at once. That is not a stylistic choice:
 > `Db.begin_txn` answers `"transaction already active"` to a second `BEGIN`, and
 > two terminals interleaving `BEGIN`/`COMMIT` on one handle would not merely
 > error — the second terminal's `COMMIT` would commit the first's half-finished
-> work.
+> work. Filed as **#555**.
 
 A TPC-C transaction is inherently multi-statement and explicit, so one granary
 connection can carry exactly one transaction at a time, and the benchmark

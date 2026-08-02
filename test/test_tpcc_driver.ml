@@ -240,6 +240,65 @@ let test_two_workers_overlap () =
   Alcotest.(check int) "a two-deep pool does run two at once" 2 !peak
 ;;
 
+(* Regression, and the most expensive bug in this PR: the terminal loop must
+   return to the scheduler between transactions.
+
+   The reference SQLite bindings are blocking calls wrapped in [Lwt.return],
+   so a whole transaction resolves without the scheduler ever running and
+   [Lwt.bind] invokes each continuation inline. Without a yield the loop then
+   recursed inline once per transaction and the process took SIGSEGV — no
+   exception, no message, exit 139 — after the pre-run consistency check and
+   before any output, which reads as a hung benchmark rather than as a
+   defect. The same absence starves the peers: one terminal that never
+   yields holds the entire measurement interval, so a run at N terminals is
+   in truth a run at one.
+
+   [tick] is unusable here — an [Lwt_unix.sleep] is the very yield whose
+   absence is the bug — so this worker chains resolved binds instead, at
+   roughly the depth one TPC-C profile costs.
+
+   The assertion is on the mechanism rather than on survival: a concurrent
+   observer counts scheduler turns taken while the run is in flight. One
+   turn or none means the loop ran to completion without ever yielding, and
+   survival at that point is a matter of how deep the stack happened to
+   get. *)
+let sync_worker _ =
+  let rec chain n =
+    if n = 0 then Lwt.return_unit else Lwt.bind Lwt.return_unit (fun () -> chain (n - 1))
+  in
+  chain 60
+;;
+
+let test_loop_returns_to_the_scheduler () =
+  let config = { base_config with terminals = 4; seconds = 0.3 } in
+  let turns = ref 0 in
+  let stop = ref false in
+  let rec observer () =
+    if !stop
+    then Lwt.return_unit
+    else
+      Lwt.bind (Lwt.pause ()) (fun () ->
+        incr turns;
+        observer ())
+  in
+  let driver =
+    Lwt.map
+      (fun r ->
+         stop := true;
+         r)
+      (D.run config ~workers:[ sync_worker ])
+  in
+  let r = fst (Lwt_main.run (Lwt.both driver (observer ()))) in
+  Alcotest.(check bool)
+    "the run made progress"
+    true
+    (total (fun s -> s.D.committed) r > 100);
+  Alcotest.(check bool)
+    "the terminal loop yielded between transactions"
+    true
+    (!turns > 100)
+;;
+
 let test_extra_terminals_show_up_as_wait () =
   let one = run_with ~config:{ base_config with terminals = 1 } [ ok_worker ] in
   let many = run_with ~config:{ base_config with terminals = 8 } [ ok_worker ] in
@@ -434,6 +493,10 @@ let () =
             `Quick
             test_one_worker_never_overlaps
         ; Alcotest.test_case "two workers overlap" `Quick test_two_workers_overlap
+        ; Alcotest.test_case
+            "the loop returns to the scheduler"
+            `Quick
+            test_loop_returns_to_the_scheduler
         ; Alcotest.test_case
             "extra terminals become wait"
             `Quick
