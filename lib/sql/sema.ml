@@ -3413,8 +3413,8 @@ let bind_seq_insert ~columns ~values ~on_conflict ~returning ~upsert_update =
 (* ALTER TABLE                                                          *)
 (* ------------------------------------------------------------------ *)
 
-(* Validate an ALTER TABLE ADD COLUMN: reject duplicate columns, NOT NULL
-   without a usable DEFAULT, and unresolved REFERENCES targets. *)
+(* Validate an ALTER TABLE ADD COLUMN: reject duplicate columns, PRIMARY KEY,
+   NOT NULL without a usable DEFAULT, and unresolved REFERENCES targets. *)
 let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.column_def) =
   let col_name = col_def.Ast.name in
   let exists =
@@ -3422,6 +3422,18 @@ let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.co
   in
   if exists
   then Lwt.return (Error (Already_exists col_name))
+  else if col_def.Ast.primary_key
+  then
+    (* #533: this used to be accepted and was a lie — no [__pk] index was built
+       for the added column, so it enforced neither uniqueness nor (before #530)
+       NOT NULL, and the DDL it rendered no longer round-tripped once #530 made
+       a restored PRIMARY KEY column NOT NULL.  Refused instead, which is also
+       what SQLite does ("Cannot add a PRIMARY KEY column"): a table with rows
+       already has NULLs in the new column, so the key could not hold anyway. *)
+    Lwt.return
+      (Error
+         (Unsupported
+            "ADD COLUMN cannot add a PRIMARY KEY column — declare it in CREATE TABLE"))
   else if
     col_def.Ast.not_null
     && (col_def.Ast.default = None || col_def.Ast.default = Some Ast.L_null)
@@ -3462,10 +3474,20 @@ let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.co
             Lwt.return
               (Error
                  (Unsupported
-                    (Printf.sprintf
-                       "REFERENCES: column '%s' not found in '%s'"
-                       parent_col
-                       parent_table)))
+                    (if parent_col = ""
+                     then
+                       (* #533: the inference failed, so there is no column name
+                          to report — saying "column '' not found" named nothing
+                          and hid the real reason. *)
+                       Printf.sprintf
+                         "REFERENCES: parent '%s' has no single-column PRIMARY KEY to \
+                          infer"
+                         parent_table
+                     else
+                       Printf.sprintf
+                         "REFERENCES: column '%s' not found in '%s'"
+                         parent_col
+                         parent_table)))
           | Some _ -> Lwt.return (Ok (BS_alter_table { table_meta; action })))))
 ;;
 

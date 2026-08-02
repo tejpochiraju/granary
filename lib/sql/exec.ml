@@ -355,26 +355,47 @@ let format_pk_suffix ~autoinc_idx i (col : Row.column) buf =
   if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT"
 ;;
 
-(* #530: a composite PRIMARY KEY now marks every one of its columns, so the
-   inline [PRIMARY KEY] suffix has to be suppressed for it — emitting it per
-   column would render [PRIMARY KEY (k, j)] as two separate single-column keys,
-   which is a different table.  The table-level form is not emitted instead
-   because [Row.column] records no key ORDINAL: reconstructing
-   [PRIMARY KEY (...)] from storage order would silently reorder the key.  So a
-   composite PK stays absent from the rendered DDL and continues to round-trip
-   through [Db.dump] as the plain [CREATE UNIQUE INDEX] documented there — the
-   pre-existing, intentional downgrade, unchanged by this issue. *)
-let inline_pk_column_count (cols : Row.column list) =
-  List.length (List.filter (fun (c : Row.column) -> c.Row.primary_key) cols)
+(* #530: a composite PRIMARY KEY marks every one of its columns, so the inline
+   [PRIMARY KEY] suffix cannot be emitted per column — that would render
+   [PRIMARY KEY (k, j)] as two separate single-column keys, a different table.
+
+   #533: the suppressed set is derived from the KEY ITSELF — the `Implicit_pk
+   index, whose [idx_columns] names exactly the members of one table-level
+   [PRIMARY KEY (...)], in key order.  Counting marked columns globally (the
+   first cut of #530) is wrong, because this engine accepts more than one
+   [PRIMARY KEY] declaration on a table (SQLite rejects it; we don't).  A count
+   of 2 then dropped BOTH single-column keys out of the rendered DDL — and
+   [ddl_implies_index] still called their indexes implied, so [Db.dump] emitted
+   a table with no primary key and no unique index at all.
+
+   That index is also what supplies the key ORDINAL that [Row.column] lacks, so
+   the table-level form is now reconstructed faithfully instead of dropped: a
+   composite PK survives [Db.dump] as a PRIMARY KEY rather than being downgraded
+   to a bare UNIQUE index. *)
+let composite_pks (indexes : Cat.index_info list) =
+  List.filter_map
+    (fun (i : Cat.index_info) ->
+       match i.Cat.idx_origin, i.Cat.idx_columns with
+       | `Implicit_pk, (_ :: _ :: _ as cols) -> Some cols
+       | _ -> None)
+    indexes
 ;;
 
-let format_column ~autoinc_idx ~pk_count i (col : Row.column) =
+(* Does [ddl_of_table] emit the inline [PRIMARY KEY] suffix on [col]?  The one
+   predicate both the renderer and [ddl_implies_index] ask, so the two can no
+   longer answer it independently and drift apart. *)
+let inline_pk_emitted ~composite (col : Row.column) =
+  col.Row.primary_key
+  && not (List.exists (fun cols -> List.mem col.Row.name cols) composite)
+;;
+
+let format_column ~autoinc_idx ~composite i (col : Row.column) =
   let buf = Buffer.create 64 in
   Buffer.add_string buf (quote_ident col.Row.name);
   Buffer.add_char buf ' ';
   Buffer.add_string buf (sql_of_row_type col.Row.ty);
   if col.Row.not_null then Buffer.add_string buf " NOT NULL";
-  if col.Row.primary_key && pk_count = 1 then format_pk_suffix ~autoinc_idx i col buf;
+  if inline_pk_emitted ~composite col then format_pk_suffix ~autoinc_idx i col buf;
   (match col.Row.default with
    | None -> ()
    | Some dv ->
@@ -396,7 +417,7 @@ let format_column ~autoinc_idx ~pk_count i (col : Row.column) =
   Buffer.contents buf
 ;;
 
-let ddl_of_table (meta : Cat.table_meta) =
+let ddl_of_table ~(indexes : Cat.index_info list) (meta : Cat.table_meta) =
   let without_rowid, autoincrement =
     match meta.Cat.storage with
     | Cat.Row { without_rowid; autoincrement; _ } -> without_rowid, autoincrement
@@ -407,8 +428,16 @@ let ddl_of_table (meta : Cat.table_meta) =
     then Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid
     else None
   in
-  let pk_count = inline_pk_column_count meta.Cat.columns in
-  let col_parts = List.mapi (format_column ~autoinc_idx ~pk_count) meta.Cat.columns in
+  let composite = composite_pks indexes in
+  let col_parts = List.mapi (format_column ~autoinc_idx ~composite) meta.Cat.columns in
+  let pk_parts =
+    List.map
+      (fun cols ->
+         Printf.sprintf
+           "PRIMARY KEY (%s)"
+           (String.concat ", " (List.map quote_ident cols)))
+      composite
+  in
   let fk_parts =
     List.map
       (fun (fk : Cat.fk_constraint) ->
@@ -424,9 +453,29 @@ let ddl_of_table (meta : Cat.table_meta) =
   Printf.sprintf
     "CREATE TABLE %s (%s)%s%s"
     (quote_ident meta.Cat.name)
-    (String.concat ", " (col_parts @ fk_parts))
+    (String.concat ", " (col_parts @ pk_parts @ fk_parts))
     (if without_rowid then " WITHOUT ROWID" else "")
     (if Cat.is_columnar meta then " USING COLUMNSTORE" else "")
+;;
+
+(* #533: is [idx] already implied by the DDL [ddl_of_table] renders for its
+   table, so [Db.dump] can skip its CREATE INDEX?  Answered from
+   [inline_pk_emitted]/[composite_pks] — the SAME predicates the renderer used —
+   because the two used to answer it independently, and that is exactly how a
+   suppressed inline PRIMARY KEY ended up paired with a suppressed index and a
+   dump that silently accepted duplicates on restore. *)
+let ddl_implies_index (meta : Cat.table_meta) ~indexes (idx : Cat.index_info) =
+  match idx.Cat.idx_origin with
+  | `Implicit_unique | `User -> false
+  | `Implicit_pk ->
+    let composite = composite_pks indexes in
+    (match idx.Cat.idx_columns with
+     | [ col ] ->
+       List.exists
+         (fun (c : Row.column) ->
+            String.equal c.Row.name col && inline_pk_emitted ~composite c)
+         meta.Cat.columns
+     | cols -> List.mem cols composite)
 ;;
 
 (** Extract the ON <table> target from a CREATE TRIGGER statement.
@@ -6921,7 +6970,14 @@ let clear_table_expr_caches table_name =
   clear generated_expr_cache
 ;;
 
-(* Convert an AST column definition into a catalog [Row.column]. *)
+(* Convert an AST column definition into a catalog [Row.column].
+
+   #530/#533: [not_null] is derived as [not_null || primary_key], the same
+   derivation [Sema.column_of_def] makes on the CREATE TABLE path — the two are
+   siblings and had drifted, so an ALTER-added PRIMARY KEY column came out
+   nullable.  [Sema.bind_add_column] now refuses to add a PRIMARY KEY column at
+   all, so this is belt-and-braces; it is kept so the two converters cannot
+   disagree again if that guard ever moves. *)
 let column_of_col_def col_def : Row.column =
   { Row.name = col_def.Ast.name
   ; Row.ty =
@@ -6930,7 +6986,7 @@ let column_of_col_def col_def : Row.column =
        | Ast.Ty_text -> Row.Text
        | Ast.Ty_real -> Row.Real
        | Ast.Ty_blob -> Row.Blob)
-  ; Row.not_null = col_def.Ast.not_null
+  ; Row.not_null = col_def.Ast.not_null || col_def.Ast.primary_key
   ; Row.primary_key = col_def.Ast.primary_key
   ; Row.pk_desc = col_def.Ast.pk_desc
   ; Row.default =
@@ -6968,9 +7024,12 @@ let alter_add_column ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) col_def :
            match Cat.find_table_cached cat ~name:parent_table with
            | None -> parent_col
            | Some pm ->
-             (match
-                List.find_opt (fun (c : Row.column) -> c.primary_key) pm.Cat.columns
-              with
+             (* #533: the exactly-one question, like every other parent-PK
+                inference site — [List.find_opt] would silently infer a
+                single-column reference to the FIRST column of a composite key.
+                Unreachable while [Sema.bind_add_column] refuses first, but the
+                two must not be able to disagree. *)
+             (match Sema.sole_pk_column pm.Cat.columns with
               | None -> parent_col
               | Some pk -> pk.Row.name))
          else parent_col
@@ -9975,7 +10034,10 @@ and stream_sqlite_master store cat =
           ; Row.V_text meta.Cat.name
           ; Row.V_text meta.Cat.name
           ; Row.V_int (Int64.of_int sm_tree_id)
-          ; Row.V_text (ddl_of_table meta)
+          ; Row.V_text
+              (ddl_of_table
+                 ~indexes:(Cat.indexes_for_table cat_val ~table:meta.Cat.name)
+                 meta)
          |])
       tables
   in

@@ -883,7 +883,18 @@
 (test
  (name test_pk_not_null_530)
  (modules test_pk_not_null_530)
- (libraries granary granary.unix alcotest lwt.unix unix))
+ (libraries
+  granary
+  granary.unix
+  granary.sql
+  granary.catalog
+  granary.store
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
 
 ; #513: join must not discard the driving table's access path.
 

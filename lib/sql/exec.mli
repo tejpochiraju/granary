@@ -237,10 +237,31 @@ val quote_ident : string -> string
 (** #264: reconstruct a [CREATE TABLE] statement from catalog metadata (used by
     both [sqlite_master] and the logical dump). Emits column types, constraints
     (NOT NULL, column-level PRIMARY KEY, DEFAULT, CHECK, GENERATED), foreign
-    keys, and the [WITHOUT ROWID] clause. UNIQUE and composite/table-level
-    PRIMARY KEY constraints are carried by their backing indexes
-    ({!ddl_of_index}), not inline. *)
-val ddl_of_table : Granary_catalog.Catalog.table_meta -> string
+    keys, and the [WITHOUT ROWID] clause. UNIQUE constraints are carried by
+    their backing indexes ({!ddl_of_index}), not inline.
+
+    [indexes] must be the table's own indexes ([Catalog.indexes_for_table]). A
+    composite [PRIMARY KEY] is rendered as a table-level constraint recovered
+    from its implicit index, which is the only place the key's column ORDER is
+    recorded — [Row.column] has no key ordinal (#533). Pass the real index list:
+    with the wrong one a composite key renders as several single-column keys,
+    which is a different table. *)
+val ddl_of_table
+  :  indexes:Granary_catalog.Catalog.index_info list
+  -> Granary_catalog.Catalog.table_meta
+  -> string
+
+(** #533: is [idx] already implied by the [PRIMARY KEY] that
+    {!ddl_of_table} renders for [meta], so a logical dump can skip emitting its
+    [CREATE INDEX]? [indexes] must be the same list passed to {!ddl_of_table} —
+    the two answers are derived from one predicate so they cannot drift apart
+    and drop a uniqueness constraint from the dump. Always [false] for [`User]
+    and [`Implicit_unique] indexes. *)
+val ddl_implies_index
+  :  Granary_catalog.Catalog.table_meta
+  -> indexes:Granary_catalog.Catalog.index_info list
+  -> Granary_catalog.Catalog.index_info
+  -> bool
 
 (** #264: reconstruct a [CREATE [UNIQUE] INDEX] statement from index metadata. *)
 val ddl_of_index : Granary_catalog.Catalog.index_info -> string

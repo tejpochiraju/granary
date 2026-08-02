@@ -334,6 +334,26 @@ type error =
 
 val pp_error : Format.formatter -> error -> unit
 
+(** #530: mark every column named by a table-level [PRIMARY KEY (...)]
+    constraint with [primary_key = true], leaving every other field of every
+    column untouched. Applied to the AST column definitions {e before}
+    [not_null] is derived from them, which is what makes a table-level PRIMARY
+    KEY imply NOT NULL whichever way the key is spelled. Exposed for testing. *)
+val mark_table_pk
+  :  Ast.table_constraint list
+  -> Ast.column_def list
+  -> Ast.column_def list
+
+(** #530: the table's one and only PRIMARY KEY column, or [None] if it has none
+    or has more than one. For the consumers that can only handle a single
+    column — a [FOREIGN KEY] naming no parent column infers it. Asked as an
+    exactly-one question because every column of a composite key carries
+    [primary_key], so picking the first match would silently infer a
+    single-column reference to part of a composite key. *)
+val sole_pk_column
+  :  Granary_encoding.Row.column list
+  -> Granary_encoding.Row.column option
+
 (** Resolve and type-check a parsed {!Ast.stmt} against the catalog,
     producing a {!bound_stmt} or a semantic [error].  [?views] supplies
     view definitions so references to views resolve. *)

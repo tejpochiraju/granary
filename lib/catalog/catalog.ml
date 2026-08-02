@@ -1778,6 +1778,57 @@ let open_ store =
            m.name
        | _ -> ())
     mirror;
+  (* #533/#542: re-derive PRIMARY KEY column flags from the implicit PK indexes.
+
+     [primary_key]/[not_null] are stored PER COLUMN, and every database written
+     before #530 stored them wrong for a table-level [PRIMARY KEY (...)]: the
+     marking ran too late to reach the [not_null = not_null || primary_key]
+     derivation, and a composite key marked no column at all.  The oldest column
+     encoding is worse still — [decode_column] has no flag bytes to read and
+     defaults both to false for EVERY column.
+
+     Leaving that as-read is not just "the old permissive INSERT semantics".  It
+     is the exact input [Planner.seek_is_unique_point] tests, so a pre-existing
+     TPC-C file would keep failing [all_not_null], drop its composite-PK point
+     lookup out of the one-row class and silently revert the #513 StockLevel win
+     — the very thing #526's exemption was covering for.
+
+     The `Implicit_pk index names exactly the key's columns and is the same
+     thing #530 derives the flags from at CREATE time, so it is a faithful
+     re-derivation rather than a guess.  In memory only: nothing is rewritten to
+     disk, so an older build still reads the file it wrote.  Marking is additive
+     — a column already flagged is left alone and no flag is ever cleared — and
+     it runs AFTER the #174 drift check so the comparison still sees both copies
+     exactly as stored. *)
+  let pk_cols_of_table = Hashtbl.create 8 in
+  Hashtbl.iter
+    (fun _ (i : index_info) ->
+       if i.idx_origin = `Implicit_pk
+       then (
+         let prev =
+           Option.value ~default:[] (Hashtbl.find_opt pk_cols_of_table i.idx_table)
+         in
+         Hashtbl.replace pk_cols_of_table i.idx_table (i.idx_columns @ prev)))
+    indexes;
+  let normalized =
+    Hashtbl.fold
+      (fun name (m : table_meta) acc ->
+         match Hashtbl.find_opt pk_cols_of_table name with
+         | None -> acc
+         | Some pk_cols ->
+           let columns =
+             List.map
+               (fun (c : Row.column) ->
+                  if List.mem c.Row.name pk_cols
+                  then { c with Row.primary_key = true; not_null = true }
+                  else c)
+               m.columns
+           in
+           if columns = m.columns then acc else (name, { m with columns }) :: acc)
+      cache
+      []
+  in
+  List.iter (fun (name, m) -> Hashtbl.replace cache name m) normalized;
   (* #283: seed the sealed cache durably (no undo, this is open-time state).
      [put_table_durable] re-stamps each table's #174 page-header tag, replacing
      the old explicit [register_tag] iteration. *)

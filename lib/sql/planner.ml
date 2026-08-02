@@ -659,8 +659,18 @@ let table_rows_estimate (meta : Cat.table_meta) =
     and hence [not_null = false], so the composite-PK point lookup — precisely
     the #508/#516 shape this series exists for — fell out of the one-row class
     and lost its probe (201 rows examined against 2). #530 fixed the marking at
-    its source, every PK column is NOT NULL, and the exemption is gone: the PK
-    index now satisfies [all_not_null] on its own merits.
+    its source and the exemption is gone: the columns of a table-level PRIMARY
+    KEY are now DECLARED NOT NULL, so the PK index satisfies [all_not_null] on
+    its own merits. #533 made [Catalog.open_] re-derive those flags from the
+    implicit PK index on load, so a file written before #530 — whose stored
+    flags are all false — reaches the one-row class too, instead of silently
+    reverting the #513 StockLevel win on every pre-existing database.
+
+    {b [not_null] is a declaration, not an invariant.} Enforcement is bind-time
+    and literal-only, so [INSERT INTO t SELECT ...] can still land a NULL in a
+    column declared NOT NULL — including a PRIMARY KEY column. The estimate
+    survives that for the same reason the check is coarse in the first place:
+    see below.
 
     The residual exposure on a [`User] or [`Implicit_unique] index is smaller
     than it looks, because a key is only ever pinned by [col = value] and that
