@@ -86,6 +86,10 @@ type agg_proj_item =
   | AP_agg_slot of int
   (** project the [i]-th aggregate result from the aggregate output *)
   | AP_window_slot of int (** post-aggregate window function result *)
+  | AP_expr of bound_expr
+  (** #507: an arbitrary scalar expression over the aggregate output row.
+      Column indices address [group_cols @ aggs]; [BE_window_slot j] stands for
+      the j-th post-aggregate window function. *)
 
 (** A bound JOIN clause.
     Column ordinals in [on] are absolute within the combined

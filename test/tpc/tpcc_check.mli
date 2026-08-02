@@ -43,14 +43,13 @@
     must not rely on a different condition to notice its own subject
     disappearing.
 
-    {b #507} is a further, unrelated reason conditions 3 and 4 could not be
-    single queries in any case: granary's aggregation planner rejects any
-    [GROUP BY] projection item that is not a bare grouped column, a bare
-    aggregate call, or a window function, so both [MAX(x) - MIN(x)] and a
-    subquery beside a sum are rejected outright with "complex expression in
-    aggregated projection not supported". Fixing #507 does {e not} license a
-    revert to a single query: only the client-side join closes the zero-rows
-    hole.
+    {b #507} used to be a further, unrelated reason conditions 3 and 4 could
+    not be single queries: the aggregation planner rejected any [GROUP BY]
+    projection item that was not a bare grouped column, a bare aggregate call,
+    or a window function, so [MAX(x) - MIN(x)] was refused outright. It is
+    accepted now (a subquery beside an aggregate still is not), and that does
+    {e not} license a revert to a single query: only the client-side join
+    closes the zero-rows hole.
 
     Two empty groups are not the same thing, and the difference is decided
     per condition rather than by default:

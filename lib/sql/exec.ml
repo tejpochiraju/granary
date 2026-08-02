@@ -9708,6 +9708,10 @@ and aggregate_fast_path
       (List.for_all
          (function
            | Plan.PI_agg_slot _ -> true
+           (* #507: with no GROUP BY the aggregate output row IS the aggregate
+              value array, so an expression over it evaluates directly against
+              the accumulators — no need to give up the fast path for it. *)
+           | Plan.PI_expr _ -> true
            | _ -> false)
          proj)
   then Lwt.return None
@@ -9786,6 +9790,7 @@ and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs
                  (List.map
                     (function
                       | Plan.PI_agg_slot k -> agg_vals.(k)
+                      | Plan.PI_expr e -> eval_expr clock params agg_vals e
                       | Plan.PI_group_col _ | Plan.PI_window_slot _ ->
                         assert false (* excluded above *))
                     proj)
@@ -9869,7 +9874,10 @@ and stream_aggregate
                 (function
                   | Plan.PI_group_col i -> agg_row.(i)
                   | Plan.PI_agg_slot k -> agg_row.(n_group_cols + k)
-                  | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j))
+                  | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j)
+                  (* #507: window slots inside [e] were already rewritten to
+                     [n_agg_cols + j] by the planner. *)
+                  | Plan.PI_expr e -> eval_expr clock params agg_row e)
                 proj))
         with_windows
     in

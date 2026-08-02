@@ -162,6 +162,11 @@ type agg_proj_item =
   | AP_group_col of int (** index into group_cols list *)
   | AP_agg_slot of int
   | AP_window_slot of int (** post-aggregate window function result *)
+  | AP_expr of bound_expr
+  (** #507: an expression over the aggregate output row.  Column references
+      are indices into [group_cols @ aggs], and [BE_window_slot j] stands for
+      the j-th post-aggregate window function (resolved once the aggregate list
+      is final). *)
 
 (** A bound JOIN clause.  See sema.mli for layout details. *)
 type bound_join =
@@ -923,16 +928,31 @@ let agg_col_ord
 let bind_expr_agg
       ~param_counter
       ~named_params
+      ?(register : (agg_spec -> int) option)
+      ?(on_window :
+         (Ast.window_func
+          -> Ast.expr list
+          -> Ast.window_spec
+          -> (bound_expr, error) result)
+           option)
       ~(resolver : col_resolver)
       ~(offset : int)
       (e : Ast.expr)
   : (bound_expr * agg_spec list, error) result
   =
   let aggs = ref [] in
+  (* Returns the absolute index of the aggregate in the output row.  With
+     [register] the caller owns the aggregate list (#507: the projection shares
+     one list across all its items, and a window function bound mid-expression
+     may append to it too), so [offset] applies to the caller's index and the
+     local list stays empty. *)
   let add_agg spec =
-    let idx = List.length !aggs in
-    aggs := !aggs @ [ spec ];
-    idx
+    match register with
+    | Some f -> f spec
+    | None ->
+      let idx = offset + List.length !aggs in
+      aggs := !aggs @ [ spec ];
+      idx
   in
   let rec go = function
     | Ast.E_lit l -> Ok (BE_lit l)
@@ -999,9 +1019,7 @@ let bind_expr_agg
     | Ast.E_agg (func, arg_opt) ->
       (match agg_col_ord ~resolver func arg_opt with
        | Error e -> Error e
-       | Ok col_ord ->
-         let slot = add_agg { func; col_ord } in
-         Ok (BE_col (offset + slot)))
+       | Ok col_ord -> Ok (BE_col (add_agg { func; col_ord })))
     | Ast.E_func (func, args) -> bind_func ~bind:go func args
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
@@ -1017,8 +1035,11 @@ let bind_expr_agg
       (match go e with
        | Ok be -> Ok (BE_collate (be, c))
        | Error e -> Error e)
-    | Ast.E_window _ ->
-      Error (Unsupported "window functions not yet supported in aggregate context")
+    | Ast.E_window { func; args; window } ->
+      (match on_window with
+       | Some f -> f func args window
+       | None ->
+         Error (Unsupported "window functions not yet supported in aggregate context"))
     | Ast.E_fts_snippet _ ->
       Error (Unsupported "snippet() is only supported in FTS SELECT projection")
   in
@@ -1655,6 +1676,13 @@ let bind_upsert_rhs_expr
   | other -> bind_expr ~param_counter ~named_params meta other
 ;;
 
+(* #547: DO UPDATE SET is an UPDATE of an existing row, so it enforces the same
+   static NOT NULL check as [bind_update_assignments] — without it a literal
+   NULL reached a NOT NULL column, and since #530 that includes every PRIMARY
+   KEY column, leaving a row the table's own rendered DDL would refuse to
+   restore.  Enforcement is literal-only in both binders (a NULL arriving via a
+   subquery or a parameter is not caught here); the two paths are deliberately
+   identical, including in what they miss. *)
 let bind_upsert_assignments
       ~param_counter
       ~named_params
@@ -1669,9 +1697,13 @@ let bind_upsert_assignments
          (match col_index meta.columns col_name with
           | None -> Error (Unknown_column { table = meta.name; column = col_name })
           | Some i ->
-            (match bind_upsert_rhs_expr ~param_counter ~named_params meta rhs_expr with
-             | Error e -> Error e
-             | Ok be -> Ok (bound_list @ [ i, be ]))))
+            let col = List.nth meta.columns i in
+            if col.Row.not_null && rhs_expr = Ast.E_lit Ast.L_null
+            then Error (Not_null_violation col.Row.name)
+            else (
+              match bind_upsert_rhs_expr ~param_counter ~named_params meta rhs_expr with
+              | Error e -> Error e
+              | Ok be -> Ok (bound_list @ [ i, be ]))))
     (Ok [])
     assigns
 ;;
@@ -2553,8 +2585,91 @@ let project_agg
        Ok (AP_agg_slot slot))
 ;;
 
+(* #507: bind an aggregated projection item that is neither a bare grouped
+   column, a bare aggregate, nor a bare window function — any scalar expression
+   over those.  Uses the same binder and the same resolver discipline as
+   HAVING, so the two agree on what a legal leaf is: a grouped column, an
+   aggregate call, a window function, a literal, or a parameter.  A bare
+   ungrouped column is refused wherever it appears, since a group has no single
+   value for it.  Aggregates found here are appended to the projection's shared
+   [acc_aggs] (via [add_agg]) as they are met, which is also what keeps a window
+   function's own aggregate arguments in the right slots. *)
+let project_agg_expr
+      ~param_counter
+      ~named_params
+      ~(tables : (Cat.table_meta * int * string option) list)
+      ~meta
+      ~group_cols
+      ~offset_for_aggs
+      ~add_agg
+      ~acc_aggs
+      ~agg_windows_queue
+      (e : Ast.expr)
+  : (agg_proj_item, error) result
+  =
+  let grouped_only lookup describe name =
+    match lookup name with
+    | Error e -> Error e
+    | Ok i ->
+      (match select_find_pos group_cols i with
+       | Some pos -> Ok pos
+       | None ->
+         Error
+           (Unsupported
+              (Printf.sprintf
+                 "column '%s' must appear in GROUP BY clause"
+                 (describe name))))
+  in
+  let resolver =
+    { resolve_unqual =
+        (fun name -> grouped_only (select_proj_lookup ~tables ~meta) Fun.id name)
+    ; resolve_qual =
+        (fun t c ->
+          grouped_only
+            (fun (t, c) -> (select_qual_lookup ~tables) t c)
+            (fun (t, c) -> t ^ "." ^ c)
+            (t, c))
+    ; (* Inside an aggregate's arguments any table column is legal, exactly as
+         in HAVING — that is what the aggregate consumes. *)
+      resolve_agg_arg = select_proj_lookup ~tables ~meta
+    ; resolve_agg_arg_qual = select_qual_lookup ~tables
+    }
+  in
+  let on_window func args window =
+    match
+      project_window
+        ~tables
+        ~meta
+        ~group_cols
+        ~offset_for_aggs
+        ~acc_aggs
+        ~agg_windows_queue
+        func
+        args
+        window
+    with
+    | Error e -> Error e
+    | Ok (AP_window_slot slot) -> Ok (BE_window_slot slot)
+    | Ok _ -> Error (Unsupported "unexpected window binding in aggregated projection")
+  in
+  match
+    bind_expr_agg
+      ~param_counter
+      ~named_params
+      ~register:(fun spec -> offset_for_aggs + add_agg spec)
+      ~on_window
+      ~resolver
+      ~offset:offset_for_aggs
+      e
+  with
+  | Error e -> Error e
+  | Ok (be, _) -> Ok (AP_expr be)
+;;
+
 (* Bind one explicit projection item of an aggregated SELECT. *)
 let project_agg_item
+      ~param_counter
+      ~named_params
       ~(tables : (Cat.table_meta * int * string option) list)
       ~meta
       ~group_cols
@@ -2599,12 +2714,25 @@ let project_agg_item
       func
       args
       window
-  | _ -> Error (Unsupported "complex expression in aggregated projection not supported")
+  | other ->
+    project_agg_expr
+      ~param_counter
+      ~named_params
+      ~tables
+      ~meta
+      ~group_cols
+      ~offset_for_aggs
+      ~add_agg
+      ~acc_aggs
+      ~agg_windows_queue
+      other
 ;;
 
 (* Bind the projection of an aggregated SELECT: builds agg_proj items,
    aggregate specs, and post-aggregate window functions. *)
 let bind_aggregated_proj
+      ~param_counter
+      ~named_params
       ~(tables : (Cat.table_meta * int * string option) list)
       ~(meta : Cat.table_meta)
       ~group_cols
@@ -2637,6 +2765,8 @@ let bind_aggregated_proj
            | Ok items ->
              (match
                 project_agg_item
+                  ~param_counter
+                  ~named_params
                   ~tables
                   ~meta
                   ~group_cols
@@ -2839,7 +2969,15 @@ let bind_select_resolved
     if not is_aggregated
     then bind_unaggregated_proj ~param_counter ~named_params ~tables ~meta proj
     else
-      bind_aggregated_proj ~tables ~meta ~group_cols ~offset_for_aggs ~is_aggregated proj
+      bind_aggregated_proj
+        ~param_counter
+        ~named_params
+        ~tables
+        ~meta
+        ~group_cols
+        ~offset_for_aggs
+        ~is_aggregated
+        proj
   in
   let$ proj_ords, agg_proj_items, proj_aggs, proj_exprs, proj_windows, agg_wins =
     proj_result

@@ -870,6 +870,7 @@ let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
   | Sema.AP_group_col i -> Plan.PI_group_col i
   | Sema.AP_agg_slot i -> Plan.PI_agg_slot i
   | Sema.AP_window_slot i -> Plan.PI_window_slot i
+  | Sema.AP_expr e -> Plan.PI_expr (plan_expr e)
 ;;
 
 let plan_window_item (ws : Sema.window_sema) : Plan.window_plan_item =
@@ -921,6 +922,22 @@ let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
   | Plan.P_collate (e, c) -> Plan.P_collate (go e, c)
   | e' -> e'
+;;
+
+(* #507: an aggregated projection item may be an expression over the aggregate
+   output row.  A window function inside such an expression is bound to a slot
+   number, which only becomes a column index once the aggregate list is final —
+   the window results sit after [group_cols @ aggs] in the row the executor
+   builds.  Hence the substitution belongs here rather than in [Sema], which
+   binds the projection before HAVING has contributed its own aggregates. *)
+let plan_agg_proj ~group_by ~aggs agg_proj =
+  let n_input_cols = List.length group_by + List.length aggs in
+  List.map
+    (fun item ->
+       match sema_agg_proj_to_plan item with
+       | Plan.PI_expr e -> Plan.PI_expr (substitute_window_slots ~n_input_cols e)
+       | other -> other)
+    agg_proj
 ;;
 
 (* Wrap [child] in a filter for the conjuncts an access path did not consume. *)
@@ -1063,7 +1080,7 @@ let plan_projection
       ; group_cols = group_by
       ; aggs = List.map sema_agg_to_plan aggs
       ; having = Option.map plan_expr having
-      ; proj = List.map sema_agg_proj_to_plan agg_proj
+      ; proj = plan_agg_proj ~group_by ~aggs agg_proj
       ; windows = List.map plan_window_item agg_windows
       }
   else if expr_proj <> []
