@@ -46,8 +46,27 @@
     window: 1.70 <= 1.15" on an 8-core host running several suites at once;
     reproduced here as the secondary gate at 1.19x against a 1.20x floor).
     Unlike [test_fts_scaling] (#537) the timed region is NOT too short — the
-    writer phase is ~1.5 s by construction — so the fix is the other half of
-    that treatment: a BEST-OF-N over whole trials.  See [measure].
+    writer phase is ~1.5 s by construction — so the first half of the fix is
+    the other half of that treatment: a BEST-OF-N over whole trials.
+
+    Best-of-N alone is NOT enough here, and finding out why located the actual
+    root cause (#538).  Reproduced under a parallel [dune test] at load
+    average 13: [calibrate_read_ops] chose read_ops=22639 targeting
+    T_r = 0.45 x T_w = 0.68 s, and the measured reader phase came out 4.4-6.4 s
+    against a 1.5 s writer — a 6-9x overshoot, so ALL THREE trials failed
+    identically at overlap 2.04.  The calibration probes run with no writer and
+    take the MINIMUM of three, i.e. the most optimistic per-op cost available;
+    if they happen to land in an idle window while the measurement then runs
+    under load, the workload is oversized and every subsequent trial inherits
+    it.  Erring low on per-op cost errs HIGH on the workload, which is the one
+    direction [calibrate_read_ops] documents as unsafe.
+
+    So the second half of the fix closes the loop: a trial whose readers
+    overran the writer window rescales read_ops by the observed overshoot and
+    restarts the statistic (durations from different workloads are not
+    comparable).  That is measurement feedback rather than a better guess, and
+    it converges in one step because T_r is ~linear in read_ops.  See
+    [measure].
 
     {b Where these gates actually run armed.}  Every automated job that
     invokes [dune runtest] sets [GRANARY_BENCH_MIN_SPEEDUP=0], which
@@ -602,7 +621,7 @@ let test_fsync_overlap () =
      configs deliberately share one calibration: per-op cost differs between
      them (shared-tid pays writer CoW eviction), and holding read_ops fixed
      is what makes the two speedups comparable. *)
-  let trial label t =
+  let trial label t ~read_ops ~read_ops_src =
     let base = run_config ~delay ~n_seed `Baseline ~n_commits ~n_readers ~read_ops in
     let par = run_config ~delay ~n_seed `Parallel ~n_commits ~n_readers ~read_ops in
     Printf.printf
@@ -631,21 +650,80 @@ let test_fsync_overlap () =
     cleanup path;
     base, par
   in
-  (* Best-of-N over whole trials (#538).  Both gates are wall-clock ratios and
-     both were single-shot; on a co-scheduled box a reader fiber that loses the
-     CPU for one scheduling quantum lands directly on the verdict.  The loop
-     stops as soon as the aggregate passes, so an unloaded host still pays for
-     exactly one trial (~4 s per config) and only a noisy one pays more. *)
+  (* Best-of-N over whole trials, with read_ops feedback (#538).
+
+     Both gates are wall-clock ratios and both were single-shot; on a
+     co-scheduled box a reader fiber that loses the CPU for one scheduling
+     quantum lands directly on the verdict.  The loop stops as soon as the
+     aggregate passes, so an unloaded host still pays for exactly one trial
+     (~4 s per config) and only a noisy one pays more.
+
+     Retries also RESIZE the reader workload when a trial's readers overran
+     the writer window, because that is the failure mode that repeating alone
+     cannot fix: [calibrate_read_ops] probes once, without a writer, and takes
+     the fastest probe, so a calibration that landed in an idle window
+     oversizes read_ops for every later trial (measured: target T_r 0.68 s,
+     actual 4.4-6.4 s, all three trials failing identically).  T_r is ~linear
+     in read_ops, so scaling by [overlap_target / observed] converges in one
+     step.  The accumulator is reset on a resize: minima taken across two
+     different workloads would not describe either.
+
+     {b The resize is deliberately bounded, and this is the load-bearing part.}
+     Shrinking the reader workload moves the primary gate's own metric, so an
+     unbounded loop would walk a REAL serialisation regression down to passing:
+     serialised readers show ratio 1 + T_r/T_w, and driving T_r towards zero
+     drives that towards 1.0, which is under the 1.15 gate.  Two bounds keep
+     that out of reach — at most ONE resize per config, and a trigger chosen so
+     that the resize is safe by construction rather than by a fudge factor:
+
+     Under the serialised model the observed ratio is [1 + r] with
+     [r = T_r / T_w], so scaling the workload by [f] leaves [1 + f * (obs - 1)].
+     The resize picks [f = overlap_target / obs], which gives
+     [1.5 - 0.5 / obs] — increasing in [obs], so its worst case is exactly at
+     the trigger.  Requiring that worst case to stay above the 1.15 gate gives
+     [obs >= 1.667]; [resize_trigger] is 1.7, for which a serialised run lands
+     at 1.21 and still fails.  A well-calibrated regression never triggers a
+     resize at all: at the ~0.45 target ratio it shows 1.45.
+
+     That derivation is why there is no arbitrary floor on the resized count.
+     An earlier draft clamped it at a quarter of the calibrated workload, which
+     bought the same safety but could not correct a large blowout (a forced
+     8.5x overshoot resized to the clamp and still failed).  With the trigger
+     doing the work, an arbitrarily oversized calibration is corrected in one
+     step and a serialised one still fails. *)
+  let overlap_target = 0.5 in
+  let resize_trigger = 1.7 in
   let measure label =
     (* Neutralized runs take exactly one trial: nothing is asserted, so extra
        trials would only burn time. *)
     let budget = if min_speedup <= 0.0 then 1 else trials in
-    let rec loop t acc =
-      let base, par = trial label t in
+    let rec loop t ~read_ops ~read_ops_src ~resized acc =
+      let base, par = trial label t ~read_ops ~read_ops_src in
       let acc = agg_add acc ~base ~par in
-      if t >= budget || gates_pass acc ~min_speedup then t, acc else loop (t + 1) acc
+      let observed = par.reader_phase /. par.writer_phase in
+      if t >= budget || gates_pass acc ~min_speedup
+      then t, acc
+      else if resized || observed <= resize_trigger
+      then loop (t + 1) ~read_ops ~read_ops_src ~resized acc
+      else (
+        (* Oversized workload rather than bad luck — shrink it once, floored,
+           and restart the statistic.  See the header for why the bounds
+           matter. *)
+        let scaled =
+          max 1 (int_of_float (float_of_int read_ops *. overlap_target /. observed))
+        in
+        Printf.printf
+          "  [%s] readers overran the writer window (%.2f > %.2f); calibration was \
+           oversized — resizing read_ops %d -> %d and restarting the statistic\n\
+           %!"
+          label
+          observed
+          resize_trigger
+          read_ops
+          scaled;
+        loop (t + 1) ~read_ops:scaled ~read_ops_src:"resized" ~resized:true agg_empty)
     in
-    let n_trials, a = loop 1 agg_empty in
+    let n_trials, a = loop 1 ~read_ops ~read_ops_src ~resized:false agg_empty in
     Printf.printf
       "  [%s] best-of-%d (min per phase): baseline=%.3fs parallel=%.3fs \
        writer_done=%.3fs reader_done=%.3fs overlap=%.2f (gate %.2f) speedup=%.2fx (gate \
