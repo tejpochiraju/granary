@@ -2222,24 +2222,66 @@ let not_null_exempt_col (col : Row.column) : bool =
    The message matches SQLite's ("NOT NULL constraint failed: t.c") and the
    wording already used by [eval_check_constraints] / the UNIQUE paths; it
    surfaces to callers as [Db.Runtime]. *)
-let enforce_not_null (table_meta : Cat.table_meta) (row : Row.t) : unit =
+(* #599: the check itself, decoupled from the raise.  [INSERT OR IGNORE] has to
+   ask "does this row violate NOT NULL?" and then *skip* rather than fail, so
+   the predicate is separated from the policy.  Only the INSERT call site is
+   allowed to soften it — see [execute_insert_write]; the UPDATE site keeps
+   [enforce_not_null] because UPDATE has no [OR IGNORE] form to consult.
+
+   Returns the message for the FIRST violating column, matching the column
+   order the raising version reported. *)
+let not_null_violation (table_meta : Cat.table_meta) (row : Row.t) : string option =
   let n = Array.length row in
-  List.iteri
-    (fun i (col : Row.column) ->
-       let violated =
-         col.Row.not_null
-         && (not (not_null_exempt_col col))
-         && i < n
-         && row.(i) = Row.V_null
-       in
-       if violated
-       then
-         failwith
-           (Printf.sprintf
-              "NOT NULL constraint failed: %s.%s"
-              table_meta.Cat.name
-              col.Row.name))
-    table_meta.Cat.columns
+  let rec go i = function
+    | [] -> None
+    | (col : Row.column) :: rest ->
+      let violated =
+        col.Row.not_null
+        && (not (not_null_exempt_col col))
+        && i < n
+        && row.(i) = Row.V_null
+      in
+      if violated
+      then
+        Some
+          (Printf.sprintf
+             "NOT NULL constraint failed: %s.%s"
+             table_meta.Cat.name
+             col.Row.name)
+      else go (i + 1) rest
+  in
+  go 0 table_meta.Cat.columns
+;;
+
+let enforce_not_null (table_meta : Cat.table_meta) (row : Row.t) : unit =
+  match not_null_violation table_meta row with
+  | None -> ()
+  | Some msg -> failwith msg
+;;
+
+(* #599: NOT NULL under a conflict-resolution modifier.  [OR IGNORE] means
+   "skip rows that violate a constraint" and NOT NULL is a constraint, so it
+   skips here exactly as it already did for UNIQUE — returning [true] for
+   "skip this row".  Every other resolution raises:
+
+   - [OR ABORT] / [OR FAIL] / [OR ROLLBACK] and the bare INSERT all raise on a
+     UNIQUE violation too ([check_insert_unique]'s catch-all), so raising here
+     keeps the two constraint kinds in step.
+   - [OR REPLACE] raises, and that is a deliberate divergence from SQLite,
+     which substitutes the column's DEFAULT for the NULL and only aborts when
+     there is none.  REPLACE here means "delete the row this one conflicts
+     with"; there is no conflicting row for a NULL, and silently rewriting a
+     caller's value is a bigger surprise than the error.  Pinned in
+     [test_not_null_599.ml]. *)
+let not_null_skip_or_fail
+      (table_meta : Cat.table_meta)
+      (row : Row.t)
+      ~(on_conflict : Ast.conflict_action option)
+  : bool
+  =
+  match not_null_violation table_meta row with
+  | None -> false
+  | Some msg -> if on_conflict = Some Ast.CA_ignore then true else failwith msg
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3845,20 +3887,25 @@ let execute_insert_write
       ~after_hook
   : bool Lwt.t
   =
-  if skip
+  (* #567: the rowid-alias column has just been written back by [insert_rowid],
+     so by now the row is exactly what will be encoded — check it before any
+     REPLACE deletes or index writes happen.  #599: under [OR IGNORE] the
+     violation skips the row instead of raising, which is what the same
+     modifier already did for a UNIQUE conflict; every other resolution
+     raises.  Not evaluated when [skip] is already set: that only happens under
+     [CA_ignore], which would answer the same way. *)
+  let null_skip = (not skip) && not_null_skip_or_fail table_meta row ~on_conflict in
+  if skip || null_skip
   then
     (* IGNORE from secondary-index pre-check: rollback if owned.
        [on_conflict = CA_ignore] means [check_insert_unique] set [skip=true]
        and never populated [to_delete], so the else-branch (including
        [delete_replace_conflicts]) is unreachable — no hooks have fired and no
-       B-tree deletes have been made, so [S.rollback] is safe. *)
+       B-tree deletes have been made, so [S.rollback] is safe.  The same holds
+       for [null_skip], which is decided before any write. *)
     let* () = if owned then S.rollback tx else Lwt.return_unit in
     Lwt.return false
-  else (
-    (* #567: the rowid-alias column has just been written back by
-       [insert_rowid], so by now the row is exactly what will be encoded —
-       check it before any REPLACE deletes or index writes happen. *)
-    enforce_not_null table_meta row;
+  else
     let* displaced_rows =
       delete_replace_conflicts
         tx
@@ -4010,7 +4057,7 @@ let execute_insert_write
            ~on_upsert_update
        | _ ->
          Lwt.fail_with
-           (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name)))
+           (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name))
 ;;
 
 (* Build the row to insert: use [prebuilt_row] if given, else evaluate each
@@ -7435,7 +7482,7 @@ let execute_with_count
       in
       Lwt.return 0
   | Plan.Op_insert
-      { table_meta; ordinals; values; on_conflict = _; returning = _; upsert_update = _ }
+      { table_meta; ordinals; values; on_conflict; returning = _; upsert_update = _ }
     when Cat.is_columnar table_meta ->
     let* tx, owned = acquire_txn store mode in
     Lwt.catch
@@ -7443,7 +7490,7 @@ let execute_with_count
          let col_store = col_store_of_meta table_meta in
          let n_cols = List.length table_meta.Cat.columns in
          let rows =
-           List.map
+           List.filter_map
              (fun vals ->
                 let row = Array.make n_cols Row.V_null in
                 List.iter2
@@ -7455,15 +7502,18 @@ let execute_with_count
                    it needs the same check the row-store path gets before its
                    encode.  Without it the bound-parameter spelling the issue
                    calls out as the one that matters in practice wrote NULL
-                   into a NOT NULL column here. *)
-                enforce_not_null table_meta row;
-                row)
+                   into a NOT NULL column here.  #599: [OR IGNORE] drops the
+                   offending row here too, so the modifier means the same thing
+                   on both storage engines. *)
+                if not_null_skip_or_fail table_meta row ~on_conflict
+                then None
+                else Some row)
              values
          in
          Granary_columnar.Col_store.insert_rows col_store (Array.of_list rows);
          let* () = release_txn ~cat tx owned in
-         if values <> [] then mark_dirty table_meta.Cat.name;
-         Lwt.return (List.length values))
+         if rows <> [] then mark_dirty table_meta.Cat.name;
+         Lwt.return (List.length rows))
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.fail exn)
@@ -7486,7 +7536,7 @@ let execute_with_count
       ~values
       ~on_conflict
       ~upsert_update
-  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict = _ }
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict }
     when Cat.is_columnar table_meta ->
     let col_store = col_store_of_meta table_meta in
     let n_cols = List.length table_meta.Cat.columns in
@@ -7494,15 +7544,17 @@ let execute_with_count
     let* src_rows = Lwt_stream.to_list stream in
     let batch =
       Array.of_list
-        (List.map
+        (List.filter_map
            (fun src_row ->
               let dest = Array.make n_cols Row.V_null in
               List.iteri (fun i ord -> dest.(ord) <- src_row.(i)) ordinals;
               (* #567: same as the columnar VALUES path above — no encode, so
                  the check has to be here.  Raised before the txn is acquired,
-                 so nothing has been written when it fires. *)
-              enforce_not_null table_meta dest;
-              dest)
+                 so nothing has been written when it fires.  #599: under
+                 [OR IGNORE] the row is dropped instead. *)
+              if not_null_skip_or_fail table_meta dest ~on_conflict
+              then None
+              else Some dest)
            src_rows)
     in
     let* tx, owned = acquire_txn store mode in
@@ -10595,7 +10647,7 @@ and not_null_scan_cols (meta : Cat.table_meta) : (int * string) list =
    hand back — the store exposes no delete — so the victim list is empty and
    only the count is reported.  [not_null_repair] refuses such a table rather
    than reporting a repair it did not perform. *)
-and not_null_scan_columnar (meta : Cat.table_meta) (cols : (int * string) list) =
+and not_null_count_columnar (meta : Cat.table_meta) (cols : (int * string) list) =
   let cs = col_store_of_meta meta in
   let counts = List.map (fun (i, name) -> i, name, ref 0) cols in
   Seq.iter
@@ -10604,15 +10656,69 @@ and not_null_scan_columnar (meta : Cat.table_meta) (cols : (int * string) list) 
          (fun (i, _, n) -> if i < Array.length row && row.(i) = Row.V_null then incr n)
          counts)
     (Granary_columnar.Col_store.to_row_seq cs);
-  List.filter_map
-    (fun (_i, name, n) -> if !n = 0 then None else Some (name, !n, []))
-    counts
+  List.filter_map (fun (_i, name, n) -> if !n = 0 then None else Some (name, !n)) counts
+
+(* #600: the counting half of the scan, which is all [PRAGMA not_null_check]
+   ever needs — it emits (table, column, count) and nothing else.
+
+   [not_null_scan_table] below retains every violating row so the repair can
+   delete it, and the shape this command exists for is a legacy file whose
+   declared-NOT NULL column is wholly NULL: retaining there costs O(table)
+   resident memory in the one command an operator runs FIRST, on a database
+   whose scope of damage is still unknown.  Being OOM-killed while surveying
+   the damage is the worst possible moment for it, so the report path counts
+   each row and drops it.  The columnstore arm always worked this way; this is
+   the row-store arm catching up.
+
+   It scans through [S.seek_ge]/[S.seek_next] rather than [S.cursor_open],
+   which is the other half of the same problem: [cursor_open] drains the whole
+   tree into a list up front (the #228/#229 finding), so retaining nothing
+   downstream of it would still have left the report O(table).  [seek_ge] from
+   the empty key positions before the first entry in O(log n) and yields one
+   [(key, value)] at a time. *)
+and not_null_count_table : type m. m S.txn -> Cat.table_meta -> (string * int) list Lwt.t =
+  fun tx meta ->
+  let cols = not_null_scan_cols meta in
+  if cols = []
+  then Lwt.return []
+  else (
+    match meta.Cat.storage with
+    | Cat.Columnar _ -> Lwt.return (not_null_count_columnar meta cols)
+    | Cat.Row { tree_id; _ } ->
+      let counters = List.map (fun (i, name) -> i, name, ref 0) cols in
+      let note row (i, _, n) =
+        if i < Array.length row && row.(i) = Row.V_null then incr n
+      in
+      let* cur = S.seek_ge tx tree_id Bytes.empty in
+      let rec go () =
+        let* nxt = S.seek_next cur in
+        match nxt with
+        | None -> Lwt.return_unit
+        | Some (_k, v) ->
+          let row = Row.decode meta.Cat.columns v in
+          List.iter (note row) counters;
+          go ()
+      in
+      let* () = go () in
+      S.seek_close cur;
+      Lwt.return
+        (List.filter_map
+           (fun (_i, name, n) -> if !n = 0 then None else Some (name, !n))
+           counters))
 
 (* #563: scan one table for stored NULLs in a declared-NOT NULL column.
    Returns one entry per VIOLATING column: its name, how many rows violate it,
    and — for a row-store table — those rows with their rowids, which is what
    the repair deletes.  Columns with no violation are dropped, so an empty
-   result means the table honours its own schema. *)
+   result means the table honours its own schema.
+
+   #600: this is the REPAIR path only; the report uses [not_null_count_table],
+   which retains nothing.  The retention here is deliberate and must stay —
+   #541 found that fetching in index-key order costs up to a page read per row
+   once the table outgrows the pager cache, so the candidate rowids have to be
+   collected and sorted before they are fetched.  The bound on this buffer is
+   one TABLE's violations (see [stream_pragma_not_null_repair]), not the whole
+   database's. *)
 and not_null_scan_table
   : type m. m S.txn -> Cat.table_meta -> (string * int * (int64 * Row.t) list) list Lwt.t
   =
@@ -10622,7 +10728,8 @@ and not_null_scan_table
   then Lwt.return []
   else (
     match meta.Cat.storage with
-    | Cat.Columnar _ -> Lwt.return (not_null_scan_columnar meta cols)
+    | Cat.Columnar _ ->
+      Lwt.return (List.map (fun (n, c) -> n, c, []) (not_null_count_columnar meta cols))
     | Cat.Row { tree_id; _ } ->
       let buckets = List.map (fun (i, name) -> i, name, ref []) cols in
       let* cur = S.cursor_open tx tree_id in
@@ -10656,7 +10763,7 @@ and not_null_scan_table
    the difference is precisely what the operator has to see. *)
 and not_null_report_rows (meta : Cat.table_meta) ~counted found =
   List.map
-    (fun (name, n, _) ->
+    (fun (name, n) ->
        [| Row.V_text meta.Cat.name
         ; Row.V_text name
         ; Row.V_int (Int64.of_int (counted n))
@@ -10685,7 +10792,9 @@ and stream_pragma_not_null_check store mode cat =
     let* per_table =
       Lwt_list.map_s
         (fun (meta : Cat.table_meta) ->
-           let* found = not_null_scan_table tx meta in
+           (* #600: counts only — the report never looks at a violating row, so
+              it must not hold one. *)
+           let* found = not_null_count_table tx meta in
            Lwt.return (not_null_report_rows meta ~counted:Fun.id found))
         tables
     in
@@ -10713,17 +10822,18 @@ and stream_pragma_not_null_repair store mode cat =
   let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-       let* scans =
+       (* #600: scan and repair one table at a time.  Scanning every table
+          first made the peak victim buffer the SUM over the whole database
+          rather than the largest single table; nothing needed the earlier
+          scans once their table was repaired.  Interleaving also makes the
+          reported counts truer: a repair whose ON DELETE CASCADE removes rows
+          from a later table no longer reports them as separately found. *)
+       let* per_table =
          Lwt_list.map_s
            (fun (meta : Cat.table_meta) ->
               let* found = not_null_scan_table tx meta in
-              Lwt.return (meta, found))
+              repair_not_null_table tx cat_val meta found)
            tables
-       in
-       let* per_table =
-         Lwt_list.map_s
-           (fun (meta, found) -> repair_not_null_table tx cat_val meta found)
-           scans
        in
        let* () = release_txn ~cat:cat_val tx owned in
        Lwt.return (Lwt_stream.of_list (List.concat per_table)))
@@ -10755,10 +10865,11 @@ and stream_pragma_not_null_repair store mode cat =
    the [Db.query_impl] guard, and closing it should turn this branch back into
    a raise. *)
 and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) found =
+  let counts = List.map (fun (name, n, _) -> name, n) found in
   if found = []
   then Lwt.return []
   else if Cat.is_columnar meta
-  then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) found)
+  then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) counts)
   else (
     let indexes = Cat.indexes_for_table cat_val ~table:meta.Cat.name in
     let* child_refs =
@@ -10789,7 +10900,7 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) found =
         victims
     in
     mark_dirty meta.Cat.name;
-    Lwt.return (not_null_report_rows meta ~counted:Fun.id found))
+    Lwt.return (not_null_report_rows meta ~counted:Fun.id counts))
 
 and stream_sqlite_master store cat =
   let cat_val =

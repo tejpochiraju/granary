@@ -1823,13 +1823,22 @@ let bind_explicit_insert_cols
 
 (* Bind a single VALUES row: returns (ordinals, full_vals) covering every
    table column, applying DEFAULT/NULL for omitted columns and enforcing
-   arity and NOT NULL rules. *)
+   arity and NOT NULL rules.
+
+   #599: [on_conflict] is consulted by the NOT NULL check below.  Without it
+   this binder was the reason `OR IGNORE` behaved differently for the two
+   spellings of the same NULL: a bound parameter was skipped by the runtime
+   check, while a LITERAL NULL was rejected here — and rejected for the whole
+   statement, so `INSERT OR IGNORE INTO t VALUES (1,10),(2,NULL),(3,30)` lost
+   all three rows rather than skipping one.  That is worse than the defect
+   #599 opens with, and it is the most obvious spelling. *)
 let bind_insert_row
       ~param_counter
       ~named_params
       ~(meta : Cat.table_meta)
       ~table
       ~columns
+      ~(on_conflict : Ast.conflict_action option)
       row_vals
   =
   let n_cols = List.length columns in
@@ -1866,8 +1875,16 @@ let bind_insert_row
       (* NOT NULL enforcement (params checked at runtime, not here).
          #243 (T1): the INTEGER PRIMARY KEY rowid-alias column is exempt — a
          NULL/omitted value is auto-assigned the next rowid by [insert_rowid],
-         so it can never be stored NULL (SQLite parity). *)
+         so it can never be stored NULL (SQLite parity).
+
+         #599: under [OR IGNORE] the row is not rejected — it is bound as it
+         stands and left for [Exec.not_null_skip_or_fail] to skip at write
+         time, which is where the parameter spelling is already skipped.  Only
+         ONE place decides what `OR IGNORE` means, and it is the runtime one;
+         this binder just stops pre-empting it.  Every other resolution keeps
+         the static error, which stays the earlier and better-located one. *)
       let alias_col = Cat.rowid_alias_col meta in
+      let ignore_nulls = on_conflict = Some Ast.CA_ignore in
       let nn_result =
         List.fold_left
           (fun acc (i, bexpr) ->
@@ -1876,7 +1893,8 @@ let bind_insert_row
              | Ok () ->
                let col = List.nth meta.columns i in
                (match bexpr with
-                | BE_lit Ast.L_null when col.Row.not_null && Some i <> alias_col ->
+                | BE_lit Ast.L_null
+                  when (not ignore_nulls) && col.Row.not_null && Some i <> alias_col ->
                   Error (Not_null_violation col.Row.name)
                 | _ -> Ok ()))
           (Ok ())
@@ -1961,7 +1979,14 @@ let bind_insert
            | Error e -> Error e
            | Ok bound_rows ->
              (match
-                bind_insert_row ~param_counter ~named_params ~meta ~table ~columns row
+                bind_insert_row
+                  ~param_counter
+                  ~named_params
+                  ~meta
+                  ~table
+                  ~columns
+                  ~on_conflict
+                  row
               with
               | Error e -> Error e
               | Ok (ords, vals) -> Ok (bound_rows @ [ ords, vals ])))

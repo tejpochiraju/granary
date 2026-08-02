@@ -83,6 +83,24 @@ O(n²) bulk insert, a lost reader/writer overlap:
 | `bench_wal_reader_scaling` | #149 parallel-read regression | parallel ≤ 2.0x serial | `GRANARY_BENCH_PARALLEL_MAX` |
 | `bench_slow_read_yield` | reader starving the writer | writer ≤ 3.0 s | `GRANARY_BENCH_MAX_WRITER_S` |
 
+One gate is **not** wall-clock and therefore **not** neutralized anywhere:
+
+| test | guards | gate | knob |
+|---|---|---|---|
+| `test_not_null_600` | #600 `PRAGMA not_null_check` retaining every violating row | marginal peak live heap < 4 words/row when the table doubles | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
+
+It measures *allocation* (peak live major-heap words, sampled through a `Gc`
+alarm), so a loaded runner does not move it — ±0.02% across runs, which no
+wall-clock gate manages. That is why it runs armed in `ci.yml`, `coverage.yml`
+and `cross-arch.yml` alongside the ones those jobs disarm. What load cannot
+change, a different allocator or word size can, and `cross-arch.yml`'s arm64
+arm has never run it, so `GRANARY_MEM_MAX_WORDS_PER_ROW` exists as the escape
+hatch — it raises the ceiling without disabling the correctness assertions the
+same test makes. Reach for it only after ruling out the thing it guards: the
+measured slopes are ≈20-23 words/row retaining (19.61-23.52 across three runs;
+the 40 000-row point is the noisy one) and 1.6-1.9 counting, so a failure
+anywhere between those two bands is a regression, not a platform difference.
+
 **Where they run armed.** `ci.yml`, `coverage.yml` and `cross-arch.yml` — all
 six files, Forgejo and GitHub — neutralize every one of them, because those
 jobs share a loaded runner with every other PR. The single *scheduled* job that
@@ -295,6 +313,47 @@ EOF
   #579. There are four independent value comparators in the tree
   (`compare_values`, `cmp_result`, `row_key`'s string rendering, and
   `Reactive_view.value_compare`) and they do not all agree.
+
+- **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
+  A conflict-resolution modifier means the same thing for NOT NULL as it does
+  for UNIQUE. `OR IGNORE` skips the offending row — consistent with the UNIQUE
+  path, with the modifier's own meaning, and (incidentally, not decisively)
+  with SQLite. Every other resolution raises: bare, `OR ABORT`, `OR FAIL`,
+  `OR ROLLBACK` and `OR REPLACE`.
+
+  **`OR REPLACE` is the divergence.** SQLite substitutes the column's DEFAULT
+  for the NULL and aborts only when the column has none — oracle-checked:
+  `INSERT OR REPLACE INTO d VALUES (2, NULL)` on `v INTEGER NOT NULL DEFAULT 42`
+  stores `2|42`. Granary raises even when a DEFAULT exists. `REPLACE` here
+  means "delete the row this one conflicts with", and a NULL conflicts with
+  nothing; storing a value the caller never supplied is a larger surprise than
+  the error. Anyone changing this is changing a decision, not fixing an
+  oversight.
+
+  **The skip is decided in exactly one place, and it is the runtime one.**
+  `Exec.not_null_skip_or_fail` is called from the INSERT sites only —
+  `execute_insert_write` and the two columnstore `Op_insert` /
+  `Op_insert_select` arms. `Exec.enforce_not_null` is unchanged and still
+  raises unconditionally. Since #620 it has exactly ONE call site left —
+  `write_row_rekeyed` — but three write paths funnel through it: plain
+  `UPDATE`, `UPSERT ... DO UPDATE`, and `ON UPDATE CASCADE`. None of the three
+  has an `OR IGNORE` form to consult, so softening that function would relax
+  all three at once, silently and with no syntax asking for it.
+  `Sema.bind_insert_row`'s static literal-NULL check **suspends itself** under
+  `CA_ignore` rather than deciding anything — it exists to give the better,
+  earlier error for the other resolutions, and it must not pre-empt the
+  runtime skip.
+
+  That last point is the one that shipped wrong once. The static check fires
+  per STATEMENT, so while it was unconditional
+  `INSERT OR IGNORE INTO t VALUES (1,10),(2,NULL),(3,30)` lost **all three**
+  rows, where the parameter spelling of the same statement skipped one — worse
+  than the defect #599 was filed about. Note also that the boundary was never
+  "a literal NULL is a bind error" but "a literal NULL *in a VALUES list*":
+  `INSERT OR IGNORE ... SELECT k, NULL FROM s` was always skipped silently,
+  because `Sema` does not inspect a projection. `or_ignore_skips_every_spelling_of_null`
+  in `test/test_not_null_599.ml` pins all four spellings together for that
+  reason.
 
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 

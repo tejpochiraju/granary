@@ -1114,6 +1114,38 @@
   lwt.unix
   unix))
 
+; #599: a conflict-resolution modifier means the same thing for NOT NULL as it
+; does for UNIQUE — OR IGNORE skips the row on both.
+
+(test
+ (name test_not_null_599)
+ (modules test_not_null_599)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+; #600: PRAGMA not_null_check counts without retaining the rows it counts, and
+; repair's victim buffer is bounded to one table.
+
+(test
+ (name test_not_null_600)
+ (modules test_not_null_600)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
 ; #568: the SUM/AVG non-numeric argument check must not depend on spelling.
 
 (test
