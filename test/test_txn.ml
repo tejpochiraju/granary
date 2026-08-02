@@ -1006,9 +1006,11 @@ let test_worker_handle_serializes_without_poison () =
   Alcotest.(check bool) "B blocked on the shared writer lock" true !b_was_blocked;
   Alcotest.(check bool) "parent handle never poisoned" false (Db.transaction_poisoned db);
   Alcotest.(check bool) "worker handle never poisoned" false (Db.transaction_poisoned wdb);
-  (* Committed rows ARE visible across handles — they share one store. It is
-     only the per-catalog rowid counter that goes stale; see
-     [test_worker_handle_stale_rowid_counter]. Hence the explicit ids above. *)
+  (* Committed rows ARE visible across handles — they share one store — and
+     since #589 the rowid allocator is shared too, so engine-assigned ids no
+     longer collide either (see [test_worker_handle_stale_rowid_counter] and
+     test_worker_handle_589.ml). The ids here stay explicit because this test is
+     about the writer lock, not the allocator. *)
   Alcotest.(check (list int))
     "each handle sees the other's committed rows"
     [ 1; 2 ]
@@ -1019,23 +1021,22 @@ let test_worker_handle_serializes_without_poison () =
     (query_ints db "SELECT n FROM t ORDER BY n ASC")
 ;;
 
-(* KNOWN-CURRENT BEHAVIOUR, PINNED — the sharp edge on [create_worker_handle],
-   found while writing the test above (#589).
+(* #589, FIXED: the sharp edge that used to sit next to the test above.
 
-   [create_worker_handle] is [of_store], which builds a FRESH catalog. A catalog
-   caches each rowid table's [next_rowid]. Two handles therefore hold two
-   independent counters over one shared data tree, and neither invalidates the
-   other. So an INSERT that lets the engine assign the rowid can allocate a
-   rowid the other handle has already committed, and the second write SILENTLY
-   OVERWRITES the first. No error, no constraint violation, one row where there
-   should be two.
+   [create_worker_handle] is [of_store], which builds a FRESH catalog, and a
+   catalog used to own each rowid table's [next_rowid] outright. Two handles then
+   held two independent counters over one shared data tree, so an INSERT that let
+   the engine assign the rowid could allocate one the other handle had already
+   committed and SILENTLY OVERWRITE it — one row where there should be two, with
+   no error and no constraint violation.
 
-   The shared writer lock does not help: this is not a race. The sequence below
-   is strictly sequential and still loses the row.
+   The shared writer lock never helped: it was not a race. The sequences below
+   are strictly sequential and used to lose the row.
 
-   This is why the fibers test above inserts explicit primary keys, and why
-   CLAUDE.md's pointer to [create_worker_handle] carries the caveat in capitals.
-   A fix (re-derive or share the counter) SHOULD make this test fail. *)
+   The catalog now shares its rowid allocator with every catalog over the same
+   [Store.t], so both handles allocate from one counter. The full table-shape
+   matrix lives in test_worker_handle_589.ml; these two stay here because they
+   are the exact sequences #589 was filed with. *)
 let query_text_text db sql =
   match run (Db.query db sql) with
   | Error _ -> []
@@ -1048,21 +1049,16 @@ let query_text_text db sql =
       (rows_of stream)
 ;;
 
-(* KNOWN-CURRENT BEHAVIOUR, PINNED — the worst face of #589, and the reason the
-   guidance is "WITHOUT ROWID or a caller-supplied INTEGER PRIMARY KEY", NOT the
-   plausible-sounding "use explicit primary keys".
+(* #589's worst face, now fixed: a TEXT PRIMARY KEY table still has an
+   engine-assigned rowid underneath, so the stale counter collided there too —
+   but the damage was worse than a lost row. The PK index kept a phantom entry
+   for the overwritten key pointing at the reused rowid, which by then held the
+   other row's payload, so a seek on the lost key returned the WRONG ROW and
+   re-inserting it failed with a phantom UNIQUE violation: wrong answers, not
+   merely missing ones.
 
-   A TEXT PRIMARY KEY is an explicit primary key with explicit values, and it is
-   NOT safe: the table still has an engine-assigned rowid underneath, so the
-   stale counter still collides. But here the damage is worse than a lost row.
-   The PK index keeps a phantom entry for the overwritten key pointing at the
-   reused rowid, which now holds the other row's payload, so:
-
-   - a seek on the lost key returns the WRONG ROW, and
-   - re-inserting the lost key fails with a phantom UNIQUE violation.
-
-   Silent corruption producing wrong answers, not merely row loss. A fix for
-   #589 SHOULD make this test fail. *)
+   This test kept its name — it is the one the issue cites — and now asserts
+   that none of that happens. *)
 let test_worker_handle_text_pk_corruption () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (k TEXT PRIMARY KEY, b TEXT)";
@@ -1070,17 +1066,16 @@ let test_worker_handle_text_pk_corruption () =
   exec db "INSERT INTO t (k, b) VALUES ('k1', 'x')";
   exec wdb "INSERT INTO t (k, b) VALUES ('k2', 'y')";
   Alcotest.(check (list (pair string string)))
-    "#589: k1's row was overwritten despite an explicit TEXT PRIMARY KEY"
-    [ "k2", "y" ]
+    "#589: both keys survive"
+    [ "k1", "x"; "k2", "y" ]
     (query_text_text db "SELECT k, b FROM t ORDER BY k ASC");
-  (* The index still has an entry for k1, pointing at the reused rowid. *)
   Alcotest.(check (list (pair string string)))
-    "#589: seeking the lost key returns the WRONG row"
-    [ "k2", "y" ]
+    "#589: the PK seek returns k1's own row"
+    [ "k1", "x" ]
     (query_text_text db "SELECT k, b FROM t WHERE k = 'k1'");
-  (* And the key can never be re-inserted. *)
+  (* The UNIQUE violation here is the genuine one: 'k1' really is present. *)
   Alcotest.(check bool)
-    "#589: phantom UNIQUE violation re-inserting the lost key"
+    "#589: re-inserting a live key still conflicts"
     true
     (is_err (run (Db.execute db "INSERT INTO t (k, b) VALUES ('k1', 'z')")))
 ;;
@@ -1088,15 +1083,15 @@ let test_worker_handle_text_pk_corruption () =
 let test_worker_handle_stale_rowid_counter () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
-  (* The worker's catalog snapshots next_rowid = 1 for [t]. *)
+  (* The worker's catalog shares the parent's rowid allocator. *)
   let wdb = run (Db.create_worker_handle db) in
   exec db "INSERT INTO t (b) VALUES ('x')";
   (* parent assigns rowid 1 *)
   exec wdb "INSERT INTO t (b) VALUES ('y')";
-  (* worker assigns rowid 1 AGAIN *)
+  (* worker assigns rowid 2, not 1 again *)
   Alcotest.(check (list (pair int string)))
-    "#589: the worker's stale counter overwrote the parent's row"
-    [ 1, "y" ]
+    "#589: the worker allocates past the parent's committed rowid"
+    [ 1, "x"; 2, "y" ]
     (query_int_text db "SELECT a, b FROM t ORDER BY a ASC")
 ;;
 

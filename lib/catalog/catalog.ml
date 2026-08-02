@@ -171,10 +171,21 @@ type fts_table_meta =
 module Schema_cache : sig
   type t
 
+  (** #589: the rowid allocator's live state, keyed by TREE ID and shareable
+      between caches.  See the implementation note below for why it exists and
+      why the key is a tree id rather than a table name. *)
+  type rowid_counters
+
   (** [stamp] re-stamps the #174 tree-tag for a [table_meta]; wired to
       [register_tag store].  Every [table_meta] entering the cache is stamped so the
-      page-stamp stays consistent automatically, and an undo re-stamps the prior. *)
-  val create : stamp:(table_meta -> unit) -> t
+      page-stamp stays consistent automatically, and an undo re-stamps the prior.
+      [rowid_counters], when given, makes this cache share another cache's rowid
+      allocator state (#589) instead of starting its own. *)
+  val create : ?rowid_counters:rowid_counters -> stamp:(table_meta -> unit) -> unit -> t
+
+  (** This cache's rowid allocator state, to hand to [create] for a second cache
+      over the SAME data trees. *)
+  val rowid_counters : t -> rowid_counters
 
   (* reads — never touch the undo log *)
   val find_table : t -> string -> table_meta option
@@ -198,6 +209,13 @@ module Schema_cache : sig
 
   (* durable mutators (catalog-internal autocommit / ephemeral — no undo) *)
   val put_table_durable : t -> name:string -> table_meta -> unit
+
+  (** #589: open-time seeding ONLY.  Identical to [put_table_durable] except that
+      it does not overwrite a shared rowid counter that is already live — a
+      worker handle re-reads the catalog off disk, and disk is by definition no
+      fresher than the counter the sharing handles are already using. *)
+  val seed_table : t -> name:string -> table_meta -> unit
+
   val remove_table_durable : t -> name:string -> unit
   val put_index_durable : t -> name:string -> index_info -> unit
   val put_fts_durable : t -> name:string -> fts_table_meta -> unit
@@ -247,6 +265,73 @@ end = struct
     ; sp_columnar : (string * bytes * bool) list
     }
 
+  (* #589: the live rowid allocator state, lifted OUT of [tables] and into a
+     table that two caches over one [Store.t] can share.
+
+     [Db.create_worker_handle] is [of_store] over the same store, and [of_store]
+     builds a fresh catalog.  Each catalog used to own its table's [next_rowid]
+     outright, inside its cached [table_meta].  Two handles then held two
+     counters over one data tree and neither invalidated the other, so an
+     engine-assigned rowid was handed out twice and the second write silently
+     overwrote the first: one row where there should be two, and for a
+     [TEXT PRIMARY KEY] table an index entry left pointing at the wrong row.
+     Symmetric (the parent went stale in exactly the same way once the worker
+     wrote), unbounded, and durable.
+
+     So [tables] no longer holds the counter's truth — this table does.  Every
+     read of a cached [table_meta] is patched from here on the way out, and every
+     write publishes here on the way in, which keeps [table_meta] the one type
+     the rest of the engine has to know about.
+
+     Keyed by TREE ID, not by table name: a tree id is the identity of the data
+     tree the counter counts for, and it survives [ALTER TABLE ... RENAME].
+     Keying by name would let a DROP+CREATE inherit the dead table's counter.
+
+     BUT A TREE ID IS NOT UNIQUE FOR ALL TIME, and the difference matters:
+
+     - Never reused after a COMMITTED DROP — [next_user_tid] only moves forward
+       and nothing hands the dropped id back.  (Measured: drop tid 16, next
+       CREATE gets 18.)
+     - REUSED after a ROLLED-BACK CREATE.  [next_user_tid_tx] writes the bumped
+       counter INSIDE the transaction, so [S.rollback] reverts it and the next
+       CREATE TABLE gets the same id the doomed table had.  (Measured: doomed
+       tid 17, rolled back, next CREATE also gets 17.)
+
+     So the invariant that keeps a recreated table from inheriting a dead
+     counter is NOT "tree ids are unique".  It is that the entry is cleared or
+     overwritten before the reused id is allocated from, and TWO REDUNDANT
+     MECHANISMS do that — verified by mutation, each one alone is sufficient:
+
+     1. [put_table]'s undo runs [del_meta] -> [unpublish], dropping the doomed
+        table's entry when the CREATE rolls back.
+     2. The replacement CREATE goes through [put_table] -> [set_meta] ->
+        [publish], and a fresh table's meta carries [empty_next_rowid], so it
+        OVERWRITES whatever sat under that tree id.
+
+     Removing either one alone still passes; removing BOTH loses the row.  That
+     is exactly what [test_tid_reuse_after_rolled_back_create] and
+     [test_tid_reuse_worker] pin — they are a guard on the pair, not on either
+     mechanism, so do not read a green suite as proof that the one you are
+     editing is unused.  Keep DDL on the [set_meta]/[del_meta] chokepoints and
+     both stay true for free.
+
+     Negative tree ids are skipped entirely: they are the ephemeral/sentinel
+     metas, which name no data tree, allocate no rowid, and would otherwise all
+     collide on one entry.  There are four — [-1] for a CTE and for a decoded
+     columnar table whose stored tid is 0, [-2] for [sqlite_master], [-3] for
+     [sqlite_sequence] (see planner.ml's sentinel block and
+     [decode_table_storage]) — and the [tree_id >= 0] guard covers all of
+     them.
+
+     Sharing is safe under the store's single-writer lock, which is what makes
+     the two handles serialize: a counter can only be observed by another handle
+     between writes, and the two directions of staleness that mattered — a
+     counter too LOW, which collides — cannot happen when the allocation is
+     published immediately.  A ROLLBACK lowers it again through
+     [set_rowid_durable] (#293's recompute) and [restore_rowids] (#303's
+     savepoint restore), by which point no other handle can hold the lock. *)
+  type rowid_counters = (S.tree_id, int64) Hashtbl.t
+
   type t =
     { tables : (string, table_meta) Hashtbl.t
     ; indexes : (string, index_info) Hashtbl.t
@@ -257,9 +342,10 @@ end = struct
     ; mutable savepoints : savepoint list
     ; mutable poisoned : bool
     ; rowid_bumped : (string, unit) Hashtbl.t
+    ; counters : rowid_counters
     }
 
-  let create ~stamp =
+  let create ?rowid_counters ~stamp () =
     { tables = Hashtbl.create 16
     ; indexes = Hashtbl.create 16
     ; indexes_by_table = Hashtbl.create 16
@@ -269,19 +355,72 @@ end = struct
     ; savepoints = []
     ; poisoned = false
     ; rowid_bumped = Hashtbl.create 8
+    ; counters =
+        (match rowid_counters with
+         | Some c -> c
+         | None -> Hashtbl.create 16)
     }
+  ;;
+
+  let rowid_counters t = t.counters
+
+  (* Patch a cached [table_meta] with the shared counter on the way out. *)
+  let patch t (m : table_meta) =
+    match m.storage with
+    | Row ({ tree_id; next_rowid; _ } as r) when tree_id >= 0 ->
+      (match Hashtbl.find_opt t.counters tree_id with
+       | Some n when not (Int64.equal n next_rowid) ->
+         { m with storage = Row { r with next_rowid = n } }
+       | _ -> m)
+    | Row _ | Columnar _ -> m
+  ;;
+
+  (* Publish a [table_meta]'s counter to the shared table on the way in. *)
+  let publish t (m : table_meta) =
+    match m.storage with
+    | Row { tree_id; next_rowid; _ } when tree_id >= 0 ->
+      Hashtbl.replace t.counters tree_id next_rowid
+    | Row _ | Columnar _ -> ()
+  ;;
+
+  (* Open-time seeding: never overwrite a counter another cache is already
+     using — disk is no fresher than the live allocator. *)
+  let publish_if_absent t (m : table_meta) =
+    match m.storage with
+    | Row { tree_id; next_rowid; _ } when tree_id >= 0 ->
+      if not (Hashtbl.mem t.counters tree_id)
+      then Hashtbl.replace t.counters tree_id next_rowid
+    | Row _ | Columnar _ -> ()
+  ;;
+
+  let unpublish t name =
+    match Hashtbl.find_opt t.tables name with
+    | Some { storage = Row { tree_id; _ }; _ } when tree_id >= 0 ->
+      Hashtbl.remove t.counters tree_id
+    | _ -> ()
+  ;;
+
+  (* THE two chokepoints: no other code in this module may touch [t.tables]. *)
+  let set_meta t name m =
+    Hashtbl.replace t.tables name m;
+    publish t m
+  ;;
+
+  let del_meta t name =
+    unpublish t name;
+    Hashtbl.remove t.tables name
   ;;
 
   (* The undo log only ever grows by prepending, so a saved suffix stays
      physically identical (==) — the invariant [savepoint_rollback] relies on. *)
   let push_undo t f = t.undo <- f :: t.undo
   let register_undo = push_undo
-  let find_table t name = Hashtbl.find_opt t.tables name
+  let find_table t name = Option.map (patch t) (Hashtbl.find_opt t.tables name)
   let mem_table t name = Hashtbl.mem t.tables name
   let find_index t name = Hashtbl.find_opt t.indexes name
   let mem_index t name = Hashtbl.mem t.indexes name
   let find_fts t name = Hashtbl.find_opt t.fts name
-  let fold_tables f t acc = Hashtbl.fold f t.tables acc
+  let fold_tables f t acc = Hashtbl.fold (fun k m acc -> f k (patch t m) acc) t.tables acc
   let fold_fts f t acc = Hashtbl.fold f t.fts acc
 
   let indexes_for_table t ~table =
@@ -293,24 +432,24 @@ end = struct
   let count_fts t = Hashtbl.length t.fts
 
   let put_table t ~name meta =
-    let prior = Hashtbl.find_opt t.tables name in
-    Hashtbl.replace t.tables name meta;
+    let prior = Option.map (patch t) (Hashtbl.find_opt t.tables name) in
+    set_meta t name meta;
     t.stamp meta;
     push_undo t (fun () ->
       match prior with
       | Some m ->
-        Hashtbl.replace t.tables name m;
+        set_meta t name m;
         t.stamp m
-      | None -> Hashtbl.remove t.tables name)
+      | None -> del_meta t name)
   ;;
 
   let remove_table t ~name =
-    let prior = Hashtbl.find_opt t.tables name in
-    Hashtbl.remove t.tables name;
+    let prior = Option.map (patch t) (Hashtbl.find_opt t.tables name) in
+    del_meta t name;
     push_undo t (fun () ->
       match prior with
       | Some m ->
-        Hashtbl.replace t.tables name m;
+        set_meta t name m;
         t.stamp m
       | None -> ())
   ;;
@@ -369,11 +508,17 @@ end = struct
   ;;
 
   let put_table_durable t ~name meta =
-    Hashtbl.replace t.tables name meta;
+    set_meta t name meta;
     t.stamp meta
   ;;
 
-  let remove_table_durable t ~name = Hashtbl.remove t.tables name
+  let seed_table t ~name meta =
+    Hashtbl.replace t.tables name meta;
+    publish_if_absent t meta;
+    t.stamp meta
+  ;;
+
+  let remove_table_durable t ~name = del_meta t name
 
   let put_index_durable t ~name info =
     (match Hashtbl.find_opt t.indexes name with
@@ -386,11 +531,11 @@ end = struct
   let put_fts_durable t ~name meta = Hashtbl.replace t.fts name meta
 
   let bump_rowid t ~name meta =
-    Hashtbl.replace t.tables name meta;
+    set_meta t name meta;
     Hashtbl.replace t.rowid_bumped name ()
   ;;
 
-  let set_rowid_durable t ~name meta = Hashtbl.replace t.tables name meta
+  let set_rowid_durable t ~name meta = set_meta t name meta
 
   let take_rowid_bumped t =
     let names = Hashtbl.fold (fun k _ acc -> k :: acc) t.rowid_bumped [] in
@@ -425,7 +570,7 @@ end = struct
   let snapshot_rowids t =
     Hashtbl.fold
       (fun name (m : table_meta) acc ->
-         match m.storage with
+         match (patch t m).storage with
          | Row { next_rowid; _ } -> (name, next_rowid) :: acc
          | Columnar _ -> acc)
       t.tables
@@ -468,7 +613,7 @@ end = struct
       (fun (name, next_rowid) ->
          match Hashtbl.find_opt t.tables name with
          | Some ({ storage = Row r; _ } as m) ->
-           Hashtbl.replace t.tables name { m with storage = Row { r with next_rowid } }
+           set_meta t name { m with storage = Row { r with next_rowid } }
          | _ -> ())
       rowids
   ;;
@@ -483,7 +628,7 @@ end = struct
          | Some ({ storage = Columnar (_, tid); columns; _ } as m) ->
            let cs = Granary_columnar.Col_store.decode columns encoded in
            if was_dirty then Granary_columnar.Col_store.mark_dirty cs;
-           Hashtbl.replace t.tables name { m with storage = Columnar (cs, tid) }
+           set_meta t name { m with storage = Columnar (cs, tid) }
          | _ -> ())
       snapshots
   ;;
@@ -530,6 +675,10 @@ end = struct
   let mark_poisoned t = t.poisoned <- true
   let is_poisoned t = t.poisoned
 end
+
+(* #589: re-export so a second catalog over the same store can be opened with
+   the first's rowid allocator. *)
+type rowid_counters = Schema_cache.rowid_counters
 
 type t =
   { store : S.t
@@ -1713,7 +1862,7 @@ let set_fk_constraints t ~table_name ~fks =
 (* Public API                                                           *)
 (* ------------------------------------------------------------------ *)
 
-let open_ store =
+let open_ ?rowid_counters store =
   let%lwt cache = load_all_tables store in
   let%lwt indexes = load_all_indexes store in
   let%lwt fts = load_all_fts store in
@@ -1832,8 +1981,15 @@ let open_ store =
   (* #283: seed the sealed cache durably (no undo, this is open-time state).
      [put_table_durable] re-stamps each table's #174 page-header tag, replacing
      the old explicit [register_tag] iteration. *)
-  let sc = Schema_cache.create ~stamp:(fun m -> register_tag store m) in
-  Hashtbl.iter (fun name m -> Schema_cache.put_table_durable sc ~name m) cache;
+  let sc =
+    Schema_cache.create ?rowid_counters ~stamp:(fun m -> register_tag store m) ()
+  in
+  (* #589: [seed_table], not [put_table_durable] — when [rowid_counters] came
+     from a sibling handle over the same store, the counters it already holds are
+     at least as fresh as what we just read off disk, and clobbering them with
+     the disk values would reintroduce the very collision this fixes (in the
+     opposite direction: the PARENT would go stale). *)
+  Hashtbl.iter (fun name m -> Schema_cache.seed_table sc ~name m) cache;
   Hashtbl.iter (fun name i -> Schema_cache.put_index_durable sc ~name i) indexes;
   Hashtbl.iter (fun name m -> Schema_cache.put_fts_durable sc ~name m) fts;
   Lwt.return
@@ -1846,6 +2002,11 @@ let open_ store =
     ; last_inserted_rowid = 0L
     }
 ;;
+
+(* #589: hand this catalog's rowid allocator state to a second catalog opened
+   over the SAME store, so the two cannot allocate the same rowid twice.  See the
+   [rowid_counters] note in [Schema_cache]. *)
+let rowid_counters t = Schema_cache.rowid_counters t.sc
 
 (* #243 (T1): last-inserted rowid accessors for [last_insert_rowid()]. *)
 let set_last_inserted_rowid t rowid = t.last_inserted_rowid <- rowid

@@ -143,9 +143,26 @@ type fts_table_meta =
   ; fts_columns : string list
   }
 
+(** #589: the live rowid-allocator state, which two catalogs over the SAME store
+    must share or they will hand out the same rowid twice and silently overwrite
+    each other's rows.  Opaque; obtained from {!rowid_counters} and passed to
+    {!open_}. *)
+type rowid_counters
+
+(** This catalog's rowid-allocator state, to pass to {!open_} for a second
+    catalog over the same store (that is what {!Granary.Db.create_worker_handle}
+    does). *)
+val rowid_counters : t -> rowid_counters
+
 (** Open (or initialise) a catalog on the given store.
-    Loads all existing table metadata and index metadata from the store. *)
-val open_ : Granary_store.Store.t -> t Lwt.t
+    Loads all existing table metadata and index metadata from the store.
+
+    [?rowid_counters] shares another catalog's rowid allocator (#589).  Pass it
+    if and only if the other catalog is open over the SAME [Store.t]: the
+    counters are keyed by tree id, which only identifies a data tree within one
+    store.  Counters already live in the shared state win over the values read
+    from disk, since disk is never fresher than the running allocator. *)
+val open_ : ?rowid_counters:rowid_counters -> Granary_store.Store.t -> t Lwt.t
 
 (** Read the user_version from the sys_meta tree inside an already-open
     transaction (RO or RW).  Returns 0 if not yet set. *)

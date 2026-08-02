@@ -399,68 +399,140 @@ held its writer lock) and `DETACH DATABASE` (which would otherwise drop the
 sub-handle and its transaction — a clean outcome, but a *second* exit from the
 poisoned state, making "ROLLBACK is the sole exit" false).
 
-**The ATTACH story is not closed.** #555's poison only fires on a *collision*,
-and under ATTACH one `Db.t` legitimately holds two explicit-transaction slots.
-A `PRAGMA active_database` switch mid-transaction therefore makes a statement
-silently autocommit into the wrong schema, with `transaction_poisoned = false`
-throughout — no collision, so nothing fires. Pre-existing and untouched by
-#555; tracked as **#598**.
+**#555's "arriving at a poisoned schema stays legal" valve no longer exists.**
+It was there so a schema poisoned from elsewhere could still be reached to be
+rolled back. Since #598, arriving requires a switch, a poisoned schema by
+construction holds a transaction, so the #598 gate refuses the arrival too. The
+state is unreachable today — a poisoned schema is always the one the caller is
+already on, because that is where their `BEGIN` went — so nothing is stranded.
+But anything that makes a poisoned schema reachable from elsewhere (a session
+object, #555 option 1) must re-open that path explicitly rather than assume the
+valve is still there.
+
+**The ATTACH story is contained, not closed (#598).** #555's poison only fires
+on a *collision*, and under ATTACH one `Db.t` legitimately holds two
+explicit-transaction slots — so nothing collided when a `PRAGMA
+active_database` switch moved the routing out from under an open transaction.
+The caller's next write then landed in the *other* database and was durably
+autocommitted there, with `transaction_poisoned = false` throughout; the caller
+found out at `COMMIT`, after the write was on disk.
+
+Since #598 the two statements that can move a caller's routing are **refused
+while any schema on the connection has an explicit transaction open**:
+`PRAGMA active_database = …` (unless it names the schema already active, which
+is a no-op and stays legal) and `DETACH DATABASE`. The error is a distinct
+message from `poisoned_msg` — nothing is poisoned and the caller's transaction
+is intact; the statement just cannot be honoured yet. The gate sits *below*
+#555's two poison gates in `execute_control_op`, so on a poisoned connection
+the caller is still told to `ROLLBACK` rather than told a transaction is open,
+and "ROLLBACK is the sole exit" stays true. Pinned by
+`test/test_attach_active_txn_598.ml`.
+
+That is the issue's *interim containment*, and it is deliberately blunt: it
+buys loudness by removing the ability to switch schemas mid-transaction. The
+real fix is the #585 family — bind a statement to the transaction its caller
+opened instead of resolving it through shared mutable routing state at
+execution time.
+
+**Two deliberate compatibility breaks, both wider than the bug:**
+
+- `PRAGMA active_database` mid-transaction previously worked for a pure **read**
+  of another schema, and that is now refused too. The gate cannot tell a read
+  from a write ahead of time, and the read case is one statement away from the
+  write case that loses data.
+- `DETACH DATABASE` is refused while **any** schema has a transaction open, even
+  when the detach target itself has none. Narrowing it to the target's own slot
+  would be defensible; it is not what is implemented.
 
 ### Running explicit transactions from more than one fiber
 
-> **`Db.create_worker_handle` is currently UNSAFE for concurrent writes to any
-> table with an engine-assigned rowid (#589).** It is safe only for
-> `WITHOUT ROWID` tables, or rowid tables where you supply the
-> `INTEGER PRIMARY KEY` value on every insert. A `TEXT PRIMARY KEY` or
-> `AUTOINCREMENT` table is **NOT** safe: it loses rows *and* leaves the index
-> pointing at the wrong row.
+`Db.create_worker_handle` is the mechanism, and it is sound: it is `of_store`
+over the *same* `Store.t`, so each handle gets its own `explicit_txn` while
+sharing the store's single-writer `Rwlock`. A second fiber's `BEGIN` **blocks**
+until the first commits rather than contaminating it, and neither handle is ever
+poisoned. (This also corrects #555's premise that "a second `Db.t` over the same
+path would be a second lock with no mutual exclusion" — true of a second
+`open_file`, false here.)
 
-Read that before the rest of this section. "Use explicit primary keys" was the
-advice here until 2026-08-02 and it is **false** — a `TEXT PRIMARY KEY` with
-caller-supplied values is an explicit primary key, and it is the worst case in
-the matrix, not an exception to it.
+**#589 is fixed — writes to every table shape are now safe.** Read the history
+anyway, because the fix's invariant is what keeps it that way.
 
-`create_worker_handle` is nonetheless the only mechanism available, and the
-mechanism itself is sound: it is `of_store` over the *same* `Store.t`, so each
-handle gets its own `explicit_txn` while sharing the store's single-writer
-`Rwlock`. A second fiber's `BEGIN` **blocks** until the first commits rather than
-contaminating it, and neither handle is ever poisoned. (This also corrects #555's
-premise that "a second `Db.t` over the same path would be a second lock with no
-mutual exclusion" — true of a second `open_file`, false here.)
+Each handle still gets a *fresh catalog* — that is what makes DDL invisible
+across handles — but it no longer gets a fresh **rowid allocator**. The
+allocator's live state was lifted out of the cached `table_meta` and into
+`Schema_cache.rowid_counters`, a table `Cat.open_ ?rowid_counters` accepts so a
+second catalog over the same store shares it. Every read of a cached
+`table_meta` is patched from that table on the way out and every write publishes
+to it on the way in, which keeps `table_meta` the only type the rest of the
+engine sees. Two rules make the sharing correct and must survive any future
+edit:
 
-**What #589 actually does.** Each handle gets a *fresh catalog*, and a catalog
-caches `next_rowid`. Two handles hold two counters over one data tree and neither
-invalidates the other, so an `INSERT` with an engine-assigned rowid reuses a
-rowid the other handle already committed. Measured across the table shapes:
+- **Keyed by tree id, not by table name** — a tree id identifies the data tree
+  the counter counts for and survives `ALTER TABLE … RENAME`; keying by name
+  would let a `DROP`+`CREATE` inherit the dead table's counter. **But a tree id
+  is not unique for all time.** It is never reused after a *committed* `DROP`
+  (measured: drop tid 16, next `CREATE` gets 18) and **is** reused after a
+  *rolled-back* `CREATE` — `next_user_tid_tx` writes the bumped counter inside
+  the transaction, so `S.rollback` reverts it and the next `CREATE` gets the
+  same id (measured: doomed 17, rolled back, next `CREATE` also 17). **The real
+  invariant is therefore not "tree ids are unique" but "the entry is cleared or
+  overwritten before the reused id is allocated from"** — and *two redundant
+  mechanisms* do that, each sufficient alone (verified by mutation): (1)
+  `put_table`'s undo runs `del_meta` → `unpublish`; (2) the replacement `CREATE`
+  publishes `empty_next_rowid` under the same tree id, overwriting the stale
+  entry. Removing either alone still passes the suite; removing both loses the
+  row. `tid_reuse_after_rolled_back_create` and `tid_reuse_worker` guard **the
+  pair** — so a green suite is not evidence that the mechanism you are editing
+  is dead. Keeping DDL on the `set_meta`/`del_meta` chokepoints keeps both.
+- Negative tree ids are skipped (`tree_id >= 0` guard) because they are
+  ephemeral/sentinel metas that name no data tree and would all collide on one
+  entry. There are four: `-1` for a CTE *and* for a decoded columnar table whose
+  stored tid is 0, `-2` for `sqlite_master`, `-3` for `sqlite_sequence`.
+- **Open-time seeding uses `seed_table`, not `put_table_durable`** — it will not
+  overwrite a counter that is already live. A worker re-reads the catalog off
+  disk, and disk is never fresher than the running allocator; clobbering would
+  reintroduce the same collision with the roles exchanged, making the **parent**
+  go stale.
 
-| shape | result |
-|---|---|
-| `CREATE TABLE t (b TEXT)` — plain rowid, the commonest shape | 1 row where there should be 2 |
-| `a INTEGER PRIMARY KEY`, engine-assigned | 1 row |
-| `a INTEGER PRIMARY KEY`, **caller-supplied** values | correct |
-| `a INTEGER PRIMARY KEY AUTOINCREMENT` | 1 row; `sqlite_sequence` reads `1` on both handles |
-| `k TEXT PRIMARY KEY`, caller-supplied keys | 1 row **plus index corruption** |
-| `WITHOUT ROWID` | correct |
+What it used to do, and what the tests now assert the opposite of — two counters
+over one data tree, neither invalidating the other, so an `INSERT` with an
+engine-assigned rowid reused a rowid the other handle had already committed and
+silently overwrote it:
 
-For `TEXT PRIMARY KEY` the consequence is **wrong query answers**, not row loss:
-the index keeps a phantom entry for the overwritten key pointing at the reused
-rowid, so `WHERE k = 'k1'` returns a row whose `k` is `k2`, a secondary-index
-seek does the same, and re-inserting `'k1'` fails with a phantom
-`UNIQUE constraint failed`. Pinned by `worker_handle_text_pk_corruption`.
+| shape | before #589 | now |
+|---|---|---|
+| `CREATE TABLE t (b TEXT)` — plain rowid, the commonest shape | 1 row where there should be 2 | 2 rows |
+| `a INTEGER PRIMARY KEY`, engine-assigned | 1 row | 2 rows, ids 1 and 2 |
+| `a INTEGER PRIMARY KEY`, **caller-supplied** values | correct | correct |
+| `a INTEGER PRIMARY KEY AUTOINCREMENT` | 1 row; `sqlite_sequence` reads `1` on both handles | 2 rows; `sqlite_sequence` reads `2` on both |
+| `k TEXT PRIMARY KEY`, caller-supplied keys | 1 row **plus index corruption** | 2 rows, seeks correct |
+| `WITHOUT ROWID` | correct | correct |
 
-It is symmetric and unbounded, not one-shot: a worker created *after* the
-parent's rows snapshots correctly, and then the **parent** goes stale and
-overwrites the worker's row. Three handles and five inserts leave two rows. It
-persists to disk, survives close/reopen, and explicit transactions on both
-handles do not help — it is not a race, and the writer lock is irrelevant.
+`TEXT PRIMARY KEY` was the worst case because the consequence was **wrong query
+answers**, not row loss: the index kept a phantom entry for the overwritten key
+pointing at the reused rowid. It was also symmetric and unbounded (a worker
+created *after* the parent's rows snapshotted correctly, then the parent went
+stale), persisted to disk, and was unaffected by explicit transactions — never a
+race, so the writer lock was irrelevant. The whole matrix plus three
+handles/five inserts, a rollback, and a close/reopen is pinned by
+`test/test_worker_handle_589.ml`; `worker_handle_text_pk_corruption` and
+`worker_handle_stale_rowid_counter` in `test_txn.ml` keep the issue's own two
+sequences.
 
-The other limits, none of which corrupt anything:
+**What is still unsafe about a worker handle** — none of it corrupts anything:
 
-- DDL on one handle is invisible to the other's schema cache (same fresh-catalog
-  cause).
-- Reactive views, ATTACHed schemas and the active schema are per-handle.
+- **DDL on one handle is invisible to the other's schema cache.** This one is
+  inherent to the per-handle catalog and was *not* fixed: create a table on the
+  parent and the worker cannot see it until reopened. Pinned by
+  `ddl_still_invisible_across_handles`.
+- Reactive views, ATTACHed schemas and the active schema are per-handle; a
+  worker starts with none of the parent's.
 - Write transactions *serialize* on the shared lock rather than overlapping, and
-  a read-only transaction does not overlap a writer either.
+  a read-only transaction does not overlap a writer either. Genuine write
+  concurrency still needs #555 option 1.
+- Anything else that reaches `Db.of_store` over an **already-open** store owes
+  it `~rowid_counters` by hand; `create_worker_handle` is the only caller that
+  does so today.
 
 `Tpcc_driver`'s one-deep worker pool predates this and serializes whole
 transactions on a single handle; that is why its terminal-count sweep flatlines

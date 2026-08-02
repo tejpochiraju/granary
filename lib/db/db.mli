@@ -81,11 +81,19 @@ val open_block
     database-wide durability knob (full/batched/off) on the store before the
     catalog is loaded — use this to configure the store's fsync policy at
     open time without needing a raw store handle afterwards.  Used by the
-    [granary.unix] driver and by ATTACH. *)
+    [granary.unix] driver and by ATTACH.
+
+    [rowid_counters] (#589) shares an existing catalog's rowid allocator with the
+    new handle, and must be passed whenever [store] is already open under another
+    [Db.t] — otherwise the two handles allocate rowids independently over one set
+    of data trees and silently overwrite each other's rows.
+    {!create_worker_handle} is the intended way in; a caller reaching for
+    [of_store] over a store that is already open owes the same argument. *)
 val of_store
   :  ?clock:(unit -> float)
   -> ?durability:Granary_store.Store.durability
   -> ?file_path:string
+  -> ?rowid_counters:Granary_catalog.Catalog.rowid_counters
   -> Granary_store.Store.t
   -> t Lwt.t
 
@@ -116,38 +124,31 @@ val set_file_provider : file_provider -> unit
 val close : t -> unit Lwt.t
 
 (** Create a lightweight worker handle sharing the same underlying store.
-    Equivalent to [let* () = Lwt.return_unit in of_store (store t)].
-    Used by Jepsen-style concurrent workloads where each worker needs
+    Equivalent to [of_store ~rowid_counters:(Catalog.rowid_counters (catalog t))
+    (store t)]. Used by Jepsen-style concurrent workloads where each worker needs
     its own [explicit_txn] without exposing the raw store.
 
-    {b #589: UNSAFE for concurrent writes to any table with an engine-assigned
-    rowid.} Safe only for [WITHOUT ROWID] tables, or rowid tables where the
-    caller supplies the [INTEGER PRIMARY KEY] value on every insert. A
-    [TEXT PRIMARY KEY] or [AUTOINCREMENT] table is {b NOT} safe.
+    #555: this is the supported way to run explicit transactions from more than
+    one fiber. Each handle gets its own transaction slot, and because they share
+    one [Store.t] they share its single-writer [Rwlock], so a second fiber's
+    [BEGIN]/write {e blocks} until the first commits rather than contaminating it
+    or poisoning anything. Neither handle is ever poisoned by the other —
+    {!transaction_poisoned} is about two fibers sharing {e one} handle.
 
-    Each handle is built by [of_store], so it gets a {b fresh catalog}, and a
-    catalog caches [next_rowid]. Two handles hold two counters over one data
-    tree and neither invalidates the other, so an [INSERT] with an
-    engine-assigned rowid reuses one the other handle already committed. On a
-    plain rowid table that silently loses a row. On a [TEXT PRIMARY KEY] table
-    it is worse: the index keeps a phantom entry for the overwritten key
-    pointing at the reused rowid, so a seek on the lost key returns {b the wrong
-    row} and re-inserting it fails with a phantom [UNIQUE] violation — wrong
-    answers, not merely missing ones. Symmetric (the parent goes stale too),
-    unbounded, persists to disk, and unaffected by explicit transactions: it is
-    not a race, so the shared lock does not help.
+    {b #589 (fixed): rowid allocation is shared, so writes to any table shape are
+    safe.} Each handle still gets a fresh {e catalog}, but no longer a fresh
+    {e rowid allocator}: the counters travel with the store, keyed by tree id.
+    Before that fix, two counters over one data tree handed out the same
+    engine-assigned rowid twice and the second write silently overwrote the
+    first — a lost row on a plain rowid table, and on a [TEXT PRIMARY KEY] table
+    an index entry left pointing at the wrong row (wrong answers, not merely
+    missing ones). Pinned across the full table-shape matrix by
+    [test/test_worker_handle_589.ml].
 
-    #555: subject to that, this is the supported way to run explicit
-    transactions from more than one fiber. Each handle gets its own transaction
-    slot, and because they share one [Store.t] they share its single-writer
-    [Rwlock], so a second fiber's [BEGIN]/write {e blocks} until the first
-    commits rather than contaminating it or poisoning anything. Neither handle
-    is ever poisoned by the other — {!transaction_poisoned} is about two fibers
-    sharing {e one} handle.
-
-    Its other limits:
-    - DDL executed on one handle is invisible to the other's schema cache (same
-      fresh-catalog cause as #589).
+    Its remaining limits, none of which corrupt anything:
+    - DDL executed on one handle is {b invisible} to the other's schema cache.
+      That one really is inherent to the per-handle catalog: create a table on
+      the parent and the worker cannot see it until it is reopened.
     - Reactive views, ATTACHed schemas and the active-schema setting are
       per-handle; a worker handle starts with none of the parent's.
     - Write transactions {b serialize} on the shared [Rwlock] rather than
@@ -226,8 +227,7 @@ val vacuum : t -> unit Lwt.t
     So this is a loud failure in place of a silent one over a bounded window,
     not a safe way to share a handle.  Do not treat it as permission to run
     explicit transactions concurrently on one [Db.t] — use
-    {!create_worker_handle} for that, and read its {b #589} warning first: it is
-    unsafe for concurrent writes to any table with an engine-assigned rowid.
+    {!create_worker_handle} for that.
 
     {2 Recovery}
 

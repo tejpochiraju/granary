@@ -1197,3 +1197,17 @@
   lwt
   lwt.unix
   unix))
+
+; #589: one rowid allocator per store, shared across worker handles.
+
+(test
+ (name test_worker_handle_589)
+ (modules test_worker_handle_589)
+ (libraries granary granary.unix alcotest lwt.unix))
+
+; #598: routing statements refused while any schema holds a transaction.
+
+(test
+ (name test_attach_active_txn_598)
+ (modules test_attach_active_txn_598)
+ (libraries granary granary.unix alcotest lwt.unix))

@@ -314,14 +314,14 @@ let load_triggers_into_hashtbl store trig_tbl =
    (Some for file-backed handles, None for in-memory / arbitrary devices).
    [durability] sets the database-wide durability knob on the store before
    loading the catalog. *)
-let of_store ?clock ?durability ?file_path store =
+let of_store ?clock ?durability ?file_path ?rowid_counters store =
   (match clock with
    | Some c -> S.set_clock store c
    | None -> ());
   (match durability with
    | Some d -> S.set_durability store d
    | None -> ());
-  let* catalog = Cat.open_ store in
+  let* catalog = Cat.open_ ?rowid_counters store in
   (* Load persisted columnar data for columnar tables. *)
   let* () = Cat.load_columnar_stores catalog store in
   let views = Hashtbl.create 4 in
@@ -396,9 +396,15 @@ let close t =
   S.close t.store
 ;;
 
+(* #589: the worker gets a fresh catalog — that is what makes DDL on one handle
+   invisible to the other — but it must NOT get a fresh rowid allocator.  Both
+   catalogs sit over one [Store.t] and therefore over one set of data trees, and
+   two counters over one tree hand the same rowid out twice: the second write
+   silently overwrites the first (and, on a [TEXT PRIMARY KEY] table, leaves the
+   index pointing at the wrong row).  Sharing the allocator is the whole fix. *)
 let create_worker_handle t =
   let* () = Lwt.return_unit in
-  of_store t.store
+  of_store ~rowid_counters:(Cat.rowid_counters t.catalog) t.store
 ;;
 
 let wal_sync_count t = S.wal_sync_count t.store
@@ -644,6 +650,32 @@ let active_handle (top : t) =
     genuinely poisoned connection. *)
 let transaction_poisoned t =
   is_poisoned t || Hashtbl.fold (fun _ sub acc -> acc || is_poisoned sub) t.attached false
+;;
+
+(* #598: whether ANY schema reachable from this handle has an explicit
+   transaction open.  Under ATTACH each schema is its own [Db.t] with its own
+   slot, so a connection legitimately holds several at once and the question
+   "is a transaction open here" has no single-slot answer. *)
+let any_explicit_txn (top : t) =
+  Option.is_some top.explicit_txn
+  || Hashtbl.fold
+       (fun _ sub acc -> acc || Option.is_some sub.explicit_txn)
+       top.attached
+       false
+;;
+
+(* #598: the message for a routing statement refused because a transaction is
+   open somewhere on the connection.  Distinct from [poisoned_msg]: nothing is
+   poisoned, nothing is doomed, and the caller's transaction is intact — the
+   statement simply cannot be honoured while it is open. *)
+let routing_blocked_msg verb =
+  Printf.sprintf
+    "%s refused: an explicit transaction is open on this connection (#598).  Under \
+     ATTACH each schema has its own transaction slot while the active schema is shared \
+     handle state, so moving the routing now would silently autocommit the caller's next \
+     write into a different database and orphan the open transaction.  COMMIT or \
+     ROLLBACK first."
+    verb
 ;;
 
 let begin_txn t =
@@ -1639,9 +1671,20 @@ let execute_control_op top t sql op =
      poisoned.  That let a caller walk away from a poisoned sub-handle, at which
      point the prescribed recovery breaks: the subsequent ROLLBACK routes to the
      new schema and answers "no active transaction" while the poisoned one still
-     holds its writer lock.  Refuse to leave a poisoned schema; arriving at one
+     holds its writer lock.  Refuse to leave a poisoned schema.
+
+     #598 NOTE: this gate used to be paired with "arriving at a poisoned schema
      stays legal, or a schema poisoned from elsewhere could never be reached to
-     be rolled back. *)
+     be rolled back".  That safety valve NO LONGER EXISTS.  Arriving requires a
+     switch; a poisoned schema by construction holds a transaction (the poison
+     fires on a second BEGIN against an occupied slot); so [any_explicit_txn top]
+     is true and the #598 gate below refuses the arrival too.  The state is
+     unreachable today — a poisoned schema is always the one the caller is
+     already on, because that is where their BEGIN went — so nothing is stranded.
+     But it is no longer a valve, and anything that makes a poisoned schema
+     reachable from elsewhere (a session object, #555 option 1) must re-open the
+     arrival path explicitly rather than assume this comment still guarantees
+     it. *)
   | Sql.Plan.Op_active_database_set _ when is_poisoned (active_handle top) ->
     Some (Lwt.return (Error (Runtime poisoned_msg)))
   (* #555: DETACH is a routing statement too, and left ungated it was a SECOND
@@ -1652,6 +1695,26 @@ let execute_control_op top t sql op =
      second, undocumented one. *)
   | Sql.Plan.Op_detach _ when is_poisoned (active_handle top) ->
     Some (Lwt.return (Error (Runtime poisoned_msg)))
+  (* #598: the poison only fires on a COLLISION — two [BEGIN]s against one slot.
+     Under ATTACH nothing collides: main's slot is occupied once, aux's is never
+     opened, and a schema switch simply moves the routing out from under the open
+     transaction.  The caller's next write then lands in the other database and
+     is AUTOCOMMITTED there, durably, with [transaction_poisoned = false]
+     throughout; the caller finds out at COMMIT ("no active transaction"), after
+     the write is on disk.  There is nothing for the poison to detect, so refuse
+     the switch outright while any schema holds a transaction.  Switching to the
+     schema already active is a no-op and stays legal, so re-asserting one's own
+     routing inside a transaction still works.
+
+     This gate sits BELOW the two poison gates above deliberately: on a poisoned
+     connection the caller must be told to ROLLBACK, not that a transaction is
+     open.  DETACH gets the same treatment for the same reason — dropping a
+     sub-handle whose transaction is open would discard it silently. *)
+  | Sql.Plan.Op_active_database_set { schema }
+    when (not (String.equal schema top.active_schema)) && any_explicit_txn top ->
+    Some (Lwt.return (Error (Runtime (routing_blocked_msg "active_database"))))
+  | Sql.Plan.Op_detach _ when any_explicit_txn top ->
+    Some (Lwt.return (Error (Runtime (routing_blocked_msg "DETACH"))))
   | _ when is_poisoned t -> Some (Lwt.return (Error (Runtime poisoned_msg)))
   | Sql.Plan.Op_begin -> Some (begin_txn t)
   | Sql.Plan.Op_commit -> Some (commit_txn t)
