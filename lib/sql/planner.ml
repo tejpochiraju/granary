@@ -408,6 +408,105 @@ let make_scan (meta : Cat.table_meta) : Plan.op =
   | Cat.Row _ -> Plan.Op_seq_scan { table_meta = meta }
 ;;
 
+(* Realise a chosen seek as the base-table plan op it reads through. *)
+let seek_op (table_meta : Cat.table_meta) = function
+  | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val }
+  | Plan.Seek_index { idx_tree; keys; range } ->
+    let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
+    Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; range; table_meta }
+;;
+
+(* #508: pick an access path from already-recognised equalities.  [eqs] is the
+   [(position, column ordinal, value)] triples the caller extracted — position
+   identifies which conjunct an equality came from, so a repeated column pins the
+   prefix once and leaves the rest to the caller.  [range_conjuncts] are the
+   conjuncts a #517 range bound may be read out of; pass [[]] for a caller that
+   has none to offer.
+
+   Returns the chosen path with the conjunct positions it consumed. *)
+let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts =
+  let alias_eq =
+    List.find_opt
+      (fun (_, col_idx, _) -> Cat.rowid_alias_col table_meta = Some col_idx)
+      eqs
+  in
+  match alias_eq with
+  | Some (pos, _, lit_expr) ->
+    (* #243 (T1): the alias column IS the table key — a single rowid seek, no
+       index. *)
+    Some (Plan.Seek_rowid (plan_expr lit_expr), [ pos ])
+  | None ->
+    if eqs = []
+    then None
+    else (
+      match find_index_for_eqs cat table_meta eqs with
+      | None -> None
+      | Some (idx, prefix, consumed) ->
+        let keys =
+          List.map
+            (fun (col_idx, v) ->
+               col_idx, (List.nth table_meta.Cat.columns col_idx).Row.ty, plan_expr v)
+            prefix
+        in
+        let range =
+          range_for_index table_meta idx ~n_eq:(List.length prefix) range_conjuncts
+        in
+        Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed))
+;;
+
+(** #528: the plan op a join's right table is read through when it is the {i
+    build} side of a hash join.
+
+    [make_scan] was unconditional here, so a hash join always read the whole
+    right table even when the WHERE clause pinned a leading prefix of one of its
+    indexes — the TPC-C StockLevel shape, where [s_w_id = ?] makes one
+    warehouse's [stock] directly seekable out of 100,000 rows across every
+    warehouse.  [right_eqs] is the same re-based equality list {!best_probe}
+    consumes, so the two strategies now narrow the right table from the same
+    facts.
+
+    Soundness is the invariant #513 and #516 already rest on: [chain_joins]
+    applies the whole WHERE clause to the joined row, so restricting what the
+    build side reads cannot change which joined rows survive.  This holds for
+    LEFT JOIN for the reason #516 settled on — a narrowed build side null-extends
+    left rows a full scan would have matched, those rows carry NULL in the very
+    column the narrowing conjunct tests, [col = value] is never true of NULL, and
+    the post-join filter drops them exactly as it dropped the wider rows they
+    replaced.
+
+    No range bound is offered ([range_conjuncts] is empty): the WHERE conjuncts
+    address the combined row, so their ordinals would have to be re-based into
+    right-table space before {!range_for_index} could read them, which the
+    equality path gets for free from {!right_table_eqs} and a range does not.
+    That is a missed narrowing, never an unsound one — tracked as #532.
+
+    The seek is taken unconditionally whenever a prefix is pinned, because there
+    is no selectivity estimate to consult.  Where the prefix selects nearly the
+    whole table this trades one ordered leaf walk for an index traversal plus a
+    random row fetch per entry, which in-memory measurement cannot see — #546.
+
+    Synthesized right tables — CTEs, [sqlite_master], [sqlite_sequence], marked
+    by a negative [tree_id] — and columnar tables have no B-tree to seek and are
+    left to {!make_scan}.  For a CTE the guard is load-bearing, not defensive:
+    {!access_path_for_eqs} reaches the catalog {i by name}, so a CTE that
+    shadows a real table would otherwise pick up that table's indexes and plan
+    an [Op_index_lookup] against a tree it has nothing to do with — a wrong
+    answer, pinned by [cte_shadowing_a_real_table_still_scans]. *)
+let build_side cat (right_meta : Cat.table_meta) ~right_eqs =
+  let seekable =
+    match right_meta.Cat.storage with
+    | Cat.Row { tree_id; _ } -> tree_id >= 0
+    | Cat.Columnar _ -> false
+  in
+  if not seekable
+  then make_scan right_meta
+  else (
+    let eqs = List.mapi (fun pos (col_idx, v) -> pos, col_idx, v) right_eqs in
+    match access_path_for_eqs cat right_meta ~eqs ~range_conjuncts:[] with
+    | None -> make_scan right_meta
+    | Some (seek, _consumed) -> seek_op right_meta seek)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* #520: a crude static cardinality estimate for the join's driving side *)
 (* ------------------------------------------------------------------ *)
@@ -447,8 +546,13 @@ let unbounded_rows = max_int
     the ratio against a 200-row right table even though the real window is 21
     rows.  The floor is the slack that covers a made-up number.  Second, it is
     the only thing that can fire when R is not knowable at all — a WITHOUT ROWID
-    or columnar right table estimates as {!unbounded_rows}, the ratio can never
-    hold, and without the floor such a join could never take a probe.
+    or columnar right table usually estimates as {!unbounded_rows}, the ratio
+    can never hold, and without the floor such a join could never take a probe.
+    (#528 put one crack in that "never": a WITHOUT ROWID right table whose whole
+    unique key is pinned by the WHERE clause now seeks to a provable single row,
+    so {!estimate_rows} answers 1 rather than {!unbounded_rows} and the ratio
+    can hold after all.  A columnar right table has no seek and is still
+    unknowable.)
 
     Those two jobs want different numbers (100 keeps every test green but
     strands the unknowable-R case), so 1000 is a single compromise between them
@@ -548,10 +652,25 @@ let seek_is_unique_point cat (meta : Cat.table_meta) ~idx_tree ~keys =
 
 (** #520: estimate how many rows [op] produces, statically.
 
-    Only the three shapes a driving side can actually take are classified.
+    Two callers reach here, and they see different shapes.
+
+    As the {i driving}-side estimate, only three shapes are possible:
     [chain_joins] hands {!plan_join} either the base access path — which
     [plan_base] builds as a bare scan or seek when the query has joins, never
-    wrapped in a filter — or a previous join, so nothing else reaches here.
+    wrapped in a filter — or a previous join.
+
+    #528 added the second caller: the {i build}-side estimate, whose op comes
+    from {!build_side}.  That adds the synthesized and columnar scans
+    {!make_scan} can produce — [Op_cte_scan], [Op_sqlite_master],
+    [Op_sqlite_sequence], [Op_col_seq_scan] — all of which fall to the
+    [unbounded_rows] arm.  That is the same answer {!table_rows_estimate} gives
+    for a columnar table, and a pessimistic one for the three synthesized
+    shapes; it is inert wherever {!best_probe} finds no index on them, since the
+    strategy then lands on the hash join whatever [right_rows] says.  A CTE that
+    shadows a real table is the exception: {!best_probe} reaches the catalog by
+    name and carries no [tree_id] guard of its own — it is unguarded here, #551
+    — so it can find the shadowed table's indexes.
+
     Every other op answers {!unbounded_rows} rather than adding an arm no test
     can reach: an [Op_aggregate] with no GROUP BY is exactly one row and an
     [Op_limit] is capped by its limit, both of which would be easy to classify
@@ -631,11 +750,27 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
   let right_offset = bj.right_col_offset in
   let n_right_cols = List.length bj.right_meta.Cat.columns in
   let right_eqs = right_table_eqs ~right_offset ~n_right_cols where_conjuncts in
+  (* #528: the build side of a hash join, narrowed by the same WHERE equalities
+     that would complete a probe key.  It does not depend on the strategy chosen
+     — but the cost model's [right_rows] depends on IT, so build it first. *)
+  let right_op = build_side cat bj.right_meta ~right_eqs in
   (* #520: neither side of the cost comparison depends on which strategy is
      chosen or on which column the ON predicate resolves to — compute both once,
      outside the match. *)
   let driving_rows = estimate_rows cat left_op in
-  let right_rows = table_rows_estimate bj.right_meta in
+  (* #528: R in the cost comparison is what the hash join would actually read,
+     so it is estimated from the (possibly narrowed) build-side op rather than
+     from the whole table.
+
+     Be precise about how much that moves: it shrinks ONLY where the seek is
+     provably a point.  {!estimate_rows} answers [table_rows_estimate] for the
+     [Op_seq_scan] case, and for an [Op_index_lookup] it answers
+     [unbounded_rows] — hence [table_rows_estimate] after the [min] — unless
+     {!seek_is_unique_point} holds or the seek carries a range, and
+     {!build_side} passes no range (#532).  So R is unchanged for every partial
+     prefix pin, and collapses to 1 for a full-unique-key or rowid-alias pin.
+     There is no selectivity estimate here; do not read this as one. *)
+  let right_rows = estimate_rows cat right_op in
   let mk_with_left_col_right_col left_col right_col : Plan.op =
     let probe =
       if probe_is_worth_it ~driving_rows ~right_rows
@@ -656,7 +791,7 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
     | None ->
       Plan.Op_hash_join
         { left = left_op
-        ; right = make_scan bj.right_meta
+        ; right = right_op
         ; left_key = left_col
         ; right_key = right_col
         ; join_kind
@@ -674,7 +809,7 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
     let cart =
       Plan.Op_hash_join
         { left = left_op
-        ; right = make_scan bj.right_meta
+        ; right = right_op
         ; left_key = -1
         ; right_key = -1
         ; join_kind
@@ -772,41 +907,7 @@ let choose_access_path cat (table_meta : Cat.table_meta) conjuncts_list =
       Option.map (fun (col_idx, v) -> pos, col_idx, v) (recognise_eq_col_lit c))
     |> List.filter_map Fun.id
   in
-  let alias_eq =
-    List.find_opt
-      (fun (_, col_idx, _) -> Cat.rowid_alias_col table_meta = Some col_idx)
-      eqs
-  in
-  match alias_eq with
-  | Some (pos, _, lit_expr) ->
-    (* #243 (T1): the alias column IS the table key — a single rowid seek, no
-       index. *)
-    Some (Plan.Seek_rowid (plan_expr lit_expr), [ pos ])
-  | None ->
-    if eqs = []
-    then None
-    else (
-      match find_index_for_eqs cat table_meta eqs with
-      | None -> None
-      | Some (idx, prefix, consumed) ->
-        let keys =
-          List.map
-            (fun (col_idx, v) ->
-               col_idx, (List.nth table_meta.Cat.columns col_idx).Row.ty, plan_expr v)
-            prefix
-        in
-        let range =
-          range_for_index table_meta idx ~n_eq:(List.length prefix) conjuncts_list
-        in
-        Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed))
-;;
-
-(* Realise a chosen seek as the base-table plan op it reads through. *)
-let seek_op (table_meta : Cat.table_meta) = function
-  | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val }
-  | Plan.Seek_index { idx_tree; keys; range } ->
-    let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
-    Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; range; table_meta }
+  access_path_for_eqs cat table_meta ~eqs ~range_conjuncts:conjuncts_list
 ;;
 
 (* #513: the conjuncts of a joined query that speak only about the driving
