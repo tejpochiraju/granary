@@ -258,22 +258,50 @@ let right_table_ranges ~right_offset ~n_right_cols cs =
     cs
 ;;
 
+(** #551: is [meta] backed by a real B-tree the planner may seek or probe?
+
+    The catalog is reached {i by name} — [Cat.indexes_for_table cat ~table:name]
+    — but a name is not an identity.  [Cat.register_ephemeral] replaces only the
+    {i table} entry and leaves [indexes_by_table] alone, so a CTE that shadows a
+    real table answers with that table's indexes while carrying a synthesized
+    [table_meta] whose [tree_id] is negative.  Probing the shadowed tree with
+    the CTE's shape is a silently wrong answer (zero rows), not a missed
+    optimisation.
+
+    Synthesized tables — CTEs, [sqlite_master], [sqlite_sequence] — are marked
+    by a negative [tree_id]; a columnar table has no B-tree at all. *)
+let meta_is_btree_backed (meta : Cat.table_meta) =
+  match meta.Cat.storage with
+  | Cat.Row { tree_id; _ } -> tree_id >= 0
+  | Cat.Columnar _ -> false
+;;
+
 (** Pick the candidate index of [right_meta] whose probe key covers the most
-    columns. *)
+    columns.
+
+    #551: gated on {!meta_is_btree_backed}, for the reason spelled out there —
+    without it a CTE shadowing a real table takes a nested-loop probe against
+    that table's index tree and returns nothing.  #531 added the same guard on
+    the build side; this is its sibling, and it needs a driving side below
+    {!nlj_min_driving_rows} to be reached at all. *)
 let best_probe cat (right_meta : Cat.table_meta) ~join_col ~left_col ~right_eqs =
-  Cat.indexes_for_table cat ~table:right_meta.Cat.name
-  |> List.filter_map (fun (i : Cat.index_info) ->
-    Option.map
-      (fun parts -> i, parts)
-      (probe_key_for_index right_meta ~join_col ~left_col ~right_eqs i))
-  |> function
-  | [] -> None
-  | c :: rest ->
-    Some
-      (List.fold_left
-         (fun (bi, bp) (i, p) -> if List.length p > List.length bp then i, p else bi, bp)
-         c
-         rest)
+  if not (meta_is_btree_backed right_meta)
+  then None
+  else
+    Cat.indexes_for_table cat ~table:right_meta.Cat.name
+    |> List.filter_map (fun (i : Cat.index_info) ->
+      Option.map
+        (fun parts -> i, parts)
+        (probe_key_for_index right_meta ~join_col ~left_col ~right_eqs i))
+    |> function
+    | [] -> None
+    | c :: rest ->
+      Some
+        (List.fold_left
+           (fun (bi, bp) (i, p) ->
+              if List.length p > List.length bp then i, p else bi, bp)
+           c
+           rest)
 ;;
 
 (** Flatten the top-level [AND] spine of a WHERE clause into its conjuncts.
@@ -863,11 +891,12 @@ let seek_is_unique_point cat (meta : Cat.table_meta) ~idx_tree ~keys =
     [Op_sqlite_sequence], [Op_col_seq_scan] — all of which fall to the
     [unbounded_rows] arm.  That is the same answer {!table_rows_estimate} gives
     for a columnar table, and a pessimistic one for the three synthesized
-    shapes; it is inert wherever {!best_probe} finds no index on them, since the
-    strategy then lands on the hash join whatever [right_rows] says.  A CTE that
-    shadows a real table is the exception: {!best_probe} reaches the catalog by
-    name and carries no [tree_id] guard of its own — it is unguarded here, #551
-    — so it can find the shadowed table's indexes.
+    shapes; it is inert because {!best_probe} answers [None] for all of them, so
+    the strategy lands on the hash join whatever [right_rows] says.  That was
+    once argued as "finds no index on them", which was false for a CTE shadowing
+    a real table — {!best_probe} reaches the catalog by name and found the
+    shadowed table's indexes (#551).  It now carries the {!meta_is_btree_backed}
+    guard, so the claim holds by construction rather than by luck.
 
     Every other op answers {!unbounded_rows} rather than adding an arm no test
     can reach: an [Op_aggregate] with no GROUP BY is exactly one row and an
@@ -917,11 +946,62 @@ let probe_is_worth_it ~driving_rows ~right_rows =
       && driving_rows <= right_rows / nlj_probe_cost_ratio)
 ;;
 
+(** #552: the join for an ON predicate the hash keys cannot express — anything
+    that is not a [col = col] equality between the two sides.  Shared by the
+    catalog path ({!plan_join}) and the no-catalog one ({!chain_joins_no_cat}),
+    which had the same defect because they had the same shape.
+
+    The op is a cartesian hash join ([left_key = -1]) and the ON predicate has
+    to be applied somewhere above the pairing.  {b Where} is not a free choice:
+
+    - [`Inner]: above the join, as an [Op_filter].  Equivalent to filtering
+      inside it, and it keeps the shape every other part of the planner and its
+      tests already expect.
+    - [`Left]: inside the join, as [on_pred].  A filter above the join is
+      {i wrong} here — the ON predicate is the match test, so a left row that
+      satisfies it for no right row must still be emitted null-extended, and
+      that null-extended row is exactly what a post-join filter rejects
+      (typically because the predicate is NULL on it, as [b > a] is).  Before
+      #552 every left row was paired with every right row, [any] was set for all
+      of them, the null-extension never fired, and the filter then dropped the
+      unmatched left row entirely — [SELECT a, b FROM l LEFT JOIN r ON b > a]
+      lost its unmatched left rows (#539) and [ON si IS NULL] returned nothing
+      at all (#552).
+
+    The WHERE clause is unaffected either way: [chain_joins] still applies it to
+    the joined row, above the join, which is where SQL puts it — a WHERE
+    conjunct on a right-table column legitimately drops null-extended rows. *)
+let general_on_join ~left_op ~right_op ~on ~join_kind ~right_offset ~n_right_cols
+  : Plan.op
+  =
+  let pred = plan_expr on in
+  let on_pred =
+    match join_kind with
+    | `Left -> Some pred
+    | `Inner -> None
+  in
+  let cart =
+    Plan.Op_hash_join
+      { left = left_op
+      ; right = right_op
+      ; left_key = -1
+      ; right_key = -1
+      ; on_pred
+      ; join_kind
+      ; right_col_offset = right_offset
+      ; n_right_cols
+      }
+  in
+  match join_kind with
+  | `Left -> cart
+  | `Inner -> Plan.Op_filter { pred; child = cart }
+;;
+
 (** Plan a JOIN.  [left_op] produces left-table rows; we wrap it with
     either Op_nested_loop_join (when the right table has an index the join can
     probe) or Op_hash_join (otherwise).  If the ON predicate is not a simple
-    equality between a left and a right column, fall back to a hash cartesian
-    product wrapped in an Op_filter.
+    equality between a left and a right column, fall back to
+    {!general_on_join}'s hash cartesian product.
 
     #516: [where_conjuncts] are the top-level [AND] conjuncts of the query's
     WHERE clause.  Equalities among them that pin a right-table column can
@@ -1007,6 +1087,7 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
         ; right = right_op
         ; left_key = left_col
         ; right_key = right_col
+        ; on_pred = None
         ; join_kind
         ; right_col_offset = right_offset
         ; n_right_cols
@@ -1018,19 +1099,7 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
   | Some (a, b) when b < n_left && a >= right_offset ->
     mk_with_left_col_right_col b (a - right_offset)
   | _ ->
-    (* General ON predicate: cartesian hash-join + post-filter. *)
-    let cart =
-      Plan.Op_hash_join
-        { left = left_op
-        ; right = right_op
-        ; left_key = -1
-        ; right_key = -1
-        ; join_kind
-        ; right_col_offset = right_offset
-        ; n_right_cols
-        }
-    in
-    Plan.Op_filter { pred = plan_expr bj.on; child = cart }
+    general_on_join ~left_op ~right_op ~on:bj.on ~join_kind ~right_offset ~n_right_cols
 ;;
 
 let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
@@ -1380,6 +1449,7 @@ let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
                 ; right = make_scan bj.right_meta
                 ; left_key = a
                 ; right_key = b - right_offset
+                ; on_pred = None
                 ; join_kind
                 ; right_col_offset = right_offset
                 ; n_right_cols
@@ -1390,23 +1460,21 @@ let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
                 ; right = make_scan bj.right_meta
                 ; left_key = b
                 ; right_key = a - right_offset
+                ; on_pred = None
                 ; join_kind
                 ; right_col_offset = right_offset
                 ; n_right_cols
                 }
             | _ ->
-              let cart =
-                Plan.Op_hash_join
-                  { left = op
-                  ; right = make_scan bj.right_meta
-                  ; left_key = -1
-                  ; right_key = -1
-                  ; join_kind
-                  ; right_col_offset = right_offset
-                  ; n_right_cols
-                  }
-              in
-              Plan.Op_filter { pred = plan_expr bj.on; child = cart }
+              (* #552: shared with the catalog path, which had the same defect
+                 because it had the same shape. *)
+              general_on_join
+                ~left_op:op
+                ~right_op:(make_scan bj.right_meta)
+                ~on:bj.on
+                ~join_kind
+                ~right_offset
+                ~n_right_cols
           in
           joined, n_left + n_right_cols)
        (base, List.length table_meta.columns)

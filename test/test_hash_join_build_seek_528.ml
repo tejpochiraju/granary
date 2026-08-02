@@ -267,26 +267,26 @@ let general_on_predicate_build_side_seeks () =
 (* The general-ON path crossed with LEFT — the combination this PR newly widened,
    and the one place the argument needs two filters rather than one.
 
-   [Op_filter (plan_expr bj.on)] runs ABOVE the cartesian join (planner.ml), so
-   an ON predicate that is true of a null-extended row — [si IS NULL] — would
-   emit rows the narrowing could make strictly more numerous. Two things stop
-   that. The first is [chain_joins], which wraps the whole chain in the WHERE
-   clause, whose [sw = 1] is NULL on a null-extended row. The second is the
-   executor itself, and it is a bug: the cartesian arm of [stream_hash_join]
-   (exec.ml) sets [any := true] for EVERY right row, so it null-extends only
-   when the build side is entirely empty — never for an individual unmatched
-   left row. So [si IS NULL] currently returns nothing at all, from either
-   spelling: that half of this case is a [] = [] comparison, pinned to #552, and
-   only its [examined seek < foil] assertion bites. It is kept because when #552
-   is fixed this is the case that will start producing rows, and the agreement
-   check is already sitting on it.
+   #552 moved the ON predicate INSIDE the join for an outer join, so an
+   unmatched left row is now genuinely null-extended rather than dropped. An ON
+   predicate true of a null-extended row — [si IS NULL] — would therefore emit
+   rows the narrowing could make strictly more numerous. What stops that is
+   [chain_joins], which wraps the whole chain in the WHERE clause: [sw] is NULL
+   on a null-extended row, and [sw = 1] is never true of NULL. The seek and its
+   foil null-extend DIFFERENT left rows and both sets are then dropped, which is
+   exactly the argument #516 settled on.
 
-   For the same reason the [o = 20] driving row is not a null-extension
-   candidate under either predicate — the cartesian join pairs it with every
-   stock row regardless — it only widens the set of rows the filters must
-   reject.
+   That is also why this test cannot observe null extension itself: under a
+   WHERE equality on the right table it is unobservable by construction. The
+   [si IS NULL] case is therefore [] = [], and deliberately so — its
+   [examined seek < foil] assertion is what bites here. The null extension it
+   used to swallow is pinned separately, without a WHERE clause, by
+   [is_null_on_null_extends_every_left_row] in [test_join_general_on_552.ml];
+   the assertion below checks the same query here so that a regression of #552
+   shows up in this file too rather than making the case silently vacuous again.
 
-   Both spellings must agree with their foils. *)
+   The [o = 20] driving row matches no stock row under either predicate, so it
+   is the one that must survive the WHERE-less LEFT JOIN null-extended. *)
 let general_on_predicate_left_join_agrees () =
   with_db (fun db ->
     exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
@@ -320,9 +320,10 @@ let general_on_predicate_left_join_agrees () =
            ~label:(Printf.sprintf "LEFT + general ON %S agrees with its scan" on)
            ~seek
            ~foil;
-         (* Non-vacuity, stated per case: [si IS NULL] is the one that yields
-            nothing today, and it does so because of #552 rather than because
-            the narrowing swallowed rows. *)
+         (* Non-vacuity, stated per case: [si IS NULL] yields nothing because
+            the WHERE clause drops every null-extended row, not because the
+            narrowing swallowed rows and not because of #552 — which is
+            re-checked just below, WHERE-less, where it IS observable. *)
          Alcotest.(check bool)
            (Printf.sprintf "ON %S: rows are%s empty" on (if nonempty then " not" else ""))
            nonempty
@@ -334,9 +335,27 @@ let general_on_predicate_left_join_agrees () =
            true
            (n_seek < n_foil))
       (* [si > i_id] is the ordinary general ON; [si IS NULL] is the one that is
-         true of a null-extended row, so it is the case the ON-filter alone
-         cannot handle — and the one #552 currently empties. *)
-      [ "si > i_id", true; "si IS NULL", false ])
+         true of a null-extended row, so it is the case an ON filter placed
+         above the join cannot handle at all (#552). *)
+      [ "si > i_id", true; "si IS NULL", false ];
+    (* #552, without the WHERE clause that makes null extension unobservable:
+       no stock row has [si IS NULL], so every one of the 20 driving rows is
+       null-extended. Before #552 this returned nothing. *)
+    let null_extended =
+      rows_of db "SELECT o, qty FROM line LEFT JOIN stock ON si IS NULL"
+    in
+    Alcotest.(check int)
+      "WHERE-less: one null-extended row per driving row"
+      20
+      (List.length null_extended);
+    Alcotest.(check bool)
+      "and every one of them carries NULL from stock"
+      true
+      (List.for_all
+         (function
+           | [ _; "NULL" ] -> true
+           | _ -> false)
+         null_extended))
 ;;
 
 (* ------------------------------------------------------------------ *)

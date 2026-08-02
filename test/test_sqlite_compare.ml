@@ -465,6 +465,57 @@ let cases =
     ; query = "SELECT a.name, b.val FROM a LEFT JOIN b ON a.id = b.aid ORDER BY a.id ASC"
     ; unordered = false
     }
+  ; (* #552 / #539: a LEFT JOIN whose ON predicate is not a [col = col] equality
+       must still null-extend left rows that match no right row. SQLite is the
+       oracle for all four spellings. *)
+    { name = "left_join_non_equi_on_null_extends"
+    ; setup =
+        [ "CREATE TABLE l (a INTEGER)"
+        ; "CREATE TABLE r (b INTEGER)"
+        ; "INSERT INTO l VALUES (1)"
+        ; "INSERT INTO l VALUES (9)"
+        ; "INSERT INTO r VALUES (5)"
+        ]
+    ; query = "SELECT a, b FROM l LEFT JOIN r ON b > a"
+    ; unordered = true
+    }
+  ; { name = "left_join_is_null_on_null_extends"
+    ; setup =
+        [ "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER)"
+        ; "CREATE TABLE stock (sw INTEGER, si INTEGER, qty INTEGER)"
+        ; "INSERT INTO line VALUES (1,1,1)"
+        ; "INSERT INTO line VALUES (1,2,2)"
+        ; "INSERT INTO line VALUES (1,3,3)"
+        ; "INSERT INTO stock VALUES (1,1,11)"
+        ]
+    ; query = "SELECT o, qty FROM line LEFT JOIN stock ON si IS NULL"
+    ; unordered = true
+    }
+  ; { name = "left_join_general_on_mixed_population"
+    ; setup =
+        [ "CREATE TABLE l (a INTEGER)"
+        ; "CREATE TABLE r (b INTEGER)"
+        ; "INSERT INTO l VALUES (1)"
+        ; "INSERT INTO l VALUES (4)"
+        ; "INSERT INTO l VALUES (9)"
+        ; "INSERT INTO r VALUES (2)"
+        ; "INSERT INTO r VALUES (5)"
+        ; "INSERT INTO r VALUES (7)"
+        ]
+    ; query = "SELECT a, b FROM l LEFT JOIN r ON b > a"
+    ; unordered = true
+    }
+  ; { name = "inner_join_general_on_unchanged"
+    ; setup =
+        [ "CREATE TABLE l (a INTEGER)"
+        ; "CREATE TABLE r (b INTEGER)"
+        ; "INSERT INTO l VALUES (1)"
+        ; "INSERT INTO l VALUES (9)"
+        ; "INSERT INTO r VALUES (5)"
+        ]
+    ; query = "SELECT a, b FROM l INNER JOIN r ON b > a"
+    ; unordered = true
+    }
   ; { name = "join_null_key_excluded"
     ; setup =
         [ "CREATE TABLE a (id INTEGER, name TEXT)"

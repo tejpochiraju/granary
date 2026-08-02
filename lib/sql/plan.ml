@@ -220,6 +220,18 @@ type op =
       ; right : op
       ; left_key : int (** col ordinal in the left row *)
       ; right_key : int (** col ordinal in the right row *)
+      ; on_pred : expr option
+        (** #552: the ON predicate, evaluated on the joined row {i inside} the
+            join as its match test.  Set only on the cartesian fallback
+            ([left_key < 0]), where the ON predicate is not a [col = col]
+            equality the hash keys can express.
+
+            It has to live here rather than in an [Op_filter] above the join
+            because for an outer join the ON predicate {b is} the match test: a
+            left row that satisfies it for no right row must still be emitted,
+            null-extended, and a filter above the join sees that null-extended
+            row and rejects it.  For an [`Inner] join the two placements are
+            equivalent and the planner still emits the filter. *)
       ; join_kind : [ `Inner | `Left ]
       ; right_col_offset : int
       ; n_right_cols : int

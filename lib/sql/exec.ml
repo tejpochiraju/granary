@@ -6334,10 +6334,15 @@ let op_name = function
   | Plan.Op_limit { limit; offset; _ } ->
     Printf.sprintf "Limit(%d offset %d)" limit offset
   | Plan.Op_aggregate _ -> "Aggregate"
-  | Plan.Op_hash_join { join_kind; _ } ->
+  | Plan.Op_hash_join { join_kind; on_pred; _ } ->
+    (* #552: a general ON predicate on an outer join lives inside the join
+       rather than in an [Op_filter] above it, so without this suffix the
+       predicate disappears from EXPLAIN entirely and the [`Inner] and [`Left]
+       spellings of the same query explain differently for no visible reason. *)
+    let on = if Option.is_some on_pred then "(ON)" else "" in
     (match join_kind with
-     | `Inner -> "HashJoin"
-     | `Left -> "LeftHashJoin")
+     | `Inner -> "HashJoin" ^ on
+     | `Left -> "LeftHashJoin" ^ on)
   | Plan.Op_nested_loop_join { join_kind; right_meta; _ } ->
     (match join_kind with
      | `Inner -> "NestedLoopJoin(" ^ right_meta.Cat.name ^ ")"
@@ -9382,15 +9387,48 @@ and stream_hash_join
       right
       left_key
       right_key
+      on_pred
       join_kind
       n_right_cols
   =
+  (* [on_pred] is only ever consulted by the cartesian arm below, so a keyed
+     join carrying one would drop its match test silently.  [Op_hash_join] is a
+     public constructor — the planner honouring that invariant is not enough to
+     enforce it, and the failure mode is a wrong answer, not a crash. *)
+  if left_key >= 0 && right_key >= 0 && Option.is_some on_pred
+  then
+    invalid_arg
+      "Exec.stream_hash_join: on_pred is only meaningful on the cartesian arm (left_key \
+       < 0 || right_key < 0)";
   let* left_stream = to_stream clock params store ~mode ~cat left in
   let* right_stream = to_stream clock params store ~mode ~cat right in
   let* right_rows = Lwt_stream.to_list right_stream in
   if left_key < 0 || right_key < 0
   then (
-    (* Cartesian product fallback (general ON predicate). *)
+    (* Cartesian product fallback (general ON predicate).
+
+       #552: when the planner supplies [on_pred] it is the join's match test,
+       applied here to each pair, and a left row that survives no pair is
+       null-extended.  That is the only placement an outer join can use — a
+       filter above the join would reject the very null-extended row it has to
+       let through.  With [on_pred = None] every pair matches and the caller
+       filters, which is what an INNER join still does. *)
+    let* pred =
+      match on_pred with
+      | None -> Lwt.return None
+      | Some p ->
+        (* Uncorrelated subqueries in the ON predicate are resolved once, as
+           [stream_filter] does.  A correlated one cannot be resolved here, and
+           could not be resolved by the filter this replaces either — that
+           filter's [get_outer_scan_meta] answers [None] over a join. *)
+        let* p = pre_eval_subquery clock store params cat p in
+        Lwt.return (Some p)
+    in
+    let matches joined =
+      match pred with
+      | None -> true
+      | Some p -> value_truthy (eval_expr clock params joined p)
+    in
     let* left_rows = Lwt_stream.to_list left_stream in
     let out = ref [] in
     List.iter
@@ -9398,8 +9436,11 @@ and stream_hash_join
          let any = ref false in
          List.iter
            (fun rrow ->
-              out := Array.append lrow rrow :: !out;
-              any := true)
+              let joined = Array.append lrow rrow in
+              if matches joined
+              then (
+                out := joined :: !out;
+                any := true))
            right_rows;
          match join_kind with
          | `Left when not !any ->
@@ -10658,8 +10699,15 @@ and to_stream
       join_kind
       n_right_cols
   | Plan.Op_hash_join
-      { left; right; left_key; right_key; join_kind; right_col_offset = _; n_right_cols }
-    ->
+      { left
+      ; right
+      ; left_key
+      ; right_key
+      ; on_pred
+      ; join_kind
+      ; right_col_offset = _
+      ; n_right_cols
+      } ->
     stream_hash_join
       clock
       params
@@ -10670,6 +10718,7 @@ and to_stream
       right
       left_key
       right_key
+      on_pred
       join_kind
       n_right_cols
   | Plan.Op_aggregate { child; group_cols; aggs; having; proj; windows = agg_windows } ->
