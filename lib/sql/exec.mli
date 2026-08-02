@@ -237,8 +237,10 @@ val make_dml_seek_stats : unit -> dml_seek_stats
 val with_dml_seek_stats : dml_seek_stats -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
 (** #264: quote a SQL identifier with double-quotes when it is not a plain
-    [[A-Za-z_][A-Za-z0-9_]*] word (embedded quotes doubled); returned verbatim
-    otherwise. *)
+    [[A-Za-z_][A-Za-z0-9_]*] word, or is a reserved word (embedded quotes
+    doubled); returned verbatim otherwise. #572: an alias for
+    {!Granary_sql.Ast.quote_ident} — the DDL renderer and [Ast.expr_to_sql]
+    emit SQL text into the same catalog, so they share one rule. *)
 val quote_ident : string -> string
 
 (** #264: reconstruct a [CREATE TABLE] statement from catalog metadata (used by

@@ -588,10 +588,257 @@ let func_to_sql = function
   | Fn_sqlite_version -> "SQLITE_VERSION"
 ;;
 
+(* #572: every word the lexer maps to a keyword token instead of [IDENT].  A
+   column or table with one of these names can only ever have been spelled
+   delimited, so re-emitting it bare would produce text that no longer parses
+   — exactly the failure this list exists to prevent.
+
+   Mirrors the keyword table at the [ident] rule in [lexer.mll]; the lexer
+   uppercases before matching, so the comparison here is case-insensitive too.
+   [test_ident_quoting_572.ml] re-derives the list from [lexer.mll] and fails
+   if the two have drifted apart. *)
+let sql_keywords =
+  [ (* generated from lexer.mll *)
+    "ABORT"
+  ; "ABS"
+  ; "ACOS"
+  ; "ADD"
+  ; "AFTER"
+  ; "ALL"
+  ; "ALTER"
+  ; "ANALYZE"
+  ; "AND"
+  ; "AS"
+  ; "ASC"
+  ; "ASIN"
+  ; "ATAN"
+  ; "ATAN2"
+  ; "ATTACH"
+  ; "AUTOINCREMENT"
+  ; "AVG"
+  ; "BEFORE"
+  ; "BEGIN"
+  ; "BETWEEN"
+  ; "BLOB"
+  ; "BY"
+  ; "CASCADE"
+  ; "CASE"
+  ; "CAST"
+  ; "CEIL"
+  ; "CEILING"
+  ; "CHANGES"
+  ; "CHAR"
+  ; "CHECK"
+  ; "COALESCE"
+  ; "COLLATE"
+  ; "COLUMN"
+  ; "COLUMNSTORE"
+  ; "COMMIT"
+  ; "CONFLICT"
+  ; "COS"
+  ; "COUNT"
+  ; "CREATE"
+  ; "DATABASE"
+  ; "DATE"
+  ; "DATETIME"
+  ; "DEFAULT"
+  ; "DEFERRABLE"
+  ; "DEFERRED"
+  ; "DEGREES"
+  ; "DELETE"
+  ; "DELTA"
+  ; "DESC"
+  ; "DETACH"
+  ; "DISTINCT"
+  ; "DO"
+  ; "DOUBLE"
+  ; "DROP"
+  ; "EACH"
+  ; "ELSE"
+  ; "END"
+  ; "EXCEPT"
+  ; "EXISTS"
+  ; "EXP"
+  ; "EXPLAIN"
+  ; "FAIL"
+  ; "FLOAT"
+  ; "FLOOR"
+  ; "FOLLOWING"
+  ; "FOR"
+  ; "FOREIGN"
+  ; "FORMAT"
+  ; "FROM"
+  ; "FTS5"
+  ; "FULL"
+  ; "GLOB"
+  ; "GROUP"
+  ; "GROUP_CONCAT"
+  ; "HAVING"
+  ; "HEX"
+  ; "IF"
+  ; "IFNULL"
+  ; "IGNORE"
+  ; "IIF"
+  ; "IMMEDIATE"
+  ; "IN"
+  ; "INDEX"
+  ; "INITIALLY"
+  ; "INNER"
+  ; "INSERT"
+  ; "INSTEAD"
+  ; "INSTR"
+  ; "INT"
+  ; "INTEGER"
+  ; "INTERSECT"
+  ; "INTO"
+  ; "IS"
+  ; "JOIN"
+  ; "JSON_ARRAY"
+  ; "JSON_EXTRACT"
+  ; "JSON_INSERT"
+  ; "JSON_OBJECT"
+  ; "JSON_REMOVE"
+  ; "JSON_REPLACE"
+  ; "JSON_SET"
+  ; "JSON_TYPE"
+  ; "JSON_VALID"
+  ; "JULIANDAY"
+  ; "KEY"
+  ; "LAST_INSERT_ROWID"
+  ; "LEFT"
+  ; "LENGTH"
+  ; "LIKE"
+  ; "LIMIT"
+  ; "LN"
+  ; "LOG"
+  ; "LOG10"
+  ; "LOG2"
+  ; "LOWER"
+  ; "LTRIM"
+  ; "MATCH"
+  ; "MAX"
+  ; "MIN"
+  ; "NOT"
+  ; "NULL"
+  ; "NULLIF"
+  ; "NULLS"
+  ; "OFFSET"
+  ; "ON"
+  ; "OR"
+  ; "ORDER"
+  ; "OUTER"
+  ; "OVER"
+  ; "PARTITION"
+  ; "PI"
+  ; "POW"
+  ; "POWER"
+  ; "PRAGMA"
+  ; "PRECEDING"
+  ; "PRIMARY"
+  ; "PRINTF"
+  ; "RADIANS"
+  ; "RANDOM"
+  ; "RANDOMBLOB"
+  ; "REACTIVE"
+  ; "REAL"
+  ; "RECURSIVE"
+  ; "REFERENCES"
+  ; "REFRESH"
+  ; "RELEASE"
+  ; "RENAME"
+  ; "REPLACE"
+  ; "RESTRICT"
+  ; "RETURNING"
+  ; "ROLLBACK"
+  ; "ROUND"
+  ; "ROW"
+  ; "ROWID"
+  ; "RTRIM"
+  ; "SAVEPOINT"
+  ; "SELECT"
+  ; "SET"
+  ; "SIGN"
+  ; "SIN"
+  ; "SNIPPET"
+  ; "SQLITE_VERSION"
+  ; "SQRT"
+  ; "STRFTIME"
+  ; "STRING_AGG"
+  ; "SUBSTR"
+  ; "SUBSTRING"
+  ; "SUM"
+  ; "TABLE"
+  ; "TAN"
+  ; "TEXT"
+  ; "THEN"
+  ; "TIME"
+  ; "TO"
+  ; "TOTAL_CHANGES"
+  ; "TRIGGER"
+  ; "TRIM"
+  ; "TRUNC"
+  ; "TRUNCATE"
+  ; "TYPEOF"
+  ; "UNICODE"
+  ; "UNION"
+  ; "UNIQUE"
+  ; "UNIXEPOCH"
+  ; "UPDATE"
+  ; "UPPER"
+  ; "USING"
+  ; "VACUUM"
+  ; "VALUES"
+  ; "VARCHAR"
+  ; "VIEW"
+  ; "VIRTUAL"
+  ; "WHEN"
+  ; "WHERE"
+  ; "WITH"
+  ; "WITHOUT"
+  ; "ZEROBLOB"
+  ]
+;;
+
+let keyword_table =
+  lazy
+    (let h = Hashtbl.create 512 in
+     List.iter (fun k -> Hashtbl.replace h k ()) sql_keywords;
+     h)
+;;
+
+let is_sql_keyword s = Hashtbl.mem (Lazy.force keyword_table) (String.uppercase_ascii s)
+
+(* An identifier survives being written back bare only if it is a plain
+   [[A-Za-z_][A-Za-z0-9_]*] word that the lexer would not swallow as a
+   keyword.  Everything else — the empty name, a leading digit, a space, any
+   punctuation, an embedded quote — has to be delimited. *)
+let ident_needs_quoting s =
+  String.length s = 0
+  || (let c = s.[0] in
+      not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = '_'))
+  || String.exists
+       (fun c ->
+          not
+            ((c >= 'A' && c <= 'Z')
+             || (c >= 'a' && c <= 'z')
+             || (c >= '0' && c <= '9')
+             || c = '_'))
+       s
+  || is_sql_keyword s
+;;
+
+let quote_ident s =
+  if ident_needs_quoting s
+  then "\"" ^ String.concat "\"\"" (String.split_on_char '"' s) ^ "\""
+  else s
+;;
+
+(* A single-quoted SQL string literal, with embedded quotes doubled. *)
+let quote_text_literal s = "'" ^ String.concat "''" (String.split_on_char '\'' s) ^ "'"
+
 let rec expr_to_sql = function
   | E_lit (L_int n) -> Int64.to_string n
-  | E_lit (L_text s) ->
-    Printf.sprintf "'%s'" (String.concat "''" (String.split_on_char '\'' s))
+  | E_lit (L_text s) -> quote_text_literal s
   | E_lit L_null -> "NULL"
   | E_lit (L_real f) -> Printf.sprintf "%.17g" f
   | E_lit (L_blob _) ->
@@ -599,8 +846,12 @@ let rec expr_to_sql = function
   | E_lit L_current_timestamp -> "CURRENT_TIMESTAMP"
   | E_lit L_current_date -> "CURRENT_DATE"
   | E_lit L_current_time -> "CURRENT_TIME"
-  | E_col name -> name
-  | E_tbl_col (t, c) -> Printf.sprintf "%s.%s" t c
+  (* #572: delimit a name that needs it.  Without this a column called
+     ["my col"] renders as [my col], and the CHECK / GENERATED / partial-index
+     text built from it never parses again — the table it belongs to is
+     created successfully and is then permanently un-insertable. *)
+  | E_col name -> quote_ident name
+  | E_tbl_col (t, c) -> Printf.sprintf "%s.%s" (quote_ident t) (quote_ident c)
   | E_param Param_anon -> "?"
   | E_param (Param_index i) -> Printf.sprintf "?%d" i
   | E_param (Param_name n) -> Printf.sprintf ":%s" n
@@ -665,13 +916,15 @@ let rec expr_to_sql = function
     in
     Printf.sprintf "(%s) COLLATE %s" (expr_to_sql e) cname
   | E_fts_snippet { table; col_idx; start_tag; end_tag; ellipsis; n_tokens } ->
+    (* #572: the table name is an identifier and the three tags are string
+       literals; both need escaping for this to parse back. *)
     Printf.sprintf
-      "snippet(%s,%d,'%s','%s','%s',%d)"
-      table
+      "snippet(%s,%d,%s,%s,%s,%d)"
+      (quote_ident table)
       col_idx
-      start_tag
-      end_tag
-      ellipsis
+      (quote_text_literal start_tag)
+      (quote_text_literal end_tag)
+      (quote_text_literal ellipsis)
       n_tokens
   | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ ->
     failwith "expr_to_sql: unsupported expression form"

@@ -416,10 +416,17 @@ val add_column
     column). Matching is case-sensitive, as every other column lookup in this
     module is. Every byte it does not rename is preserved exactly.
 
-    Note that a column whose name needs quoting cannot currently reach this
-    function at all: {!Granary_sql.Ast.expr_to_sql} emits identifiers unquoted,
-    so such a column already poisons its own CHECK / GENERATED expression at
-    CREATE time, with no ALTER involved (#572). *)
+    #572: a column whose name needs quoting used to be unable to reach this
+    function at all — {!Granary_sql.Ast.expr_to_sql} emitted identifiers
+    unquoted, so such a column poisoned its own CHECK / GENERATED expression at
+    CREATE time, with no ALTER involved. That emitter now delimits, so the
+    delimited-identifier branch above is live and covered end to end.
+
+    [new_name] is written delimited when it is not a plain
+    [[A-Za-z_][A-Za-z0-9_]*] word, so renaming into a bare position cannot
+    produce text that no longer parses. Renaming to a {e reserved word} is the
+    one case still broken (#577): this module sits below the parser and has no
+    keyword table to consult. *)
 val rewrite_ident_in_sql : old_name:string -> new_name:string -> string -> string
 
 (** Rename a table.

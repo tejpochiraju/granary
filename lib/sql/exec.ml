@@ -326,26 +326,16 @@ let sql_of_fk_action = function
 
 (* Phase 35 task 3b: quote DDL identifiers that contain non-alphanumeric
    characters, start with a digit, or are empty.  Embedded double-quotes are
-   doubled per SQL identifier syntax. *)
-let needs_quoting s =
-  String.length s = 0
-  || (let c = s.[0] in
-      not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = '_'))
-  || String.exists
-       (fun c ->
-          not
-            ((c >= 'A' && c <= 'Z')
-             || (c >= 'a' && c <= 'z')
-             || (c >= '0' && c <= '9')
-             || c = '_'))
-       s
-;;
+   doubled per SQL identifier syntax.
 
-let quote_ident s =
-  if needs_quoting s
-  then "\"" ^ String.concat "\"\"" (String.split_on_char '"' s) ^ "\""
-  else s
-;;
+   #572: the rule now lives in [Ast] and is shared with [Ast.expr_to_sql],
+   which had no quoting at all and so poisoned the CHECK / GENERATED /
+   partial-index text it built.  Two emitters of the same SQL text must agree
+   on when a name is bare, so there is one implementation, not two — and the
+   one implementation also covers the case this copy missed: a name that is a
+   plain word but a reserved one ([CREATE TABLE t ("key" INTEGER)] rendered as
+   [key INTEGER], which does not parse). *)
+let quote_ident = Ast.quote_ident
 
 let format_pk_suffix ~autoinc_idx i (col : Row.column) buf =
   Buffer.add_string buf " PRIMARY KEY";

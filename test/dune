@@ -1046,3 +1046,21 @@
   qcheck-alcotest
   lwt.unix
   unix))
+
+; #572: identifier quoting in stored SQL text (CHECK / GENERATED / partial and
+; expression indexes).  Depends on lexer.mll so the reserved-word list in
+; Ast can be checked against the lexer's own table.
+
+(test
+ (name test_ident_quoting_572)
+ (modules test_ident_quoting_572)
+ (deps %{project_root}/lib/sql/lexer.mll)
+ (libraries
+  granary
+  granary.sql
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt
+  lwt.unix
+  unix))

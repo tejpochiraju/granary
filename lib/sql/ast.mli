@@ -527,7 +527,29 @@ val binop_to_sql : binop -> string
 (** Render a scalar function as its SQL keyword (e.g. [Fn_length] → ["LENGTH"]). *)
 val func_to_sql : scalar_func -> string
 
+(** #572: every word the lexer turns into a keyword token rather than an
+    identifier, upper-cased. Mirrors the keyword table in [lexer.mll]. *)
+val sql_keywords : string list
+
+(** [is_sql_keyword s] is whether [s] — compared case-insensitively, as the
+    lexer does — is one of {!sql_keywords}. *)
+val is_sql_keyword : string -> bool
+
+(** [ident_needs_quoting s] is whether [s] must be written delimited to be read
+    back as the identifier [s]: it is not a plain [[A-Za-z_][A-Za-z0-9_]*]
+    word, or it is one that the lexer would swallow as a keyword. *)
+val ident_needs_quoting : string -> bool
+
+(** #572: quote a SQL identifier with double quotes when
+    {!ident_needs_quoting} says so (embedded quotes doubled); returned verbatim
+    otherwise. The single rule shared by every SQL-text emitter in the engine —
+    {!expr_to_sql} here and the DDL renderer in [Exec]. *)
+val quote_ident : string -> string
+
 (** Serialise an expression back to SQL text, used for CHECK-constraint
-    round-tripping. Raises [Failure] on forms with no SQL surface
-    (aggregates, MATCH, subqueries, EXISTS, window calls, and BLOB literals). *)
+    round-tripping. Identifiers are delimited when they need it, so
+    [parse -> expr_to_sql -> parse] is closed over every name the lexer accepts
+    as a quoted identifier (#572). Raises [Failure] on forms with no SQL
+    surface (aggregates, MATCH, subqueries, EXISTS, window calls, and BLOB
+    literals). *)
 val expr_to_sql : expr -> string

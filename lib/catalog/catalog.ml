@@ -2843,6 +2843,35 @@ let copy_quoted_ident sql buf i ~old_name ~new_name =
     stop
 ;;
 
+(* #572: a name that is not a plain [[A-Za-z_][A-Za-z0-9_]*] word cannot be
+   written into a bare-identifier position as-is — [a -> "my col"] would turn
+   [(a > 0)] into [(my col > 0)], which no longer parses, exactly the failure
+   #572 fixed at the emitter.  Substituting the delimited spelling is always
+   valid wherever a bare word stood.
+
+   This deliberately does NOT consult a reserved-word list, unlike
+   {!Granary_sql.Ast.quote_ident}: the catalog sits below the parser and has no
+   access to the lexer's keyword table, and duplicating it here is exactly the
+   drift this module cannot detect.  Renaming a column TO a reserved word is
+   therefore still broken; that is #577.
+
+   Note this uses the LEXER's notion of a bare word ([[A-Za-z_][A-Za-z0-9_]*]),
+   which is narrower than {!is_ident_char} above — that one also admits ['$']
+   and bytes ≥ 128 so the scanner treats them as part of one word rather than
+   splitting mid-name, but neither can appear in a bare identifier. *)
+let is_plain_word s =
+  let plain_start c = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = '_' in
+  s <> ""
+  && plain_start s.[0]
+  && String.for_all (fun c -> plain_start c || (c >= '0' && c <= '9')) s
+;;
+
+let bare_position_spelling name =
+  if is_plain_word name
+  then name
+  else "\"" ^ String.concat "\"\"" (String.split_on_char '"' name) ^ "\""
+;;
+
 (* A bare word starting at [i], renamed when it stands in a column position. *)
 let copy_bare_ident sql buf i ~old_name ~new_name =
   let n = String.length sql in
@@ -2851,7 +2880,9 @@ let copy_bare_ident sql buf i ~old_name ~new_name =
   let word = String.sub sql i (j - i) in
   Buffer.add_string
     buf
-    (if String.equal word old_name && is_column_ref_at sql j then new_name else word);
+    (if String.equal word old_name && is_column_ref_at sql j
+     then bare_position_spelling new_name
+     else word);
   j
 ;;
 
