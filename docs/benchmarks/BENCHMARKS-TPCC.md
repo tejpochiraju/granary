@@ -132,7 +132,59 @@ podman run --rm --user 0 -v "$(pwd):/workspace:z" -w /workspace \
 The W=1 load costs roughly 45 s per engine and dominates a short run; that cost
 is untimed and reported separately on stderr.
 
+## A known crash on the SQLite side: #571
+
+`bench_tpcc` takes **SIGSEGV (exit 139)** during the reference-SQLite
+measurement interval once the run is long enough, with **two or more
+terminals**. It is not transaction volume (a one-terminal run completed 34,623
+transactions cleanly) and it is not the stack (it reproduces under a 256 MB
+`ulimit`). Filed as **#571** with the bisection table.
+
+Practical consequence: `GRANARY_TPCC_SECONDS` defaults to 10 and the recorded
+comparison below was taken at 5 s per engine, in **separate processes**, which
+completes reliably. Running both engines in one process is where it is most
+likely to bite, since the crash threshold appears to be per-process rather than
+per-engine. Prefer `GRANARY_TPCC_ENGINES=granary` and
+`GRANARY_TPCC_ENGINES=sqlite` as two invocations until #571 is closed — which
+also removes the page-cache asymmetry noted above.
+
 ## Recorded results
 
-See `bench/results/` for CSV output, and the PR for #500 for the run that
-produced the first recorded numbers along with the exact invocation.
+CSV under `bench/results/`. Every number below is from the invocation printed
+beside it, on a shared dev host under concurrent load from other work, so treat
+run-to-run spread of a few tens of percent as noise — the 40x engine gap is not.
+
+### NewOrder/sec, W=1, granary vs reference SQLite
+
+`bench/results/2026-08-02-tpcc-w1-vs-sqlite.csv`, 4 terminals, 5 s measured,
+1 s warm-up, each engine in its own process:
+
+| engine | NewOrder/sec | new_order mean | service | wait |
+|---|---|---|---|---|
+| granary | 19.32 | 84.9 ms | 19.8 ms | 65.1 ms |
+| sqlite | 808.59 | 0.79 ms | 0.79 ms | 0.00 ms |
+
+Reference SQLite is about **42x** granary's NewOrder rate on this workload. Its
+`wait` is zero throughout: the bindings are blocking, so a transaction never
+yields and a terminal never queues.
+
+### Terminal sweep, W=1, granary
+
+`bench/results/2026-08-02-tpcc-w1-sweep.csv`, 10 s measured, 2 s warm-up:
+
+| terminals | NewOrder/sec | new_order mean | service | wait |
+|---|---|---|---|---|
+| 1 | 25.70 | 16.2 ms | 16.2 ms | 0.0 ms |
+| 2 | 21.97 | 37.5 ms | 20.2 ms | 17.3 ms |
+| 4 | 20.02 | 88.2 ms | 22.4 ms | 65.8 ms |
+| 8 | 18.30 | 213.2 ms | 28.5 ms | 184.7 ms |
+| 16 | 9.88 | 779.9 ms | 49.0 ms | 731.0 ms |
+
+**This is the result, not a tuning failure.** Throughput does not rise with
+terminals — it drifts down — while mean latency rises by 48x, and essentially
+all of that rise is `wait`. `service` is roughly flat from 1 to 8 terminals,
+which is what a one-deep pool must produce: the engine is doing the same work
+per transaction, and every additional terminal is queued behind it.
+
+The one-terminal figure (25.7 NewOrder/sec) is therefore the honest ceiling for
+this workload today, and it is a *single-connection* ceiling — see #555.

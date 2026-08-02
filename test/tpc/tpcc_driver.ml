@@ -188,40 +188,66 @@ let stats_of_acc a =
 (* ── worker pool ──────────────────────────────────────────────────────────
    The pool is what enforces "one transaction at a time per worker" (see the
    module header: a granary Db.t has one explicit-transaction slot, and two
-   terminals sharing it would let one COMMIT the other's half-done work). *)
+   terminals sharing it would let one COMMIT the other's half-done work).
 
-let make_pool workers =
-  let remaining = ref workers in
-  Lwt_pool.create (List.length workers) (fun () ->
-    match !remaining with
-    | w :: rest ->
-      remaining := rest;
-      Lwt.return w
-    | [] ->
-      (* Lwt_pool never calls the creator more than [n] times. *)
-      Lwt.fail_with "Tpcc_driver: worker pool creator exhausted")
+   Hand-rolled rather than [Lwt_pool], for two reasons.
+
+   {b An exception must not evict the worker.} [Lwt_pool] disposes of an
+   element whose user raised. On a one-deep pool that ends the run at the
+   first failed transaction — while still reporting a rate for the truncated
+   interval, which is the worst kind of wrong number. Here a worker is
+   returned on every path and the caller classifies the failure.
+
+   {b And a released worker is handed on with [Lwt.wakeup_later], not
+   [Lwt.wakeup].} The later form resolves the next waiter from the scheduler
+   rather than inline, so a terminal's transaction is never run inside the
+   stack frame of the transaction that released the worker to it. That bound
+   matters exactly when the engine never awaits anything real — the
+   reference SQLite bindings are blocking calls wrapped in [Lwt.return] —
+   because then nothing else in the chain returns to the scheduler either.
+   See [terminal_loop] below for the other half of the same concern. *)
+
+type 'a pool =
+  { mutable free : 'a list
+  ; waiting : 'a Lwt.u Queue.t
+  }
+
+let make_pool workers = { free = workers; waiting = Queue.create () }
+
+let pool_acquire p =
+  match p.free with
+  | w :: rest ->
+    p.free <- rest;
+    Lwt.return w
+  | [] ->
+    let t, u = Lwt.task () in
+    Queue.add u p.waiting;
+    t
+;;
+
+let pool_release p w =
+  match Queue.take_opt p.waiting with
+  | Some u -> Lwt.wakeup_later u w
+  | None -> p.free <- w :: p.free
 ;;
 
 let now = Unix.gettimeofday
 
-(* One attempt. Never lets an exception escape the [Lwt_pool.use] callback:
-   Lwt_pool disposes of an element whose user raised, which would shrink the
-   pool — and on a one-worker pool would end the run — turning an ordinary
-   transaction failure into a silently truncated measurement. *)
+(* One attempt, timed in two halves: [wait_ms] up to acquiring a worker,
+   [service_ms] inside it. Nothing escapes — the worker is released on the
+   failure path too, or a one-deep pool would deadlock on the first raise. *)
 let attempt_once pool ~input =
   let submitted = now () in
-  let started = ref submitted in
+  let* w = pool_acquire pool in
+  let started = now () in
   let+ outcome =
-    Lwt_pool.use pool (fun w ->
-      started := now ();
-      Lwt.catch
-        (fun () -> Lwt.map (fun () -> Ok ()) (w input))
-        (fun exn -> Lwt.return (Error exn)))
+    Lwt.catch
+      (fun () -> Lwt.map (fun () -> Ok ()) (w input))
+      (fun exn -> Lwt.return (Error exn))
   in
   let finished = now () in
-  let wait_ms = 1000.0 *. (!started -. submitted) in
-  let service_ms = 1000.0 *. (finished -. !started) in
-  outcome, wait_ms, service_ms
+  pool_release pool w;
+  outcome, 1000.0 *. (started -. submitted), 1000.0 *. (finished -. started)
 ;;
 
 let record_success rec_ a ~input ~wait_ms ~service_ms =

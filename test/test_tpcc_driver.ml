@@ -262,7 +262,7 @@ let test_two_workers_overlap () =
    turn or none means the loop ran to completion without ever yielding, and
    survival at that point is a matter of how deep the stack happened to
    get. *)
-let sync_worker _ =
+let sync_worker () =
   let rec chain n =
     if n = 0 then Lwt.return_unit else Lwt.bind Lwt.return_unit (fun () -> chain (n - 1))
   in
@@ -286,7 +286,7 @@ let test_loop_returns_to_the_scheduler () =
       (fun r ->
          stop := true;
          r)
-      (D.run config ~workers:[ sync_worker ])
+      (D.run config ~workers:[ (fun _ -> sync_worker ()) ])
   in
   let r = fst (Lwt_main.run (Lwt.both driver (observer ()))) in
   Alcotest.(check bool)
@@ -297,6 +297,35 @@ let test_loop_returns_to_the_scheduler () =
     "the terminal loop yielded between transactions"
     true
     (!turns > 100)
+;;
+
+(* Pins the pool's hand-off bound: releasing a worker must not run the next
+   terminal's transaction inside the releasing one's stack frame, which is
+   what [Lwt.wakeup_later] buys over [Lwt.wakeup]. Needs two or more
+   terminals to mean anything — with one there is never a waiter to hand off
+   to.
+
+   Honest about its own reach: this measures depth through
+   [Printexc.get_callstack], and OCaml's tail-call optimisation flattens
+   enough of the chain that swapping [wakeup_later] back to [wakeup] does
+   {e not} make it fail. It is a property guard, not a reproduction of the
+   SIGSEGV described in [docs/benchmarks/BENCHMARKS-TPCC.md]; that crash is
+   still open as #571 and is not explained by this hand-off path. *)
+let test_worker_handoff_does_not_nest () =
+  let lo = ref max_int in
+  let hi = ref 0 in
+  let worker _ =
+    let d = Printexc.raw_backtrace_length (Printexc.get_callstack 100_000) in
+    if d < !lo then lo := d;
+    if d > !hi then hi := d;
+    sync_worker ()
+  in
+  let config = { base_config with terminals = 4; seconds = 0.3 } in
+  let _ = run_with ~config [ worker ] in
+  Alcotest.(check bool)
+    "stack depth stays bounded across worker hand-offs"
+    true
+    (!hi - !lo < 200)
 ;;
 
 let test_extra_terminals_show_up_as_wait () =
@@ -497,6 +526,10 @@ let () =
             "the loop returns to the scheduler"
             `Quick
             test_loop_returns_to_the_scheduler
+        ; Alcotest.test_case
+            "worker hand-off does not nest"
+            `Quick
+            test_worker_handoff_does_not_nest
         ; Alcotest.test_case
             "extra terminals become wait"
             `Quick
