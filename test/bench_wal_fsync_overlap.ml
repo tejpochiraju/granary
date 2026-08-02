@@ -54,24 +54,70 @@
     average 13: [calibrate_read_ops] chose read_ops=22639 targeting
     T_r = 0.45 x T_w = 0.68 s, and the measured reader phase came out 4.4-6.4 s
     against a 1.5 s writer — a 6-9x overshoot, so ALL THREE trials failed
-    identically at overlap 2.04.  The calibration probes run with no writer,
-    and they used to take the MINIMUM of three, i.e. the most optimistic per-op
-    cost available; if they land in an idle window while the measurement then
-    runs under load, the workload is oversized and every subsequent trial
-    inherits it.  Erring low on per-op cost errs HIGH on the workload, which is
-    the one direction [calibrate_read_ops] documents as unsafe.
+    identically at overlap 2.04.  Every part of that is a CALIBRATION error, not
+    a measurement one: a workload sized from a per-op cost the measurement never
+    pays is deterministically wrong for every trial that follows.  Erring low on
+    per-op cost errs HIGH on the workload, which is the one direction
+    [calibrate_read_ops] documents as unsafe.
 
-    So the fix has two parts, in order of importance:
-    - {b at the source}: [calibrate_read_ops] now reduces its probes with the
-      MEDIAN rather than the minimum, which tracks the load actually present
-      and discards the lucky idle probe that causes blowouts.  A divisor is not
-      a verdict — see the comment there for why min is right in [measure] and
-      wrong in calibration.
+    So the fix is layered, in order of importance — all three at the source, one
+    safety net:
+    - {b representative probes} (#569): the probes now run WITH THE WRITER
+      ACTIVE, so per-op cost is measured under the contention the measurement
+      actually sees.  They used to run readers alone at [delay:0.0], which made
+      the estimate depend on how busy the box happened to be between the probe
+      and the measurement — the model error that produced the blowouts.  See
+      [probe_reader_phase].
+    - {b median, not minimum} (#538): the probes are repeated and reduced with
+      the MEDIAN, not the most optimistic draw.  A divisor is not a verdict —
+      see the comment in [calibrate_read_ops] for why min is right in [measure]
+      and wrong in calibration.
+    - {b a floor on the estimate} (#569): the per-op cost is the marginal
+      probe difference OR the larger probe's average cost, whichever is bigger.
+      The marginal difference cancels the fixed cold-cache cost exactly but
+      amplifies noise; the average is biased high and never low.  Taking the max
+      keeps the unbiased estimator while removing its dangerous tail.
     - {b as a safety net}: a trial whose readers overran the writer window
       resizes read_ops by the observed overshoot and restarts the statistic
       (durations from different workloads are not comparable).  Bounded, and
       the bounds are load-bearing — see [measure].  It is run-wide rather than
       per-config, so both configs keep sharing one calibration.
+
+    Measured effect of the two #569 changes, 6 runs each (12 config
+    measurements) on an 8-core box at load average 8-16, i.e. exactly the
+    co-scheduled conditions that produced #538:
+
+    {v
+      probes            per-op estimator   overlap ratio     worst / 1.15 gate
+      idle (pre-#569)   marginal           0.22 - 1.08       94%
+      contended         marginal           0.22 - 1.05       91%
+      contended         max(marginal,avg)  0.35 - 0.79       69%
+    v}
+
+    The chosen read_ops spread narrowed from ~4x to ~2x run-to-run at the same
+    time.  The residual spread is genuine load variation between calibration and
+    measurement, not model error, which is why the target ratio stays at 0.45 —
+    see [reader_ratio].
+
+    The estimator floor buys that robustness with gate SENSITIVITY: read_ops
+    comes out systematically undersized, so the primary gate is easier to pass
+    and its margin against a serialisation regression roughly halves.  It is
+    bounded by the opposing speedup gate rather than by a clamp.  The full
+    accounting is at the [average] binding in [calibrate_read_ops]; #590 tracks
+    whether to buy the sensitivity back.
+
+    It also has a second consequence, handled at [speedup_unreachable]: when the
+    workload comes out small enough, the SECONDARY gate becomes arithmetically
+    unsatisfiable — even perfect overlap cannot reach the 1.2x floor — and the
+    run must say so rather than report a 1.02x "regression" that no engine could
+    have avoided.  Raising GRANARY_BENCH_TRIALS does not help there; the sizing
+    is run-wide (#603, which also covers the composed best-of-N drift the
+    nightly's TRIALS=15 makes visible).
+
+    Related, filed, and deliberately NOT fixed here: #591 (no shellcheck gate in
+    CI, which is why the sibling policy-script defects were reviewable-only),
+    #604 (policy scope: bench/ and .mli unscanned, symlinks evade), #605 (the
+    ["Sqlite" ^ "3"] evasion pattern).
 
     {b Where these gates actually run armed.}  Every automated job that
     invokes [dune runtest] sets [GRANARY_BENCH_MIN_SPEEDUP=0], which
@@ -306,6 +352,32 @@ let seed st n =
    commit triggers one [wal_sync] — the parameter [tag] keeps baseline
    and parallel runs from colliding on key space, since [seed] is
    re-run between configurations on a fresh DB. *)
+(* Writer for the calibration probes (#569): commits until [stop] is set,
+   rather than a fixed count.  The probe wants the readers timed *under the
+   writer's contention*, but it must not also pay for the writer's full
+   [n_commits * delay] phase — so the readers set [stop] when they are done and
+   the writer exits after finishing at most one more commit (~[delay]).  A flag
+   rather than [Lwt.cancel] because cancelling mid-commit would leave the store
+   in a state [S.close] has no reason to tolerate. *)
+let writer_workload_until st ~stop ~tag =
+  let rec loop i =
+    if !stop
+    then Lwt.return_unit
+    else
+      let* tx = S.rw_begin st in
+      let* () =
+        S.put
+          tx
+          !tid_write
+          (bs (Printf.sprintf "%s%06d" tag i))
+          (bs (Printf.sprintf "%sv%06d" tag i))
+      in
+      let* () = S.commit tx in
+      loop (i + 1)
+  in
+  loop 0
+;;
+
 let writer_workload st ~n_commits ~tag =
   let rec loop i =
     if i >= n_commits
@@ -417,17 +489,49 @@ let run_config ~delay ~n_seed mode ~n_commits ~n_readers ~read_ops =
    override calibration and push T_r past T_w, which is #468 mirrored. *)
 let probe_ops = 1000
 
-(* Time the baseline reader phase alone — [n_readers] fibers joined, no
-   writer, no fsync delay.  Used by [calibrate_read_ops]. *)
-let probe_reader_phase ~n_seed ~n_readers ~read_ops =
+(* Time the reader phase — [n_readers] fibers joined — WITH THE WRITER ACTIVE
+   (#569).  Used by [calibrate_read_ops].
+
+   This probe used to run readers alone on an idle scheduler at [delay:0.0],
+   which is the model error #569 records: the calibration measured a per-op cost
+   the real measurement never sees, so the chosen workload was systematically
+   oversized and the target ratio had to be held at a deliberately low 0.45 to
+   absorb the overshoot.  Worse, the size of the overshoot depended on how busy
+   the box happened to be *between* the probe and the measurement, which is what
+   produced the uncorrectable blowout band in [(1.15, 1.667]].
+
+   Measuring under the same contention the measurement runs under removes the
+   error at its source rather than correcting for it downstream.  The writer
+   runs with the real [delay], so readers interleave with its [wal_sync] sleeps
+   exactly as they will in [parallel_run].
+
+   The probe writer targets [!tid_read], i.e. the SHARED-tree config, which is
+   the more contended of the two configs the run measures (writer CoW churns the
+   pages the readers walk, #159).  read_ops is shared by both configs, so
+   calibrating on the harder one errs the documented-safe way: a higher per-op
+   cost yields a SMALLER workload. *)
+let probe_reader_phase ~n_seed ~n_readers ~read_ops ~delay =
   cleanup path;
   run
-    (let* st = open_slow_wal ~path ~delay:0.0 in
+    (let* st = open_slow_wal ~path ~delay in
      let* () = seed st n_seed in
+     let stop = ref false in
      let t0 = Unix.gettimeofday () in
+     let writer = writer_workload_until st ~stop ~tag:"c" in
      let readers = List.init n_readers (fun _ -> reader_workload st ~read_ops) in
-     let* () = Lwt.join readers in
+     (* [stop] must be set even if a reader raises, or the probe writer keeps
+        committing.  ([Lwt_main.run] does raise as soon as this promise rejects,
+        so the *exception* is never lost — the earlier comment here claimed
+        otherwise and was wrong; the leak is the still-scheduled writer.) *)
+     let* () =
+       Lwt.finalize
+         (fun () -> Lwt.join readers)
+         (fun () ->
+            stop := true;
+            Lwt.return_unit)
+     in
      let t1 = Unix.gettimeofday () in
+     let* () = writer in
      let* () = S.close st in
      Lwt.return (t1 -. t0))
 ;;
@@ -448,16 +552,19 @@ let probe_reader_phase ~n_seed ~n_readers ~read_ops =
    READ_OPS is chosen so T_r lands near [ratio] x T_w.  The floor then
    measures overlap quality rather than host read speed.
 
-   Err LOW, deliberately.  Two effects punish T_r near T_w:
-   - the metric is not monotonic in T_r.  Past T_r = T_w the expression
-     becomes 1 + T_w / T_r and the speedup falls again; and
-   - readers are slower under contention than the probes (which run with no
-     writer on an idle scheduler), so actual T_r overshoots target by ~1.5x
-     and, once readers set the parallel wall, that inflation lands directly
-     on the denominator.  A cold run measured 1.27x this way.
-   Hence the low default ratio and the hard writer-relative cap below: T_r is
-   kept clear of T_w so the writer always bounds the parallel wall. *)
-let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio =
+   Err LOW, deliberately.  The metric is not monotonic in T_r: past T_r = T_w
+   the expression becomes 1 + T_w / T_r and the speedup falls again.  Hence the
+   conservative default ratio and the hard writer-relative cap below: T_r is
+   kept clear of T_w so the writer always bounds the parallel wall.
+
+   A second effect used to compound this and no longer does.  The probes ran
+   with no writer on an idle scheduler, so actual T_r overshot the target by
+   ~1.5x once contention was added, and that inflation landed directly on the
+   denominator (a cold run measured 1.27x).  Since #569 the probes run WITH the
+   writer active — see [probe_reader_phase] — so the per-op cost is measured
+   under the contention the measurement actually sees and the systematic
+   overshoot is gone. *)
+let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio ~delay =
   (* Probes are repeated because single-shot ones drifted read_ops by up to
      1.5x run to run, which showed up directly as speedup spread (1.25x on the
      unlucky draw).  The reduction is the MEDIAN, not the minimum (#538 review).
@@ -477,7 +584,8 @@ let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio =
      documented-safe way (slightly oversized per_op -> slightly undersized
      workload) and it discards the one lucky idle probe that causes the large
      blowouts.  It costs nothing extra: the probes were already being repeated,
-     only the fold changed. *)
+     only the fold changed.  Since #569 the probes are also contended, which
+     shrinks the spread the median has to survive in the first place. *)
   let probe_reps = 3 in
   let median = function
     | [] -> infinity
@@ -486,15 +594,60 @@ let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio =
       Array.sort compare a;
       a.(Array.length a / 2)
   in
+  (* Probe under the shared-tree config — the harder of the two the run
+     measures — then restore.  [Fun.protect] so a raising probe cannot leave the
+     global mutated for whatever runs next (#574 review). *)
   let typical ~read_ops =
     median
-      (List.init probe_reps (fun _ -> probe_reader_phase ~n_seed ~n_readers ~read_ops))
+      (List.init probe_reps (fun _ ->
+         probe_reader_phase ~n_seed ~n_readers ~read_ops ~delay))
   in
-  let t1 = typical ~read_ops:probe_ops in
-  let t2 = typical ~read_ops:(2 * probe_ops) in
+  let t1, t2 =
+    let saved_write = !tid_write in
+    tid_write := !tid_read;
+    Fun.protect
+      ~finally:(fun () -> tid_write := saved_write)
+      (fun () ->
+         let t1 = typical ~read_ops:probe_ops in
+         let t2 = typical ~read_ops:(2 * probe_ops) in
+         t1, t2)
+  in
   let marginal = (t2 -. t1) /. float_of_int probe_ops in
-  (* Fall back to the average cost if the two probes were swamped by jitter. *)
-  let per_op = if marginal > 0.0 then marginal else t2 /. float_of_int (2 * probe_ops) in
+  (* Average cost of the LARGER probe.  Two roles, and the second is the
+     important one (#569):
+
+     - it is the fallback when the marginal difference came out non-positive,
+       i.e. the two probes were swamped by jitter; and
+     - it is a FLOOR on the estimate.  Writing the probe as [F + n * p], the
+       marginal difference cancels the fixed cost [F] exactly, which is why it
+       is the estimator of record — but it is a difference of two noisy
+       quantities of the same magnitude, so its noise is amplified while the
+       average's is not.  Measured on this box at load ~10 across five runs,
+       marginal-only chose per-op costs spanning 103-419 us while the workload
+       actually ran at 246-369 us; the 103 us draw produced read_ops=6548 and an
+       overlap of 1.05 against a 1.15 gate.  The average is biased HIGH by
+       exactly [F / 2n] — never low — so [max] of the two cannot underestimate
+       [p] by more than the marginal alone would, and it removes the low tail
+       that is the only dangerous direction here.  With 2000 probe ops the bias
+       it introduces is a fraction of one cold walk.
+
+     {b It is not free, and the cost is on the gate's sensitivity (#590).}  The
+     floor is biased HIGH by construction, so [read_ops] comes out
+     systematically UNDERSIZED and the primary overlap gate becomes
+     systematically easier to pass.  Measured against main in one worktree at
+     load 6.8-12.0: overlap 0.27-0.53 here versus 0.42-0.63 there.  Under
+     serialisation the invariant reads [1 + T_r/T_w], so a worst case of 0.27
+     would present as ~1.27 against the 1.15 gate where main's 0.42 presents as
+     ~1.42 — the detection margin is roughly halved.  That is a real reduction
+     in sensitivity, accepted because the alternative was a gate that FAILED
+     outright on a good engine roughly one run in six, and because it cannot
+     degrade silently: driving T_r down drives the SECONDARY gate's ceiling
+     [1 + T_r/T_w] down with it, and that gate was measured at 1.30 against its
+     1.20 floor, i.e. only ~8% of headroom left.  Undersize the workload much
+     further and the speedup gate fails first and loudly.  #590 tracks whether
+     the sensitivity is worth buying back with a tighter estimator. *)
+  let average = t2 /. float_of_int (2 * probe_ops) in
+  let per_op = if marginal > 0.0 then Float.max marginal average else average in
   (* Unreachable unless the clock runs backwards — [t2] is a positive
      duration — so this branch is defence only and will not be covered. *)
   if per_op <= 0.0
@@ -504,9 +657,16 @@ let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio =
     let want = ops_for (writer_secs *. ratio) in
     (* Upper clamps: predicted T_r stays at most 0.75 x T_w (see above), and
        200k ops keeps a pathologically slow host from running for minutes.
-       Lower clamp is 1, not [probe_ops]: a probe size is not a workload
-       floor, and forcing one on a slow host recreates #468 with the
-       inequality flipped. *)
+
+       Lower clamp is 1, not [probe_ops], and deliberately stays that way even
+       though the #569 estimator undersizes (#590).  Any absolute lower clamp is
+       a fixed op count, which is exactly what #468 was: on a slow host it
+       overrides calibration and pushes T_r past T_w, where the metric is not
+       even monotonic.  The protection against undersizing is not a clamp, it is
+       the opposing SECONDARY gate — its ceiling is [1 + T_r/T_w], so a workload
+       driven too small fails the 1.2x speedup floor loudly.  A relative clamp
+       (some fraction of [want]) would be circular, since [want] is the quantity
+       under suspicion. *)
     max 1 (min (min 200_000 (ops_for (writer_secs *. 0.75))) want))
 ;;
 
@@ -573,11 +733,57 @@ let writer_inflation a = a.par_writer /. a.base_writer
 let inconclusive a = writer_inflation a > 1.25
 let overlap_max = 1.15
 
+(* The second way the secondary gate can be UNSATISFIABLE rather than failed
+   (#590 review).
+
+   The parallel wall can never drop below the writer's own window, so the very
+   best this run's numbers could produce is [base_wall / par_writer] — that is
+   the speedup at PERFECT overlap, computed from measured phases only.  If that
+   ceiling is already under [min_speedup], no engine could have passed: the
+   reader workload was sized below what the gate can resolve.  Observed at load
+   11.7 on an armed run, roughly 1 in 15:
+
+     [disjoint tid] read_ops=1906 overlap=0.14 speedup=1.02x  FAIL (gate 1.20x)
+
+   which reads as a performance regression and is not one.  The #569 estimator
+   floor makes this more likely, because it undersizes [read_ops] on purpose
+   (see [average] in [calibrate_read_ops]); #590 tracks buying that back.
+
+   Why the measured ceiling and not the obvious [overlap_ratio < min_speedup -
+   1.0]: on the SAME armed run the other config read overlap 0.16 — under that
+   threshold — yet actually achieved 1.46x and passed.  The overlap ratio is a
+   parallel-run quantity and the speedup's headroom comes from the BASELINE
+   wall, so the proxy suppresses gates that would have passed.  [base_wall /.
+   par_writer] is exact by construction and does not.
+
+   The resulting rule is sharper than "skip pathological runs", and worth
+   stating exactly, because it is what makes the guard safe.  When the readers
+   finish inside the writer window, [par_wall = par_writer], so the ceiling and
+   the achieved speedup are THE SAME NUMBER and every shortfall is declared
+   unreachable.  That is correct: in that regime the overlap is already perfect
+   and [base_wall / par_wall] measures nothing but how big T_r was — it carries
+   no information about overlap quality, which is the only thing this gate
+   exists to judge.  The secondary gate therefore now asserts exactly when the
+   readers set the parallel wall, i.e. [par_wall > par_writer] — which is
+   precisely the serialisation regime: serialised readers give
+   [par_wall = par_writer + par_reader], the ceiling sits strictly above the
+   achieved speedup at [1 + T_r/T_w] = 1.45 for a workload at the intended
+   ratio, and the gate fails at ~1.0 as it should.  So the regression the gate
+   exists for is still caught, and the primary overlap invariant — which does
+   carry overlap information — remains unconditional either way. *)
+let speedup_ceiling a = a.base_wall /. a.par_writer
+let speedup_unreachable a ~min_speedup = speedup_ceiling a < min_speedup
+
 (* Would the gates pass on the aggregate so far?  Used to stop trialling early
    — best-of-N passes iff SOME trial's aggregate passes, so once one does
-   there is nothing left to buy and the extra ~4 s per trial is not spent. *)
+   there is nothing left to buy and the extra ~4 s per trial is not spent.
+
+   Note that raising GRANARY_BENCH_TRIALS is NOT a mitigation for either
+   inconclusive case: both are properties of the workload sizing, which is
+   run-wide and identical across trials.  bench-nightly runs TRIALS=15 (#603). *)
 let gates_pass a ~min_speedup =
-  overlap_ratio a <= overlap_max && (inconclusive a || speedup a >= min_speedup)
+  overlap_ratio a <= overlap_max
+  && (inconclusive a || speedup_unreachable a ~min_speedup || speedup a >= min_speedup)
 ;;
 
 (* The two gates for one config.  See the header for why there are two. *)
@@ -599,6 +805,21 @@ let assert_gates ~label ~a ~min_speedup =
        %!"
       label
       (writer_inflation a)
+  else if speedup_unreachable a ~min_speedup
+  then
+    Printf.printf
+      "  INCONCLUSIVE [%s]: reader workload sized below what this gate can resolve — \
+       even PERFECT overlap caps the speedup at %.2fx (baseline %.3fs / writer window \
+       %.3fs), under the %.2fx floor, at overlap %.2f.  Not a performance result; the \
+       calibration undersized read_ops (#590).  The overlap invariant above still \
+       applies and passed.\n\
+       %!"
+      label
+      (speedup_ceiling a)
+      a.base_wall
+      a.par_writer
+      min_speedup
+      (overlap_ratio a)
   else
     Alcotest.(check bool)
       (Printf.sprintf "[%s] speedup %.2fx >= %.2fx" label (speedup a) min_speedup)
@@ -611,11 +832,19 @@ let test_fsync_overlap () =
   let n_commits = getenv_int "GRANARY_BENCH_N_COMMITS" 30 in
   let n_readers = getenv_int "GRANARY_BENCH_N_READERS" 4 in
   let n_seed = getenv_int "GRANARY_BENCH_SEED_ROWS" 200 in
-  (* Target reader phase as a fraction of the writer phase.  Contention makes
-     the real T_r overshoot this somewhat, so 0.45 lands the effective ratio
-     near 0.5 and the expected speedup near 1.5x — well over the 1.2x floor
-     while keeping T_r clear of T_w (see [calibrate_read_ops]).  A
-     non-positive or unparseable value means "unset". *)
+  (* Target reader phase as a fraction of the writer phase.  0.45 lands the
+     expected speedup near 1.45x — well over the 1.2x floor while keeping T_r
+     clear of T_w (see [calibrate_read_ops]).  A non-positive or unparseable
+     value means "unset".
+
+     #569 asked whether making the probes representative would let this rise off
+     its deliberately-low 0.45.  Measured: no, not on evidence.  With contended
+     probes the MEAN observed overlap does land on target (0.47 over 12 config
+     measurements, against 0.59 before), but the WORST case is 0.79 — 1.8x the
+     target — because load still varies between calibration and measurement.
+     Raising the target to 0.6 would put that worst case at ~1.05 against a 1.15
+     gate.  The number that would justify raising this is a tighter worst case,
+     not a better mean. *)
   let reader_ratio =
     let default = 0.45 in
     let r = getenv_float "GRANARY_BENCH_READER_RATIO" default in
@@ -642,7 +871,8 @@ let test_fsync_overlap () =
     | Some n -> n, "env"
     | None when min_speedup <= 0.0 -> probe_ops, "gate-off"
     | None ->
-      calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio:reader_ratio, "calibrated"
+      ( calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio:reader_ratio ~delay
+      , "calibrated" )
   in
   (* Run baseline vs parallel under the currently-configured tid pair and
      assert the overlap win clears the floor.  Called once per config.  Both
@@ -725,15 +955,27 @@ let test_fsync_overlap () =
 
      {b The resize is a safety net, not the primary fix, and it does not cover
      everything.}  The trigger cannot be lowered — 1.667 is exactly where the
-     derivation stops holding — so a calibration blowout landing in
-     [(1.15, 1.667]] (roughly a 2.5-3.7x oversize) fails the gate and gets no
-     resize, and retrying cannot help because a bad calibration is
-     deterministic across trials.  That band is uncovered here BY CONSTRUCTION,
-     which is why the real fix for #538 is at the source: see the median in
-     [calibrate_read_ops], which removes the lucky-idle-probe mode that
-     produced the blowouts in the first place.  The resize only has to catch
-     what survives that.  The residual band is tracked in #569, which also
-     records the two candidate ways to close it properly. *)
+     derivation stops holding, and below it the resize starts being able to walk
+     a genuine serialisation regression down to passing — so a calibration
+     blowout landing in [(1.15, 1.667]] (roughly a 2.5-3.7x oversize) fails the
+     gate and gets no resize, and retrying cannot help because a bad calibration
+     is deterministic across trials.  That band is uncovered here BY
+     CONSTRUCTION.
+
+     That is why every fix for #538 and #569 is at the SOURCE rather than here:
+     representative (contended) probes, the median fold, and the average-cost
+     floor on the per-op estimate, all in [calibrate_read_ops].  #569 chose that
+     route over the alternative of discriminating blowout from serialisation
+     directly ([par.reader_phase ~ par.writer_phase + T_r] under serialisation
+     vs [~ max] under overlap), which would decouple the trigger from the safety
+     derivation entirely but was investigated during #559 and NOT adopted: on
+     the reproduced failure it read 0.99 on a trial that was a blowout, because
+     a reader-dominated workload leaves almost no overlap to detect.  It would
+     have to be sized so readers never dominate before it could be trusted.
+
+     After #569 the measured worst-case overlap on a load-8-16 box is 0.79 —
+     comfortably below the 1.15 gate, let alone inside the uncorrectable band.
+     The resize only has to catch what survives the source fixes. *)
   let overlap_target = 0.5 in
   let resize_trigger = 1.7 in
   (* The resized workload is RUN-scoped, not [measure]-scoped (#538 review).

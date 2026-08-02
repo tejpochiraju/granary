@@ -1,3 +1,21 @@
+; ---------------------------------------------------------------------------
+; ADDING A REAL-SQLITE COMPARISON EXECUTABLE?  READ THIS FIRST.  (#370, #574)
+;
+; Granary must not acquire a dependency on real SQLite, and CI enforces that
+; with two greps over lib/ bin/ containers/ test/: one for the `"sqlite3 ..."`
+; CLI error-string form, one for the OCaml `Sqlite3.` module.  Designated
+; comparison files — the `(optional)` stanzas below that name `sqlite3`, or
+; that shell out to the sqlite3 CLI — are allowlisted by path.
+;
+; The allowlists live in scripts/check-sqlite-policy.sh.  A new comparison
+; file that is not listed there turns CI red on main even though it violates
+; no policy; that has now happened twice (#505 for bench_tpch.ml, #500 for
+; bench_tpcc.ml).  Add yours to the script in the same commit.
+;
+; The two lists are deliberately different sizes — shelling out to the CLI does
+; not qualify a file to link the module.  The script explains why.
+; ---------------------------------------------------------------------------
+
 (tests
  (names
   test_dummy
@@ -306,6 +324,7 @@
  ; Converted from (test) to (executable) so default @runtest skips it.
  ; (optional) is a defensive no-op here (no sqlite3 library dep) but kept
  ; for consistency with bench_compare.
+ ; Allowlisted in scripts/check-sqlite-policy.sh (CLI guard only).
  (name test_sqlite_compare)
  (optional)
  (modules test_sqlite_compare)
@@ -314,6 +333,7 @@
 (executable
  ; #91 SQLite .dump import integration: shells out to the sqlite3 CLI, so it is
  ; an (executable) (default @runtest skips it) and gated on sqlite3 in PATH.
+ ; Allowlisted in scripts/check-sqlite-policy.sh (CLI guard only).
  (name test_sqlite_import_91)
  (optional)
  (modules test_sqlite_import_91)
@@ -553,6 +573,7 @@
 ; Converted from (test) to (executable) so default @runtest skips it.
 ; (optional) is a defensive no-op here (no sqlite3 library dep) but kept
 ; for consistency with bench_compare.
+; Allowlisted in scripts/check-sqlite-policy.sh (CLI guard only).
 
 (executable
  (name bench_perf_compare_sqlite3)
@@ -685,6 +706,7 @@
 ; `(optional)` lets builds where `sqlite3` is absent (e.g. `dune build @install`)
 ; skip it instead of failing; CI and the bench image install `sqlite3` so it is
 ; still compiled and type-checked there.
+; Allowlisted in scripts/check-sqlite-policy.sh (BOTH guards).
 
 (executable
  (name bench_compare)
@@ -838,6 +860,7 @@
 
 ; TPC-H-derived benchmark (#482).  `(optional)` for the same reason as
 ; bench_compare: builds where `sqlite3` is absent skip it rather than fail.
+; Allowlisted in scripts/check-sqlite-policy.sh (BOTH guards).
 
 (executable
  (name bench_tpch)
@@ -847,6 +870,7 @@
 
 ; TPC-C-derived benchmark (#500).  `(optional)` for the same reason as
 ; bench_tpch: builds where `sqlite3` is absent skip it rather than fail.
+; Allowlisted in scripts/check-sqlite-policy.sh (BOTH guards).
 
 (executable
  (name bench_tpcc)
