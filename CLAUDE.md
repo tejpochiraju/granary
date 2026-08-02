@@ -28,18 +28,25 @@ chmod 777 .worktrees/<short-name>
 
 **Never use `git stash`.** `refs/stash` is one repo-wide stack, not per-worktree, and several agents work in sibling worktrees at once — a `pop` in one worktree can apply another's changes and silently empty its tree (2026-08-01, #527 and #514).
 
-To measure before/after numbers, use one of these instead. **Prefer the WIP commit** — it is the only option with no shared namespace to collide in:
+To measure before/after numbers, use one of the three alternatives below — they are a menu, not a sequence. `SP` is your session scratchpad directory and `529` stands for your worktree; set both to your own:
 
 ```sh
-git commit -m wip                  # WIP checkpoint on your own branch:
-                                   #   git checkout HEAD~1 -- lib/   (old code)
-                                   #   git checkout HEAD  -- lib/    (back to WIP)
+SP=<your session scratchpad>; WT=529   # prefix every scratch file with $WT
+
+# 1. WIP commit — preferred: no shared namespace to collide in
+git commit -m wip
+git checkout HEAD~1 -- lib/        # old code
+git checkout HEAD   -- lib/        # back to WIP
+
+# 2. or: patch aside
 git add -N .                       # so new files are seen
-git diff HEAD > $SP/wip.patch      # staged + unstaged; git checkout -- . then git apply later
-cp lib/sql/exec.ml $SP/exec.ml.good
+git diff HEAD > "$SP/$WT-wip.patch"
+
+# 3. or: copy aside
+cp lib/sql/exec.ml "$SP/$WT-exec.ml.good"
 ```
 
-**Name every scratch file after your worktree** — `$SP/529-exec.ml.good`, not `$SP/exec.ml.good`. The session scratchpad is shared by *all* agents in the session, not one per worktree. On 2026-08-01 two agents each saved `exec.ml.good` there; the second overwrote the first, and the first restored the other's `exec.ml` into its own tree. That is the same failure the `git stash` ban exists to prevent, arriving through a different shared namespace — a generic filename in a shared directory is a stash by another name.
+**Name every scratch file after your worktree** — `$SP/529-exec.ml.good`, never `$SP/exec.ml.good`. The session scratchpad is shared by *all* agents in the session, not one per worktree. On 2026-08-01 two agents each saved `exec.ml.good` there; the second overwrote the first, and the first restored the other's `exec.ml` into its own tree. A generic filename in a shared directory is a stash by another name — `refs/stash` was one instance of the pattern, not the pattern.
 
 Plain `git diff` captures neither staged nor untracked changes — use `git diff HEAD` after `git add -N`. `git checkout HEAD~1 -- lib/` also will not delete files that exist only in the WIP commit; remove those by hand. Commit early on your own branch regardless: an uncommitted tree is the only thing at risk.
 

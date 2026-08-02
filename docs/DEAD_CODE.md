@@ -32,10 +32,12 @@ suite calls — `Db.query_as_of`, `Mem.create`, most of `Db` — is reported as
 dead. `@check` builds `.cmt`s for everything without linking or running.
 
 `@check` currently fails on `test/bench_compare.ml` (needs the `sqlite3` opam
-library, absent from the dev image by design; the stanza is `(optional)` —
-`test/dune:672` — so ordinary builds skip it). That failure is expected and
-harmless: dune still emits the other 119
-test `.cmt`s before it stops.
+library, absent from the dev image by design). The stanza is `(optional)` —
+`test/dune:673` — so an ordinary build silently skips it; `@check` is not an
+ordinary build, and asks for a `.cmt` from every stanza whether or not its
+libraries resolve, which is why only this target sees the failure. It is
+expected and harmless: dune still emits the other 119 test `.cmt`s before it
+stops.
 
 ## Baseline (2026-07-31, `ca67f20` + our 5.4 port)
 
