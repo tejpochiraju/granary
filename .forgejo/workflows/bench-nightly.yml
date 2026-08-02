@@ -1,0 +1,147 @@
+name: Timing gates nightly (#549)
+
+# The ONLY automated job that runs granary's timing/scaling gates ARMED.
+#
+# Every other job that invokes `dune runtest` neutralizes them (#549):
+#   .forgejo/workflows/ci.yml, coverage.yml, cross-arch.yml and their
+#   .github/ mirrors all set GRANARY_BENCH_MIN_SPEEDUP=0,
+#   GRANARY_BENCH_PARALLEL_MAX / _MAX_WRITER_S / _MAX_RATIO = 1000000.
+# That is deliberate — those jobs share a loaded runner with every other PR
+# and a wall-clock gate flakes there — but the consequence was that
+# test_fts_scaling (#233), test_insert_scaling (#228/#229) and the bench_*
+# suites were protected on the honour system: armed only for whoever happened
+# to run the suite locally AND read the output.
+#
+# This job restores that coverage. It deliberately sets NO GRANARY_BENCH_*
+# neutralizer, and instead buys accuracy the way #537 intended:
+#   - `dune runtest -j 1`, so the suite does not contend with itself;
+#   - GRANARY_BENCH_TRIALS raised, so each gate's best-of-N statistic has more
+#     draws to find an unperturbed one.
+# `concurrency` keeps two of these from overlapping, and the 03:30 UTC slot is
+# 30 minutes after the Jepsen nightly's 03:00 so the two do not share the box.
+#
+# REPORTING, NOT BLOCKING. It does not run on push or pull_request, so it can
+# never fail a PR. On failure it files/updates a Forgejo issue (same dedup
+# pattern as jepsen-nightly.yml) — a red nightly is a signal to investigate,
+# and if the failure turns out to be runner noise rather than a regression the
+# fix is to make that gate's statistic more robust (as #537 did for
+# test_fts_scaling and #538 for bench_wal_fsync_overlap), not to disarm it.
+#
+# Runner mode: `container:` mode, NOT the host mode jepsen-nightly.yml uses.
+# jepsen-nightly runs host-mode only because it needs `--device /dev/fuse
+# --cap-add SYS_ADMIN` for lazyfs; that mode executes inside the Alpine
+# act_runner container (no node, no sudo, podman as a remote client with no
+# usable bind mounts — see #305/PR #306) and cannot run `dune` at all. A job
+# whose whole content is `dune runtest` belongs in the same ocaml/opam
+# container ci.yml already uses successfully; the steps below are ci.yml's
+# build-and-test job with the neutralizing env removed. Only the schedule,
+# concurrency and failure-reporting shape come from jepsen-nightly.yml.
+
+on:
+  schedule:
+    # 03:30 UTC daily (09:00 IST) — after the Jepsen nightly's 03:00 slot.
+    - cron: "30 3 * * *"
+  # Allow ad-hoc manual runs (so the suite can be triggered on demand).
+  workflow_dispatch: {}
+
+concurrency:
+  group: bench-nightly
+  cancel-in-progress: false
+
+jobs:
+  armed-timing-gates:
+    runs-on: self-hosted
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+
+    steps:
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          # Same closure as ci.yml's build-and-test job, so this job warms and
+          # reuses the same cache entry rather than building its own.
+          key: opam-5.4-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
+          restore-keys: opam-5.4-
+
+      - name: Install opam packages
+        # Keep in sync with ci.yml — this job runs the same `dune runtest`, so
+        # it needs the same dependency closure (#462).
+        run: |
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+            mirage-block mirage-block-unix uutf uucp ocamlformat.0.29.0 \
+            mirage-crypto mirage-crypto-rng alcotest-lwt sqlite3 \
+            nottui nottui-lwt lwd
+
+      - name: Build
+        run: opam exec -- dune build
+
+      - name: Record load before the timed run
+        # A timing gate's verdict is only interpretable against the load it ran
+        # under; print it so a failure can be triaged without a re-run.
+        run: |
+          uptime
+          nproc
+
+      - name: Test with the timing gates ARMED
+        # DELIBERATELY no GRANARY_BENCH_MIN_SPEEDUP / _PARALLEL_MAX /
+        # _MAX_WRITER_S / _MAX_RATIO here. That is the entire point of this
+        # job (#549) — do not "fix" a flaky nightly by adding them back.
+        #
+        # GRANARY_BENCH_TRIALS is a tuning knob, not a gate: it cannot make a
+        # failing test pass, it only gives the best-of-N statistic more draws
+        # (test_fts_scaling default 9, bench_wal_fsync_overlap default 3).
+        # 15 was measured to buy nothing over 9 on a *loaded* 8-core box, so
+        # on a genuinely quiet runner it is headroom rather than a requirement.
+        env:
+          GRANARY_BENCH_TRIALS: "15"
+        # -j 1: the suite must not contend with itself. A parallel `dune
+        # runtest` is exactly the co-scheduling that produced the false 10.5x
+        # in #529 and the 1.70 overlap ratio in #538.
+        run: opam exec -- dune runtest --force -j 1
+
+      # On any failure above, open a Forgejo issue so the nightly does not fail
+      # silently. Deduped by title marker: if an open issue already exists for a
+      # previous failing nightly, comment on it instead of opening a duplicate
+      # (the scheduled job runs unattended every night).
+      - name: File issue on failure
+        if: failure()
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          MARKER: "Armed timing gates nightly failed"
+        run: |
+          set -eu
+          body="The armed timing-gate nightly (#549) failed.\n\nThis job is the only automated one that runs the timing/scaling gates with their ceilings live, so a failure here is either a real performance regression or runner noise that the gate's best-of-N statistic did not absorb.\n\n- Run: ${RUN_URL}\n- Commit: ${GITHUB_SHA}\n- Ref: ${GITHUB_REF}\n\nSee the workflow logs for the failing gate and its printed measurements (each gate prints its per-trial numbers and its best-of-N verdict), plus the recorded load average.\n\nDo NOT fix this by adding GRANARY_BENCH_* neutralizers to this workflow — that would put the gate back on the honour system (#549)."
+          # Look for an existing open failure issue (dedup by title marker).
+          existing=$(curl -sS \
+            -H "Authorization: token ${TOKEN}" \
+            "${API}/issues?state=open&type=issues&q=$(printf '%s' "${MARKER}" | tr ' ' '+')")
+          number=$(printf '%s' "${existing}" | grep -o "\"number\":[0-9]*" | head -n1 | grep -o "[0-9]*" || true)
+          if printf '%s' "${existing}" | grep -q "${MARKER}" && [ -n "${number}" ]; then
+            echo "Open failure issue #${number} exists; adding a comment."
+            curl -sSf -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": \"Failed again on run ${RUN_URL} (commit ${GITHUB_SHA}).\"}" \
+              "${API}/issues/${number}/comments" >/dev/null
+          else
+            echo "No open failure issue; opening one."
+            curl -sSf -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"title\": \"${MARKER} (run ${{ github.run_number }})\", \"body\": \"${body}\"}" \
+              "${API}/issues" >/dev/null
+          fi

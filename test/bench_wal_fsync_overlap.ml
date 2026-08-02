@@ -41,6 +41,24 @@
     DELAY_MS x N_COMMITS should stay well above a second (default 1.5s);
     at a few tens of ms, fixed per-run overhead dominates both walls.
 
+    Both gates are wall-clock measurements, so both were single-shot and
+    flaked on a co-scheduled box (#538: "readers finish inside the writer
+    window: 1.70 <= 1.15" on an 8-core host running several suites at once;
+    reproduced here as the secondary gate at 1.19x against a 1.20x floor).
+    Unlike [test_fts_scaling] (#537) the timed region is NOT too short — the
+    writer phase is ~1.5 s by construction — so the fix is the other half of
+    that treatment: a BEST-OF-N over whole trials.  See [measure].
+
+    {b Where these gates actually run armed.}  Every automated job that
+    invokes [dune runtest] sets [GRANARY_BENCH_MIN_SPEEDUP=0], which
+    neutralizes both gates (see the [min_speedup <= 0.0] branch in [measure]).
+    The one job that runs them ARMED is the nightly
+    [.forgejo/workflows/bench-nightly.yml] (mirrored to [.github/]), which
+    deliberately sets no [GRANARY_BENCH_*] neutralizer and runs [dune runtest
+    -j 1] on an otherwise-idle self-hosted runner.  It reports (files/updates
+    an issue) rather than blocking PRs.  Outside that nightly this gate is
+    armed only for a developer running the suite locally (#549).
+
     Env vars (all optional):
       GRANARY_BENCH_FSYNC_DELAY_MS  injected per-fsync sleep (default 50)
       GRANARY_BENCH_N_COMMITS       writer commits (default 30)
@@ -49,6 +67,7 @@
       GRANARY_BENCH_READER_RATIO    target T_readers / T_writer (default 0.45)
       GRANARY_BENCH_SEED_ROWS       initial tree size (default 200)
       GRANARY_BENCH_MIN_SPEEDUP     pass/fail threshold (default 1.2)
+      GRANARY_BENCH_TRIALS          max measurement trials per config (default 3)
 *)
 
 open Lwt.Syntax
@@ -66,6 +85,19 @@ let getenv_int k d =
 let getenv_float k d =
   try float_of_string (Sys.getenv k) with
   | _ -> d
+;;
+
+(* Maximum measurement trials per config (#538); the verdict is the best of
+   them (see [measure]).  3, not 9 as in [test_fts_scaling] — a trial here
+   costs ~4 s of real fsync-delay wall time rather than ~15 ms, and the loop
+   exits at the first passing aggregate, so 3 buys two retries for a bad draw
+   without a routine 3x runtime.  Same env-var name as [test_fts_scaling] so
+   one setting tunes every timing gate in the suite; a nightly on a quiet
+   runner can raise it instead of turning the gate off. *)
+let trials =
+  match Option.bind (Sys.getenv_opt "GRANARY_BENCH_TRIALS") int_of_string_opt with
+  | Some n when n > 0 -> n
+  | _ -> 3
 ;;
 
 (* WAL I/O helpers: identical to those in [test_group_commit] — keep
@@ -431,46 +463,100 @@ let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio =
     max 1 (min (min 200_000 (ops_for (writer_secs *. 0.75))) want))
 ;;
 
+(* Best-of-N accumulator (#538).  Every field is a MINIMUM across trials.
+
+   Why minima of the five durations rather than the best of the per-trial
+   ratios: timing noise is one-sided — a phase can be delayed, never hurried —
+   so the minimum of a duration really is the closest estimate of its
+   unperturbed cost.  A ratio, by contrast, has a noisy denominator too, so
+   best-of-ratios systematically picks the trial whose denominator was most
+   perturbed and biases the verdict (the same trap #537 hit in
+   [test_fts_scaling], where min-over-ratios reported a 3x index as CHEAPER
+   per op).  Reduce each side independently, then divide.
+
+   This cannot mask the regressions the gates exist for.  If readers were
+   serialised behind the writer they could not start until it finished, so
+   [reader_done > writer_done] in EVERY trial — no draw of the dice produces
+   an overlapping one, and the minimum of each is still ordered the same way. *)
+type agg =
+  { base_wall : float
+  ; par_wall : float
+  ; base_writer : float
+  ; par_writer : float
+  ; par_reader : float
+  }
+
+let agg_empty =
+  { base_wall = infinity
+  ; par_wall = infinity
+  ; base_writer = infinity
+  ; par_writer = infinity
+  ; par_reader = infinity
+  }
+;;
+
+let agg_add a ~base ~par =
+  { base_wall = Float.min a.base_wall base.wall
+  ; par_wall = Float.min a.par_wall par.wall
+  ; base_writer = Float.min a.base_writer base.writer_phase
+  ; par_writer = Float.min a.par_writer par.writer_phase
+  ; par_reader = Float.min a.par_reader par.reader_phase
+  }
+;;
+
+(* Primary metric: the overlap invariant.  If readers were serialised behind
+   the writer they could not start until it finished, so [reader_done] would
+   necessarily exceed [writer_done] by the whole reader phase (measured:
+   1.5x).  Overlapping readers finish inside the writer's window (measured:
+   0.37-0.51, and unchanged by host speed, since both terms scale together).
+   Unlike the speedup ratio this needs no assumption about T_r / T_w. *)
+let overlap_ratio a = a.par_reader /. a.par_writer
+
+(* Secondary metric: the wall-clock win. *)
+let speedup a = a.base_wall /. a.par_wall
+
+(* This one DOES assume parallel ~ max (T_w, T_r), which needs enough CPU
+   headroom for the readers' work to fit inside the writer's fsync sleeps.  On
+   a starved host the writer's own phase inflates (measured: 1.61s -> 2.23s at
+   0.15 CPU) and the ratio collapses below the floor with overlap perfectly
+   intact — so report that inconclusive rather than failing.  A serialisation
+   regression does NOT inflate the writer's phase, and the invariant above
+   catches it unconditionally. *)
+let writer_inflation a = a.par_writer /. a.base_writer
+let inconclusive a = writer_inflation a > 1.25
+let overlap_max = 1.15
+
+(* Would the gates pass on the aggregate so far?  Used to stop trialling early
+   — best-of-N passes iff SOME trial's aggregate passes, so once one does
+   there is nothing left to buy and the extra ~4 s per trial is not spent. *)
+let gates_pass a ~min_speedup =
+  overlap_ratio a <= overlap_max && (inconclusive a || speedup a >= min_speedup)
+;;
+
 (* The two gates for one config.  See the header for why there are two. *)
-let assert_gates ~label ~base ~par ~speedup ~min_speedup =
-  (* Primary gate: the overlap invariant itself, asserted directly and
-     host-independently.  If readers were serialised behind the writer they
-     could not start until it finished, so [reader_done] would necessarily
-     exceed [writer_done] by the whole reader phase (measured: 1.5x).
-     Overlapping readers finish inside the writer's window (measured: 0.37-0.48,
-     and unchanged by host speed, since both terms scale together).  Unlike the
-     speedup ratio this needs no assumption about T_r / T_w. *)
-  let overlap_ratio = par.reader_phase /. par.writer_phase in
+let assert_gates ~label ~a ~min_speedup =
   Alcotest.(check bool)
     (Printf.sprintf
        "[%s] readers finish inside the writer window: reader_done/writer_done %.2f <= \
-        1.15"
+        %.2f"
        label
-       overlap_ratio)
+       (overlap_ratio a)
+       overlap_max)
     true
-    (overlap_ratio <= 1.15);
-  (* Secondary gate: the wall-clock win.  This one DOES assume parallel ~
-     max (T_w, T_r), which needs enough CPU headroom for the readers' work to
-     fit inside the writer's fsync sleeps.  On a starved host the writer's own
-     phase inflates (measured: 1.61s -> 2.23s at 0.15 CPU) and the ratio
-     collapses below the floor with overlap perfectly intact — so report that
-     inconclusive rather than failing.  A serialisation regression does NOT
-     inflate the writer's phase, and the invariant above catches it
-     unconditionally. *)
-  let writer_inflation = par.writer_phase /. base.writer_phase in
-  if writer_inflation > 1.25
+    (overlap_ratio a <= overlap_max);
+  if inconclusive a
   then
     Printf.printf
       "  INCONCLUSIVE [%s]: writer phase inflated %.2fx under load (no CPU headroom to \
        overlap); speedup floor not asserted\n\
        %!"
       label
-      writer_inflation
+      (writer_inflation a)
   else
     Alcotest.(check bool)
-      (Printf.sprintf "[%s] speedup %.2fx >= %.2fx" label speedup min_speedup)
+      (Printf.sprintf "[%s] speedup %.2fx >= %.2fx" label (speedup a) min_speedup)
       true
-      (speedup >= min_speedup)
+      (speedup a >= min_speedup)
 ;;
 
 let test_fsync_overlap () =
@@ -516,16 +602,18 @@ let test_fsync_overlap () =
      configs deliberately share one calibration: per-op cost differs between
      them (shared-tid pays writer CoW eviction), and holding read_ops fixed
      is what makes the two speedups comparable. *)
-  let measure label =
+  let trial label t =
     let base = run_config ~delay ~n_seed `Baseline ~n_commits ~n_readers ~read_ops in
     let par = run_config ~delay ~n_seed `Parallel ~n_commits ~n_readers ~read_ops in
-    let speedup = base.wall /. par.wall in
     Printf.printf
-      "fsync-overlap bench [%s]: delay=%dms commits=%d readers=%d read_ops=%d (%s) seed=%d\n\
+      "fsync-overlap bench [%s] trial %d/%d: delay=%dms commits=%d readers=%d \
+       read_ops=%d (%s) seed=%d\n\
       \  baseline=%.3fs (writer=%.3fs, readers=%.3fs) parallel=%.3fs (writer_done=%.3fs \
        reader_done=%.3fs) speedup=%.2fx (min %.2fx)\n\
        %!"
       label
+      t
+      trials
       delay_ms
       n_commits
       n_readers
@@ -538,9 +626,41 @@ let test_fsync_overlap () =
       par.wall
       par.writer_phase
       par.reader_phase
-      speedup
+      (base.wall /. par.wall)
       min_speedup;
     cleanup path;
+    base, par
+  in
+  (* Best-of-N over whole trials (#538).  Both gates are wall-clock ratios and
+     both were single-shot; on a co-scheduled box a reader fiber that loses the
+     CPU for one scheduling quantum lands directly on the verdict.  The loop
+     stops as soon as the aggregate passes, so an unloaded host still pays for
+     exactly one trial (~4 s per config) and only a noisy one pays more. *)
+  let measure label =
+    (* Neutralized runs take exactly one trial: nothing is asserted, so extra
+       trials would only burn time. *)
+    let budget = if min_speedup <= 0.0 then 1 else trials in
+    let rec loop t acc =
+      let base, par = trial label t in
+      let acc = agg_add acc ~base ~par in
+      if t >= budget || gates_pass acc ~min_speedup then t, acc else loop (t + 1) acc
+    in
+    let n_trials, a = loop 1 agg_empty in
+    Printf.printf
+      "  [%s] best-of-%d (min per phase): baseline=%.3fs parallel=%.3fs \
+       writer_done=%.3fs reader_done=%.3fs overlap=%.2f (gate %.2f) speedup=%.2fx (gate \
+       %.2fx)\n\
+       %!"
+      label
+      n_trials
+      a.base_wall
+      a.par_wall
+      a.par_writer
+      a.par_reader
+      (overlap_ratio a)
+      overlap_max
+      (speedup a)
+      min_speedup;
     (* GRANARY_BENCH_MIN_SPEEDUP=0 is the documented way to neutralize this
        bench (coverage runs use it — instrumentation slows everything enough to
        make timing gates near-deterministic failures).  Honour it for BOTH
@@ -552,7 +672,7 @@ let test_fsync_overlap () =
         "  [%s] gates neutralized (GRANARY_BENCH_MIN_SPEEDUP=%.2f)\n%!"
         label
         min_speedup
-    else assert_gates ~label ~base ~par ~speedup ~min_speedup
+    else assert_gates ~label ~a ~min_speedup
   in
   (* Config A: shared tree (reader and writer on the SAME tree).  This is
      the #159 regression case — every writer commit CoW-paths the reader's
