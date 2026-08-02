@@ -39,6 +39,25 @@ type t =
   ; mutable catalog : Cat.t
   ; clock : (unit -> float) option
   ; mutable explicit_txn : S.rw S.txn option
+  ; mutable txn_poisoned : bool
+    (** #555: cross-fiber transaction containment.  A [Db.t] has exactly one
+        explicit-transaction slot ([explicit_txn] above), and every statement
+        resolves its transaction from it.  So when two fibers share one handle
+        and interleave [BEGIN … COMMIT], the second [BEGIN] failing is {e not}
+        enough: the losing fiber's later statements would run inside the
+        winner's transaction and its [COMMIT] would commit the winner's
+        half-finished work.  Setting this flag on the losing [BEGIN] turns that
+        silent contamination into a loud refusal — while it is set every
+        statement on this handle is rejected except [ROLLBACK], which aborts the
+        in-flight transaction and clears the flag.
+
+        The window it covers is bounded by that recovery: once [ROLLBACK] clears
+        the flag the slot is free again, and the same contamination is reachable
+        with the fibers exchanged (#584).  So this NARROWS the hazard, it does
+        not close it, and it is not a fix for the one-slot design — see #585
+        (scoped transaction combinator) and #555 option 1 (session object).
+        {!create_worker_handle} is what an application that wants concurrent
+        explicit transactions should use today. *)
   ; views : (string, Sql.Ast.stmt) Hashtbl.t
   ; triggers : (string, Sql.Ast.stmt) Hashtbl.t (* trigger_name -> S_create_trigger AST *)
   ; mutable savepoint_names : string list (* active savepoints, newest first *)
@@ -233,6 +252,7 @@ let open_in_memory ?clock () =
     ; catalog
     ; clock
     ; explicit_txn = None
+    ; txn_poisoned = false
     ; views = Hashtbl.create 4
     ; triggers = Hashtbl.create 4
     ; savepoint_names = []
@@ -313,6 +333,7 @@ let of_store ?clock ?durability ?file_path store =
     ; catalog
     ; clock
     ; explicit_txn = None
+    ; txn_poisoned = false
     ; views
     ; triggers
     ; savepoint_names = []
@@ -581,9 +602,63 @@ type stmt =
 (* Explicit transaction management                                      *)
 (* ------------------------------------------------------------------ *)
 
+(* #555: the message every statement gets while the connection is poisoned.
+   Deliberately verbose: the only way out is a ROLLBACK, and whoever reads this
+   in a log needs to know that the in-flight transaction is now doomed. *)
+let poisoned_msg =
+  "connection poisoned: a second BEGIN was issued while an explicit transaction was \
+   already active on this handle (#555).  Every statement is rejected until ROLLBACK, \
+   which aborts the in-flight transaction and clears the poison.  Do not share one Db.t \
+   across fibers that use explicit transactions - use Db.create_worker_handle so each \
+   fiber has its own transaction slot."
+;;
+
+(* #555: THE poison predicate — one spelling, used at every gate.
+
+   It is applied to the handle whose transaction slot the statement would
+   actually use, which under multi-database routing (#64) is the handle
+   [compile_routed] / [resolve_target_ast] picked, NOT necessarily the top-level
+   handle the caller holds.  Each attached schema is its own [Db.t] with its own
+   [explicit_txn], so poisoning is per-handle: a poisoned "aux" does not (and
+   must not) stop statements that route to "main", which has its own slot and no
+   contamination to contain. *)
+let is_poisoned t = t.txn_poisoned
+
+(* #555: the handle that non-routing statements currently route to.  Distinct
+   from [resolve_target_ast]'s answer for a ROUTING statement such as
+   [PRAGMA active_database = …], which is always [top] — which is exactly why
+   the schema switch needs this and cannot reuse the generic gate below. *)
+let active_handle (top : t) =
+  if String.equal top.active_schema "main"
+  then top
+  else (
+    match Hashtbl.find_opt top.attached top.active_schema with
+    | Some sub -> sub
+    | None -> top)
+;;
+
+(** #555: whether ANY handle reachable from this one — the top-level handle or
+    any ATTACHed schema — is poisoned.  Must consider the attached sub-handles:
+    [BEGIN] routes to the active schema, so under ATTACH the poison lands on the
+    sub and a check of the top-level flag alone would report [false] on a
+    genuinely poisoned connection. *)
+let transaction_poisoned t =
+  is_poisoned t || Hashtbl.fold (fun _ sub acc -> acc || is_poisoned sub) t.attached false
+;;
+
 let begin_txn t =
   match t.explicit_txn with
-  | Some _ -> Lwt.return (Error (Runtime "transaction already active"))
+  | _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
+  | Some _ ->
+    (* #555: refusing this BEGIN is not sufficient — without the poison the
+       caller's *next* statement would silently join the transaction that won
+       the race, and its COMMIT would commit that transaction's work.  Poison
+       the handle so the whole sequence fails loudly instead, for as long as the
+       poison lasts: it is cleared by the ROLLBACK that recovery prescribes, and
+       past that point the same contamination is reachable with the roles
+       exchanged (#584). *)
+    t.txn_poisoned <- true;
+    Lwt.return (Error (Runtime "transaction already active"))
   | None ->
     let* tx = S.rw_begin t.store in
     (* #269: defensive — start with an empty schema-undo log so a stale entry
@@ -726,9 +801,25 @@ let commit_txn t =
         | exn -> Lwt.fail exn)
 ;;
 
+(* #555: ROLLBACK is the sole exit from the poisoned state, and it is
+   unconditional — it clears the flag whether or not there was a transaction
+   left to abort, so a handle can never be left permanently unusable.  Any fiber
+   may issue it; there is no ownership to check, which is precisely the
+   limitation #585 (a scoped transaction combinator) would remove.
+
+   That unconditional clear is also the end of the containment window: it frees
+   the slot for a fresh BEGIN while the fiber whose transaction was just aborted
+   has not been told, which is #584.  Making the clear conditional does not help
+   — without an owner token there is nobody to condition it on, and refusing to
+   clear would strand the handle instead. *)
 let rollback_txn t =
+  let was_poisoned = is_poisoned t in
+  t.txn_poisoned <- false;
   match t.explicit_txn with
-  | None -> Lwt.return (Error (Runtime "no active transaction"))
+  | None ->
+    if was_poisoned
+    then Lwt.return (Ok ())
+    else Lwt.return (Error (Runtime "no active transaction"))
   | Some tx ->
     (* #269: [force_rollback_txn] reverts any in-txn DDL's in-memory cache
        changes (schema-undo log) along with the store. *)
@@ -1539,9 +1630,31 @@ let rv_owned_table top tbl =
    latter maps the [unit] result to a [0] change count. *)
 let execute_control_op top t sql op =
   match op with
+  (* #555: ROLLBACK is checked first so it stays reachable on a poisoned
+     connection — it is the defined way to clear the poison. *)
+  | Sql.Plan.Op_rollback -> Some (rollback_txn t)
+  (* #555: [PRAGMA active_database = …] is a ROUTING statement, so
+     [resolve_target_ast] sends it to [top] and the generic gate below — which
+     tests the routed handle — would wave it through while the ACTIVE schema is
+     poisoned.  That let a caller walk away from a poisoned sub-handle, at which
+     point the prescribed recovery breaks: the subsequent ROLLBACK routes to the
+     new schema and answers "no active transaction" while the poisoned one still
+     holds its writer lock.  Refuse to leave a poisoned schema; arriving at one
+     stays legal, or a schema poisoned from elsewhere could never be reached to
+     be rolled back. *)
+  | Sql.Plan.Op_active_database_set _ when is_poisoned (active_handle top) ->
+    Some (Lwt.return (Error (Runtime poisoned_msg)))
+  (* #555: DETACH is a routing statement too, and left ungated it was a SECOND
+     exit from the poisoned state — it drops the sub-handle, resets
+     [active_schema] and closes the store, discarding the poisoned transaction's
+     uncommitted writes.  The outcome is clean, but "ROLLBACK is the sole exit"
+     is the contract this fix documents, so keep it true rather than acquire a
+     second, undocumented one. *)
+  | Sql.Plan.Op_detach _ when is_poisoned (active_handle top) ->
+    Some (Lwt.return (Error (Runtime poisoned_msg)))
+  | _ when is_poisoned t -> Some (Lwt.return (Error (Runtime poisoned_msg)))
   | Sql.Plan.Op_begin -> Some (begin_txn t)
   | Sql.Plan.Op_commit -> Some (commit_txn t)
-  | Sql.Plan.Op_rollback -> Some (rollback_txn t)
   | Sql.Plan.Op_savepoint name -> Some (savepoint_txn t name)
   | Sql.Plan.Op_release name -> Some (release_savepoint t name)
   | Sql.Plan.Op_rollback_to name -> Some (rollback_to_savepoint t name)
@@ -1844,6 +1957,14 @@ let execute_core top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   match op with
+  (* #555 (F4): checked ahead of the [Error] branches so a malformed statement on
+     a poisoned handle reports the poison rather than a parse error — [query_impl]
+     orders it the same way, and the two disagreeing was gratuitous.  Scoped to
+     the [Error] arms so [Ok Op_rollback] still reaches [execute_control_op],
+     which exempts it — recovery must stay reachable.  This also covers the
+     INSTEAD OF path below, which bypasses [execute_control_op] and would
+     otherwise run a trigger body's statements ungated. *)
+  | Error _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
   | Error (Sema (Sql.Sema.Unknown_table view_name)) when Hashtbl.mem t.views view_name ->
     (match parse sql with
      | Error _ -> Lwt.return (Error (Parse "syntax error"))
@@ -1863,6 +1984,8 @@ let execute_change_count_core top sql =
     | Error e -> Lwt.return (Error e)
   in
   match op with
+  (* #555 (F4): same ordering as [execute_core]. *)
+  | Error _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
   | Error (Sema (Sql.Sema.Unknown_table view_name)) when Hashtbl.mem t.views view_name ->
     (match parse sql with
      | Error _ -> Lwt.return (Error (Parse "syntax error"))
@@ -1953,6 +2076,10 @@ let query_impl ?stats ?mode top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   match op with
+  (* #555: a read on a poisoned handle would resolve [In_txn] from the
+     transaction that won the BEGIN race and see its uncommitted writes.  Reject
+     it — there is no ROLLBACK to exempt on the read path. *)
+  | _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
   | Error e -> Lwt.return (Error e)
   | Ok Sql.Plan.Op_changes ->
     Lwt.return (Ok (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int t.last_changes) |] ]))
@@ -2066,6 +2193,13 @@ let query_as_of top (target : Granary_store.History.target) sql =
           orders are independent). *)
        let op_promise, t = compile_routed top sql in
        let* op = op_promise in
+       (* #555 (F3): deliberately NOT gated on [is_poisoned].  This is the one
+          [compile_routed] caller that never resolves its transaction from
+          [t.explicit_txn] — it opens its own historical RO snapshot below, so it
+          cannot observe the winning transaction's uncommitted writes and has no
+          contamination to contain.  Reading history while another fiber's
+          transaction is stuck is legitimate, and is arguably the most useful
+          thing to be able to do at that moment.  Not an oversight. *)
        match op with
        | Error e -> Lwt.return (Error e)
        | Ok op ->
@@ -2180,6 +2314,12 @@ let params_of_named st named =
 let run_core st ~params =
   if st.finalized
   then Lwt.return (Error (Runtime "statement already finalized"))
+  else if
+    (* #555: a prepared write resolves its mode from [explicit_txn] just like a
+             one-shot statement, so it is exposed to the same contamination.
+             [st.db_ref] is already the routed handle — [prepare] resolved it. *)
+    is_poisoned st.db_ref
+  then Lwt.return (Error (Runtime poisoned_msg))
   else (
     let params_arr = Array.of_list params in
     let t = st.db_ref in
@@ -2273,6 +2413,11 @@ let run_with_dirty st ~params =
 let iter_impl ?stats st ~params =
   if st.finalized
   then Lwt.return (Error (Runtime "statement already finalized"))
+  else if
+    (* #555: as in [run_core] — the mode below is resolved from
+             [explicit_txn], which on a poisoned handle is somebody else's. *)
+    is_poisoned st.db_ref
+  then Lwt.return (Error (Runtime poisoned_msg))
   else (
     let params_arr = Array.of_list params in
     let t = st.db_ref in

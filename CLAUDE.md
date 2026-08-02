@@ -231,7 +231,181 @@ EOF
 - Tests that require real SQLite live in `test/test_sqlite_compare.ml`; they skip gracefully via `sqlite3_available ()` (`:18`) when `sqlite3` is not in `PATH`, and its header comment has the exact `podman run` invocation that mounts the host `sqlite3` and its libs into the container. **There is no `test/compare_sqlite/` directory** — that path was in this file for a while and sent agents looking for a harness they concluded did not exist.
 - Nothing in the tree reads `GRANARY_TEST_SQLITE`; it is a phantom invented by the same stale sentence. The SQLite comparison tests gate on `sqlite3` in `PATH`; the slow TPC-C smoke run gates on `GRANARY_TPCC_SMOKE` (`test/test_tpcc_smoke.ml:238`).
 - Granary is **inspired by** SQLite, not a port of it. When pinning a behaviour that differs from SQLite, record the divergence deliberately rather than assuming parity is the goal — e.g. since #530 every PRIMARY KEY column implies NOT NULL, whichever way the key is spelled, where SQLite leaves PK columns nullable on *rowid* tables (its legacy behaviour; it does enforce PK NOT NULL on `WITHOUT ROWID` tables, which this engine also supports). `ALTER TABLE ... ADD COLUMN ... PRIMARY KEY` is refused outright for the same reason: that path built no backing index, so it could only ever have produced a "primary key" that was not one.
+- **NaN is a value here, and it sorts below every number (#536, decided 2026-08-02).**
+  SQLite has no NaN at all: `sqlite3_bind_double(NaN)` binds NULL, and a NaN
+  expression result is NULL, so `o >= ?` bound to NaN is *unknown* and returns
+  no rows. Granary instead keeps NaN as a real value in a total order, and
+  diverges from SQLite in **both** directions — `o >= NaN` returns every row,
+  `o <= NaN` returns none. Two mechanisms have to agree for that to be sound:
+  - `Exec.cmp_result` promotes cross-type numeric operands with `Float.compare`,
+    whose total order puts NaN below `neg_infinity`.
+  - `Index_key.encode_value` writes NaN as the single `0x00` NULL/NaN byte,
+    which also sorts below every other key.
+
+  **They agree that NaN sorts below every number, and that — not blanket
+  agreement — is what keeps this from being a rows-lost bug.** (They do *not*
+  agree about NaN vs NULL; see below. That costs no rows on the read path,
+  because a seek over the shared `0x00` prefix still runs the residual
+  predicate.) A seek and its residual predicate can never disagree about where
+  NaN sits relative to a number, so no future change may move one of the two
+  without the other, or an index seek will start skipping rows the predicate
+  would have kept. Option A (fold NaN to NULL at the value-ingress points,
+  matching SQLite) remains the only variant worth the disruption; option B
+  (NULL comparison, unchanged storage) was rejected precisely because it breaks
+  that agreement.
+
+  `nan_and_infinite_bounds_are_sound` in `test/test_range_bound_517.ml` pins it
+  (300 rows for a NaN lower bound, 0 for an upper one).
+
+  **The agreement is only about NaN vs *numbers*.** The rest of the engine was
+  surveyed when #536 was decided, and NaN vs *NULL* is where the two levels part
+  company — `Exec.compare_values` puts `NULL < NaN < every number`, while the
+  index encoding makes NaN and NULL the same `0x00` byte, i.e. *equal*. The
+  value-level answers are all coherent with the decided order and need no
+  change:
+  - **ORDER BY** (`compare_with_nulls`) places NULLs by an explicit flag and
+    sends NaN to `compare_values`, so NaN sorts after NULLs and before every
+    other real.
+  - **DISTINCT** and hash joins dedup on `row_key`'s `%h` rendering, so all NaNs
+    collapse to one and none collapses into NULL.
+  - **GROUP BY** / window PARTITION BY group on `compare_values = 0`, so two
+    NaNs group together and NaN never groups with NULL — consistent with
+    DISTINCT.
+  - **MIN/MAX** skip NULLs and use `compare_values`, so `MIN` over a REAL column
+    containing NaN returns NaN and `MAX` only does when NaN is the sole
+    non-NULL value.
+
+  **Index-keyed uniqueness is the one that does NOT agree, and it is a real
+  bug — #578, not part of this decision.** The UNIQUE NULL exemption
+  (`any_null_val`) tests the *value*, so a NaN is correctly not exempted; but
+  the conflict probe then compares *encoded bytes*, where NaN's key is
+  byte-identical to NULL's. So `INSERT NULL` then `INSERT NaN` raises a spurious
+  `UNIQUE constraint failed`, while the reverse order succeeds. Do not "fix"
+  that by making the exemption byte-based — that would silently exempt NaN from
+  uniqueness altogether. **Option C should not be treated as fully settled while
+  that stands**: an order-dependent `UNIQUE` on any nullable REAL column is a
+  live defect, and if it is fixed by giving NaN its own tag byte, the "NaN is a
+  value in a total order" position gets stronger rather than weaker.
+
+  One further comparator defect surfaced in the same survey and is *not*
+  NaN-specific: `Exec.compare_values` returns `0` for any int-vs-real pair (its
+  `| _, _ -> 0` catch-all), while `Exec.cmp_result` promotes through
+  `Float.compare`. Strict column typing hides this for stored columns, but
+  `ORDER BY` over a mixed *computed* column returns rows unsorted. Tracked as
+  #579. There are four independent value comparators in the tree
+  (`compare_values`, `cmp_result`, `row_key`'s string rendering, and
+  `Reactive_view.value_compare`) and they do not all agree.
+
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
+
+### One `Db.t`, one explicit transaction (#555)
+
+A `Db.t` carries a single explicit-transaction slot and every statement resolves
+its transaction from it. **Autocommit sharing across fibers is fine and stays
+fine** — `test_concurrent_rmw_223.ml` and `test_multifiber_stress.ml` both share
+one handle across fibers and are correct. Explicit transactions are the problem:
+two fibers cannot hold two.
+
+Since #555 a `BEGIN` that arrives while another explicit transaction is active
+fails *and* **poisons the handle**. While poisoned, every statement — read,
+write, DDL, `SAVEPOINT`, prepared `run`/`iter`, and `COMMIT` — is rejected with a
+`Runtime` error. `ROLLBACK` is the sole exit: it aborts whatever transaction was
+in flight and clears the poison, after which the handle is fully usable.
+`Db.transaction_poisoned` exposes the flag.
+
+**The poison narrows the hazard; it does not close it.** It covers the window
+between the failed `BEGIN` and the first `ROLLBACK` — and `ROLLBACK` is the
+prescribed recovery, so the window closes by design. Past it the original
+contamination is reachable with the fibers exchanged: the recovering fiber
+`BEGIN`s afresh, and the fiber whose transaction was aborted — never told —
+writes into the new one and commits it. That is **#584**, pinned as a canary by
+`residual_584` in `test_txn.ml`. The enabling change for a real fix is **#585**
+(a scoped `Db.with_transaction`, giving the engine an extent to attach an owner
+token to); **#555** option 1 (a session object) is what an OLTP throughput
+number needs. Do not read the poison as permission to share a handle.
+
+It also dooms the *winner's* transaction — the engine cannot tell the two fibers
+apart, so it cannot let `COMMIT` through without letting the wrong fiber's
+`COMMIT` through.
+
+Under ATTACH, poisoning is **per-handle**: each attached schema is its own
+`Db.t` with its own slot, `BEGIN` routes to the active schema, and a poisoned
+`aux` does not stop statements routed to `main`. Three consequences are wired in
+deliberately — `Db.transaction_poisoned` ORs over the attached sub-handles (or
+it would answer `false` on a genuinely poisoned connection), and both routing
+statements that could carry a caller *away* from a poisoned schema are refused:
+`PRAGMA active_database = …` (or the recovering `ROLLBACK` would route to the
+wrong schema and answer "no active transaction" while the poisoned one still
+held its writer lock) and `DETACH DATABASE` (which would otherwise drop the
+sub-handle and its transaction — a clean outcome, but a *second* exit from the
+poisoned state, making "ROLLBACK is the sole exit" false).
+
+**The ATTACH story is not closed.** #555's poison only fires on a *collision*,
+and under ATTACH one `Db.t` legitimately holds two explicit-transaction slots.
+A `PRAGMA active_database` switch mid-transaction therefore makes a statement
+silently autocommit into the wrong schema, with `transaction_poisoned = false`
+throughout — no collision, so nothing fires. Pre-existing and untouched by
+#555; tracked as **#598**.
+
+### Running explicit transactions from more than one fiber
+
+> **`Db.create_worker_handle` is currently UNSAFE for concurrent writes to any
+> table with an engine-assigned rowid (#589).** It is safe only for
+> `WITHOUT ROWID` tables, or rowid tables where you supply the
+> `INTEGER PRIMARY KEY` value on every insert. A `TEXT PRIMARY KEY` or
+> `AUTOINCREMENT` table is **NOT** safe: it loses rows *and* leaves the index
+> pointing at the wrong row.
+
+Read that before the rest of this section. "Use explicit primary keys" was the
+advice here until 2026-08-02 and it is **false** — a `TEXT PRIMARY KEY` with
+caller-supplied values is an explicit primary key, and it is the worst case in
+the matrix, not an exception to it.
+
+`create_worker_handle` is nonetheless the only mechanism available, and the
+mechanism itself is sound: it is `of_store` over the *same* `Store.t`, so each
+handle gets its own `explicit_txn` while sharing the store's single-writer
+`Rwlock`. A second fiber's `BEGIN` **blocks** until the first commits rather than
+contaminating it, and neither handle is ever poisoned. (This also corrects #555's
+premise that "a second `Db.t` over the same path would be a second lock with no
+mutual exclusion" — true of a second `open_file`, false here.)
+
+**What #589 actually does.** Each handle gets a *fresh catalog*, and a catalog
+caches `next_rowid`. Two handles hold two counters over one data tree and neither
+invalidates the other, so an `INSERT` with an engine-assigned rowid reuses a
+rowid the other handle already committed. Measured across the table shapes:
+
+| shape | result |
+|---|---|
+| `CREATE TABLE t (b TEXT)` — plain rowid, the commonest shape | 1 row where there should be 2 |
+| `a INTEGER PRIMARY KEY`, engine-assigned | 1 row |
+| `a INTEGER PRIMARY KEY`, **caller-supplied** values | correct |
+| `a INTEGER PRIMARY KEY AUTOINCREMENT` | 1 row; `sqlite_sequence` reads `1` on both handles |
+| `k TEXT PRIMARY KEY`, caller-supplied keys | 1 row **plus index corruption** |
+| `WITHOUT ROWID` | correct |
+
+For `TEXT PRIMARY KEY` the consequence is **wrong query answers**, not row loss:
+the index keeps a phantom entry for the overwritten key pointing at the reused
+rowid, so `WHERE k = 'k1'` returns a row whose `k` is `k2`, a secondary-index
+seek does the same, and re-inserting `'k1'` fails with a phantom
+`UNIQUE constraint failed`. Pinned by `worker_handle_text_pk_corruption`.
+
+It is symmetric and unbounded, not one-shot: a worker created *after* the
+parent's rows snapshots correctly, and then the **parent** goes stale and
+overwrites the worker's row. Three handles and five inserts leave two rows. It
+persists to disk, survives close/reopen, and explicit transactions on both
+handles do not help — it is not a race, and the writer lock is irrelevant.
+
+The other limits, none of which corrupt anything:
+
+- DDL on one handle is invisible to the other's schema cache (same fresh-catalog
+  cause).
+- Reactive views, ATTACHed schemas and the active schema are per-handle.
+- Write transactions *serialize* on the shared lock rather than overlapping, and
+  a read-only transaction does not overlap a writer either.
+
+`Tpcc_driver`'s one-deep worker pool predates this and serializes whole
+transactions on a single handle; that is why its terminal-count sweep flatlines
+by construction.
 
 ## Repository structure
 

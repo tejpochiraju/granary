@@ -118,7 +118,41 @@ val close : t -> unit Lwt.t
 (** Create a lightweight worker handle sharing the same underlying store.
     Equivalent to [let* () = Lwt.return_unit in of_store (store t)].
     Used by Jepsen-style concurrent workloads where each worker needs
-    its own [explicit_txn] without exposing the raw store. *)
+    its own [explicit_txn] without exposing the raw store.
+
+    {b #589: UNSAFE for concurrent writes to any table with an engine-assigned
+    rowid.} Safe only for [WITHOUT ROWID] tables, or rowid tables where the
+    caller supplies the [INTEGER PRIMARY KEY] value on every insert. A
+    [TEXT PRIMARY KEY] or [AUTOINCREMENT] table is {b NOT} safe.
+
+    Each handle is built by [of_store], so it gets a {b fresh catalog}, and a
+    catalog caches [next_rowid]. Two handles hold two counters over one data
+    tree and neither invalidates the other, so an [INSERT] with an
+    engine-assigned rowid reuses one the other handle already committed. On a
+    plain rowid table that silently loses a row. On a [TEXT PRIMARY KEY] table
+    it is worse: the index keeps a phantom entry for the overwritten key
+    pointing at the reused rowid, so a seek on the lost key returns {b the wrong
+    row} and re-inserting it fails with a phantom [UNIQUE] violation — wrong
+    answers, not merely missing ones. Symmetric (the parent goes stale too),
+    unbounded, persists to disk, and unaffected by explicit transactions: it is
+    not a race, so the shared lock does not help.
+
+    #555: subject to that, this is the supported way to run explicit
+    transactions from more than one fiber. Each handle gets its own transaction
+    slot, and because they share one [Store.t] they share its single-writer
+    [Rwlock], so a second fiber's [BEGIN]/write {e blocks} until the first
+    commits rather than contaminating it or poisoning anything. Neither handle
+    is ever poisoned by the other — {!transaction_poisoned} is about two fibers
+    sharing {e one} handle.
+
+    Its other limits:
+    - DDL executed on one handle is invisible to the other's schema cache (same
+      fresh-catalog cause as #589).
+    - Reactive views, ATTACHed schemas and the active-schema setting are
+      per-handle; a worker handle starts with none of the parent's.
+    - Write transactions {b serialize} on the shared [Rwlock] rather than
+      overlapping, and read-only transactions do not overlap a writer either.
+      Genuine concurrency needs #555 option 1. *)
 val create_worker_handle : t -> t Lwt.t
 
 (** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL
@@ -165,6 +199,76 @@ val catalog : t -> Granary_catalog.Catalog.t
     prepared statements created from the previous file will continue
     to work logically but observe the recompacted file.  Phase 37 / #120. *)
 val vacuum : t -> unit Lwt.t
+
+(** #555: whether this connection has been {e poisoned} by an overlapping
+    explicit transaction — either the top-level handle or any ATTACHed schema.
+
+    A [Db.t] holds exactly one explicit-transaction slot and every statement
+    resolves its transaction from it, so two fibers sharing one handle cannot
+    hold two transactions.  When a [BEGIN] arrives while another explicit
+    transaction is already active on the handle, that [BEGIN] fails {e and} the
+    handle is poisoned: every subsequent statement on it is rejected with a
+    [Runtime] error.
+
+    {2 What this does and does not guarantee}
+
+    It {e narrows} the hazard; it does not close it.  While the poison is set,
+    the losing fiber cannot read or write inside the winner's transaction and
+    cannot commit the winner's half-finished work.  But the poison covers only
+    the window between the failed [BEGIN] and the first [ROLLBACK] — and
+    [ROLLBACK] is the prescribed recovery.  Once it clears, the slot is free
+    again and the original contamination is reachable with the fibers exchanged:
+    the recovering fiber can [BEGIN] afresh and the fiber whose transaction was
+    aborted, never having been told, writes into the new one.  See #584 for the
+    exact sequence, and #585 for the scoped-transaction combinator that is the
+    enabling change for a real fix.
+
+    So this is a loud failure in place of a silent one over a bounded window,
+    not a safe way to share a handle.  Do not treat it as permission to run
+    explicit transactions concurrently on one [Db.t] — use
+    {!create_worker_handle} for that, and read its {b #589} warning first: it is
+    unsafe for concurrent writes to any table with an engine-assigned rowid.
+
+    {2 Recovery}
+
+    [ROLLBACK] aborts whatever transaction was in flight and clears the poison,
+    and it is the only thing that does.  Not [COMMIT] — that is exactly the
+    operation that must not be allowed to succeed here — and not finalizing a
+    statement.  Under ATTACH, the two routing statements that could otherwise
+    have dropped a poisoned schema out from under the caller,
+    [PRAGMA active_database = …] and [DETACH DATABASE], are both refused while
+    the active schema is poisoned, so this stays a single-exit contract.  Any
+    fiber may issue the [ROLLBACK]; the handle has no notion of transaction
+    ownership, which is the limitation #585 removes.  It clears the flag even
+    when no transaction remains to abort, so a handle can never be left
+    permanently unusable.
+
+    Note this dooms the {e winner's} transaction too.  The engine cannot tell
+    the two fibers apart, so it cannot let [COMMIT] through without letting the
+    wrong fiber's [COMMIT] through.
+
+    {2 Under ATTACH}
+
+    Poisoning is per-handle: each attached schema is its own [Db.t] with its own
+    slot, [BEGIN] routes to the active schema, and a poisoned ["aux"] does not
+    stop statements that route to ["main"].  This predicate reports whether
+    {e any} of them is poisoned, so an application polling it for recovery is
+    not told [false] about a genuinely poisoned connection.  Leaving a poisoned
+    schema — via [PRAGMA active_database = …] or [DETACH DATABASE] — is refused,
+    so the [ROLLBACK] that recovers it cannot be routed away from it; arriving at
+    one stays legal.
+
+    This does not make ATTACH safe in general.  The poison fires only on a
+    {e collision}, and one [Db.t] under ATTACH legitimately holds two
+    transaction slots, so switching schema mid-transaction makes a statement
+    autocommit into the wrong schema with no collision and no poison.  That is
+    pre-existing and tracked as #598.
+
+    {2 Autocommit}
+
+    Unaffected, as long as no explicit transaction is used: sharing a [Db.t]
+    across fibers without [BEGIN] never poisons it. *)
+val transaction_poisoned : t -> bool
 
 (** Execute a DDL or DML statement (CREATE TABLE, INSERT, UPDATE, ...).
     Returns [Ok ()] on success, [Error e] on failure. *)

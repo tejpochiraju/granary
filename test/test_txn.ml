@@ -1,11 +1,15 @@
 (** Tests for SQL-level BEGIN / COMMIT / ROLLBACK (Phase 3). *)
 
+open Lwt.Syntax
+
 module Db = struct
   include Granary.Db
 
   let open_file = Granary_unix.open_file
 end
 
+(* #555: ATTACH needs the Unix file provider installed. *)
+let () = Granary_unix.install ()
 let run = Lwt_main.run
 let fresh_db () = run (Db.open_in_memory ())
 let db_counter = ref 0
@@ -647,6 +651,455 @@ let test_execute_change_count_drop_table () =
   | Error _ -> Alcotest.fail "DROP TABLE failed"
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #555: overlapping-BEGIN containment                                  *)
+(* ------------------------------------------------------------------ *)
+
+(* A [Db.t] has one explicit-transaction slot, so a second BEGIN cannot be
+   honoured.  Before #555 it was merely refused, and the refused caller's NEXT
+   statement silently joined the transaction that won — up to and including a
+   COMMIT of somebody else's half-finished work.  These pin the containment:
+   after the refused BEGIN the handle is poisoned, every statement is rejected,
+   and only ROLLBACK clears it.
+
+   Everything below is scoped to the POISON WINDOW — the span between the failed
+   BEGIN and the first ROLLBACK.  The containment does not extend past that; see
+   the [residual_584] group for what is still reachable once the poison clears,
+   and [worker_handle_serializes_without_poison] for what an application should
+   be doing instead of sharing a handle. *)
+
+let test_double_begin_poisons_connection () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "BEGIN";
+  Alcotest.(check bool) "not poisoned before" false (Db.transaction_poisoned db);
+  let r = run (Db.execute db "BEGIN") in
+  Alcotest.(check bool) "second BEGIN is error" true (Result.is_error r);
+  Alcotest.(check bool) "poisoned after" true (Db.transaction_poisoned db);
+  (* Every statement kind is now rejected — this is the whole point: the losing
+     fiber cannot read or write inside the winner's transaction. *)
+  Alcotest.(check bool)
+    "write rejected"
+    true
+    (Result.is_error (run (Db.execute db "INSERT INTO t (n) VALUES (1)")));
+  Alcotest.(check bool)
+    "read rejected"
+    true
+    (Result.is_error (run (Db.query db "SELECT n FROM t")));
+  Alcotest.(check bool)
+    "DDL rejected"
+    true
+    (Result.is_error (run (Db.execute db "CREATE TABLE u (n INTEGER)")));
+  Alcotest.(check bool)
+    "SAVEPOINT rejected"
+    true
+    (Result.is_error (run (Db.execute db "SAVEPOINT sp")));
+  (* The hazard itself: COMMIT must NOT be able to commit the winner's work. *)
+  Alcotest.(check bool)
+    "COMMIT rejected"
+    true
+    (Result.is_error (run (Db.execute db "COMMIT")));
+  Alcotest.(check bool) "still poisoned" true (Db.transaction_poisoned db);
+  (* ROLLBACK is the one exit, and it succeeds. *)
+  (match run (Db.execute db "ROLLBACK") with
+   | Ok () -> ()
+   | Error _ -> Alcotest.fail "ROLLBACK on a poisoned connection must succeed");
+  Alcotest.(check bool) "poison cleared" false (Db.transaction_poisoned db);
+  (* And the connection is fully usable again — recovery is well-defined. *)
+  exec db "INSERT INTO t (n) VALUES (7)";
+  Alcotest.(check (list int))
+    "usable after rollback"
+    [ 7 ]
+    (query_ints db "SELECT n FROM t")
+;;
+
+(* Inside the window, the poisoned COMMIT must not commit the winner's
+   uncommitted writes: the ROLLBACK that clears the poison discards them.
+   (Contrast [test_584_rollback_reopens_the_hazard], where a COMMIT issued AFTER
+   the poison has cleared does commit somebody else's work.) *)
+let test_poisoned_commit_does_not_commit_other_txn () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "BEGIN";
+  exec db "INSERT INTO t (n) VALUES (1)";
+  (* "fiber B" arrives *)
+  ignore (run (Db.execute db "BEGIN"));
+  ignore (run (Db.execute db "COMMIT"));
+  ignore (run (Db.execute db "ROLLBACK"));
+  Alcotest.(check (list int))
+    "in-flight writes discarded, not committed"
+    []
+    (query_ints db "SELECT n FROM t")
+;;
+
+(* Prepared statements resolve their mode from the same one slot, so they are
+   gated too. *)
+let test_poison_rejects_prepared_statements () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  let ins =
+    match run (Db.prepare db "INSERT INTO t (n) VALUES (?)") with
+    | Ok st -> st
+    | Error _ -> Alcotest.fail "prepare INSERT failed"
+  in
+  let sel =
+    match run (Db.prepare db "SELECT n FROM t") with
+    | Ok st -> st
+    | Error _ -> Alcotest.fail "prepare SELECT failed"
+  in
+  exec db "BEGIN";
+  ignore (run (Db.execute db "BEGIN"));
+  Alcotest.(check bool)
+    "prepared run rejected"
+    true
+    (Result.is_error (run (Db.run ins ~params:[ Db.V_int 1L ])));
+  Alcotest.(check bool)
+    "prepared iter rejected"
+    true
+    (Result.is_error (run (Db.iter sel ~params:[])));
+  ignore (run (Db.execute db "ROLLBACK"))
+;;
+
+(* ROLLBACK on a connection that was never poisoned and has no transaction is
+   still an error — the poison exit did not weaken that. *)
+let test_rollback_without_begin_still_errors_when_clean () =
+  let db = fresh_db () in
+  Alcotest.(check bool)
+    "ROLLBACK with nothing open is an error"
+    true
+    (Result.is_error (run (Db.execute db "ROLLBACK")))
+;;
+
+(* Autocommit sharing is untouched: no BEGIN, no poison, ever. *)
+let test_autocommit_never_poisons () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  for i = 1 to 20 do
+    exec db (Printf.sprintf "INSERT INTO t (n) VALUES (%d)" i)
+  done;
+  Alcotest.(check bool) "never poisoned" false (Db.transaction_poisoned db);
+  Alcotest.(check (list int))
+    "all autocommit writes visible"
+    (List.init 20 (fun i -> i + 1))
+    (query_ints db "SELECT n FROM t ORDER BY n ASC")
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #555 under ATTACH, and the #584 residual                             *)
+(* ------------------------------------------------------------------ *)
+
+let is_err r = Result.is_error r
+let ok_exn what r = if Result.is_error r then Alcotest.failf "%s: expected Ok" what
+
+(* BEGIN is not a routing statement, so it goes to the ACTIVE schema's
+   sub-handle and the poison lands there — not on the handle the application
+   holds. Two consequences, both of which were wrong in the first cut of this
+   fix:
+
+   - [transaction_poisoned] must look at the attached sub-handles, or it answers
+     [false] on a genuinely poisoned connection and an application polling it
+     for recovery never learns it must ROLLBACK.
+   - [PRAGMA active_database = …] IS a routing statement, so it resolves to the
+     top-level handle and the generic gate (which tests the routed handle) waves
+     it through. That let a caller walk away from the poisoned schema, after
+     which the prescribed recovery breaks: ROLLBACK routes to the new schema and
+     answers "no active transaction" while the poisoned one still holds its
+     writer lock. Leaving a poisoned schema is now refused. *)
+let test_poison_under_attach () =
+  let db, path = fresh_file_db () in
+  let aux_path = path ^ ".aux" in
+  (try Unix.unlink aux_path with
+   | _ -> ());
+  exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux_path);
+  exec db "PRAGMA active_database = 'aux'";
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "BEGIN";
+  Alcotest.(check bool) "not poisoned before" false (Db.transaction_poisoned db);
+  Alcotest.(check bool)
+    "second BEGIN on aux is error"
+    true
+    (is_err (run (Db.execute db "BEGIN")));
+  (* The accessor must see through to the sub-handle. *)
+  Alcotest.(check bool)
+    "top-level accessor reports poisoned"
+    true
+    (Db.transaction_poisoned db);
+  (* And the schema switch must not be an escape hatch. *)
+  Alcotest.(check bool)
+    "cannot leave a poisoned schema"
+    true
+    (is_err (run (Db.execute db "PRAGMA active_database = 'main'")));
+  Alcotest.(check bool)
+    "statements on the poisoned schema still rejected"
+    true
+    (is_err (run (Db.query db "SELECT n FROM t")));
+  (* ROLLBACK still routes to aux, so recovery works. *)
+  (* DETACH routes to the top handle too, and left ungated it would drop the
+     sub-handle and its transaction — a clean outcome, but a SECOND exit from
+     the poisoned state, contradicting the documented "ROLLBACK is the sole
+     exit". Refused, so the contract stays true. *)
+  Alcotest.(check bool)
+    "cannot DETACH out of a poisoned schema"
+    true
+    (is_err (run (Db.execute db "DETACH DATABASE aux")));
+  ok_exn "ROLLBACK on the poisoned schema" (run (Db.execute db "ROLLBACK"));
+  Alcotest.(check bool) "poison cleared" false (Db.transaction_poisoned db);
+  ok_exn
+    "schema switch after recovery"
+    (run (Db.execute db "PRAGMA active_database = 'main'"));
+  ok_exn "DETACH after recovery" (run (Db.execute db "DETACH DATABASE aux"));
+  close_file_db db path;
+  (try Unix.unlink aux_path with
+   | _ -> ());
+  try Unix.unlink (aux_path ^ "-wal") with
+  | _ -> ()
+;;
+
+(* #584 — KNOWN-CURRENT BEHAVIOUR, PINNED AS A CANARY, NOT AN ENDORSEMENT.
+
+   The poison narrows the #555 hazard to the window between the failed BEGIN and
+   the first ROLLBACK. ROLLBACK is also the prescribed recovery, so the window
+   closes by design — and past it the original contamination is reachable with
+   the two fibers exchanged. Nothing below raises an error, and the final row
+   set is wrong: fiber A's COMMIT commits fiber B's uncommitted work.
+
+   This is pinned so the hole is a canary rather than an undiscovered defect. A
+   fix for #584/#585 (a scoped transaction combinator, so the engine can tell
+   the owner from the intruder) SHOULD make this test fail — at which point
+   update it to the new, correct expectations rather than deleting it. *)
+let test_584_rollback_reopens_the_hazard () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  (* A owns the slot. *)
+  exec db "BEGIN";
+  exec db "INSERT INTO t (n) VALUES (1)";
+  (* B collides, is poisoned, and recovers exactly as documented. *)
+  Alcotest.(check bool) "B BEGIN refused" true (is_err (run (Db.execute db "BEGIN")));
+  ok_exn "B ROLLBACK clears the poison" (run (Db.execute db "ROLLBACK"));
+  (* B now takes the slot. A was never told its transaction was aborted. *)
+  ok_exn "B BEGIN succeeds" (run (Db.execute db "BEGIN"));
+  ok_exn "B INSERT" (run (Db.execute db "INSERT INTO t (n) VALUES (99)"));
+  (* A's write lands inside B's transaction, and A's COMMIT commits it. *)
+  ok_exn
+    "A INSERT (silently inside B's txn)"
+    (run (Db.execute db "INSERT INTO t (n) VALUES (2)"));
+  ok_exn "A COMMIT (commits B's half-finished work)" (run (Db.execute db "COMMIT"));
+  Alcotest.(check (list int))
+    "#584: A's row 1 is gone and B's uncommitted 99 is durable"
+    [ 2; 99 ]
+    (query_ints db "SELECT n FROM t ORDER BY n ASC")
+;;
+
+(* #584, adjacent case — same root cause, also pinned.
+
+   If B recovers and does NOT re-BEGIN, A's subsequent writes run in AUTOCOMMIT.
+   Each returns Ok and is durably committed on its own; A only discovers the
+   transaction is gone at COMMIT, by which time the partial writes are on disk.
+   Atomicity is lost silently. *)
+let test_584_orphaned_writes_autocommit () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "BEGIN";
+  exec db "INSERT INTO t (n) VALUES (1)";
+  Alcotest.(check bool) "B BEGIN refused" true (is_err (run (Db.execute db "BEGIN")));
+  ok_exn "B ROLLBACK" (run (Db.execute db "ROLLBACK"));
+  (* A carries on, unaware. Each write autocommits. *)
+  ok_exn "A INSERT 2" (run (Db.execute db "INSERT INTO t (n) VALUES (2)"));
+  ok_exn "A INSERT 3" (run (Db.execute db "INSERT INTO t (n) VALUES (3)"));
+  Alcotest.(check bool)
+    "A only finds out at COMMIT"
+    true
+    (is_err (run (Db.execute db "COMMIT")));
+  Alcotest.(check (list int))
+    "#584: row 1 rolled back, rows 2 and 3 committed non-atomically"
+    [ 2; 3 ]
+    (query_ints db "SELECT n FROM t ORDER BY n ASC")
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #555 with two genuine Lwt fibers                                     *)
+(* ------------------------------------------------------------------ *)
+
+(* The cases above drive one handle sequentially, which is what the hazard
+   reduces to. This one interleaves two real fibers on a shared handle, so the
+   claim "two fibers sharing a Db.t" is exercised rather than asserted. *)
+let test_two_fibers_share_one_handle () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  let a_has_begun, wake_a_begun = Lwt.wait () in
+  let b_has_collided, wake_b_collided = Lwt.wait () in
+  let b_begin_err = ref false
+  and a_write_after_poison_err = ref false
+  and poisoned_seen = ref false in
+  run
+    (Lwt.join
+       [ (let* r = Db.execute db "BEGIN" in
+          ok_exn "A BEGIN" r;
+          let* r = Db.execute db "INSERT INTO t (n) VALUES (1)" in
+          ok_exn "A INSERT" r;
+          Lwt.wakeup wake_a_begun ();
+          let* () = b_has_collided in
+          (* A is now collateral damage: its own writes are refused too. *)
+          let* r = Db.execute db "INSERT INTO t (n) VALUES (2)" in
+          a_write_after_poison_err := is_err r;
+          Lwt.return_unit)
+       ; (let* () = a_has_begun in
+          let* r = Db.execute db "BEGIN" in
+          b_begin_err := is_err r;
+          poisoned_seen := Db.transaction_poisoned db;
+          Lwt.wakeup wake_b_collided ();
+          Lwt.return_unit)
+       ]);
+  Alcotest.(check bool) "B's BEGIN errored" true !b_begin_err;
+  Alcotest.(check bool) "B observed the poison" true !poisoned_seen;
+  Alcotest.(check bool) "A's own write refused too" true !a_write_after_poison_err;
+  ok_exn "ROLLBACK recovers" (run (Db.execute db "ROLLBACK"));
+  Alcotest.(check (list int)) "nothing committed" [] (query_ints db "SELECT n FROM t")
+;;
+
+(* [create_worker_handle] is the supported way to run explicit transactions from
+   more than one fiber, and it does NOT go through the poison at all: each
+   handle has its own transaction slot, and because both share one [Store.t]
+   they share its single-writer lock, so the second fiber BLOCKS until the first
+   commits. Pinned because CLAUDE.md now points applications here, and because
+   #555's premise — "a second Db.t over the same path would be a second lock
+   with no mutual exclusion" — is false for this constructor. *)
+let test_worker_handle_serializes_without_poison () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)";
+  let wdb = run (Db.create_worker_handle db) in
+  let a_has_begun, wake_a_begun = Lwt.wait () in
+  let a_may_commit, wake_a_commit = Lwt.wait () in
+  let b_was_blocked = ref false in
+  let rec spin n =
+    if n = 0 then Lwt.return_unit else Lwt.bind (Lwt.pause ()) (fun () -> spin (n - 1))
+  in
+  run
+    (Lwt.join
+       [ (let* r = Db.execute db "BEGIN" in
+          ok_exn "A BEGIN" r;
+          let* r = Db.execute db "INSERT INTO t (id, n) VALUES (10, 1)" in
+          ok_exn "A INSERT" r;
+          Lwt.wakeup wake_a_begun ();
+          let* () = a_may_commit in
+          let* r = Db.execute db "COMMIT" in
+          ok_exn "A COMMIT" r;
+          Lwt.return_unit)
+       ; (let* () = a_has_begun in
+          (* B's BEGIN must not error and must not resolve while A holds the
+             writer lock. *)
+          let p = Db.execute wdb "BEGIN" in
+          let* () = spin 50 in
+          (b_was_blocked
+           := match Lwt.state p with
+              | Lwt.Sleep -> true
+              | _ -> false);
+          Lwt.wakeup wake_a_commit ();
+          let* r = p in
+          ok_exn "B BEGIN (once A committed)" r;
+          let* r = Db.execute wdb "INSERT INTO t (id, n) VALUES (20, 2)" in
+          ok_exn "B INSERT" r;
+          let* r = Db.execute wdb "COMMIT" in
+          ok_exn "B COMMIT" r;
+          Lwt.return_unit)
+       ]);
+  Alcotest.(check bool) "B blocked on the shared writer lock" true !b_was_blocked;
+  Alcotest.(check bool) "parent handle never poisoned" false (Db.transaction_poisoned db);
+  Alcotest.(check bool) "worker handle never poisoned" false (Db.transaction_poisoned wdb);
+  (* Committed rows ARE visible across handles — they share one store. It is
+     only the per-catalog rowid counter that goes stale; see
+     [test_worker_handle_stale_rowid_counter]. Hence the explicit ids above. *)
+  Alcotest.(check (list int))
+    "each handle sees the other's committed rows"
+    [ 1; 2 ]
+    (query_ints wdb "SELECT n FROM t ORDER BY n ASC");
+  Alcotest.(check (list int))
+    "both transactions committed, in order"
+    [ 1; 2 ]
+    (query_ints db "SELECT n FROM t ORDER BY n ASC")
+;;
+
+(* KNOWN-CURRENT BEHAVIOUR, PINNED — the sharp edge on [create_worker_handle],
+   found while writing the test above (#589).
+
+   [create_worker_handle] is [of_store], which builds a FRESH catalog. A catalog
+   caches each rowid table's [next_rowid]. Two handles therefore hold two
+   independent counters over one shared data tree, and neither invalidates the
+   other. So an INSERT that lets the engine assign the rowid can allocate a
+   rowid the other handle has already committed, and the second write SILENTLY
+   OVERWRITES the first. No error, no constraint violation, one row where there
+   should be two.
+
+   The shared writer lock does not help: this is not a race. The sequence below
+   is strictly sequential and still loses the row.
+
+   This is why the fibers test above inserts explicit primary keys, and why
+   CLAUDE.md's pointer to [create_worker_handle] carries the caveat in capitals.
+   A fix (re-derive or share the counter) SHOULD make this test fail. *)
+let query_text_text db sql =
+  match run (Db.query db sql) with
+  | Error _ -> []
+  | Ok stream ->
+    List.map
+      (fun row ->
+         match row.(0), row.(1) with
+         | Db.V_text a, Db.V_text b -> a, b
+         | _ -> "?", "?")
+      (rows_of stream)
+;;
+
+(* KNOWN-CURRENT BEHAVIOUR, PINNED — the worst face of #589, and the reason the
+   guidance is "WITHOUT ROWID or a caller-supplied INTEGER PRIMARY KEY", NOT the
+   plausible-sounding "use explicit primary keys".
+
+   A TEXT PRIMARY KEY is an explicit primary key with explicit values, and it is
+   NOT safe: the table still has an engine-assigned rowid underneath, so the
+   stale counter still collides. But here the damage is worse than a lost row.
+   The PK index keeps a phantom entry for the overwritten key pointing at the
+   reused rowid, which now holds the other row's payload, so:
+
+   - a seek on the lost key returns the WRONG ROW, and
+   - re-inserting the lost key fails with a phantom UNIQUE violation.
+
+   Silent corruption producing wrong answers, not merely row loss. A fix for
+   #589 SHOULD make this test fail. *)
+let test_worker_handle_text_pk_corruption () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (k TEXT PRIMARY KEY, b TEXT)";
+  let wdb = run (Db.create_worker_handle db) in
+  exec db "INSERT INTO t (k, b) VALUES ('k1', 'x')";
+  exec wdb "INSERT INTO t (k, b) VALUES ('k2', 'y')";
+  Alcotest.(check (list (pair string string)))
+    "#589: k1's row was overwritten despite an explicit TEXT PRIMARY KEY"
+    [ "k2", "y" ]
+    (query_text_text db "SELECT k, b FROM t ORDER BY k ASC");
+  (* The index still has an entry for k1, pointing at the reused rowid. *)
+  Alcotest.(check (list (pair string string)))
+    "#589: seeking the lost key returns the WRONG row"
+    [ "k2", "y" ]
+    (query_text_text db "SELECT k, b FROM t WHERE k = 'k1'");
+  (* And the key can never be re-inserted. *)
+  Alcotest.(check bool)
+    "#589: phantom UNIQUE violation re-inserting the lost key"
+    true
+    (is_err (run (Db.execute db "INSERT INTO t (k, b) VALUES ('k1', 'z')")))
+;;
+
+let test_worker_handle_stale_rowid_counter () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  (* The worker's catalog snapshots next_rowid = 1 for [t]. *)
+  let wdb = run (Db.create_worker_handle db) in
+  exec db "INSERT INTO t (b) VALUES ('x')";
+  (* parent assigns rowid 1 *)
+  exec wdb "INSERT INTO t (b) VALUES ('y')";
+  (* worker assigns rowid 1 AGAIN *)
+  Alcotest.(check (list (pair int string)))
+    "#589: the worker's stale counter overwrote the parent's row"
+    [ 1, "y" ]
+    (query_int_text db "SELECT a, b FROM t ORDER BY a ASC")
+;;
+
 let () =
   Alcotest.run
     "test_txn"
@@ -669,6 +1122,55 @@ let () =
             "unique_violation_survives"
             `Quick
             test_unique_violation_survives
+        ] )
+    ; ( "poison_555"
+      , [ Alcotest.test_case
+            "double_begin_poisons_connection"
+            `Quick
+            test_double_begin_poisons_connection
+        ; Alcotest.test_case
+            "poisoned_commit_does_not_commit_other_txn"
+            `Quick
+            test_poisoned_commit_does_not_commit_other_txn
+        ; Alcotest.test_case
+            "poison_rejects_prepared_statements"
+            `Quick
+            test_poison_rejects_prepared_statements
+        ; Alcotest.test_case
+            "rollback_without_begin_still_errors_when_clean"
+            `Quick
+            test_rollback_without_begin_still_errors_when_clean
+        ; Alcotest.test_case
+            "autocommit_never_poisons"
+            `Quick
+            test_autocommit_never_poisons
+        ; Alcotest.test_case "poison_under_attach" `Quick test_poison_under_attach
+        ; Alcotest.test_case
+            "two_fibers_share_one_handle"
+            `Quick
+            test_two_fibers_share_one_handle
+        ; Alcotest.test_case
+            "worker_handle_serializes_without_poison"
+            `Quick
+            test_worker_handle_serializes_without_poison
+        ; Alcotest.test_case
+            "worker_handle_stale_rowid_counter"
+            `Quick
+            test_worker_handle_stale_rowid_counter
+        ; Alcotest.test_case
+            "worker_handle_text_pk_corruption"
+            `Quick
+            test_worker_handle_text_pk_corruption
+        ] )
+    ; ( "residual_584"
+      , [ Alcotest.test_case
+            "rollback_reopens_the_hazard"
+            `Quick
+            test_584_rollback_reopens_the_hazard
+        ; Alcotest.test_case
+            "orphaned_writes_autocommit"
+            `Quick
+            test_584_orphaned_writes_autocommit
         ] )
     ; ( "multi_stmt"
       , [ Alcotest.test_case "update_delete_commit" `Quick test_txn_with_update_delete

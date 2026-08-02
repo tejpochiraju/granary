@@ -986,11 +986,31 @@ let integer_bound_narrows_a_real_column () =
    to the single [0x00] NULL/NaN byte, which sorts below every other key. That
    agrees with the residual predicate, whose [Float.compare] also orders NaN
    below every number — so a NaN LOWER bound admits every row and a NaN UPPER
-   bound stops the walk on the first key. The expectations below are the foil's,
-   not SQLite's: SQLite has no NaN at all (it stores one as NULL, which would
-   make both ends match nothing), and that divergence is the comparison stack's
-   business, not the seek's. It is tracked as #536 — these cases pin the
-   current behaviour, not a decision that it is the right one. *)
+   bound stops the walk on the first key.
+
+   The expectations below are the foil's, not SQLite's. SQLite has no NaN at
+   all: [sqlite3_bind_double(NaN)] binds NULL and a NaN expression result is
+   NULL, so [o >= ?] bound to NaN is unknown and returns NO rows — we return all
+   300, and none for [<=], diverging in both directions.
+
+   #536 CLOSED that as a DELIBERATE, DECIDED divergence (option C, 2026-08-02):
+   granary keeps NaN as a real value in a coherent total order rather than
+   adopting SQLite's fold-to-NULL. So these cases no longer merely pin "current
+   behaviour" — they pin the decision, and a future change that makes them fail
+   is reopening #536, not fixing a bug.
+
+   What they are really guarding is the AGREEMENT between the two mechanisms:
+   [Exec.cmp_result]'s [Float.compare] and [Index_key.encode_value]'s [0x00]
+   byte both put NaN below everything, so a seek and its residual predicate can
+   never disagree. Move one without the other and this becomes a rows-lost bug.
+   That is why each case is checked against the unoptimizable foil as well as
+   against a row count. See CLAUDE.md's "inspired by, not a port" section.
+
+   That agreement holds for NaN vs NUMBERS only. NaN vs NULL is where the two
+   levels part company — [compare_values] says NULL < NaN, the index encoding
+   says NaN = NULL — and index-keyed UNIQUE enforcement reads those bytes as an
+   equality, so it answers order-dependently. That is #578, a bug, and it is
+   deliberately out of scope here: nothing below involves a UNIQUE index. *)
 let nan_and_infinite_bounds_are_sound () =
   with_db (fun db ->
     seed db;
