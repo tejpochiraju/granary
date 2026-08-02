@@ -16,8 +16,11 @@
     expression it appears — that is the whole point of the restriction, and it
     is checked here at both the top level and nested inside arithmetic.
 
-    Subqueries remain rejected in an aggregated projection, exactly as they are
-    in HAVING; see the boundary tests at the bottom. *)
+    Subqueries were left rejected here, exactly as they were in HAVING. #558
+    closed that half too: they are now bound like any other leaf and resolved
+    by [stream_aggregate]. The case that used to pin the rejection is kept as
+    an accepted shape; [test_agg_subquery_558.ml] is where the subquery
+    behaviour, including what remains refused, is pinned in full. *)
 
 open Lwt.Syntax
 module Db = Granary.Db
@@ -351,20 +354,24 @@ let ungrouped_qualified_column_inside_expression_rejected () =
       (contains_sub ~needle:"GROUP BY" msg))
 ;;
 
-(* Subqueries in an aggregated projection are still unsupported, and say so —
-   the same boundary HAVING has.  The half of #507 that asked for a correlated
-   subquery beside an aggregate is not addressed here. *)
-let subquery_beside_an_aggregate_rejected () =
+(* #558 closed the half of #507 this used to pin as rejected: a subquery beside
+   an aggregate is bound like any other leaf and resolved by [stream_aggregate]
+   — uncorrelated once, correlated per group against the grouped columns. The
+   case moves here as an ACCEPTED shape so that the boundary #507 drew is not
+   silently re-drawn; [test_agg_subquery_558.ml] carries the full set,
+   including what is still refused. *)
+let subquery_beside_an_aggregate_accepted () =
   with_db (fun db ->
     seed db;
     exec db "CREATE TABLE u (a INTEGER)";
-    let msg =
-      query_err db "SELECT a, COUNT(*) + (SELECT COUNT(*) FROM u) FROM t GROUP BY a"
-    in
-    Alcotest.(check bool)
-      (Printf.sprintf "names subqueries (%S)" msg)
-      true
-      (contains_sub ~needle:"subquer" msg))
+    exec db "INSERT INTO u VALUES (1)";
+    (* [t] holds 3 rows in group a=1 and 2 in a=2 (see [seed]); [u] holds one,
+       so every group's count gains exactly 1. *)
+    Alcotest.check
+      pair_list
+      "the subquery is resolved, not rejected"
+      [ 1, 4; 2, 3 ]
+      (pairs (query db "SELECT a, COUNT(*) + (SELECT COUNT(*) FROM u) FROM t GROUP BY a")))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -511,6 +518,10 @@ let () =
         ; Alcotest.test_case "TPC-H #494 shapes" `Quick tpch_494_shapes
         ; Alcotest.test_case "consistent with HAVING" `Quick consistent_with_having
         ; Alcotest.test_case "DISTINCT" `Quick distinct_over_expression
+        ; Alcotest.test_case
+            "subquery beside aggregate (#558)"
+            `Quick
+            subquery_beside_an_aggregate_accepted
         ] )
     ; ( "rejected"
       , [ Alcotest.test_case "bare ungrouped column" `Quick bare_ungrouped_column_rejected
@@ -522,10 +533,6 @@ let () =
             "ungrouped qualified column in expression"
             `Quick
             ungrouped_qualified_column_inside_expression_rejected
-        ; Alcotest.test_case
-            "subquery beside aggregate"
-            `Quick
-            subquery_beside_an_aggregate_rejected
         ] )
     ; ( "properties"
       , List.map

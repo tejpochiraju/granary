@@ -8257,30 +8257,197 @@ let rec plan_expr_has_subquery : Plan.expr -> bool = function
   | _ -> false
 ;;
 
-(** Extract table_meta from the leftmost seq scan in a plan op. *)
-let rec get_outer_scan_meta : Plan.op -> Cat.table_meta option = function
-  | Plan.Op_seq_scan { table_meta } -> Some table_meta
-  | Plan.Op_col_seq_scan { table_meta } -> Some table_meta
-  | Plan.Op_filter { child; _ } -> get_outer_scan_meta child
-  | Plan.Op_sort { child; _ } -> get_outer_scan_meta child
-  | Plan.Op_limit { child; _ } -> get_outer_scan_meta child
-  | Plan.Op_index_lookup { table_meta; _ } -> Some table_meta
-  | Plan.Op_rowid_lookup { table_meta; _ } -> Some table_meta
+(** #592: the width of the row a plan subtree emits, or [None] when a node
+    reshapes it (projection, aggregate, set operation, …). Only the
+    layout-preserving spine is walked, because the width is used to place a
+    join's right-hand columns and a projection between the two would move
+    them. *)
+let rec outer_row_width : Plan.op -> int option = function
+  | Plan.Op_seq_scan { table_meta }
+  | Plan.Op_col_seq_scan { table_meta }
+  | Plan.Op_index_lookup { table_meta; _ }
+  | Plan.Op_rowid_lookup { table_meta; _ } -> Some (List.length table_meta.Cat.columns)
+  | Plan.Op_filter { child; _ } | Plan.Op_sort { child; _ } | Plan.Op_limit { child; _ }
+    -> outer_row_width child
+  | Plan.Op_hash_join { left; n_right_cols; _ } ->
+    Option.map (fun w -> w + n_right_cols) (outer_row_width left)
+  | Plan.Op_nested_loop_join { right_col_offset; n_right_cols; _ } ->
+    Some (right_col_offset + n_right_cols)
   | _ -> None
 ;;
 
-(** Substitute outer column refs (table.col) with literal values from the outer row. *)
-let rec substitute_outer_in_expr (meta : Cat.table_meta) (row : Row.t) (e : Ast.expr)
+(** #592: every base table feeding a plan subtree, paired with the ordinal of
+    its first column in that subtree's output row.
+
+    This replaces the single-table [get_outer_scan_meta] that answered [None]
+    over a join — the reason a correlated subquery in an INNER join's ON clause
+    silently dropped every row. Both join operators concatenate [left] then
+    [right] ([Array.append lrow rrow]), so the offsets are exactly the widths
+    to the left of each input.
+
+    Two inputs sharing a table name (a self-join) answers [None]: resolution is
+    by name, so keeping both would silently pick one. The caller refuses
+    instead. *)
+let get_outer_scan_metas (op : Plan.op) : (Cat.table_meta * int) list option =
+  let rec go base : Plan.op -> (Cat.table_meta * int) list option = function
+    | Plan.Op_seq_scan { table_meta }
+    | Plan.Op_col_seq_scan { table_meta }
+    | Plan.Op_index_lookup { table_meta; _ }
+    | Plan.Op_rowid_lookup { table_meta; _ } -> Some [ table_meta, base ]
+    | Plan.Op_filter { child; _ } | Plan.Op_sort { child; _ } | Plan.Op_limit { child; _ }
+      -> go base child
+    | Plan.Op_hash_join { left; right; _ } ->
+      (match go base left, outer_row_width left with
+       | Some ls, Some w -> Option.map (fun rs -> ls @ rs) (go (base + w) right)
+       | _ -> None)
+    | Plan.Op_nested_loop_join { left; right_meta; right_col_offset; _ } ->
+      Option.map (fun ls -> ls @ [ right_meta, base + right_col_offset ]) (go base left)
+    | _ -> None
+  in
+  match go 0 op with
+  | None -> None
+  | Some metas ->
+    let names = List.map (fun ((m : Cat.table_meta), _) -> m.Cat.name) metas in
+    if List.length (List.sort_uniq String.compare names) <> List.length names
+    then None
+    else Some metas
+;;
+
+(** #592: how a correlated subquery's outer column references are resolved
+    against one row of the enclosing operator. Both lookups answer [None] when
+    the name is not an outer reference, in which case the reference is left
+    alone (it belongs to the subquery's own scope, or it is unresolvable and
+    the caller refuses the query). *)
+type outer_binding =
+  { bind_qual : string -> string -> Row.value option (** [table] then [column] *)
+  ; bind_unqual : string -> Row.value option
+  }
+
+(** Build an [outer_binding] over a row whose layout is described by
+    [get_outer_scan_metas]. An unqualified name that more than one input
+    carries is ambiguous and is left unresolved. *)
+let binding_of_metas (metas : (Cat.table_meta * int) list) (row : Row.t) : outer_binding =
+  let at (m : Cat.table_meta) off col =
+    match find_col_idx_by_name m.Cat.columns col with
+    | i when off + i < Array.length row -> Some row.(off + i)
+    | _ -> None
+    | exception Failure _ -> None
+  in
+  { bind_qual =
+      (fun tbl col ->
+        match
+          List.find_opt
+            (fun ((m : Cat.table_meta), _) -> String.equal m.Cat.name tbl)
+            metas
+        with
+        | None -> None
+        | Some (m, off) -> at m off col)
+  ; bind_unqual =
+      (fun col ->
+        match List.filter_map (fun (m, off) -> at m off col) metas with
+        | [ v ] -> Some v
+        | _ -> None)
+  }
+;;
+
+(** #558: the message used when a subquery beside an aggregate cannot be
+    resolved.  Only a {i grouped} column can be an outer reference here — the
+    aggregate output row holds nothing else from the input — so an ungrouped
+    reference, or a child whose base tables cannot be located, is refused. *)
+let agg_subquery_refusal () =
+  "Exec: a correlated subquery in an aggregate expression can only reference a GROUP BY \
+   column (#558). The aggregate output row carries the grouped columns and the aggregate \
+   values, and nothing else of the input rows."
+;;
+
+(** #558: bind outer column references appearing in an aggregate projection or
+    HAVING against one aggregate {i output} row, whose leading
+    [List.length group_cols] slots hold the grouped columns in order.  [metas]
+    describes the {b child} row layout, so each group ordinal is mapped back to
+    the table and column it came from. *)
+let binding_of_group_cols
+      (metas : (Cat.table_meta * int) list)
+      (group_cols : int list)
+      (agg_row : Row.t)
+  : outer_binding
+  =
+  let entry i child_ord =
+    if i >= Array.length agg_row
+    then None
+    else (
+      match
+        List.find_opt
+          (fun ((m : Cat.table_meta), off) ->
+             child_ord >= off && child_ord < off + List.length m.Cat.columns)
+          metas
+      with
+      | None -> None
+      | Some (m, off) ->
+        let c : Row.column = List.nth m.Cat.columns (child_ord - off) in
+        Some (m.Cat.name, c.Row.name, agg_row.(i)))
+  in
+  let entries = List.filter_map Fun.id (List.mapi entry group_cols) in
+  { bind_qual =
+      (fun tbl col ->
+        List.find_map
+          (fun (t, c, v) ->
+             if String.equal t tbl && String.equal c col then Some v else None)
+          entries)
+  ; bind_unqual =
+      (fun col ->
+        match
+          List.filter_map
+            (fun (_, c, v) -> if String.equal c col then Some v else None)
+            entries
+        with
+        | [ v ] -> Some v
+        | _ -> None)
+  }
+;;
+
+(** #592: the message used wherever a correlated subquery cannot be resolved.
+    It replaces the silent [fun _row -> false] that dropped every row. *)
+let correlated_filter_refusal () =
+  "Exec: a correlated subquery in this predicate cannot be resolved — its outer column \
+   reference has no source in the rows being filtered (#592). Rewrite it as an \
+   uncorrelated subquery, or qualify the outer column with its table name."
+;;
+
+(** #592: what the {i inner} SELECT already has in scope, so a reference the
+    subquery owns can be told apart from an outer one. SQL resolves
+    innermost-first, and both halves of that matter:
+
+    - [has_col] guards an {b unqualified} reference: [n] inside the subquery is
+      the subquery's own [n] if its FROM provides one.
+    - [has_table] guards a {b qualified} one: when a subquery's own FROM names
+      the same table as an outer input, a [t.x] inside it is the {i inner}
+      [t], not the outer one, and pinning it to the outer row's value answers a
+      plausible wrong result rather than an empty one. That guard was missing
+      when #592 first widened resolution to joins; on a single-table outer the
+      two [t]s are indistinguishable, so the join is what made it reachable. *)
+type inner_scope =
+  { has_col : string -> bool
+  ; has_table : string -> bool
+  }
+
+(** Substitute outer column refs with literal values drawn from [bnd], leaving
+    anything [scope] says the subquery owns alone. *)
+let rec substitute_outer_in_expr
+          ~(scope : inner_scope)
+          (bnd : outer_binding)
+          (e : Ast.expr)
   : Ast.expr
   =
-  let go = substitute_outer_in_expr meta row in
+  let go = substitute_outer_in_expr ~scope bnd in
   match e with
-  | Ast.E_tbl_col (tbl, col) when String.equal tbl meta.Cat.name ->
-    (try
-       let i = find_col_idx_by_name meta.Cat.columns col in
-       Ast.E_lit (value_to_literal row.(i))
-     with
-     | Failure _ -> e)
+  | Ast.E_tbl_col (tbl, col) when not (scope.has_table tbl) ->
+    (match bnd.bind_qual tbl col with
+     | Some v -> Ast.E_lit (value_to_literal v)
+     | None -> e)
+  | Ast.E_col name when not (scope.has_col name) ->
+    (match bnd.bind_unqual name with
+     | Some v -> Ast.E_lit (value_to_literal v)
+     | None -> e)
   | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
   | Ast.E_not a -> Ast.E_not (go a)
   | Ast.E_is_null a -> Ast.E_is_null (go a)
@@ -8300,20 +8467,69 @@ let rec substitute_outer_in_expr (meta : Cat.table_meta) (row : Row.t) (e : Ast.
   | _ -> e
 ;;
 
+(** #592: build the [inner_scope] of a SELECT.
+
+    The {b table identifiers} are pure syntax — the alias where one is given,
+    otherwise the table name — so they are computed even when the catalog
+    cannot resolve the tables. An alias {i replaces} the name rather than
+    adding to it: in [FROM t q] the identifier in scope is [q], and [t.x]
+    therefore resolves {i outward}, which is what sqlite3 does.
+
+    The {b column names} do need the catalog. If any FROM table is
+    unresolvable, [has_col] answers [true] for everything — "assume the
+    subquery owns it" — which reduces to the pre-#592 behaviour of rewriting
+    only qualified references. Anything else would rewrite on a guess.
+
+    A non-SELECT has no clauses this module rewrites, so both halves default to
+    "shadowed" there. *)
+let inner_scope_of (cat_opt : Cat.t option) (s : Ast.stmt) : inner_scope =
+  match s with
+  | Ast.S_select r ->
+    let idents =
+      Option.value r.table_alias ~default:r.table
+      :: List.map
+           (fun (j : Ast.join_clause) -> Option.value j.Ast.alias ~default:j.Ast.table)
+           r.joins
+    in
+    let has_table name = List.exists (String.equal name) idents in
+    let tables = r.table :: List.map (fun (j : Ast.join_clause) -> j.Ast.table) r.joins in
+    let resolved =
+      match cat_opt with
+      | None -> [ None ]
+      | Some cat ->
+        List.map
+          (fun t ->
+             Option.map
+               (fun (m : Cat.table_meta) ->
+                  List.map (fun (c : Row.column) -> c.Row.name) m.Cat.columns)
+               (Cat.find_table_cached cat ~name:t))
+          tables
+    in
+    let has_col =
+      if List.exists Option.is_none resolved
+      then fun _ -> true
+      else (
+        let cols = List.concat_map Option.get resolved in
+        fun name -> List.exists (String.equal name) cols)
+    in
+    { has_col; has_table }
+  | _ -> { has_col = (fun _ -> true); has_table = (fun _ -> true) }
+;;
+
 (** Substitute outer column refs in any embedded Ast.stmt nodes inside a
     Plan.expr (correlated subqueries / EXISTS / IN). *)
 let rec substitute_outer_in_plan_expr
-          (meta : Cat.table_meta)
-          (row : Row.t)
+          ~(cat : Cat.t option)
+          (bnd : outer_binding)
           (e : Plan.expr)
   : Plan.expr
   =
-  let go = substitute_outer_in_plan_expr meta row in
+  let go = substitute_outer_in_plan_expr ~cat bnd in
+  let go_s = substitute_outer_in_stmt ~cat bnd in
   match e with
-  | Plan.P_exists inner -> Plan.P_exists (substitute_outer_in_stmt meta row inner)
-  | Plan.P_in_select (x, inner) ->
-    Plan.P_in_select (go x, substitute_outer_in_stmt meta row inner)
-  | Plan.P_subquery inner -> Plan.P_subquery (substitute_outer_in_stmt meta row inner)
+  | Plan.P_exists inner -> Plan.P_exists (go_s inner)
+  | Plan.P_in_select (x, inner) -> Plan.P_in_select (go x, go_s inner)
+  | Plan.P_subquery inner -> Plan.P_subquery (go_s inner)
   | Plan.P_binop (op, a, b) -> Plan.P_binop (op, go a, go b)
   | Plan.P_not a -> Plan.P_not (go a)
   | Plan.P_is_null a -> Plan.P_is_null (go a)
@@ -8333,11 +8549,11 @@ let rec substitute_outer_in_plan_expr
   | _ -> e
 
 (** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST stmt. *)
-and substitute_outer_in_stmt (meta : Cat.table_meta) (row : Row.t) (s : Ast.stmt)
+and substitute_outer_in_stmt ~(cat : Cat.t option) (bnd : outer_binding) (s : Ast.stmt)
   : Ast.stmt
   =
-  let go_e = substitute_outer_in_expr meta row in
-  let go_s = substitute_outer_in_stmt meta row in
+  let go_e = substitute_outer_in_expr ~scope:(inner_scope_of cat s) bnd in
+  let go_s = substitute_outer_in_stmt ~cat bnd in
   match s with
   | Ast.S_select r ->
     Ast.S_select
@@ -9134,19 +9350,31 @@ and stream_filter clock params store mode cat pred child =
          (fun row -> value_truthy (eval_expr clock params row pred'))
          child_stream)
   else (
-    let outer_meta = get_outer_scan_meta child in
-    match outer_meta with
-    | None -> Lwt.return (Lwt_stream.filter (fun _row -> false) child_stream)
-    | Some meta ->
+    (* #592: a subquery that survives [pre_eval_subquery] is correlated, and
+       [eval_expr] answers [Row.V_null] for it. Until this commit an
+       unresolvable correlation source fell to [Lwt_stream.filter (fun _ ->
+       false)] — every row dropped, silently, which is how a correlated
+       subquery in an INNER join's ON clause returned an empty result set that
+       reads as a legitimate "nothing matched".
+
+       [get_outer_scan_metas] now resolves the correlation source over a join
+       (that was the whole of #566's and #592's blocker), so the common shapes
+       evaluate. What is still unresolvable is refused rather than answered. *)
+    match get_outer_scan_metas child with
+    | None -> Lwt.fail_with (correlated_filter_refusal ())
+    | Some metas ->
       Lwt.return
         (Lwt_stream.filter_s
            (fun row ->
-              let subst_pred = substitute_outer_in_plan_expr meta row pred' in
+              let bnd = binding_of_metas metas row in
+              let subst_pred = substitute_outer_in_plan_expr ~cat bnd pred' in
               let* resolved =
                 with_pull_context ~stats:s_opt ~mode (fun () ->
                   pre_eval_subquery clock store params cat subst_pred)
               in
-              Lwt.return (value_truthy (eval_expr clock params row resolved)))
+              if plan_expr_has_subquery resolved
+              then Lwt.fail_with (correlated_filter_refusal ())
+              else Lwt.return (value_truthy (eval_expr clock params row resolved)))
            child_stream))
 
 and stream_expr_project clock params store mode cat exprs child =
@@ -9163,19 +9391,19 @@ and stream_expr_project clock params store mode cat exprs child =
     let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
     Lwt.return (Lwt_stream.map eval_exprs inner))
   else (
-    let outer_meta = get_outer_scan_meta child in
-    match outer_meta with
+    match get_outer_scan_metas child with
     | None ->
       let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
       Lwt.return (Lwt_stream.map eval_exprs inner)
-    | Some meta ->
+    | Some metas ->
       Lwt.return
         (Lwt_stream.map_s
            (fun row ->
+              let bnd = binding_of_metas metas row in
               let* vals =
                 Lwt_list.map_s
                   (fun e ->
-                     let e_subst = substitute_outer_in_plan_expr meta row e in
+                     let e_subst = substitute_outer_in_plan_expr ~cat bnd e in
                      let* resolved =
                        with_pull_context ~stats:s_opt ~mode (fun () ->
                          pre_eval_subquery clock store params cat e_subst)
@@ -9511,12 +9739,14 @@ and stream_hash_join
 
            #592: this covers the OUTER case only, because [on_pred] is [Some]
            only for [`Left] — [general_on_join] puts an INNER join's ON predicate
-           in an [Op_filter] above the join instead.  That path has the same
-           defect and reaches [stream_filter], whose [get_outer_scan_meta]
-           answers [None] over a join and drops every row: the INNER spelling of
-           this query returns nothing where SQLite returns a row.  It is wrong on
-           [main] too and is not made worse here, but "inner joins are untouched"
-           should not be read as "inner joins are fine". *)
+           in an [Op_filter] above the join instead.  That path used to have the
+           same defect and drop every row silently; it now resolves the
+           correlation through [get_outer_scan_metas] and answers.  The same
+           machinery would serve here — the joined row is [lrow @ rrow] and both
+           inputs' metas are in hand — but an outer join has to evaluate the
+           predicate per {i pair} inside this loop rather than per row above it,
+           and reopening #566's refusal is a separate decision.  Until then the
+           two spellings differ deliberately. *)
         let* p = pre_eval_subquery clock store params cat p in
         if plan_expr_has_subquery p
         then
@@ -9884,8 +10114,13 @@ and aggregate_fast_path
            | Plan.PI_agg_slot _ -> true
            (* #507: with no GROUP BY the aggregate output row IS the aggregate
               value array, so an expression over it evaluates directly against
-              the accumulators — no need to give up the fast path for it. *)
-           | Plan.PI_expr _ -> true
+              the accumulators — no need to give up the fast path for it.
+
+              #558: unless it carries a subquery. This loop is pure, and
+              [eval_expr] answers [Row.V_null] for an unresolved subquery, so a
+              fast-path projection would silently drop it. [stream_aggregate]
+              resolves it; give the query up to it. *)
+           | Plan.PI_expr e -> not (plan_expr_has_subquery e)
            | _ -> false)
          proj)
   then Lwt.return None
@@ -10019,9 +10254,67 @@ and stream_aggregate
   match fast with
   | Some stream -> Lwt.return stream
   | None ->
+    (* #257: as in [stream_filter], the stats scope has to be re-established
+       around any subquery evaluated here. *)
+    let s_opt = Lwt.get query_stats_key in
     let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
     let n_group_cols = List.length group_cols in
+    (* #558: an uncorrelated subquery beside an aggregate resolves once, here.
+       Before #558 [Sema.bind_expr_agg] refused the whole shape, so nothing in
+       this path had ever seen one. *)
+    let* having =
+      match having with
+      | None -> Lwt.return None
+      | Some p ->
+        let+ p' = pre_eval_subquery clock store params cat p in
+        Some p'
+    in
+    let* proj =
+      Lwt_list.map_s
+        (function
+          | Plan.PI_expr e ->
+            let+ e' = pre_eval_subquery clock store params cat e in
+            Plan.PI_expr e'
+          | other -> Lwt.return other)
+        proj
+    in
+    (* What survives is correlated. Its only possible source in the aggregate
+       output row is a grouped column; [binding_of_group_cols] maps those back
+       to their table and column, and anything else is refused rather than
+       silently answered [NULL]. *)
+    let correlated =
+      (match having with
+       | Some p -> plan_expr_has_subquery p
+       | None -> false)
+      || List.exists
+           (function
+             | Plan.PI_expr e -> plan_expr_has_subquery e
+             | _ -> false)
+           proj
+    in
+    let metas = if correlated then get_outer_scan_metas child else None in
+    let resolve agg_row e =
+      if not (plan_expr_has_subquery e)
+      then Lwt.return e
+      else (
+        match metas with
+        | None -> Lwt.fail_with (agg_subquery_refusal ())
+        | Some metas ->
+          let bnd = binding_of_group_cols metas group_cols agg_row in
+          let* r =
+            with_pull_context ~stats:s_opt ~mode (fun () ->
+              pre_eval_subquery
+                clock
+                store
+                params
+                cat
+                (substitute_outer_in_plan_expr ~cat bnd e))
+          in
+          if plan_expr_has_subquery r
+          then Lwt.fail_with (agg_subquery_refusal ())
+          else Lwt.return r)
+    in
     let groups = aggregate_build_groups group_cols rows in
     let agg_output_rows =
       List.map
@@ -10030,30 +10323,54 @@ and stream_aggregate
            Array.of_list (group_key @ agg_vals))
         groups
     in
-    let after_having =
+    let* after_having =
       match having with
-      | None -> agg_output_rows
+      | None -> Lwt.return agg_output_rows
+      (* The pure arm is the pre-#558 code, kept because every aggregate query
+         that has no subquery at all goes through it. *)
+      | Some pred when not correlated ->
+        Lwt.return
+          (List.filter
+             (fun r -> value_truthy (eval_expr clock params r pred))
+             agg_output_rows)
       | Some pred ->
-        List.filter
-          (fun r -> value_truthy (eval_expr clock params r pred))
+        Lwt_list.filter_s
+          (fun r ->
+             let* pred' = resolve r pred in
+             Lwt.return (value_truthy (eval_expr clock params r pred')))
           agg_output_rows
     in
     let n_agg_cols = n_group_cols + List.length aggs in
     let with_windows = aggregate_apply_windows clock params agg_windows after_having in
-    let final_rows =
-      List.map
-        (fun agg_row ->
-           Array.of_list
-             (List.map
-                (function
-                  | Plan.PI_group_col i -> agg_row.(i)
-                  | Plan.PI_agg_slot k -> agg_row.(n_group_cols + k)
-                  | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j)
-                  (* #507: window slots inside [e] were already rewritten to
-                     [n_agg_cols + j] by the planner. *)
-                  | Plan.PI_expr e -> eval_expr clock params agg_row e)
-                proj))
-        with_windows
+    let project_slot agg_row = function
+      | Plan.PI_group_col i -> agg_row.(i)
+      | Plan.PI_agg_slot k -> agg_row.(n_group_cols + k)
+      | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j)
+      (* #507: window slots inside [e] were already rewritten to
+         [n_agg_cols + j] by the planner. *)
+      | Plan.PI_expr e -> eval_expr clock params agg_row e
+    in
+    let* final_rows =
+      if not correlated
+      then
+        Lwt.return
+          (List.map
+             (fun agg_row -> Array.of_list (List.map (project_slot agg_row) proj))
+             with_windows)
+      else
+        Lwt_list.map_s
+          (fun agg_row ->
+             let+ vals =
+               Lwt_list.map_s
+                 (function
+                   | Plan.PI_expr e ->
+                     let+ e' = resolve agg_row e in
+                     eval_expr clock params agg_row e'
+                   | other -> Lwt.return (project_slot agg_row other))
+                 proj
+             in
+             Array.of_list vals)
+          with_windows
     in
     Lwt.return (Lwt_stream.of_list final_rows)
 

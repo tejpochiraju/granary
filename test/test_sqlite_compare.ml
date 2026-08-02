@@ -4242,6 +4242,116 @@ let agg_expr_507_cases =
   ]
 ;;
 
+(* #592: a correlated subquery in an INNER join's ON clause used to return no
+   rows at all; #558: a subquery beside an aggregate did not bind. Both are
+   checked against real sqlite3 rather than a hand-written expectation, because
+   both fixes had to pick an answer for shapes granary had never evaluated. *)
+let subquery_592_558_cases =
+  let join_setup =
+    [ "CREATE TABLE l (a INTEGER)"
+    ; "CREATE TABLE r (b INTEGER)"
+    ; "CREATE TABLE k (v INTEGER)"
+    ; "INSERT INTO l VALUES (1)"
+    ; "INSERT INTO l VALUES (9)"
+    ; "INSERT INTO r VALUES (5)"
+    ; "INSERT INTO k VALUES (4)"
+    ]
+  in
+  (* An inner FROM naming the same table as an outer input: [t.x] inside the
+     subquery is the INNER t. *)
+  let shadow_setup =
+    [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+    ; "CREATE TABLE s (a INTEGER, z INTEGER)"
+    ; "INSERT INTO t VALUES (1, 10)"
+    ; "INSERT INTO t VALUES (2, 20)"
+    ; "INSERT INTO t VALUES (3, 30)"
+    ; "INSERT INTO s VALUES (1, 5)"
+    ; "INSERT INTO s VALUES (2, 25)"
+    ; "INSERT INTO s VALUES (3, 35)"
+    ]
+  in
+  let agg_setup =
+    [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+    ; "CREATE TABLE u (a INTEGER)"
+    ; "INSERT INTO t VALUES (1, 10)"
+    ; "INSERT INTO t VALUES (1, 20)"
+    ; "INSERT INTO t VALUES (2, 30)"
+    ; "INSERT INTO u VALUES (5)"
+    ; "INSERT INTO u VALUES (6)"
+    ; "INSERT INTO u VALUES (7)"
+    ]
+  in
+  [ { name = "inner_join_correlated_on_unqualified"
+    ; setup = join_setup
+    ; query = "SELECT a, b FROM l INNER JOIN r ON b > (SELECT v FROM k WHERE v < a)"
+    ; unordered = true
+    }
+  ; { name = "inner_join_correlated_on_qualified"
+    ; setup = join_setup
+    ; query = "SELECT a, b FROM l INNER JOIN r ON b > (SELECT v FROM k WHERE v < l.a)"
+    ; unordered = true
+    }
+  ; { name = "inner_join_correlated_on_exists"
+    ; setup = join_setup
+    ; query = "SELECT a, b FROM l JOIN r ON EXISTS (SELECT 1 FROM k WHERE v < l.a)"
+    ; unordered = true
+    }
+  ; { name = "inner_join_correlated_on_right_side"
+    ; setup = join_setup
+    ; query = "SELECT a, b FROM l JOIN r ON EXISTS (SELECT 1 FROM k WHERE v < r.b)"
+    ; unordered = true
+    }
+  ; { name = "inner_from_shadows_qualified_ref"
+    ; setup = shadow_setup
+    ; query =
+        "SELECT s.a, t.a FROM s JOIN t ON t.a > (SELECT COUNT(*) FROM t WHERE t.x > s.z) \
+         ORDER BY s.a, t.a"
+    ; unordered = false
+    }
+  ; { name = "inner_from_shadows_qualified_ref_in_where"
+    ; setup = shadow_setup
+    ; query =
+        "SELECT s.a FROM s JOIN t ON s.a = t.a WHERE (SELECT COUNT(*) FROM t WHERE t.x > \
+         15 AND t.a > s.a) > 1 ORDER BY s.a"
+    ; unordered = false
+    }
+  ; { name = "inner_alias_does_not_shadow"
+    ; setup = shadow_setup
+    ; query =
+        "SELECT s.a, t.a FROM s JOIN t ON t.a > (SELECT COUNT(*) FROM t q WHERE q.x > \
+         s.z) ORDER BY s.a, t.a"
+    ; unordered = false
+    }
+  ; { name = "where_correlated_unqualified"
+    ; setup = join_setup
+    ; query = "SELECT a FROM l WHERE a > (SELECT v FROM k WHERE v < a)"
+    ; unordered = true
+    }
+  ; { name = "agg_uncorrelated_subquery_group_by"
+    ; setup = agg_setup
+    ; query = "SELECT a, COUNT(*) + (SELECT COUNT(*) FROM u) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_uncorrelated_subquery_no_group_by"
+    ; setup = agg_setup
+    ; query = "SELECT COUNT(*) + (SELECT COUNT(*) FROM u) FROM t"
+    ; unordered = false
+    }
+  ; { name = "agg_having_subquery"
+    ; setup = agg_setup
+    ; query =
+        "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) < (SELECT COUNT(*) FROM u)"
+    ; unordered = true
+    }
+  ; { name = "agg_correlated_on_group_key"
+    ; setup = agg_setup
+    ; query =
+        "SELECT a, COUNT(*) + (SELECT COUNT(*) FROM u WHERE u.a > t.a) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ]
+;;
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -4301,5 +4411,6 @@ let () =
     ; "phase35_virtual_index", List.map make_test phase35_virtual_index_cases
     ; "phase35_snippet_parity", List.map make_test phase35_snippet_parity_cases
     ; "agg_expr_507", List.map make_test agg_expr_507_cases
+    ; "subquery_592_558", List.map make_test subquery_592_558_cases
     ]
 ;;

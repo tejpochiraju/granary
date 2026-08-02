@@ -1063,6 +1063,20 @@
   lwt.unix
   unix))
 
+; #592: a correlated subquery in an INNER join's ON clause silently returned no
+; rows; #558: a subquery beside an aggregate in a GROUP BY projection was
+; rejected at bind time.
+
+(test
+ (name test_join_subquery_592)
+ (modules test_join_subquery_592)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
+(test
+ (name test_agg_subquery_558)
+ (modules test_agg_subquery_558)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 
 (test

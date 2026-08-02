@@ -1072,8 +1072,18 @@ let bind_expr_agg
     | Ast.E_func (func, args) -> bind_func ~bind:go func args
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
-    | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ ->
-      Error (Unsupported "subqueries are not supported in aggregate expressions")
+    (* #558: a subquery beside an aggregate is bound like any other leaf. The
+       executor resolves it against the aggregate OUTPUT row — uncorrelated
+       ones once per statement, correlated ones per group against the grouped
+       columns — and refuses what it cannot resolve. Before #558 this was a
+       bind-time refusal, so a count aggregate added to a scalar subquery in a
+       GROUP BY projection did not run at all. *)
+    | Ast.E_subquery inner -> Ok (BE_subquery inner)
+    | Ast.E_exists inner -> Ok (BE_exists inner)
+    | Ast.E_in_select (x, inner) ->
+      (match go x with
+       | Error e -> Error e
+       | Ok bx -> Ok (BE_in_select (bx, inner)))
     | Ast.E_case { scrutinee; branches; else_ } ->
       bind_case ~bind:go ~scrutinee ~branches ~else_
     | Ast.E_cast (e, ty) ->

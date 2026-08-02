@@ -53,7 +53,10 @@
     [pre_eval_subquery] resolves only the uncorrelated case. A correlated
     [P_subquery] survives into [eval_expr], which answers [Row.V_null] for it, so
     an outer join's ON predicate is false for every pair and every left row
-    null-extends. #566 chose to refuse the query rather than return that. *)
+    null-extends. #566 chose to refuse the query rather than return that, and
+    that refusal still stands for [`Left]. The INNER spelling, which #592 found
+    was silently returning no rows, is now evaluated — see
+    [test_join_subquery_592.ml]. *)
 
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
@@ -772,21 +775,24 @@ let uncorrelated_on_subquery_still_works () =
       (rows_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v > 99)"))
 ;;
 
-(* #592: the INNER spelling of the refused query. It is NOT refused, because
+(* #592: the INNER spelling of the refused query. It is not refused, because
    [general_on_join] gives an INNER join's ON predicate to an [Op_filter] above
-   the join rather than to [on_pred]. It is also not correct: [stream_filter]'s
-   [get_outer_scan_meta] answers [None] over a join and drops every row, so this
-   returns nothing where sqlite3 3.45.1 returns [9|5].
+   the join rather than to [on_pred] — and until #592 it was not correct
+   either: [stream_filter]'s [get_outer_scan_meta] answered [None] over a join
+   and dropped every row, so this returned nothing where sqlite3 3.45.1
+   returns [9|5].
 
-   Pinned as-is, wrong answer and all, so that #592 has a case to flip and so
-   that "#566 left inner joins untouched" is not mistaken for "inner joins are
-   fine". *)
-let inner_correlated_on_subquery_is_still_wrong_592 () =
+   #592 replaced that lookup with [get_outer_scan_metas], which resolves a
+   correlation source over a join, so the INNER spelling now answers. The
+   refusal above stays for [`Left] only, where the ON predicate is the match
+   test and has to be evaluated inside the join. [test_join_subquery_592.ml]
+   carries the full case set. *)
+let inner_correlated_on_subquery_is_evaluated_592 () =
   with_db (fun db ->
     seed_correlated db;
     check_rows
-      ~label:"#592: INNER returns nothing; sqlite3 returns 9|5"
-      []
+      ~label:"#592: INNER agrees with sqlite3"
+      [ [ "9"; "5" ] ]
       (rows_of db "SELECT a, b FROM l INNER JOIN r ON b > (SELECT v FROM k WHERE v < a)"))
 ;;
 
@@ -893,9 +899,9 @@ let () =
             `Quick
             uncorrelated_on_subquery_still_works
         ; Alcotest.test_case
-            "INNER correlated ON subquery is still wrong (#592)"
+            "INNER correlated ON subquery is evaluated (#592)"
             `Quick
-            inner_correlated_on_subquery_is_still_wrong_592
+            inner_correlated_on_subquery_is_evaluated_592
         ; Alcotest.test_case
             "a plain general ON is untouched by the refusal"
             `Quick
