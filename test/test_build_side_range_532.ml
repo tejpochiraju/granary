@@ -389,6 +389,131 @@ let general_on_predicate_build_side_is_bounded () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* The strategy flip the range bound causes                             *)
+(* ------------------------------------------------------------------ *)
+
+(* Bounding the build side does not only change what it reads — it changes which
+   join strategy is chosen, and in the direction that is easy to state
+   backwards. [probe_is_worth_it] takes the nested-loop probe iff
+   [driving_rows <= right_rows / 8], with R on the RIGHT of the comparison, so a
+   SMALLER R makes the probe HARDER to justify. A range-bounded build side
+   shrinks R, so it moves joins towards the HASH JOIN, across the whole band
+   [nlj_min_driving_rows < D <= N/8].
+
+   That band is exactly where #520/#526 measured a wrong choice at 36x, so it
+   needs pinning: [rows_examined] tells the two strategies apart the way
+   test_join_cost_model_520.ml does — a probe reads one right row per driving
+   row, a hash join reads its whole build side once. Neither the row-equality
+   nor the [examined <= foil] assertions above can see it.
+
+   20,000 stock rows against 1,200 driving rows: without a range R is 20,000 and
+   [1200 <= 2500] keeps the probe, which is the reference plan here. *)
+let n_big_stock = 20_000
+let n_big_line = 1_200
+let big_window = 100
+
+let seed_big db =
+  exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
+  exec db "CREATE TABLE stock (sw INTEGER, si INTEGER, qty INTEGER, PRIMARY KEY (sw, si))";
+  exec db "BEGIN";
+  (* Every driving row matches one stock row inside the small window, so the
+     probe does a full row's work per driving row and the two strategies are
+     compared doing the same job. *)
+  for o = 1 to n_big_line do
+    exec
+      db
+      (Printf.sprintf "INSERT INTO line VALUES (1, %d, %d)" o (lo + (o mod big_window)))
+  done;
+  for si = 1 to n_big_stock do
+    exec db (Printf.sprintf "INSERT INTO stock VALUES (1, %d, %d)" si (si * 10))
+  done;
+  exec db "COMMIT"
+;;
+
+(* A narrow window: R falls to the [range_seek_rows] floor of 100, [1200 <= 12]
+   fails, and the join moves from probe to hash join. It is the right move — the
+   hash join reads 100 build rows where the probe did 1,200 seeks, measured on
+   disk at 2.8x faster (test/bench_build_side_strategy_532.ml). *)
+let a_narrow_window_moves_the_join_to_a_hash_join () =
+  with_db (fun db ->
+    seed_big db;
+    let window = Printf.sprintf "BETWEEN %d AND %d" lo (lo + big_window - 1) in
+    let seek = q ("sw = 1 AND si " ^ window) in
+    let foil = q ("sw = 1 AND si + 0 " ^ window) in
+    same_rows db ~label:"the flipped plan agrees with the probe it replaced" ~seek ~foil;
+    Alcotest.(check int)
+      "unranged: a probe — one stock row per driving row"
+      (n_big_line * 2)
+      (examined db foil);
+    Alcotest.(check int)
+      "ranged: a hash join over the 100-row window"
+      (n_big_line + big_window)
+      (examined db seek))
+;;
+
+(* A window as wide as the table must NOT flip. This is the case the flat
+   [range_seek_rows = 100] got wrong: it estimated R = 100 for a window covering
+   20,000 rows, chose the hash join, and measured 9.00x SLOWER than the probe on
+   disk (bench_build_side_strategy_532.ml, W=20000 D=1200). [range_rows_estimate]
+   reads the span off the literal bounds instead, R stays 20,000, [1200 <= 2500]
+   holds and the probe survives.
+
+   The assertion is the whole point: 2,400 is the probe, and the plan this
+   guards against would examine 1,200 + 19,981. *)
+let a_window_as_wide_as_the_table_keeps_the_probe () =
+  with_db (fun db ->
+    seed_big db;
+    let window = Printf.sprintf "BETWEEN %d AND %d" lo (lo + n_big_stock - 1) in
+    let seek = q ("sw = 1 AND si " ^ window) in
+    let foil = q ("sw = 1 AND si + 0 " ^ window) in
+    same_rows db ~label:"the wide window agrees with its unrecognised foil" ~seek ~foil;
+    Alcotest.(check int)
+      "still a probe — one stock row per driving row, not a 19,981-row build"
+      (n_big_line * 2)
+      (examined db seek);
+    Alcotest.(check int) "as the foil is" (n_big_line * 2) (examined db foil))
+;;
+
+(* The span is only readable off literal bounds. A parameter says nothing about
+   how wide the window is, so the estimate keeps the flat constant and the plan
+   is exactly the one it was before #532 touched the estimator — here, the hash
+   join a 100-row R chooses, even though the parameters happen to describe the
+   whole table. Deliberate: the alternative is guessing. *)
+let a_parameterised_window_keeps_the_flat_estimate () =
+  with_db (fun db ->
+    seed_big db;
+    let sql =
+      "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 1 AND si \
+       BETWEEN ? AND ?"
+    in
+    let rows, st =
+      unwrap
+        (run
+           (let open Lwt.Syntax in
+            let* st = Db.prepare db sql in
+            match st with
+            | Error e -> Lwt.return (Error e)
+            | Ok st ->
+              let* r =
+                Db.iter_with_stats
+                  st
+                  ~params:
+                    [ Db.V_int (Int64.of_int lo); Db.V_int (Int64.of_int n_big_stock) ]
+              in
+              (match r with
+               | Error e -> Lwt.return (Error e)
+               | Ok (stream, stats) ->
+                 let* rows = Lwt_stream.to_list stream in
+                 Lwt.return (Ok (List.length rows, stats)))))
+    in
+    Alcotest.(check int) "every driving row still joins" n_big_line rows;
+    Alcotest.(check int)
+      "a hash join over the whole bounded span, from the flat estimate"
+      (n_big_line + (n_big_stock - lo + 1))
+      st.Granary.Db.rows_examined)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Property: no window changes an answer                                *)
 (* ------------------------------------------------------------------ *)
 
@@ -481,6 +606,20 @@ let () =
             "general ON predicate build side is bounded"
             `Quick
             general_on_predicate_build_side_is_bounded
+        ] )
+    ; ( "strategy"
+      , [ Alcotest.test_case
+            "a narrow window moves the join to a hash join"
+            `Quick
+            a_narrow_window_moves_the_join_to_a_hash_join
+        ; Alcotest.test_case
+            "a window as wide as the table keeps the probe"
+            `Quick
+            a_window_as_wide_as_the_table_keeps_the_probe
+        ; Alcotest.test_case
+            "a parameterised window keeps the flat estimate"
+            `Quick
+            a_parameterised_window_keeps_the_flat_estimate
         ] )
     ; ( "properties"
       , List.map QCheck_alcotest.to_alcotest [ prop_window_narrows_but_does_not_change ] )

@@ -570,11 +570,23 @@ let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts 
     read all of it.  Feeding it through {!access_path_for_eqs} stops the walk at
     the upper bound.
 
-    That also feeds back into the strategy choice: {!estimate_rows} answers
-    {!range_seek_rows} rather than {!unbounded_rows} for a seek carrying a range,
-    so a range-bounded build side now shrinks R and a join that lost the ratio
-    test on the whole-prefix estimate can take a probe instead.  Both plans
-    return the same rows; see {!probe_is_worth_it}.
+    That feeds back into the strategy choice, {b in the direction that costs a
+    probe rather than the one that buys one}.  {!estimate_rows} answers
+    {!range_seek_rows} for a seek carrying a range where it answered
+    [table_rows_estimate] for a bare prefix pin, so R shrinks — and
+    {!probe_is_worth_it} takes the probe iff [driving_rows <= right_rows / 8], so
+    a {i smaller} R makes the probe {i harder} to justify.  A join above
+    {!nlj_min_driving_rows} whose right table holds N rows therefore moves from
+    nested-loop probe to hash join across the whole band D <= N/8 (12,500 for
+    N = 100,000), because R/8 falls from 12,500 to 12.
+
+    Which way the flip goes is worth stating once more because it reads
+    backwards: shrinking R moves joins towards the {i hash join}, taking probes
+    away.  Whether that is an improvement depends entirely on how wide the window
+    is, and a flat {!range_seek_rows} cannot tell — measured on disk, it was
+    right for a 21-row window (4.2x faster) and 9x WRONG for a 20,000-row one.
+    {!range_rows_estimate} reads the span off literal bounds for that reason;
+    its doc carries the measurements and the one band still left mis-costed.
 
     The seek is taken unconditionally whenever a prefix is pinned, because there
     is no selectivity estimate to consult.  Where the prefix selects nearly the
@@ -697,6 +709,74 @@ let nlj_probe_cost_ratio = 8
 
 let range_seek_rows = 100
 
+(** #532: how many rows a range-bounded seek is estimated to reach.
+
+    {!range_seek_rows} on its own is a flat 100 with no relation to the span the
+    range actually covers, and #528/#532 made that constant load-bearing: R is
+    now estimated from the build side, and R decides the join strategy.
+
+    Measured on disk, 100,000-row right table, all five rows run both ways by
+    spelling the range so the planner cannot recognise it
+    ([test/bench_build_side_strategy_532.ml], cold ms):
+
+    {v
+      window   driving   hash join   probe   what the flat 100 chose
+          21     1,200         6 ms   25 ms   hash — right, 4.2x
+       2,000     1,200        21 ms   23 ms   hash — right, 1.1x
+      20,000     1,200       281 ms   31 ms   hash — WRONG, 9.0x slower
+      20,000     5,000       205 ms  109 ms   hash — wrong, 1.9x slower
+      20,000    12,000       242 ms  301 ms   hash — right, 1.2x
+    v}
+
+    One constant cannot be right for all five, and the row it is most wrong on
+    costs 9x.  The span fixes rows 1-3 and 5.  {b Row 4 it does not fix}: the
+    span says R = 20,000, [5,000 <= 20,000/8] fails and the hash join is chosen
+    where the probe is ~1.9x better.  That is a real (bounded, ~2x) regression
+    against the pre-#532 plan, and it is left standing deliberately rather than
+    papered over with a fudge factor, because its cause is elsewhere:
+    {!nlj_probe_cost_ratio} was calibrated in #520 against a build side that is
+    SCANNED, at ~9.5 µs per hashed row.  A build side reached by an index seek
+    costs ~3 pager resolutions per row (#546's measurement), which is the same
+    order as a probe seek — so for a seeked build side the true break-even ratio
+    is far below 8 and the model overvalues the hash join.  Fixing that means
+    either #546's per-entry [rh_get] or a cost model that knows how the build
+    side is read; both are bigger than this function.  See the comment on #546.
+
+    So when both ends are integer literals, the number of keys they span is used
+    instead.  Everything else — a bound parameter, a non-integer literal, a
+    one-ended range — keeps the flat constant, so every plan this function cannot
+    speak to is exactly the plan it was before.
+
+    Two deliberate inaccuracies, both in the same direction:
+
+    - a span counts distinct key VALUES, and a non-unique index may hold many
+      rows per value, so this can under-state the row count;
+    - the estimate never goes {i below} [range_seek_rows], so a genuinely tiny
+      window still estimates 100.
+
+    Under-stating R biases towards the hash join and under-stating D biases
+    towards the probe, which is what the flat constant already did — this only
+    stops it doing so by two orders of magnitude.  Callers cap the result with
+    [table_rows_estimate], which is the only real number available. *)
+let range_rows_estimate (r : Plan.range) =
+  let int_lit = function
+    | Some (Plan.P_lit (Ast.L_int n)) -> Some n
+    | _ -> None
+  in
+  match int_lit r.Plan.r_lo, int_lit r.Plan.r_hi with
+  | Some lo, Some hi ->
+    let span = Int64.sub hi lo in
+    (* [hi < lo] is an empty window; a [span] that came out negative for the
+       other reason — [hi - lo] overflowing int64 — is as unbounded as a range
+       gets.  Both are handled by the sign test, in the direction each wants. *)
+    if Int64.compare span 0L < 0
+    then if Int64.compare hi lo < 0 then range_seek_rows else unbounded_rows
+    else if Int64.compare span (Int64.of_int unbounded_rows) >= 0
+    then unbounded_rows
+    else max range_seek_rows (Int64.to_int span + 1)
+  | _ -> range_seek_rows
+;;
+
 (** #520: how many rows [meta]'s table can hold, from the only real number the
     catalog carries: a rowid table's [next_rowid] high-water mark, which is
     [max(rowid) + 1] over everything ever inserted.
@@ -806,9 +886,10 @@ let estimate_rows cat (op : Plan.op) =
     let seek =
       if seek_is_unique_point cat table_meta ~idx_tree ~keys
       then 1
-      else if Option.is_some range
-      then range_seek_rows
-      else unbounded_rows
+      else (
+        match range with
+        | Some r -> range_rows_estimate r
+        | None -> unbounded_rows)
     in
     min seek (table_rows_estimate table_meta)
   | Plan.Op_seq_scan { table_meta } -> table_rows_estimate table_meta
@@ -883,15 +964,25 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
      so it is estimated from the (possibly narrowed) build-side op rather than
      from the whole table.
 
-     Be precise about how much that moves: it shrinks ONLY where the seek is
-     provably a point.  {!estimate_rows} answers [table_rows_estimate] for the
-     [Op_seq_scan] case, and for an [Op_index_lookup] it answers
-     [unbounded_rows] — hence [table_rows_estimate] after the [min] — unless
-     {!seek_is_unique_point} holds or the seek carries a range.  So R collapses
-     to 1 for a full-unique-key or rowid-alias pin, to [range_seek_rows] once
-     #532 gives the seek a range bound, and is otherwise unchanged for a partial
-     prefix pin.  [range_seek_rows] is a made-up constant, not a selectivity
-     estimate; do not read this as one. *)
+     Be precise about how much that moves.  {!estimate_rows} answers
+     [table_rows_estimate] for the [Op_seq_scan] case, and for an
+     [Op_index_lookup] it answers [unbounded_rows] — hence [table_rows_estimate]
+     after the [min] — unless {!seek_is_unique_point} holds or the seek carries a
+     range.  So R collapses to 1 for a full-unique-key or rowid-alias pin, to
+     [range_seek_rows] once #532 gives the seek a range bound, and is otherwise
+     unchanged for a partial prefix pin.  [range_seek_rows] is a made-up
+     constant, not a selectivity estimate; do not read this as one.
+
+     {b Which way a smaller R pushes the choice is the opposite of what it looks
+     like.}  {!probe_is_worth_it} takes the probe iff
+     [driving_rows <= right_rows / 8] — R is on the RIGHT of the comparison — so
+     shrinking R makes the probe HARDER to justify, not easier.  Every collapse
+     above therefore moves joins TOWARDS the hash join: the point-seek cases have
+     done so since #528, and #532's range case moves the whole band
+     [nlj_min_driving_rows < D <= table_rows_estimate / 8] with it.  See
+     {!build_side} for the measurement that says the range case is faster for
+     having moved.  A change that makes R more accurate will move plans; check
+     which side of that comparison it lands on before assuming the direction. *)
   let right_rows = estimate_rows cat right_op in
   let mk_with_left_col_right_col left_col right_col : Plan.op =
     let probe =

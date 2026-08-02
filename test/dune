@@ -864,6 +864,14 @@
   lwt.unix
   unix))
 
+; #532: on-disk cost of the join-strategy flip a range-bounded build side
+; causes. A measurement tool, not a gate.
+
+(executable
+ (name bench_build_side_strategy_532)
+ (modules bench_build_side_strategy_532)
+ (libraries granary granary.unix lwt.unix unix))
+
 ; #546: the index traversal an index lookup performs must be visible in stats.
 
 (test
