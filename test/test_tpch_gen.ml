@@ -615,6 +615,62 @@ let test_commitdate_straddles_receiptdate () =
   Alcotest.(check bool) "some commit >= receipt" true (!early > 0)
 ;;
 
+(* --- #509: the reproducibility contract, pinned ----------------------- *)
+
+(* Tpc_rand exists so that a seed pins the dataset across platforms, compilers
+   and OCaml versions. Until #509 several generators here drew from the LCG in
+   positions OCaml leaves unordered — arguments of one call, elements of one
+   array, fields of one record, operands of [^] — so which draw fed which column
+   was a property of the toolchain, and the contract silently did not hold.
+
+   This digest is the enforcement. A change to it means the generated dataset
+   changed: either deliberately, in which case recompute it here and say so, or
+   because some expression went back to drawing twice in an unordered position,
+   which is the bug. Floats go in by their exact bit pattern so the pin cannot
+   be loosened by a printing difference. *)
+let dataset_digest ~seed ~sf =
+  let g = G.create ~seed ~sf in
+  let buf = Buffer.create 4096 in
+  let add = function
+    | G.VInt i -> Buffer.add_string buf (string_of_int i)
+    | G.VReal f -> Buffer.add_string buf (Int64.to_string (Int64.bits_of_float f))
+    | G.VText s -> Buffer.add_string buf s
+  in
+  List.iter
+    (fun table ->
+       Buffer.add_string buf table;
+       G.iter_rows g ~table ~f:(fun row ->
+         Array.iter
+           (fun v ->
+              add v;
+              Buffer.add_char buf '\001')
+           row);
+       Buffer.add_char buf '\002')
+    G.tables;
+  Digest.to_hex (Digest.string (Buffer.contents buf))
+;;
+
+let test_dataset_digest_is_pinned () =
+  Alcotest.(check string)
+    "seed 42, sf 0.001 dataset digest"
+    "05e46ed445e4ae856a1660344ffbe730"
+    (dataset_digest ~seed:42 ~sf:0.001)
+;;
+
+let test_dataset_digest_is_stable_across_contexts () =
+  Alcotest.(check string)
+    "same seed and sf, fresh context"
+    (dataset_digest ~seed:7 ~sf:0.001)
+    (dataset_digest ~seed:7 ~sf:0.001)
+;;
+
+let test_dataset_digest_depends_on_seed () =
+  Alcotest.(check bool)
+    "a different seed gives a different dataset"
+    false
+    (String.equal (dataset_digest ~seed:42 ~sf:0.001) (dataset_digest ~seed:43 ~sf:0.001))
+;;
+
 let () =
   Alcotest.run
     "tpch_gen"
@@ -643,6 +699,17 @@ let () =
             "commit straddles receipt"
             `Quick
             test_commitdate_straddles_receiptdate
+        ] )
+    ; ( "reproducibility 509"
+      , [ Alcotest.test_case "dataset digest pinned" `Quick test_dataset_digest_is_pinned
+        ; Alcotest.test_case
+            "stable across contexts"
+            `Quick
+            test_dataset_digest_is_stable_across_contexts
+        ; Alcotest.test_case
+            "depends on the seed"
+            `Quick
+            test_dataset_digest_depends_on_seed
         ] )
     ; ( "api"
       , [ Alcotest.test_case "tables" `Quick test_tables_list

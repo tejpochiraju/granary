@@ -289,7 +289,11 @@ let customer_row r ~w_id ~d_id ~c_id =
   let first = Tpc_rand.a_string r ~lo:8 ~hi:16 in
   let last = customer_last_name r ~c_id in
   let street_1, street_2, city, state, zip = address r in
-  let phone = Tpc_rand.a_string r ~lo:16 ~hi:16 in
+  (* n_string(16,16) per clause 4.3.2.2 — sixteen DIGITS.  This drew from
+     [a_string]'s 64-symbol alphanumeric set until #509, only because
+     [Tpc_rand.phone] had an evaluation-order bug at the time; with that fixed
+     the digit-only generator is available and is what the spec asks for. *)
+  let phone = Tpc_rand.n_string r ~lo:16 ~hi:16 in
   let bad_credit = Tpc_rand.int_between r ~lo:1 ~hi:10 = 1 in
   let discount = Tpc_rand.float_between r ~lo:0.0 ~hi:0.5 ~decimals:4 in
   let data = Tpc_rand.a_string r ~lo:300 ~hi:500 in

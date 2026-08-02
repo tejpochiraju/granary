@@ -141,6 +141,63 @@ let test_phone_shape () =
   Alcotest.(check char) "third separator" '-' s.[10]
 ;;
 
+(* #509 — [phone] built its three fields from three draws written inline as
+   arguments of one [Printf.sprintf], a position OCaml leaves unordered, so
+   which draw landed in which field was toolchain-dependent. Pinning the exact
+   string for a fixed seed makes any future reordering fail here rather than
+   silently produce a different dataset. *)
+let test_phone_is_pinned_for_a_fixed_seed () =
+  let r = seeded () in
+  Alcotest.(check string)
+    "seed 42, nation 12, first draw"
+    "22-630-463-5248"
+    (Granary_tpc.Tpc_rand.phone r ~nation:12);
+  Alcotest.(check string)
+    "and the second, from the same stream"
+    "22-684-370-5525"
+    (Granary_tpc.Tpc_rand.phone r ~nation:12)
+;;
+
+(* The three fields are three separate draws in a stated order, so [phone]
+   must consume exactly three values from the stream — no more, no fewer. *)
+let test_phone_consumes_three_draws () =
+  let a = seeded () in
+  let b = seeded () in
+  ignore (Granary_tpc.Tpc_rand.phone a ~nation:0);
+  for _ = 1 to 3 do
+    ignore (Granary_tpc.Tpc_rand.int_between b ~lo:0 ~hi:1_000_000)
+  done;
+  Alcotest.(check int)
+    "streams are level after three draws"
+    (Granary_tpc.Tpc_rand.int_between b ~lo:0 ~hi:1_000_000)
+    (Granary_tpc.Tpc_rand.int_between a ~lo:0 ~hi:1_000_000)
+;;
+
+let test_n_string_is_digits_only () =
+  let r = seeded () in
+  for _ = 1 to 500 do
+    let s = Granary_tpc.Tpc_rand.n_string r ~lo:16 ~hi:16 in
+    Alcotest.(check int) "n_string(16,16) length" 16 (String.length s);
+    Alcotest.(check bool)
+      ("every character is a digit: " ^ s)
+      true
+      (String.for_all (fun c -> c >= '0' && c <= '9') s)
+  done
+;;
+
+let test_n_string_length_varies_within_bounds () =
+  let r = seeded () in
+  let seen_lo = ref false
+  and seen_hi = ref false in
+  for _ = 1 to 2_000 do
+    let n = String.length (Granary_tpc.Tpc_rand.n_string r ~lo:4 ~hi:8) in
+    Alcotest.(check bool) "within [4,8]" true (n >= 4 && n <= 8);
+    if n = 4 then seen_lo := true;
+    if n = 8 then seen_hi := true
+  done;
+  Alcotest.(check bool) "reaches both bounds" true (!seen_lo && !seen_hi)
+;;
+
 let test_pick_returns_element_from_array () =
   let r = seeded () in
   let choices = [| "a"; "b"; "c"; "d" |] in
@@ -196,6 +253,42 @@ let prop_a_string_length =
        let r = Granary_tpc.Tpc_rand.create ~seed in
        let s = Granary_tpc.Tpc_rand.a_string r ~lo ~hi in
        String.length s >= lo && String.length s <= hi)
+;;
+
+let prop_n_string_is_digits_within_bounds =
+  QCheck.Test.make
+    ~count:2000
+    ~name:"n_string is digits only and lands inside the requested bounds for any seed"
+    QCheck.(triple int (int_range 0 40) (int_range 0 40))
+    (fun (seed, a, b) ->
+       let lo = min a b
+       and hi = max a b in
+       let r = Granary_tpc.Tpc_rand.create ~seed in
+       let s = Granary_tpc.Tpc_rand.n_string r ~lo ~hi in
+       String.length s >= lo
+       && String.length s <= hi
+       && String.for_all (fun c -> c >= '0' && c <= '9') s)
+;;
+
+(* #509 — the reproducibility contract for [phone] itself: the same seed must
+   give the same string, and the three fields must be the three draws the
+   stream yields, in order. The second half is what an evaluation-order change
+   would break while leaving the first half intact. *)
+let prop_phone_fields_follow_the_stream =
+  QCheck.Test.make
+    ~count:1000
+    ~name:"phone's three fields are the next three draws, in field order"
+    QCheck.(pair int (int_range 0 24))
+    (fun (seed, nation) ->
+       let a = Granary_tpc.Tpc_rand.create ~seed in
+       let b = Granary_tpc.Tpc_rand.create ~seed in
+       let area = Granary_tpc.Tpc_rand.int_between b ~lo:100 ~hi:999 in
+       let exchange = Granary_tpc.Tpc_rand.int_between b ~lo:100 ~hi:999 in
+       let line = Granary_tpc.Tpc_rand.int_between b ~lo:1000 ~hi:9999 in
+       let expected =
+         Printf.sprintf "%02d-%03d-%03d-%04d" (nation + 10) area exchange line
+       in
+       String.equal expected (Granary_tpc.Tpc_rand.phone a ~nation))
 ;;
 
 let prop_determinism =
@@ -372,7 +465,21 @@ let () =
         ] )
     ; ( "float"
       , [ Alcotest.test_case "decimal quantization" `Quick test_float_between_decimals ] )
-    ; "phone", [ Alcotest.test_case "shape" `Quick test_phone_shape ]
+    ; ( "n_string"
+      , [ Alcotest.test_case "digits only" `Quick test_n_string_is_digits_only
+        ; Alcotest.test_case
+            "length within bounds"
+            `Quick
+            test_n_string_length_varies_within_bounds
+        ] )
+    ; ( "phone"
+      , [ Alcotest.test_case "shape" `Quick test_phone_shape
+        ; Alcotest.test_case
+            "pinned for a fixed seed"
+            `Quick
+            test_phone_is_pinned_for_a_fixed_seed
+        ; Alcotest.test_case "consumes three draws" `Quick test_phone_consumes_three_draws
+        ] )
     ; ( "pick"
       , [ Alcotest.test_case
             "returns array element"
@@ -397,6 +504,8 @@ let () =
           QCheck_alcotest.to_alcotest
           [ prop_int_between_respects_bounds
           ; prop_a_string_length
+          ; prop_n_string_is_digits_within_bounds
+          ; prop_phone_fields_follow_the_stream
           ; prop_determinism
           ; qcheck_nurand_in_range
           ; qcheck_last_name_alphabet

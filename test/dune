@@ -771,6 +771,11 @@
  (libraries granary_tpc alcotest))
 
 (test
+ (name test_tpc_sql_lint)
+ (modules test_tpc_sql_lint)
+ (libraries granary_tpc alcotest))
+
+(test
  (name test_tpch_check)
  (modules test_tpch_check)
  (libraries granary_tpc alcotest))
