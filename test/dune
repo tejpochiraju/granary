@@ -864,6 +864,36 @@
   lwt.unix
   unix))
 
+; #546: the index traversal an index lookup performs must be visible in stats.
+
+(test
+ (name test_index_entries_546)
+ (modules test_index_entries_546)
+ (libraries granary granary.sql alcotest lwt.unix unix))
+
+; #546: on-disk cost of the hash join's unconditional build-side seek.
+; A measurement tool, not a gate — hence (executable), like bench_scan_probe.
+
+(executable
+ (name bench_build_side_seek_546)
+ (modules bench_build_side_seek_546)
+ (libraries granary granary.unix lwt.unix unix))
+
+; #532: hash-join build side must take a range bound, not just an equality
+; prefix.
+
+(test
+ (name test_build_side_range_532)
+ (modules test_build_side_range_532)
+ (libraries
+  granary
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #528: hash-join build side must seek a WHERE-pinned index prefix.
 
 (test

@@ -188,18 +188,73 @@ let probe_key_for_index (right_meta : Cat.table_meta) ~join_col ~left_col ~right
     | parts, true -> Some (List.rev parts))
 ;;
 
-(** #516: the WHERE equalities that pin a column of the join's {i right} table.
-    Column ordinals in a bound WHERE clause address the combined row, so the
-    right table's own columns are the [n_right_cols] slots at [right_offset];
-    the result re-bases them to right-table ordinals. *)
+(** #516: column ordinals in a bound WHERE clause address the combined row, so
+    the join's right table owns the [n_right_cols] slots at [right_offset].
+    Answers [col_idx]'s ordinal within the right table, or [None] if the column
+    belongs to the left side.
+
+    Shared by {!right_table_eqs} and {!right_table_ranges} (#532): the two want
+    exactly the same mapping and disagreeing about it would silently mis-address
+    a seek. *)
+let rebase_right_col ~right_offset ~n_right_cols col_idx =
+  if col_idx >= right_offset && col_idx < right_offset + n_right_cols
+  then Some (col_idx - right_offset)
+  else None
+;;
+
+(** #516: the WHERE equalities that pin a column of the join's {i right} table,
+    re-based to right-table ordinals. *)
 let right_table_eqs ~right_offset ~n_right_cols cs =
   List.filter_map
     (fun c ->
        match recognise_eq_col_lit c with
-       | Some (col_idx, e)
-         when col_idx >= right_offset && col_idx < right_offset + n_right_cols ->
-         Some (col_idx - right_offset, e)
-       | Some _ | None -> None)
+       | Some (col_idx, e) ->
+         Option.map
+           (fun ord -> ord, e)
+           (rebase_right_col ~right_offset ~n_right_cols col_idx)
+       | None -> None)
+    cs
+;;
+
+(** #532: the WHERE range bounds that constrain a column of the join's {i right}
+    table, re-based to right-table ordinals so {!range_for_index} can read them.
+
+    {!right_table_eqs} re-bases by handing back the ordinal {i beside} the value,
+    and the chooser never looks at the original AST node again.  A range cannot
+    be re-based that way: {!range_for_index} re-recognises whole conjuncts, so
+    the ordinal has to move {i inside} the expression.  Rather than rewrite the
+    caller's node — which would have to know every spelling
+    {!recognise_range_col_lit} accepts, [BETWEEN] and both operand orders
+    included — each recognised end is re-emitted as its own canonical
+    [col >= v] / [col <= v] conjunct over the re-based ordinal.  Those round-trip
+    through [recognise_range_col_lit] to the same ends the original produced, and
+    [range_for_index] folds the two ends independently anyway, so splitting a
+    [BETWEEN] into its halves loses nothing.
+
+    Emitting [>=]/[<=] for a strict [>]/[<] is sound for the reason given at
+    {!recognise_range_col_lit}: that function already drops strictness, because a
+    range only narrows the span a seek walks and every row it yields is still
+    tested by the whole WHERE clause.
+
+    The narrowing this enables is sound for the invariant #513/#516/#528 rest on:
+    [chain_joins] applies the whole WHERE clause to the joined row, so
+    restricting what the build side reads cannot change which joined rows
+    survive. *)
+let right_table_ranges ~right_offset ~n_right_cols cs =
+  List.concat_map
+    (fun c ->
+       match recognise_range_col_lit c with
+       | None -> []
+       | Some (col_idx, lo, hi) ->
+         (match rebase_right_col ~right_offset ~n_right_cols col_idx with
+          | None -> []
+          | Some ord ->
+            let col = Sema.BE_col ord in
+            List.filter_map
+              Fun.id
+              [ Option.map (fun v -> Sema.BE_binop (Sema.Ge, col, v)) lo
+              ; Option.map (fun v -> Sema.BE_binop (Sema.Le, col, v)) hi
+              ]))
     cs
 ;;
 
@@ -507,16 +562,37 @@ let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts 
     the post-join filter drops them exactly as it dropped the wider rows they
     replaced.
 
-    No range bound is offered ([range_conjuncts] is empty): the WHERE conjuncts
-    address the combined row, so their ordinals would have to be re-based into
-    right-table space before {!range_for_index} could read them, which the
-    equality path gets for free from {!right_table_eqs} and a range does not.
-    That is a missed narrowing, never an unsound one — tracked as #532.
+    #532: [right_ranges] is the range half of the same re-basing, from
+    {!right_table_ranges}.  It was empty when this function landed, so a build
+    side whose prefix was pinned by equalities still walked to the end of that
+    prefix even when the WHERE clause bounded the {i next} index column — the
+    [sw = 1 AND si BETWEEN 20 AND 40] shape, which seeked warehouse 1 and then
+    read all of it.  Feeding it through {!access_path_for_eqs} stops the walk at
+    the upper bound.
+
+    That also feeds back into the strategy choice: {!estimate_rows} answers
+    {!range_seek_rows} rather than {!unbounded_rows} for a seek carrying a range,
+    so a range-bounded build side now shrinks R and a join that lost the ratio
+    test on the whole-prefix estimate can take a probe instead.  Both plans
+    return the same rows; see {!probe_is_worth_it}.
 
     The seek is taken unconditionally whenever a prefix is pinned, because there
     is no selectivity estimate to consult.  Where the prefix selects nearly the
     whole table this trades one ordered leaf walk for an index traversal plus a
-    random row fetch per entry, which in-memory measurement cannot see — #546.
+    row fetch per entry, which in-memory measurement cannot see — #546, still
+    open, and {b measured on disk}: at 100,000 build-side rows,
+    [test/bench_build_side_seek_546.ml] puts an unselective seek at 393,980 pager
+    reads and 2.6-3.5x the wall time of the scan it replaces (93,067 reads), the
+    two drawing level near 1% selectivity.  Roughly, the seek costs ~3 pager
+    resolutions per row fetched against the sequential walk's ~0.008, and that
+    figure barely moves when index order is scrambled against rowid order — so
+    the cost is the per-entry descent itself and the ordered-fetch remedy #541
+    landed for the DML drain would not recover it.  No guard is applied here
+    because none can be built from what the planner knows: distinguishing the
+    100% case from the 1% one needs a column-cardinality statistic this engine
+    does not keep (#550 carries the same gap for the driving side).
+    {!Granary_sql.Exec.query_stats}'s [index_entries] was added so a future guard
+    has something to assert on.
 
     Synthesized right tables — CTEs, [sqlite_master], [sqlite_sequence], marked
     by a negative [tree_id] — and columnar tables have no B-tree to seek and are
@@ -525,7 +601,7 @@ let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts 
     shadows a real table would otherwise pick up that table's indexes and plan
     an [Op_index_lookup] against a tree it has nothing to do with — a wrong
     answer, pinned by [cte_shadowing_a_real_table_still_scans]. *)
-let build_side cat (right_meta : Cat.table_meta) ~right_eqs =
+let build_side cat (right_meta : Cat.table_meta) ~right_eqs ~right_ranges =
   let seekable =
     match right_meta.Cat.storage with
     | Cat.Row { tree_id; _ } -> tree_id >= 0
@@ -535,7 +611,7 @@ let build_side cat (right_meta : Cat.table_meta) ~right_eqs =
   then make_scan right_meta
   else (
     let eqs = List.mapi (fun pos (col_idx, v) -> pos, col_idx, v) right_eqs in
-    match access_path_for_eqs cat right_meta ~eqs ~range_conjuncts:[] with
+    match access_path_for_eqs cat right_meta ~eqs ~range_conjuncts:right_ranges with
     | None -> make_scan right_meta
     | Some (seek, _consumed) -> seek_op right_meta seek)
 ;;
@@ -792,10 +868,13 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
   let right_offset = bj.right_col_offset in
   let n_right_cols = List.length bj.right_meta.Cat.columns in
   let right_eqs = right_table_eqs ~right_offset ~n_right_cols where_conjuncts in
+  (* #532: the range half of the same re-basing.  Only [build_side] takes it —
+     a nested-loop probe key is built from equalities alone. *)
+  let right_ranges = right_table_ranges ~right_offset ~n_right_cols where_conjuncts in
   (* #528: the build side of a hash join, narrowed by the same WHERE equalities
      that would complete a probe key.  It does not depend on the strategy chosen
      — but the cost model's [right_rows] depends on IT, so build it first. *)
-  let right_op = build_side cat bj.right_meta ~right_eqs in
+  let right_op = build_side cat bj.right_meta ~right_eqs ~right_ranges in
   (* #520: neither side of the cost comparison depends on which strategy is
      chosen or on which column the ON predicate resolves to — compute both once,
      outside the match. *)
@@ -808,10 +887,11 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
      provably a point.  {!estimate_rows} answers [table_rows_estimate] for the
      [Op_seq_scan] case, and for an [Op_index_lookup] it answers
      [unbounded_rows] — hence [table_rows_estimate] after the [min] — unless
-     {!seek_is_unique_point} holds or the seek carries a range, and
-     {!build_side} passes no range (#532).  So R is unchanged for every partial
-     prefix pin, and collapses to 1 for a full-unique-key or rowid-alias pin.
-     There is no selectivity estimate here; do not read this as one. *)
+     {!seek_is_unique_point} holds or the seek carries a range.  So R collapses
+     to 1 for a full-unique-key or rowid-alias pin, to [range_seek_rows] once
+     #532 gives the seek a range bound, and is otherwise unchanged for a partial
+     prefix pin.  [range_seek_rows] is a made-up constant, not a selectivity
+     estimate; do not read this as one. *)
   let right_rows = estimate_rows cat right_op in
   let mk_with_left_col_right_col left_col right_col : Plan.op =
     let probe =
