@@ -2668,7 +2668,15 @@ let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list 
 
 (* [2^63] as a float — exactly representable, and one past [Int64.max_int].  A
    float strictly inside [[-2^63, 2^63)] converts to an int64 without
-   overflowing; [Int64.of_float] is unspecified outside it. *)
+   overflowing; [Int64.of_float] is unspecified outside it.
+
+   #527: [Granary_sql.Planner.classify_range_bound] spells this same literal
+   inline, because this module depends on [Planner] and not the other way round,
+   so sharing it would mean moving an [Int64.of_float]-domain constant into the
+   planner's [.mli] for one use.  The two MUST stay equal: the documented
+   disagreement between classification and {!range_bound_key} is then exactly
+   the one ULP the [pred]/[succ] widening moves, and nothing more.  Change one
+   and you must change the other. *)
 let two_pow_63 = 9.2233720368547758e18
 
 (** #527: the index-key value that bounds [which] end of a range at [v], for a
@@ -2698,7 +2706,9 @@ let two_pow_63 = 9.2233720368547758e18
     [ceil]/[floor]: [ceil (pred 100.5) = 101], [ceil (pred 280.0) = 280],
     [floor (succ 119.5) = 119], [floor (succ 280.0) = 280].  The seek is thus a
     superset of the predicate under the predicate's own semantics, at a cost of
-    at most one extra key on the common path.
+    at most one extra key below 2^53.  Above it the widening admits up to a
+    whole ULP of extra keys (512 at 2^62), but those are not waste: they are
+    exactly the keys the predicate accepts, which is why the widening exists.
 
     The result must be an [IK_int] on an integer column, not the real as given:
     {!Granary_encoding.Index_key.encode_value} emits a distinct leading type tag

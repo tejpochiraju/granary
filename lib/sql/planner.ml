@@ -312,7 +312,15 @@ let bounded_type = function
     classified here as [`Orderable] (it has no [`Lo]/[`Hi] to condition on).
     A residual disagreement there costs at most a narrowing the fold would
     otherwise have kept, never a row: every candidate is individually a sound
-    bound and the predicate runs on every yielded row. *)
+    bound and the predicate runs on every yielded row.
+
+    That [9.2233720368547758e18] below is exactly 2^63, and is deliberately the
+    same literal as [Granary_sql.Exec.two_pow_63] rather than a reference to it:
+    that module depends on this one, not the reverse, so sharing the constant
+    would mean exporting an [Int64.of_float]-domain value from this [.mli] for
+    one use.  The two MUST stay equal — the one-ULP disagreement described above
+    is the {i whole} disagreement only while they are.  See the note at
+    [two_pow_63] before changing either. *)
 let classify_range_bound (ty : Row.ty) = function
   | Sema.BE_lit (Ast.L_int _) when ty = Row.Integer || ty = Row.Real -> `Orderable
   | Sema.BE_lit (Ast.L_real f) when ty = Row.Real ->
@@ -320,7 +328,7 @@ let classify_range_bound (ty : Row.ty) = function
   | Sema.BE_lit (Ast.L_real f) when ty = Row.Integer ->
     if Float.is_nan f
     then `Unknown
-    else if Float.abs f < 9.2233720368547758e18 (* exactly 2^63 *)
+    else if Float.abs f < 9.2233720368547758e18 (* exactly 2^63 — see above *)
     then `Orderable
     else `Useless
   | Sema.BE_lit _ -> `Useless

@@ -1274,6 +1274,49 @@ let prop_cross_type_range_bound_matches_foil =
          pair "o" = pair "o + 0" && between "o" = between "o + 0"))
 ;;
 
+(* #527: the same agreement, but drawn from the regime where a float ULP exceeds
+   1 and [Int64.to_float] stops being injective — which is the only place the
+   [pred]/[succ] widening does any work.  The property above draws [o] in 1..12,
+   so it would pass with plain [ceil]/[floor]; this one fails on every base
+   without the widening, and exists so the coverage cannot decay if someone
+   later edits the rounding.
+
+   Both neighbourhoods are on their own grid: at 2^53 the ULP is 2, at 2^62 it
+   is 1024, and the stored keys straddle the representable points either way.
+   The bound literal is written as an integer with a [.0] suffix and left to the
+   parser to round to the nearest double — exactly what a real query does, and
+   what puts the bound off the stored values by less than one ULP. *)
+let prop_huge_cross_type_range_bound_matches_foil =
+  let two_53 = 9007199254740992L
+  and two_62 = 4611686018427387904L in
+  QCheck.Test.make
+    ~count:100
+    ~name:"promoted cross-type range bound agrees with foil above 2^53"
+    QCheck.(pair bool (int_range (-8) 8))
+    (fun (at_53, k) ->
+       let w, base, step = if at_53 then 1, two_53, 1L else 2, two_62, 100L in
+       let bound =
+         Printf.sprintf "%Ld.0" (Int64.add base (Int64.mul step (Int64.of_int k)))
+       in
+       with_db (fun db ->
+         exec db "CREATE TABLE h (w INTEGER, o INTEGER, v INTEGER, PRIMARY KEY (w, o))";
+         exec db "BEGIN";
+         List.iter
+           (fun (wi, b, st) ->
+              for i = -8 to 8 do
+                let o = Int64.add b (Int64.mul st (Int64.of_int i)) in
+                exec db (Printf.sprintf "INSERT INTO h VALUES (%d, %Ld, %d)" wi o (i + 9))
+              done)
+           [ 1, two_53, 1L; 2, two_62, 100L ];
+         exec db "COMMIT";
+         let q col op =
+           rows_of
+             db
+             (Printf.sprintf "SELECT v FROM h WHERE w = %d AND %s %s %s" w col op bound)
+         in
+         List.for_all (fun op -> q "o" op = q "o + 0" op) [ ">="; ">"; "<="; "<" ]))
+;;
+
 let () =
   Alcotest.run
     "range_bound_517"
@@ -1398,6 +1441,7 @@ let () =
           ; prop_cross_type_between_matches_inequalities
           ; prop_folded_bounds_match_foil
           ; prop_cross_type_range_bound_matches_foil
+          ; prop_huge_cross_type_range_bound_matches_foil
           ] )
     ]
 ;;
