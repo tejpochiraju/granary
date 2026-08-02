@@ -1,0 +1,170 @@
+name: Timing gates nightly (#549)
+
+# The ONLY automated job that runs granary's timing/scaling gates ARMED.
+#
+# Every other job that invokes `dune runtest` neutralizes them (#549):
+#   .github/workflows/ci.yml, coverage.yml, cross-arch.yml and their
+#   .forgejo/ counterparts all set GRANARY_BENCH_MIN_SPEEDUP=0,
+#   GRANARY_BENCH_PARALLEL_MAX / _MAX_WRITER_S / _MAX_RATIO = 1000000.
+# That is deliberate — those jobs share a loaded runner with every other PR
+# and a wall-clock gate flakes there — but the consequence was that
+# test_fts_scaling (#233), test_insert_scaling (#228/#229) and the bench_*
+# suites were protected on the honour system: armed only for whoever happened
+# to run the suite locally AND read the output.
+#
+# This job restores that coverage. It deliberately sets NO GRANARY_BENCH_*
+# neutralizer, and instead buys accuracy the way #537 intended: `dune runtest
+# -j 1` so the suite does not contend with itself, and a raised
+# GRANARY_BENCH_TRIALS so each gate's best-of-N statistic has more draws.
+#
+# REPORTING, NOT BLOCKING. It does not run on push or pull_request, so it can
+# never fail a PR. On failure it files/updates an issue (same dedup pattern as
+# jepsen-nightly.yml).
+#
+# THIS MIRROR IS MANUAL-ONLY — `workflow_dispatch`, deliberately NO `schedule`.
+# The Forgejo copy is the authoritative armed nightly; this one exists because
+# the repo keeps the two workflow directories in sync, and directory parity is
+# satisfied by the file existing, not by an identical trigger.
+#
+# The reason is the whole point of #549. GitHub's `ubuntu-latest` is a shared
+# 2-core hosted VM with noisy neighbours — the worst place in the repo to
+# assert `overlap <= 1.15` and `speedup >= 1.2`. Scheduled nightly, it would
+# auto-file a recurring public issue that nobody acts on, and because the dedup
+# is by title marker it would become one long noise thread. Training people to
+# ignore that marker is exactly the disease #549 was filed about, not its cure.
+# So: run it here on demand (e.g. to reproduce something on hosted hardware),
+# and read a red result as weak evidence — triage against the load line the job
+# prints. Do not add a `schedule:` block without solving the noise problem.
+
+on:
+  # Deliberately manual-only — see the header. No `schedule:`.
+  workflow_dispatch: {}
+
+# A scheduled/dispatched workflow's default GITHUB_TOKEN is read-only under the
+# now-common repo default, so the failure step below could not file anything
+# without this.
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  # Shared with jepsen-nightly so the two heavy nightlies can never overlap.
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  armed-timing-gates:
+    runs-on: ubuntu-latest
+    # A serial `--force -j 1` run of ~130 executables, plus up to TRIALS
+    # retries in the timing gates, has a long tail. Bound it so a wedged run
+    # cannot hold the slot indefinitely.
+    timeout-minutes: 120
+    env:
+      OPAMROOT: /home/opam/.opam
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+      options: --user root
+
+    steps:
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          # Same closure as ci.yml's build-and-test job, so this job warms and
+          # reuses the same cache entry rather than building its own.
+          key: opam-5.4-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
+          restore-keys: opam-5.4-
+
+      - name: Install opam packages
+        # Keep in sync with ci.yml — this job runs the same `dune runtest`, so
+        # it needs the same dependency closure (#462).
+        run: |
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+            mirage-block mirage-block-unix uutf uucp ocamlformat.0.29.0 \
+            mirage-crypto mirage-crypto-rng alcotest-lwt sqlite3 \
+            nottui nottui-lwt lwd
+
+      - name: Build
+        run: opam exec -- dune build
+
+      - name: Record load before the timed run
+        # A timing gate's verdict is only interpretable against the load it ran
+        # under; print it so a failure can be triaged without a re-run.
+        run: |
+          uptime
+          nproc
+
+      - name: Test with the timing gates ARMED
+        # DELIBERATELY no GRANARY_BENCH_MIN_SPEEDUP / _PARALLEL_MAX /
+        # _MAX_WRITER_S / _MAX_RATIO here. That is the entire point of this
+        # job (#549) — do not "fix" a flaky nightly by adding them back.
+        #
+        # GRANARY_BENCH_TRIALS is a tuning knob, not a gate: it cannot make a
+        # failing test pass, it only gives the best-of-N statistic more draws
+        # (test_fts_scaling default 9, bench_wal_fsync_overlap default 3).
+        env:
+          GRANARY_BENCH_TRIALS: "15"
+        # -j 1: the suite must not contend with itself. A parallel `dune
+        # runtest` is exactly the co-scheduling that produced the false 10.5x
+        # in #529 and the 1.70 overlap ratio in #538.
+        run: opam exec -- dune runtest --force -j 1
+
+      # On any failure above, open a GitHub issue so the run does not fail
+      # silently. Deduped by title marker: if an open issue already exists for a
+      # previous failing run, comment on it instead of opening a duplicate.
+      #
+      # curl, NOT `gh`. The `gh` CLI ships in the HOSTED RUNNER IMAGE, not in
+      # this job's `container:` (ocaml/opam:ubuntu-24.04 has no gh). A `gh`
+      # call here would die with "gh: command not found" on top of the
+      # already-failed job and report nothing — reintroducing, in the mirror,
+      # exactly the silent-failure mode this workflow exists to remove.
+      # jepsen-nightly.yml's GitHub copy gets away with `gh` only because that
+      # job has no `container:` and so runs on the host. The REST calls below
+      # mirror the Forgejo copy's shape; only the host and the search syntax
+      # differ. `curl` IS present in the opam image (opam itself needs it).
+      - name: File issue on failure
+        if: failure()
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}
+          SEARCH: ${{ github.api_url }}/search/issues
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MARKER: "Armed timing gates nightly failed"
+        run: |
+          set -eu
+          # Single-line with \n escapes, so no YAML block indentation leaks
+          # into the rendered issue body.
+          body="The armed timing-gate run (#549) failed.\n\nThis job runs the timing/scaling gates with their ceilings live, so a failure is either a real performance regression or runner noise that the gate's best-of-N statistic did not absorb. NOTE: this is the GitHub mirror on a shared 2-core hosted VM — weak evidence compared with the Forgejo nightly on the self-hosted runner. Check the load line printed before the timed run.\n\n- Run: ${RUN_URL}\n- Commit: ${GITHUB_SHA}\n- Ref: ${GITHUB_REF}\n\nSee the workflow logs for the failing gate and its printed measurements (each gate prints its per-trial numbers and its best-of-N verdict).\n\nDo NOT fix this by adding GRANARY_BENCH_* neutralizers to this workflow — that would put the gate back on the honour system (#549)."
+          existing=$(curl -sS \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            --get "${SEARCH}" \
+            --data-urlencode "q=repo:${REPO} is:issue is:open in:title ${MARKER}")
+          number=$(printf '%s' "${existing}" | grep -o "\"number\":[0-9]*" | head -n1 | grep -o "[0-9]*" || true)
+          if [ -n "${number}" ]; then
+            echo "Open failure issue #${number} exists; adding a comment."
+            curl -sSf -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -d "{\"body\": \"Failed again on run ${RUN_URL} (commit ${GITHUB_SHA}).\"}" \
+              "${API}/issues/${number}/comments" >/dev/null
+          else
+            echo "No open failure issue; opening one."
+            curl -sSf -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -d "{\"title\": \"${MARKER} (run ${{ github.run_number }})\", \"body\": \"${body}\"}" \
+              "${API}/issues" >/dev/null
+          fi

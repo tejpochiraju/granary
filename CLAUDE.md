@@ -69,6 +69,49 @@ podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune test tes
 
 From inside a worktree, substitute the worktree path for `$(pwd)`.
 
+### Timing and scaling gates (`GRANARY_BENCH_*`)
+
+Several tests assert a wall-clock ratio or ceiling rather than a value. They
+guard regressions that are invisible to a correctness test — an O(n) drain, an
+O(n²) bulk insert, a lost reader/writer overlap:
+
+| test | guards | gate | neutralizer |
+|---|---|---|---|
+| `test_fts_scaling` | #233 FTS `cursor_open` drain | 3x index < 2.0x slower | `GRANARY_BENCH_MAX_RATIO` |
+| `test_insert_scaling` | #228/#229 O(n²) insert, full-scan lookup | ratio < 2.5, speedup ≥ 4.0 | `GRANARY_BENCH_MAX_RATIO`, `GRANARY_BENCH_MIN_SPEEDUP` |
+| `bench_wal_fsync_overlap` | #149/#159 fsync overlap | overlap ≤ 1.15, speedup ≥ 1.2 | `GRANARY_BENCH_MIN_SPEEDUP` |
+| `bench_wal_reader_scaling` | #149 parallel-read regression | parallel ≤ 2.0x serial | `GRANARY_BENCH_PARALLEL_MAX` |
+| `bench_slow_read_yield` | reader starving the writer | writer ≤ 3.0 s | `GRANARY_BENCH_MAX_WRITER_S` |
+
+**Where they run armed.** `ci.yml`, `coverage.yml` and `cross-arch.yml` — all
+six files, Forgejo and GitHub — neutralize every one of them, because those
+jobs share a loaded runner with every other PR. The single *scheduled* job that
+runs them with their ceilings live is `.forgejo/workflows/bench-nightly.yml`:
+`dune runtest --force -j 1`, no `GRANARY_BENCH_*` neutralizer, on the
+self-hosted runner, reporting via an auto-filed issue rather than blocking PRs
+(#549). It shares the `nightly` concurrency group with `jepsen-nightly.yml` so
+the two heavy nightlies queue instead of perturbing each other's timings.
+
+The `.github/` mirror of that file is **manual-only** (`workflow_dispatch`, no
+`schedule`) and that is deliberate: GitHub's `ubuntu-latest` is a shared 2-core
+VM, so a scheduled armed run there would auto-file a recurring public issue
+nobody acts on and train everyone to ignore the marker — #549's disease, not
+its cure. Treat a red run there as weak evidence.
+
+Do not "fix" a red nightly by adding a neutralizer to that workflow — that is
+the honour system #549 removed. Anywhere else, these gates are armed only when
+*you* run the suite locally and read the result.
+
+**Tuning knobs, not gates.** `GRANARY_BENCH_TRIALS` (best-of-N draws;
+`test_fts_scaling` default 9, `bench_wal_fsync_overlap` default 3) and
+`GRANARY_BENCH_REPS` (`test_fts_scaling` iterations per timed loop, default
+500) only reduce variance — they cannot make a failing test pass. On a loaded
+box, raise these rather than disarming the ceiling.
+
+If a gate fails on your box, check `uptime` first: sibling agents running
+suites in parallel are the usual cause, and the gates print their per-trial
+numbers so you can tell noise from a regression.
+
 ### Formatting
 
 **Use `scripts/check-fmt.sh` — it is the canonical local equivalent of CI's `dune build @fmt` gate.** It self-wraps podman (no manual `podman run`), runs the pinned ocamlformat over every `.ml`/`.mli` in `lib/ test/ bin/ bench/`, prints a unified diff for each deviation, and exits non-zero. Run it from the repo or worktree root:

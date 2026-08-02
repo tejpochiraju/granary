@@ -28,16 +28,30 @@
     The ratio gate is a wall-clock measurement: on a shared, loaded CI runner a
     sub-millisecond 1k baseline is noise-dominated and the ratio flakes.  As with
     the [bench_*] suites, CI neutralizes it via [GRANARY_BENCH_MAX_RATIO] (set
-    high) so the benches still run and print, without failing on load — which
-    means this gate is armed only for developers running the suite locally, and
-    protects #233 on the honour system (#549).
+    high) so the benches still run and print, without failing on load.
+
+    {b Where this gate actually runs armed.}  Not in ci.yml, coverage.yml or
+    cross-arch.yml — all six of those workflows (Forgejo and GitHub) neutralize
+    it.  The one automated job that runs it with the ceiling live is the nightly
+    [.forgejo/workflows/bench-nightly.yml] (its [.github/] mirror is
+    manual-only): [dune
+    runtest --force -j 1] on a self-hosted runner with no [GRANARY_BENCH_*]
+    neutralizer set, raising [GRANARY_BENCH_TRIALS] instead.  It reports rather
+    than blocking PRs.  Outside that nightly this gate is armed only for a
+    developer running the suite locally (#549).
 
     #529: a single measurement flaked under a parallel [dune test] (observed up
     to 10.5x with no code change).  Two mitigations: best-of-N over interleaved
     trials (minimum per size, then divide — see {!test_fts_queries_flat}) and
     longer timing loops (500 reps, so the timed region is tens of ms rather than
     ~1.6 ms).  The gate stays at 2.0x — the de-flake comes from the statistic
-    and the sample size, not from loosening the ceiling. *)
+    and the sample size, not from loosening the ceiling.
+
+    Correcting the record (#549): #529's stated motivation was that "the margin
+    is thin enough that CI will hit it".  That was factually wrong — CI sets
+    [GRANARY_BENCH_MAX_RATIO=1000000] on every path, so CI could not hit it at
+    any margin.  The de-flaking was still worth doing, but what it de-flaked was
+    a purely LOCAL signal until the nightly above existed. *)
 
 module Db = Granary.Db
 

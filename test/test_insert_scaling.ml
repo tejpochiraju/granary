@@ -19,7 +19,17 @@
     neutralizes the gates via the same env vars — [GRANARY_BENCH_MAX_RATIO]
     (raised high) for the insert ceiling and [GRANARY_BENCH_MIN_SPEEDUP]
     (lowered to 0) for the lookup floor — so the suite still runs and prints
-    without failing on load. *)
+    without failing on load.
+
+    {b Where these gates actually run armed.}  Not in ci.yml, coverage.yml or
+    cross-arch.yml — all six of those workflows (Forgejo and GitHub) neutralize
+    them.  The one automated job that runs them with the ceilings live is the
+    nightly [.forgejo/workflows/bench-nightly.yml] (its [.github/] mirror is
+    manual-only):
+    [dune runtest --force -j 1] on a self-hosted runner with no
+    [GRANARY_BENCH_*] neutralizer set.  It reports rather than blocking PRs.
+    Outside that nightly these gates are armed only for a developer running the
+    suite locally, which is what #549 was filed about. *)
 
 module Db = Granary.Db
 
