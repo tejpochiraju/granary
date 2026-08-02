@@ -2377,7 +2377,46 @@ let dump_index_is_implied (meta : Cat.table_meta) ~indexes (idx : Cat.index_info
    when the selected set omits generated columns); otherwise a bare
    [INSERT INTO t VALUES] is emitted.  [?mode] threads the dump's shared RO
    snapshot so reads are point-in-time. *)
-let emit_rows_as_inserts ?mode t ~name ~col_idents ~explicit_cols ~stmt =
+(* #548: a database can hold a NULL in a column its own schema declares NOT NULL.
+   Every such file predates #530, which made every PRIMARY KEY column imply NOT
+   NULL: a table-level [PRIMARY KEY (k)], every column of a composite
+   [PRIMARY KEY (a, b)], and a column added by [ALTER TABLE ... ADD COLUMN ...
+   PRIMARY KEY] all used to be nullable, and [Catalog.open_] now re-derives the
+   flag from the implicit PK index.  Reading such a file is fine; DUMPING it is
+   not, because the dump renders the CURRENT declaration and then emits the
+   stored rows, so the schema line and the data lines contradict each other and
+   the script dies on the first offending row.
+
+   The decision (#548): REFUSE, loudly and specifically, rather than emit a
+   script that cannot replay.  The alternative — quietly dropping the NOT NULL
+   from the offending column — produces a restorable script, but it is a silent
+   schema downgrade, and silent degradation in exactly this area is what #533 and
+   #553 were both about.  A database whose rows contradict its own schema is not
+   describable in SQL; saying so is the only answer that never lies.  The message
+   names the repair, and [~data_only:true] still dumps the rows.
+
+   Detected while the rows stream past, so a healthy database pays nothing: no
+   extra scan, no extra query.  A dump that trips this has already emitted
+   [BEGIN] and some statements, so [dump]'s handler closes it with [ROLLBACK] —
+   a streaming sink is left holding a script that is safe to replay (it undoes
+   itself) rather than one that half-applies. *)
+let not_null_violation_message ~table ~column =
+  Printf.sprintf
+    "dump %s: column %s is declared NOT NULL but a stored row holds NULL, so the emitted \
+     schema contradicts the emitted rows and the script would fail to replay (#548).  \
+     This database predates #530 (every PRIMARY KEY column implies NOT NULL).  Repair it \
+     first — UPDATE %s SET %s = <value> WHERE %s IS NULL keeps the rows, DELETE FROM %s \
+     WHERE %s IS NULL drops them — or dump the rows alone with ~data_only:true."
+    table
+    column
+    (Sql.Exec.quote_ident table)
+    (Sql.Exec.quote_ident column)
+    (Sql.Exec.quote_ident column)
+    (Sql.Exec.quote_ident table)
+    (Sql.Exec.quote_ident column)
+;;
+
+let emit_rows_as_inserts ?mode t ~name ~col_idents ~explicit_cols ~not_null_cols ~stmt =
   let qname = Sql.Exec.quote_ident name in
   let cols_csv = String.concat ", " col_idents in
   let select_sql = Printf.sprintf "SELECT %s FROM %s" cols_csv qname in
@@ -2392,6 +2431,11 @@ let emit_rows_as_inserts ?mode t ~name ~col_idents ~explicit_cols ~stmt =
     in
     Lwt_stream.iter_s
       (fun (row : Row.t) ->
+         List.iter
+           (fun (i, column) ->
+              if i < Array.length row && row.(i) = Row.V_null
+              then raise (Failure (not_null_violation_message ~table:name ~column)))
+           not_null_cols;
          let vals =
            Array.to_list row
            |> List.map Sql.Exec.sql_literal_of_value
@@ -2403,7 +2447,7 @@ let emit_rows_as_inserts ?mode t ~name ~col_idents ~explicit_cols ~stmt =
 
 (* Emit [INSERT] statements for every row of [meta] (skipping generated columns,
    whose values are derived). *)
-let dump_table_rows ?mode t (meta : Cat.table_meta) ~stmt =
+let dump_table_rows ?mode ?(check_not_null = true) t (meta : Cat.table_meta) ~stmt =
   let dump_cols =
     List.filter (fun (c : Row.column) -> c.Row.generated_as = None) meta.Cat.columns
   in
@@ -2414,12 +2458,25 @@ let dump_table_rows ?mode t (meta : Cat.table_meta) ~stmt =
     let col_idents =
       List.map (fun (c : Row.column) -> Sql.Exec.quote_ident c.Row.name) dump_cols
     in
+    (* #548: the positions in the emitted row that the emitted schema will
+       declare NOT NULL.  Empty when no schema is emitted ([~data_only]) — those
+       rows replay against a schema the caller supplies, so there is nothing for
+       them to contradict. *)
+    let not_null_cols =
+      if not check_not_null
+      then []
+      else
+        List.mapi (fun i (c : Row.column) -> i, c) dump_cols
+        |> List.filter_map (fun (i, (c : Row.column)) ->
+          if c.Row.not_null then Some (i, c.Row.name) else None)
+    in
     emit_rows_as_inserts
       ?mode
       t
       ~name:meta.Cat.name
       ~col_idents
       ~explicit_cols:has_generated
+      ~not_null_cols
       ~stmt)
 ;;
 
@@ -2598,7 +2655,13 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                    in
                    if schema_only
                    then Lwt.return_unit
-                   else dump_table_rows ?mode:read_mode t meta ~stmt)
+                   else
+                     dump_table_rows
+                       ?mode:read_mode
+                       ~check_not_null:(not data_only)
+                       t
+                       meta
+                       ~stmt)
                 tables
             in
             (* #319: FTS virtual tables — [CREATE VIRTUAL TABLE] (unless

@@ -402,9 +402,34 @@ val add_column
   -> column:Granary_encoding.Row.column
   -> (unit, string) result Lwt.t
 
+(** [rewrite_ident_in_sql ~old_name ~new_name sql] renames every reference to
+    the identifier [old_name] inside stored SQL text — a CHECK or GENERATED
+    expression, a partial index's WHERE clause, an expression index's column SQL.
+
+    #553: lexical rather than parse-and-reprint, because the catalog sits below
+    the parser in the dependency graph and because a reprint would rewrite text
+    the user wrote that has no need to change. Renamed: a bare identifier, and a
+    double-quoted or backtick-delimited one, whose body matches. Left alone:
+    anything inside a string literal, and — bare or delimited alike — any
+    identifier immediately followed by ['('] (a function name), by ['\''] (the
+    [x'..'] blob-literal prefix) or by ['.'] (a qualifier — a table, not a
+    column). Matching is case-sensitive, as every other column lookup in this
+    module is. Every byte it does not rename is preserved exactly.
+
+    Note that a column whose name needs quoting cannot currently reach this
+    function at all: {!Granary_sql.Ast.expr_to_sql} emits identifiers unquoted,
+    so such a column already poisons its own CHECK / GENERATED expression at
+    CREATE time, with no ALTER involved (#572). *)
+val rewrite_ident_in_sql : old_name:string -> new_name:string -> string -> string
+
 (** Rename a table.
     Updates _sys_tables, re-keys all _sys_columns entries, and refreshes the
     in-memory cache and any index entries that reference the old table name.
+
+    #553: also moves the table's primary FOREIGN KEY record, which is keyed by
+    the table name (left behind, the constraints load as absent on the next
+    open), and re-points any child table whose [fk_parent_table] named it.
+
     Returns [Error msg] if [old_name] does not exist or [new_name] already exists.
 
     [?txn] (#282): as for [add_column]. *)
@@ -417,6 +442,17 @@ val rename_table
 
 (** Rename a column within a table.
     Updates the _sys_columns entry and refreshes the in-memory cache.
+
+    #553: also remaps every OTHER stored reference to the column, in the same
+    transaction and under the same schema-cache undo — an index's [idx_columns]
+    (plain, and expression columns through {!rewrite_ident_in_sql}), a partial
+    index's [idx_where_sql], the CHECK and GENERATED expressions of every column
+    of the table, this table's [fk_local_cols], and the [fk_parent_cols] of any
+    other table referencing it. Leaving any of them behind leaves the catalog
+    naming a column the table does not have; for the implicit PRIMARY KEY index
+    that is a [Db.dump] which will not restore, since #533 made the DDL renderer
+    read that index as the record of the table's key.
+
     Returns [Error msg] if the table or column does not exist.
 
     [?txn] (#282): as for [add_column]. *)

@@ -558,21 +558,25 @@ let drop_plain_column_leaves_the_key_alone () =
     | Ok () -> Alcotest.fail "surviving composite key stopped enforcing")
 ;;
 
-(* B. [RENAME COLUMN] does not update [idx_columns], so the implicit PK index
-   outlives the name it was built on.  Trusting a stale index rendered
+(* B. [RENAME COLUMN] used not to update [idx_columns], so the implicit PK index
+   outlived the name it was built on.  Trusting a stale index rendered
    [PRIMARY KEY (k, j)] inside the CREATE TABLE for a table with no [j] — so the
    TABLE failed to restore and took all its rows with it, where before only the
-   CREATE INDEX failed.  A stale key now falls back to emitting no key at all.
+   CREATE INDEX failed.  #533 added a fallback that emits no key at all when the
+   index is stale; #553 then fixed the staleness itself, so the key now survives
+   the rename intact and there is nothing for the fallback to catch.
 
-   The underlying catalog corruption is #553; this pins the blast radius. *)
+   This pins the fixed shape.  The fallback is pinned separately, against a
+   catalog made stale directly (a file written by a pre-#553 build still has
+   one), by [stale_pk_index_still_renders_valid_ddl]. *)
 let rename_composite_pk_member_still_renders_valid_ddl () =
   with_db (fun db ->
     exec db "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
     exec db "INSERT INTO c VALUES ('a', 'b', 1)";
     exec db "ALTER TABLE c RENAME COLUMN j TO jj";
     Alcotest.(check string)
-      "no key naming a column that does not exist, and no spurious inline key"
-      "CREATE TABLE c (k TEXT NOT NULL, jj TEXT NOT NULL, v INTEGER)"
+      "the key follows the rename instead of being dropped"
+      "CREATE TABLE c (k TEXT NOT NULL, jj TEXT NOT NULL, v INTEGER, PRIMARY KEY (k, jj))"
       (ddl_of db "c"))
 ;;
 
@@ -584,13 +588,14 @@ let rename_composite_pk_member_dump_keeps_the_rows () =
   exec src "ALTER TABLE c RENAME COLUMN j TO jj";
   let script = dump_of src in
   run (Db.close src);
-  (* The stale CREATE UNIQUE INDEX still fails — that is the pre-existing bug,
-     unchanged.  What must hold is that the table and both rows survive it. *)
+  (* #553: every statement of the script must now replay cleanly — before, the
+     stale CREATE UNIQUE INDEX failed and the assertion was only that the rows
+     survived it. *)
   let dst = run (Db.open_in_memory ()) in
   List.iter
     (fun stmt ->
        let s = String.trim stmt in
-       if s <> "" then ignore (run (Db.execute dst s)))
+       if s <> "" then exec dst s)
     (String.split_on_char ';' script);
   Fun.protect
     ~finally:(fun () ->
@@ -599,8 +604,9 @@ let rename_composite_pk_member_dump_keeps_the_rows () =
     (fun () ->
        Alcotest.(check int) "both rows restored" 2 (count dst "SELECT * FROM c");
        Alcotest.(check string)
-         "table restored with the renamed column"
-         "CREATE TABLE c (k TEXT NOT NULL, jj TEXT NOT NULL, v INTEGER)"
+         "table restored with the renamed column AND its key"
+         "CREATE TABLE c (k TEXT NOT NULL, jj TEXT NOT NULL, v INTEGER, PRIMARY KEY (k, \
+          jj))"
          (ddl_of dst "c"))
 ;;
 
@@ -692,6 +698,82 @@ let with_legacy_db f =
            try run (Db.close db) with
            | _ -> ())
          (fun () -> f db))
+;;
+
+(* A catalog whose `Implicit_pk index names a column the table does not have —
+   exactly what a pre-#553 build left behind on every [RENAME COLUMN] of a key
+   column.  #553 stops new ones being created, but existing FILES still carry
+   them, so #533's fallback (render no key rather than a key naming a dead
+   column) is still load-bearing and is pinned here directly, against a stale
+   catalog built through the catalog API rather than an ALTER that no longer
+   produces one. *)
+let write_stale_pk_index_db path =
+  run
+    (let open Lwt.Syntax in
+     let* store =
+       let* r = Granary_unix.Store.open_file ~path () in
+       match r with
+       | Ok s -> Lwt.return s
+       | Error _ -> Alcotest.failf "cannot create %s" path
+     in
+     let* cat = Cat.open_ store in
+     let* _tid =
+       Cat.create_table
+         cat
+         ~name:"c"
+         ~columns:(List.map legacy_col [ "k"; "j"; "v" ])
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let* r =
+       Cat.create_index
+         cat
+         ~name:"__pk_c_k_j_0"
+         ~table:"c"
+         ~columns:[ "k"; "j" ]
+         ~unique:true
+         ~expr_flags:[ false; false ]
+         ~where_sql:None
+         ~origin:`Implicit_pk
+     in
+     let* () =
+       match r with
+       | Ok _ -> Lwt.return_unit
+       | Error m -> Alcotest.failf "create_index: %s" m
+     in
+     (* [Cat.drop_column] rewrites the columns and nothing else — the same
+        one-sided update [rename_column] used to do — so the index is left
+        naming a column the table no longer has.  [Cat.create_index] validates
+        its columns, so this is the only way to build the shape. *)
+     let* r = Cat.drop_column cat ~table_name:"c" ~col_name:"j" in
+     match r with
+     | Ok () -> Granary_store.Store.close store
+     | Error m -> Alcotest.failf "drop_column: %s" m)
+;;
+
+let stale_pk_index_still_renders_valid_ddl () =
+  let path = Filename.temp_file "granary_553_stale_" ".db" in
+  Sys.remove path;
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       write_stale_pk_index_db path;
+       let db =
+         match run (Granary_unix.open_file ~path ()) with
+         | Ok db -> db
+         | Error e -> Alcotest.failf "reopen %s: %a" path Db.pp_error e
+       in
+       Fun.protect
+         ~finally:(fun () ->
+           try run (Db.close db) with
+           | _ -> ())
+         (fun () ->
+            Alcotest.(check string)
+              "no key naming a column that does not exist, and no spurious inline key"
+              "CREATE TABLE c (k INTEGER NOT NULL, v INTEGER)"
+              (ddl_of db "c")))
 ;;
 
 (* The flags themselves: reopening re-derives both from the PK index. *)
@@ -949,6 +1031,10 @@ let () =
             "RENAME COLUMN dump keeps the rows"
             `Quick
             rename_composite_pk_member_dump_keeps_the_rows
+        ; Alcotest.test_case
+            "a stale PK index still renders valid DDL"
+            `Quick
+            stale_pk_index_still_renders_valid_ddl
         ] )
     ; ( "pre-existing databases"
       , [ Alcotest.test_case
