@@ -1138,13 +1138,22 @@ let decode_index_value bytes =
   let n_cols, off = Varint.decode_uint64 bytes off in
   let n_cols = Int64.to_int n_cols in
   let off = ref off in
-  let cols =
-    List.init n_cols (fun _ ->
+  (* #484: explicit recursion rather than [List.init].  Each element consumes
+     bytes from [off], so the decoded list's contents depend on the order the
+     elements are built in.  [List.init] is documented "evaluated left to
+     right" on the toolchain this project pins, but stating the order here
+     keeps the decode structural rather than inherited from a stdlib
+     guarantee. *)
+  let rec decode_cols remaining acc =
+    if remaining <= 0
+    then List.rev acc
+    else (
       let col_len, next_off = Varint.decode_uint64 bytes !off in
       let col = Bytes.sub_string bytes next_off (Int64.to_int col_len) in
       off := next_off + Int64.to_int col_len;
-      col)
+      decode_cols (remaining - 1) (col :: acc))
   in
+  let cols = decode_cols n_cols [] in
   let unique_byte = Bytes.get_uint8 bytes !off in
   let tree_id, off2 = Varint.decode_uint64 bytes (!off + 1) in
   let idx_expr_flags, idx_where_sql, idx_origin =
@@ -1648,14 +1657,23 @@ let decode_mirror_entry bytes : table_meta * int64 =
   let off = ref (off + 8) in
   let ncols, o = Varint.decode_uint64 bytes !off in
   off := o;
-  let columns =
-    List.init (Int64.to_int ncols) (fun _ ->
+  (* #484: explicit recursion rather than [List.init].  Each element consumes
+     bytes from [off], so the decoded list's contents depend on the order the
+     elements are built in.  [List.init] is documented "evaluated left to
+     right" on the toolchain this project pins, but stating the order here
+     keeps the decode structural rather than inherited from a stdlib
+     guarantee. *)
+  let rec decode_columns remaining acc =
+    if remaining <= 0
+    then List.rev acc
+    else (
       let clen, o = Varint.decode_uint64 bytes !off in
       let clen = Int64.to_int clen in
       let col = decode_column (Bytes.sub bytes o clen) in
       off := o + clen;
-      col)
+      decode_columns (remaining - 1) (col :: acc))
   in
+  let columns = decode_columns (Int64.to_int ncols) [] in
   let fklen, o = Varint.decode_uint64 bytes !off in
   let fkb = Bytes.sub bytes o (Int64.to_int fklen) in
   let fk_constraints = decode_fks fkb in
