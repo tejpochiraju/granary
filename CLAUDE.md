@@ -502,23 +502,50 @@ Two rules make the sharing correct and must survive any future edit:
   overwrite a counter that is already live. A worker re-reads the catalog off
   disk, and disk is never fresher than the running allocator; clobbering would
   reintroduce the same collision with the roles exchanged, making the **parent**
-  go stale. **One deliberate exception (#633):** an entry still at
-  `empty_next_rowid` has never allocated and carries no information (it means
-  "the next allocation is 1"), so seeding *does* overwrite that one — it can only
-  move the counter up, never into a collision. Without it, now that a second
-  `Cat.open_` over a live store shares the table, `recover_next_rowid`'s
-  mirror-recovery result would be invisible behind a sentinel published by the
-  original `CREATE`.
-- **An allocation is published only once it has committed (#632).**
-  `Catalog.next_rowid` — the autocommit allocator — used to publish the bumped
-  counter *before* `S.rw_begin`. Since the table is store-wide, that window made
-  an allocation visible to every other handle while it had not happened: another
-  handle could take the writer lock, `ROLLBACK`, and *lower* the counter through
-  #293's recompute, handing the same rowid out twice. It now takes the lock
-  first, does the whole read-modify-write under it, and publishes after the
-  commit. That is also what makes the shared table safe in general: **every**
-  allocator runs with the writer lock held, so the interval between an
-  allocation and its publish is an interval in which nothing else can allocate.
+  go stale. **The rule is absolute: an entry that exists is never overwritten,
+  whatever its value.** PR #650 briefly carved out an exception for
+  `empty_next_rowid` ("a sentinel has never allocated, so seeding over it can
+  only move the counter up") and it was wrong twice over — the sentinel is *also*
+  written deliberately by the sqlite_sequence reset paths
+  (`reset_next_rowid_in_txn`, `reset_all_next_rowid_in_txn`) *inside* an open
+  transaction, so a concurrent `open_` would clobber the reset with the committed
+  pre-reset high-water; and the obvious guard (skip tables dirty in
+  `rowid_bumped`) does not work, because `rowid_bumped` is **per-cache** — the
+  resetting transaction's flag lives on its own cache and the seeding cache is a
+  brand-new one whose set is empty. There is no cheap store-wide discriminator,
+  so there is no exception.
+
+  **A test that wants a genuine restart must close a file-backed store**, not
+  re-open a catalog over a live one: since #633 the latter is a worker handle and
+  correctly shares the counter. `test_mirror_recovers_next_rowid` and
+  `test_mirror_recovers_negative_next_rowid` in `test_catalog.ml` were converted
+  for exactly this reason.
+- **Every allocator allocates *and publishes* with the writer lock held (#632).**
+  That — not the weaker "the allocator holds the lock" — is the property that
+  makes the shared table safe, because it is what makes the interval between
+  reading the counter and publishing the new one an interval in which nothing
+  else can allocate. `next_rowid_in_txn` and `bump_next_rowid_in_txn` have it by
+  construction (they are handed a txn). `Catalog.next_rowid`, the autocommit
+  allocator, used to publish *before* `S.rw_begin`: another handle could take
+  the lock, `ROLLBACK`, and *lower* the counter through #293's recompute,
+  discarding an allocation already handed out. It now takes the lock first and
+  publishes immediately after the allocation, with no `Lwt` yield in between.
+
+  **`S.commit` does not count as "under the lock", and this is the trap to
+  know.** It releases the writer lock *before* its promise resolves —
+  `commit_wal` calls `unlock_once ()` (`store.ml:2071`) and only then awaits the
+  fsync; the non-WAL arm releases from a `Lwt.finalize` handler
+  (`store.ml:2184`). So publishing in a `let%lwt () = S.commit tx in …`
+  continuation runs *after* other fibers can take the lock, leaving the shared
+  counter too LOW for the whole fsync — the direction that collides. (Too HIGH
+  merely skips ids, and is the residual this design accepts if a commit fails.)
+  PR #650 shipped that ordering for one round before review caught it.
+  **The in-memory backend cannot detect the difference** — its commit releases
+  and returns an already-resolved promise (`store.ml:2164`), so the bind runs
+  synchronously and both orderings pass. Any test for this class of bug must be
+  **WAL-mode and on disk**; `wal_two_fiber_catalog_next_rowid` and
+  `wal_two_fiber_inserts` in `test/test_rowid_counter_ownership_632.ml` are.
+
   The unknown-table `Failure` stays *synchronous* (raised before any `Lwt.t`
   exists) — `test_rowid_unknown_table` in `test_catalog.ml` pins the contract.
 

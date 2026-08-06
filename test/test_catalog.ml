@@ -2133,43 +2133,78 @@ let test_mirror_reflects_add_column () =
      Lwt.return_unit)
 ;;
 
+(* #633: these two mirror-recovery tests need a GENUINE restart, not a second
+   [C.open_] over a still-live store.  The rowid allocator now belongs to
+   [Store.t], so re-opening a catalog over a live store shares the counter the
+   first catalog published at CREATE (the [empty_next_rowid] sentinel) and the
+   recovered value never becomes visible — which is correct behaviour for a
+   worker handle, and simply not what "reopen" means here.  A file-backed store
+   that is closed and reopened gives a new [Store.t], a new counter table, and
+   therefore the real recovery path.
+
+   [mirror_path] mirrors the existing file-backed helpers in this file; the pid
+   suffix follows the repo convention (sibling worktrees run suites at once). *)
+let mirror_path name =
+  Printf.sprintf "/tmp/granary_catalog_mirror_%s_%d.db" name (Unix.getpid ())
+;;
+
+let with_mirror_file name f =
+  let path = mirror_path name in
+  (try Unix.unlink path with
+   | _ -> ());
+  Fun.protect
+    ~finally:(fun () ->
+      try Unix.unlink path with
+      | _ -> ())
+    (fun () -> run (f path))
+;;
+
+let open_store_file path =
+  let* sr = S.open_file ~path () in
+  match sr with
+  | Ok s -> Lwt.return s
+  | Error e -> Alcotest.failf "open_file: %a" S.pp_error e
+;;
+
 (* #175: when a table is reconstructed from the mirror, the next_rowid
    counter must be recovered from existing data rows so auto-allocated
    rowids don't collide. *)
 let test_mirror_recovers_next_rowid () =
-  run
-    (let store = S.create () in
-     let* cat = C.open_ store in
-     let* tid =
-       C.create_table
-         cat
-         ~name:"t"
-         ~columns:[ int_col "id" ]
-         ~without_rowid:false
-         ~autoincrement:false
-     in
-     (* Insert three rows with rowids 1, 7, and 42 into the data tree. *)
-     let* tx = S.rw_begin store in
-     let* () = S.put tx tid (Rowid.encode 1L) (Bytes.of_string "row1") in
-     let* () = S.put tx tid (Rowid.encode 7L) (Bytes.of_string "row7") in
-     let* () = S.put tx tid (Rowid.encode 42L) (Bytes.of_string "row42") in
-     let* () = S.commit tx in
-     (* Delete the primary _sys_tables row to force mirror recovery. *)
-     let* tx = S.rw_begin store in
-     let* () = S.del tx 0 (Bytes.of_string "t") in
-     let* () = S.commit tx in
-     (* Reopen — the table is recovered from the mirror, and #175
-        recovers next_rowid = max(1,7,42) + 1 = 43. *)
-     let* cat2 = C.open_ store in
-     (match C.find_table_cached cat2 ~name:"t" with
-      | None -> Alcotest.fail "table t should be recovered from mirror"
-      | Some m ->
-        let _, nrid_rec, _, _ = C.row_storage m in
-        Alcotest.(check int64) "recovered next_rowid is max+1" 43L nrid_rec);
-     (* Allocate one more rowid — should yield 43, not 1. *)
-     let* r = C.next_rowid cat2 ~name:"t" in
-     Alcotest.(check int64) "next allocated rowid is 43" 43L r;
-     Lwt.return_unit)
+  with_mirror_file "recover" (fun path ->
+    let* store = open_store_file path in
+    let* cat = C.open_ store in
+    let* tid =
+      C.create_table
+        cat
+        ~name:"t"
+        ~columns:[ int_col "id" ]
+        ~without_rowid:false
+        ~autoincrement:false
+    in
+    (* Insert three rows with rowids 1, 7, and 42 into the data tree. *)
+    let* tx = S.rw_begin store in
+    let* () = S.put tx tid (Rowid.encode 1L) (Bytes.of_string "row1") in
+    let* () = S.put tx tid (Rowid.encode 7L) (Bytes.of_string "row7") in
+    let* () = S.put tx tid (Rowid.encode 42L) (Bytes.of_string "row42") in
+    let* () = S.commit tx in
+    (* Delete the primary _sys_tables row to force mirror recovery. *)
+    let* tx = S.rw_begin store in
+    let* () = S.del tx 0 (Bytes.of_string "t") in
+    let* () = S.commit tx in
+    (* A real restart: close the store, so the shared rowid counters go with
+       it, then reopen.  #175 recovers next_rowid = max(1,7,42) + 1 = 43. *)
+    let* () = S.close store in
+    let* store2 = open_store_file path in
+    let* cat2 = C.open_ store2 in
+    (match C.find_table_cached cat2 ~name:"t" with
+     | None -> Alcotest.fail "table t should be recovered from mirror"
+     | Some m ->
+       let _, nrid_rec, _, _ = C.row_storage m in
+       Alcotest.(check int64) "recovered next_rowid is max+1" 43L nrid_rec);
+    (* Allocate one more rowid — should yield 43, not 1. *)
+    let* r = C.next_rowid cat2 ~name:"t" in
+    Alcotest.(check int64) "next allocated rowid is 43" 43L r;
+    S.close store2)
 ;;
 
 (* #250: mirror recovery must track the literal max rowid, including when the
@@ -2177,33 +2212,35 @@ let test_mirror_recovers_next_rowid () =
    next auto-allocated rowid is -2, matching SQLite and the in-session path (not
    the old [1L] clamp). *)
 let test_mirror_recovers_negative_next_rowid () =
-  run
-    (let store = S.create () in
-     let* cat = C.open_ store in
-     let* tid =
-       C.create_table
-         cat
-         ~name:"t"
-         ~columns:[ int_col "id" ]
-         ~without_rowid:false
-         ~autoincrement:false
-     in
-     let* tx = S.rw_begin store in
-     let* () = S.put tx tid (Rowid.encode (-5L)) (Bytes.of_string "row-5") in
-     let* () = S.put tx tid (Rowid.encode (-3L)) (Bytes.of_string "row-3") in
-     let* () = S.commit tx in
-     let* tx = S.rw_begin store in
-     let* () = S.del tx 0 (Bytes.of_string "t") in
-     let* () = S.commit tx in
-     let* cat2 = C.open_ store in
-     (match C.find_table_cached cat2 ~name:"t" with
-      | None -> Alcotest.fail "table t should be recovered from mirror"
-      | Some m ->
-        let _, nrid_rec2, _, _ = C.row_storage m in
-        Alcotest.(check int64) "recovered next_rowid is max(-5,-3)+1 = -2" (-2L) nrid_rec2);
-     let* r = C.next_rowid cat2 ~name:"t" in
-     Alcotest.(check int64) "next allocated rowid is -2, not 1" (-2L) r;
-     Lwt.return_unit)
+  with_mirror_file "negative" (fun path ->
+    let* store = open_store_file path in
+    let* cat = C.open_ store in
+    let* tid =
+      C.create_table
+        cat
+        ~name:"t"
+        ~columns:[ int_col "id" ]
+        ~without_rowid:false
+        ~autoincrement:false
+    in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx tid (Rowid.encode (-5L)) (Bytes.of_string "row-5") in
+    let* () = S.put tx tid (Rowid.encode (-3L)) (Bytes.of_string "row-3") in
+    let* () = S.commit tx in
+    let* tx = S.rw_begin store in
+    let* () = S.del tx 0 (Bytes.of_string "t") in
+    let* () = S.commit tx in
+    let* () = S.close store in
+    let* store2 = open_store_file path in
+    let* cat2 = C.open_ store2 in
+    (match C.find_table_cached cat2 ~name:"t" with
+     | None -> Alcotest.fail "table t should be recovered from mirror"
+     | Some m ->
+       let _, nrid_rec2, _, _ = C.row_storage m in
+       Alcotest.(check int64) "recovered next_rowid is max(-5,-3)+1 = -2" (-2L) nrid_rec2);
+    let* r = C.next_rowid cat2 ~name:"t" in
+    Alcotest.(check int64) "next allocated rowid is -2, not 1" (-2L) r;
+    S.close store2)
 ;;
 
 (* #250: mirror recovery of a table with NO data rows leaves the counter at the

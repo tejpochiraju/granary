@@ -206,9 +206,10 @@ module Schema_cache : sig
   (** #589: open-time seeding ONLY.  Identical to [put_table_durable] except that
       it does not overwrite a shared rowid counter that is already live — a
       worker handle re-reads the catalog off disk, and disk is by definition no
-      fresher than the counter the sharing handles are already using.  A counter
-      still sitting at [empty_next_rowid] is NOT live (nothing has ever been
-      allocated from it) and is seeded over; see [publish_if_absent]. *)
+      fresher than the counter the sharing handles are already using.  The rule
+      is absolute — an existing entry is never overwritten, whatever its value;
+      see [publish_if_absent] for why the [empty_next_rowid] exception that PR
+      #650 briefly carried had to go. *)
   val seed_table : t -> name:string -> table_meta -> unit
 
   val remove_table_durable : t -> name:string -> unit
@@ -320,13 +321,23 @@ end = struct
 
      Sharing is safe under the store's single-writer lock, which is what makes
      the two handles serialize.  The direction of staleness that costs rows is a
-     counter too LOW, and it cannot be observed: EVERY allocator runs with the
-     writer lock held ([next_rowid_in_txn] and [bump_next_rowid_in_txn] by
-     construction, [next_rowid] since #632), so the interval between an
-     allocation and its publish is an interval in which no other fiber can
-     allocate.  A ROLLBACK lowers the counter again through [set_rowid_durable]
-     (#293's recompute) and [restore_rowids] (#303's savepoint restore), by which
-     point no other handle can hold the lock either.
+     counter too LOW — that is the one that collides — and what keeps it from
+     being observed is that every allocator both ALLOCATES AND PUBLISHES with the
+     writer lock held: [next_rowid_in_txn] and [bump_next_rowid_in_txn] by
+     construction (they are handed a txn), [next_rowid] since #632.
+
+     Read that as the precise claim it is.  It is NOT "the allocator holds the
+     lock", which would be satisfied by publishing in a continuation of
+     [S.commit] — and would be false, because [S.commit] releases the lock before
+     its promise resolves (store.ml:2071 [unlock_once ()] ahead of the fsync
+     await; store.ml:2184 for the non-WAL arm).  The publish has to happen at a
+     point where the lock is still held, which for [next_rowid] means before
+     [S.commit] is called at all.  Anything that moves a publish past a commit
+     re-opens #589 by way of #632.
+
+     A ROLLBACK lowers the counter again through [set_rowid_durable] (#293's
+     recompute) and [restore_rowids] (#303's savepoint restore), by which point
+     no other handle can hold the lock either.
 
      #633: the table itself is owned by [S.t] ([S.rowid_counters]), not by this
      cache and not by a caller.  It used to be threaded through
@@ -388,22 +399,32 @@ end = struct
   (* Open-time seeding: never overwrite a counter another cache is already
      using — disk is no fresher than the live allocator.
 
-     #633: "already using" means an entry that has actually allocated.  An entry
-     still at [empty_next_rowid] is the never-seeded sentinel: it carries no
-     information at all (it means "the next allocation is 1"), so seeding over it
-     from disk can only move the counter UP, never into a collision.  This
-     matters now that the counters live on [S.t]: a second [open_] over a live
-     store shares the table, so without this a table whose rows reached the tree
-     without going through the allocator would keep answering 1 forever. *)
+     THE RULE IS ABSOLUTE: an entry that exists is never overwritten, whatever
+     its value.  PR #650 briefly carved out an exception for [empty_next_rowid]
+     ("a sentinel has never allocated, so seeding over it can only move the
+     counter up"), and it was wrong twice over.  The sentinel is ALSO written on
+     purpose: the sqlite_sequence reset paths ([reset_next_rowid_in_txn] for
+     [DELETE FROM sqlite_sequence WHERE name = 't'], [reset_all_next_rowid_in_txn]
+     for the bare DELETE) set it INSIDE an open transaction, so an [open_] landing
+     on the same store mid-transaction would read the committed pre-reset
+     high-water off disk and clobber the reset — AUTOINCREMENT then resumes from
+     the old value once the reset commits.  And the obvious guard against that
+     (skip tables marked dirty in [rowid_bumped]) does not work, because
+     [rowid_bumped] is PER-CACHE: the resetting transaction's dirty flag lives on
+     its own cache, and the cache doing the seeding is a brand-new one whose set
+     is empty.  There is no cheap store-wide discriminator, so there is no
+     exception.
+
+     The exception existed only to let a test simulate a process restart by
+     re-opening a catalog over a still-live store.  Since #633 that is not a
+     restart — it is a worker handle, and sharing is the correct answer.  A test
+     that wants a genuine restart uses a file-backed store and closes it (see
+     [test_mirror_recovers_next_rowid] in test_catalog.ml). *)
   let publish_if_absent t (m : table_meta) =
     match m.storage with
     | Row { tree_id; next_rowid; _ } when tree_id >= 0 ->
-      let unseeded =
-        match Hashtbl.find_opt t.counters tree_id with
-        | None -> true
-        | Some n -> Int64.equal n empty_next_rowid
-      in
-      if unseeded then Hashtbl.replace t.counters tree_id next_rowid
+      if not (Hashtbl.mem t.counters tree_id)
+      then Hashtbl.replace t.counters tree_id next_rowid
     | Row _ | Columnar _ -> ()
   ;;
 
@@ -2378,12 +2399,29 @@ let alloc_rowid (next_rowid : int64) : int64 * int64 =
      never landed.
 
    Same shape as #223 (a WAL counter lost-update found by Jepsen): a read-modify-
-   write straddling a lock acquisition.  The fix is to do the whole thing under
-   the writer lock and publish only once the commit has succeeded — the order
-   [create_index]'s autocommit branch already uses.  Taking the lock first is
-   also what preserves the property the old comment was defending: two concurrent
-   autocommit callers now serialize on [rw_begin] and the second reads the first's
-   published counter, where before both could read the same stale value.
+   write straddling a lock acquisition.  The fix is to take the lock FIRST and do
+   the entire read-modify-write under it.
+
+   PUBLISHING AFTER [S.commit] WOULD NOT BE UNDER THE LOCK, and is the trap this
+   function fell into once (PR #650 review).  [S.commit] releases the writer lock
+   BEFORE its promise resolves: [commit_wal] calls [unlock_once ()]
+   (store.ml:2071) and only then awaits [group_commit_sync]'s fsync, and the
+   non-WAL btree arm releases from a [Lwt.finalize] handler (store.ml:2184).  So
+   a continuation bound with [let%lwt () = S.commit tx in ...] runs after other
+   fibers have had the chance to take the lock and read the counter.  Publishing
+   there leaves the shared counter too LOW for the whole duration of the fsync —
+   another fiber's [next_rowid_in_txn] reads the stale value and allocates the
+   same id, which is #589's symptom.  Too LOW is the dangerous direction; too
+   HIGH only skips ids.  (The in-memory backend hides this completely — its
+   commit releases and returns an already-resolved promise, store.ml:2164 — so
+   an in-memory test cannot tell the two orderings apart.  That is why
+   [wal_two_fiber_*] in test_rowid_counter_ownership_632.ml are WAL-mode.)
+
+   So the publish sits immediately after the allocation: still under the lock,
+   and with no Lwt yield point at all between reading the counter and writing it
+   back, which makes the read-modify-write atomic against other fibers on both
+   counts.  The residual is "the commit fails => the counter is too high", the
+   safe direction, and exactly what the pre-#632 code already lived with.
 
    The unknown-table check stays SYNCHRONOUS (it raises before any [Lwt.t] is
    constructed) because that is the documented behaviour and [test_catalog]'s
@@ -2406,11 +2444,11 @@ let next_rowid t ~name =
         storage = Row { tree_id; next_rowid = next; without_rowid; autoincrement }
       }
     in
+    (* #632: publish HERE — under the writer lock, and with no yield between the
+       read and the write.  Not after [S.commit]; see the note above. *)
+    Schema_cache.set_rowid_durable t.sc ~name m';
     let%lwt () = put_table_counter_tx tx m' in
     let%lwt () = S.commit tx in
-    (* #632: publish only now — the allocation is durable, so the shared counter
-       can never run ahead of what committed. *)
-    Schema_cache.set_rowid_durable t.sc ~name m';
     Lwt.return id
 ;;
 

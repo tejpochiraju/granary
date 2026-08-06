@@ -20,8 +20,11 @@
     that window the allocation was visible to every other handle while not
     having happened: another handle could take the lock, ROLLBACK, and lower the
     counter through #293's recompute, handing the same rowid out twice. It now
-    does the whole read-modify-write under the lock and publishes only after the
-    commit succeeds.
+    takes the lock first and publishes immediately after the allocation, with no
+    Lwt yield in between — NOT after [S.commit], which releases the writer lock
+    before its promise resolves and would leave the counter too low for the whole
+    fsync. Only the WAL cases at the bottom of this file can observe that
+    difference; the in-memory backend runs the commit continuation synchronously.
 
     What every test here must keep true (see CLAUDE.md):
     - counters keyed by TREE ID, not by table name;
@@ -34,16 +37,37 @@ open Lwt.Syntax
 module Store = Granary_store.Store
 module Cat = Granary_catalog.Catalog
 module Row = Granary_encoding.Row
+module Ustore = Granary_unix.Store
 
 module Db = struct
   include Granary.Db
 
   let open_file = Granary_unix.open_file
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 let () = Granary_unix.install ()
 let run = Lwt_main.run
 let fresh_db () = run (Db.open_in_memory ())
+
+(* Sibling worktrees run suites concurrently, so every path carries the pid —
+   the convention in test_concurrent_rmw_223.ml and test_attach.ml. *)
+let tmp_path name =
+  Printf.sprintf "/tmp/granary_rowid_owner_632_%s_%d.db" name (Unix.getpid ())
+;;
+
+let with_tmp_path name f =
+  let path = tmp_path name in
+  let cleanup () =
+    List.iter
+      (fun p ->
+         try Unix.unlink p with
+         | _ -> ())
+      [ path; path ^ "-wal"; path ^ ".aslog" ]
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () -> f path)
+;;
 
 let exec db sql =
   match run (Db.execute db sql) with
@@ -376,10 +400,13 @@ let test_sentinel_tables_do_not_disturb_counters () =
    [Cat.open_] used [put_table_durable] instead of [seed_table] here, the
    PARENT would go stale and reuse rowid 1.
 
-   Note the deliberate exception (#633): a counter still at [empty_next_rowid]
-   has never allocated and carries no information, so seeding DOES overwrite
-   that one — which is what keeps mirror recovery working now that a second
-   [open_] shares the table. *)
+   The rule is absolute — an entry that exists is never overwritten, whatever
+   its value. PR #650 briefly excepted [empty_next_rowid]; that is reverted,
+   because the sqlite_sequence reset paths write the sentinel DELIBERATELY
+   inside an open transaction and no per-cache flag can tell the two apart. A
+   test wanting a genuine restart closes a file-backed store instead — see
+   [test_close_reopen_recovers_from_the_tree] and test_catalog.ml's converted
+   mirror-recovery pair. *)
 let test_open_does_not_clobber_a_live_counter () =
   let store = Store.create () in
   let db1 = run (Db.of_store store) in
@@ -400,32 +427,134 @@ let test_open_does_not_clobber_a_live_counter () =
    close/reopen does, where the [Store.t] — and therefore the allocator — really
    is new and the counter has to come back from the tree. *)
 let test_close_reopen_recovers_from_the_tree () =
-  let path = "/tmp/granary_rowid_owner_632.db" in
-  (try Unix.unlink path with
-   | _ -> ());
-  let db =
-    match run (Db.open_file ~path ()) with
-    | Ok d -> d
-    | Error _ -> Alcotest.fail "open_file failed"
-  in
-  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
-  let wdb = run (Db.create_worker_handle db) in
-  exec db "INSERT INTO t (b) VALUES ('x')";
-  exec wdb "INSERT INTO t (b) VALUES ('y')";
-  run (Db.close db);
-  let db2 =
-    match run (Db.open_file ~path ()) with
-    | Ok d -> d
-    | Error _ -> Alcotest.fail "reopen failed"
-  in
-  exec db2 "INSERT INTO t (b) VALUES ('z')";
-  check
-    "a fresh store recovers the counter from the tree"
-    [ "1|x"; "2|y"; "3|z" ]
-    (rows db2 "SELECT a, b FROM t ORDER BY a");
-  run (Db.close db2);
-  try Unix.unlink path with
-  | _ -> ()
+  with_tmp_path "reopen" (fun path ->
+    let db =
+      match run (Db.open_file ~path ()) with
+      | Ok d -> d
+      | Error _ -> Alcotest.fail "open_file failed"
+    in
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    let wdb = run (Db.create_worker_handle db) in
+    exec db "INSERT INTO t (b) VALUES ('x')";
+    exec wdb "INSERT INTO t (b) VALUES ('y')";
+    run (Db.close db);
+    let db2 =
+      match run (Db.open_file ~path ()) with
+      | Ok d -> d
+      | Error _ -> Alcotest.fail "reopen failed"
+    in
+    exec db2 "INSERT INTO t (b) VALUES ('z')";
+    check
+      "a fresh store recovers the counter from the tree"
+      [ "1|x"; "2|y"; "3|z" ]
+      (rows db2 "SELECT a, b FROM t ORDER BY a");
+    run (Db.close db2))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* ON DISK, IN WAL MODE — the only place this class of bug is visible   *)
+(* ------------------------------------------------------------------ *)
+
+(* WHY THESE TWO ARE NOT IN-MEMORY.
+
+   Every other test in this file uses [Store.create ()] or [open_in_memory], and
+   the in-memory backend CANNOT distinguish a publish that happens under the
+   writer lock from one that happens after [S.commit]: its commit releases the
+   lock and returns an already-resolved promise (store.ml:2164), so the
+   continuation runs synchronously and no other fiber ever interleaves.
+
+   In WAL mode with the default [Full] durability the two orderings differ.
+   [commit_wal] calls [unlock_once ()] (store.ml:2071) and only THEN awaits the
+   fsync, so a fiber that publishes after [S.commit] does so in a continuation
+   that runs once another fiber has already had the lock — leaving the shared
+   counter too LOW for the whole fsync, which is the direction that collides.
+   PR #650 shipped exactly that ordering for one round; these tests are what
+   would have caught it. *)
+
+(* THE detector for #632: [Catalog.next_rowid] itself, on a WAL store, from two
+   fibers through two catalogs. Every allocation must be distinct — with the
+   publish-after-commit ordering the second fiber reads the counter the first
+   has allocated but not yet published, and both get the same id. *)
+let test_wal_two_fiber_catalog_next_rowid () =
+  with_tmp_path "wal_catalog" (fun path ->
+    run
+      (let* sr = Ustore.open_file_wal ~path () in
+       let store =
+         match sr with
+         | Ok s -> s
+         | Error e -> Alcotest.failf "open_file_wal: %a" Store.pp_error e
+       in
+       let* cat1 = Cat.open_ store in
+       let* _tid =
+         Cat.create_table
+           cat1
+           ~name:"t"
+           ~columns:[ int_col "id" ]
+           ~without_rowid:false
+           ~autoincrement:false
+       in
+       let* cat2 = Cat.open_ store in
+       let n = 25 in
+       let seen = ref [] in
+       let fiber cat =
+         let rec loop i =
+           if i > n
+           then Lwt.return_unit
+           else
+             let* id = Cat.next_rowid cat ~name:"t" in
+             seen := id :: !seen;
+             loop (i + 1)
+         in
+         loop 1
+       in
+       let* () = Lwt.join [ fiber cat1; fiber cat2 ] in
+       let got = List.sort Int64.compare !seen in
+       let expected = List.init (2 * n) (fun i -> Int64.of_int (i + 1)) in
+       Alcotest.(check (list int64))
+         "two fibers, two catalogs, one WAL store: every rowid distinct"
+         expected
+         got;
+       Store.close store))
+;;
+
+(* The same shape through the SQL insert path (which allocates via
+   [next_rowid_in_txn], publishing in-txn and so safe by construction) — a
+   regression guard that the whole allocator stays sound on disk, not just the
+   autocommit entry point. Row count = max rowid is the assertion that matters:
+   any reused rowid makes the count smaller than the max. *)
+let test_wal_two_fiber_inserts () =
+  with_tmp_path "wal_insert" (fun path ->
+    let db =
+      match run (Db.open_file_wal ~path ()) with
+      | Ok d -> d
+      | Error _ -> Alcotest.fail "open_file_wal failed"
+    in
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    let wdb = run (Db.create_worker_handle db) in
+    let n = 25 in
+    run
+      (let fiber h tag =
+         let rec loop i =
+           if i > n
+           then Lwt.return_unit
+           else
+             let* r =
+               Db.execute h (Printf.sprintf "INSERT INTO t (b) VALUES ('%s%d')" tag i)
+             in
+             match r with
+             | Ok () -> loop (i + 1)
+             | Error e -> Alcotest.failf "%s %d: %a" tag i Db.pp_error e
+         in
+         loop 1
+       in
+       Lwt.join [ fiber db "p"; fiber wdb "w" ]);
+    check "every row landed" [ string_of_int (2 * n) ] (rows db "SELECT COUNT(*) FROM t");
+    check "no rowid reused" [ string_of_int (2 * n) ] (rows db "SELECT MAX(a) FROM t");
+    check
+      "no duplicate rowids"
+      []
+      (rows db "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1");
+    run (Db.close db))
 ;;
 
 let () =
@@ -494,6 +623,13 @@ let () =
             "close_reopen_recovers_from_the_tree"
             `Quick
             test_close_reopen_recovers_from_the_tree
+        ] )
+    ; ( "on_disk_wal"
+      , [ Alcotest.test_case
+            "wal_two_fiber_catalog_next_rowid"
+            `Quick
+            test_wal_two_fiber_catalog_next_rowid
+        ; Alcotest.test_case "wal_two_fiber_inserts" `Quick test_wal_two_fiber_inserts
         ] )
     ]
 ;;
