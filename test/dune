@@ -1092,6 +1092,16 @@
  (modules test_agg_subquery_558)
  (libraries granary granary.unix alcotest lwt.unix unix))
 
+; #493: a correlated EXISTS abandoned its inner stream after the first row,
+; leaking one RO snapshot (and its page pins) per outer row; it was also
+; re-planned per outer row and evaluated ahead of the cheap conjuncts beside it.
+; The leak assertions read Store counters, so they need an on-disk database.
+
+(test
+ (name test_correlated_exists_493)
+ (modules test_correlated_exists_493)
+ (libraries granary granary.store granary.unix alcotest lwt.unix unix))
+
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 
 (test

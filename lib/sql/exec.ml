@@ -6630,15 +6630,35 @@ let current_txn_mode () =
   | None -> Auto
 ;;
 
-(* #262: re-establish BOTH per-query Lwt-storage contexts (the stats record and
-   the txn mode) for work that runs at pull time — outside [query]'s
-   construction-time [with_value] scope — currently the correlated-subquery
-   re-eval in [stream_filter] / [stream_expr_project].  Bundling the pair here
-   keeps them in lock-step: a future pull-time site cannot restore one and
-   silently drop the other (the exact omission #262 corrected for the mode). *)
-let with_pull_context ~stats ~mode f =
+(* #493: the per-query plan cache for correlated subqueries, keyed by the inner
+   [Ast.stmt] as it stands AFTER outer-reference substitution.
+
+   It is only sound to install because #493 also changed that substitution to
+   emit a positional PARAMETER for each outer reference rather than the row's
+   literal value: with a literal the substituted statement differed on every
+   outer row, so the table would have grown without bound and never hit.  With a
+   parameter the substituted statement is structurally identical for every row,
+   so one bind+plan serves the whole scan and the table holds one entry per
+   subquery site.
+
+   Anything that reinstates literal substitution at a cached site MUST pass
+   [~cache:None] there, or the cache becomes a per-row memory leak. *)
+type subplan_cache = (Ast.stmt, Plan.op) Hashtbl.t
+
+let subplan_cache_key : subplan_cache Lwt.key = Lwt.new_key ()
+
+(* #262: re-establish the per-query Lwt-storage contexts (the stats record, the
+   txn mode, and #493's subquery plan cache) for work that runs at pull time —
+   outside [query]'s construction-time [with_value] scope — currently the
+   correlated-subquery re-eval in [stream_filter] / [stream_expr_project].
+   Bundling them here keeps them in lock-step: a future pull-time site cannot
+   restore one and silently drop the other (the exact omission #262 corrected
+   for the mode). *)
+let with_pull_context ~stats ~mode ~(cache : subplan_cache option) f =
   Lwt.with_value query_stats_key stats
-  @@ fun () -> Lwt.with_value txn_mode_key (Some mode) f
+  @@ fun () ->
+  Lwt.with_value txn_mode_key (Some mode)
+  @@ fun () -> Lwt.with_value subplan_cache_key cache f
 ;;
 
 (* Increment via the closure-captured option; never calls [Lwt.get] at pull time
@@ -8369,10 +8389,16 @@ let get_outer_scan_metas (op : Plan.op) : (Cat.table_meta * int) list option =
     against one row of the enclosing operator. Both lookups answer [None] when
     the name is not an outer reference, in which case the reference is left
     alone (it belongs to the subquery's own scope, or it is unresolvable and
-    the caller refuses the query). *)
+    the caller refuses the query).
+
+    #493: the two lookups answer an [Ast.expr] rather than a [Row.value],
+    because there are now two ways to pin an outer reference — as the row's
+    literal value ({!binding_of_metas}) or as a positional parameter addressing
+    that row slot ({!param_binding_of_metas}). The substitution walk is shared
+    and does not care which. *)
 type outer_binding =
-  { bind_qual : string -> string -> Row.value option (** [table] then [column] *)
-  ; bind_unqual : string -> Row.value option
+  { bind_qual : string -> string -> Ast.expr option (** [table] then [column] *)
+  ; bind_unqual : string -> Ast.expr option
   }
 
 (** Build an [outer_binding] over a row whose layout is described by
@@ -8381,7 +8407,8 @@ type outer_binding =
 let binding_of_metas (metas : (Cat.table_meta * int) list) (row : Row.t) : outer_binding =
   let at (m : Cat.table_meta) off col =
     match find_col_idx_by_name m.Cat.columns col with
-    | i when off + i < Array.length row -> Some row.(off + i)
+    | i when off + i < Array.length row ->
+      Some (Ast.E_lit (value_to_literal row.(off + i)))
     | _ -> None
     | exception Failure _ -> None
   in
@@ -8400,6 +8427,166 @@ let binding_of_metas (metas : (Cat.table_meta * int) list) (row : Row.t) : outer
         | [ v ] -> Some v
         | _ -> None)
   }
+;;
+
+(** #493: the same binding as {!binding_of_metas}, except each outer reference
+    is pinned as a positional PARAMETER addressing the row slot it came from
+    rather than as that slot's literal value.
+
+    [base] is where the outer row is spliced into the parameter array — the
+    caller runs the subquery with [Array.append params row], so outer row slot
+    [k] is parameter [base + k] (0-based), spelled [Ast.Param_index] which
+    {!Sema.resolve_param} reads 1-based.
+
+    Why this exists: with literals the substituted subquery statement differs on
+    every outer row, so it has to be re-bound and re-planned per row — the whole
+    of #493's cost. With parameters it is structurally identical for every row,
+    which is what makes the {!subplan_cache} hit, and the planner still gets an
+    index seek out of it because {!Planner.recognise_eq_col_lit} accepts a bound
+    parameter on the value side exactly as it accepts a literal (#228's prepared
+    point lookup).
+
+    [row_len] must be the width of the rows being scanned, so that the
+    "is this actually an outer reference?" decision matches the literal
+    binding's bound check exactly. *)
+let param_binding_of_metas
+      ~(base : int)
+      ~(row_len : int)
+      (metas : (Cat.table_meta * int) list)
+  : outer_binding
+  =
+  let at (m : Cat.table_meta) off col =
+    match find_col_idx_by_name m.Cat.columns col with
+    | i when off + i < row_len ->
+      Some (Ast.E_param (Ast.Param_index (base + off + i + 1)))
+    | _ -> None
+    | exception Failure _ -> None
+  in
+  { bind_qual =
+      (fun tbl col ->
+        match
+          List.find_opt
+            (fun ((m : Cat.table_meta), _) -> String.equal m.Cat.name tbl)
+            metas
+        with
+        | None -> None
+        | Some (m, off) -> at m off col)
+  ; bind_unqual =
+      (fun col ->
+        match List.filter_map (fun (m, off) -> at m off col) metas with
+        | [ v ] -> Some v
+        | _ -> None)
+  }
+;;
+
+(** #493: does [e] mention a bound parameter anywhere, including inside a nested
+    subquery?
+
+    The parameter substitution above splices the outer row in at [base =
+    Array.length params], which is safe only while the inner statement has no
+    parameters of its own: {!Sema.resolve_param} numbers an inner statement's
+    placeholders from 0 with a fresh counter, and an explicit [Param_index] also
+    {i advances} that counter, so a subquery that mixes its own [?] with the
+    injected ones could have a placeholder land on a row slot. Rather than
+    reason about encounter order, the caller falls back to the pre-#493
+    literal-substitution path whenever this answers [true]. *)
+let rec ast_expr_uses_param : Ast.expr -> bool = function
+  | Ast.E_param _ -> true
+  | Ast.E_binop (_, a, b) -> ast_expr_uses_param a || ast_expr_uses_param b
+  | Ast.E_not a
+  | Ast.E_is_null a
+  | Ast.E_is_not_null a
+  | Ast.E_neg a
+  | Ast.E_bitnot a
+  | Ast.E_collate (a, _)
+  | Ast.E_cast (a, _) -> ast_expr_uses_param a
+  | Ast.E_between (x, lo, hi) ->
+    ast_expr_uses_param x || ast_expr_uses_param lo || ast_expr_uses_param hi
+  | Ast.E_in (x, vs) -> ast_expr_uses_param x || List.exists ast_expr_uses_param vs
+  | Ast.E_agg (_, a) -> Option.fold ~none:false ~some:ast_expr_uses_param a
+  | Ast.E_func (_, args) -> List.exists ast_expr_uses_param args
+  | Ast.E_subquery s | Ast.E_exists s -> ast_stmt_uses_param s
+  | Ast.E_in_select (x, s) -> ast_expr_uses_param x || ast_stmt_uses_param s
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:false ~some:ast_expr_uses_param scrutinee
+    || List.exists (fun (c, r) -> ast_expr_uses_param c || ast_expr_uses_param r) branches
+    || Option.fold ~none:false ~some:ast_expr_uses_param else_
+  | Ast.E_window { args; window; _ } ->
+    List.exists ast_expr_uses_param args
+    || List.exists ast_expr_uses_param window.Ast.partition_by
+    || List.exists
+         (fun (k : Ast.order_key) -> ast_expr_uses_param k.Ast.expr)
+         window.Ast.order_by
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_match _ | Ast.E_fts_snippet _ ->
+    false
+
+(** #493: the statement-level half of {!ast_expr_uses_param}. Anything that is
+    not a SELECT-shaped statement answers [true] — conservatively refusing the
+    parameterized path rather than enumerating write-statement shapes that
+    cannot appear in a subquery position anyway. *)
+and ast_stmt_uses_param : Ast.stmt -> bool = function
+  | Ast.S_select r ->
+    (match r.proj with
+     | `All | `Cols _ -> false
+     | `Exprs es -> List.exists (fun (e, _) -> ast_expr_uses_param e) es)
+    || Option.fold ~none:false ~some:ast_expr_uses_param r.where
+    || Option.fold ~none:false ~some:ast_expr_uses_param r.having
+    || List.exists (fun (j : Ast.join_clause) -> ast_expr_uses_param j.Ast.on) r.joins
+    || List.exists (fun (k : Ast.order_key) -> ast_expr_uses_param k.Ast.expr) r.order
+  | Ast.S_compound { left; right; order; _ } ->
+    ast_stmt_uses_param left
+    || ast_stmt_uses_param right
+    || List.exists (fun (k : Ast.order_key) -> ast_expr_uses_param k.Ast.expr) order
+  | Ast.S_with_cte { def; query; _ } ->
+    ast_stmt_uses_param def || ast_stmt_uses_param query
+  | _ -> true
+;;
+
+(** #493: does any subquery embedded in this plan expression use a parameter of
+    its own?  Only the three subquery-carrying nodes are inspected; the plan
+    expression's own [P_param] nodes are irrelevant, because they address the
+    OUTER statement's parameter array, whose slots all sit below [base]. *)
+let rec plan_expr_subqueries_use_param : Plan.expr -> bool = function
+  | Plan.P_subquery s | Plan.P_exists s -> ast_stmt_uses_param s
+  | Plan.P_in_select (x, s) -> plan_expr_subqueries_use_param x || ast_stmt_uses_param s
+  | Plan.P_binop (_, a, b) ->
+    plan_expr_subqueries_use_param a || plan_expr_subqueries_use_param b
+  | Plan.P_not e
+  | Plan.P_is_null e
+  | Plan.P_is_not_null e
+  | Plan.P_neg e
+  | Plan.P_bitnot e
+  | Plan.P_cast (e, _)
+  | Plan.P_collate (e, _) -> plan_expr_subqueries_use_param e
+  | Plan.P_between (x, lo, hi) ->
+    plan_expr_subqueries_use_param x
+    || plan_expr_subqueries_use_param lo
+    || plan_expr_subqueries_use_param hi
+  | Plan.P_in (x, vs) ->
+    plan_expr_subqueries_use_param x || List.exists plan_expr_subqueries_use_param vs
+  | Plan.P_func (_, args) -> List.exists plan_expr_subqueries_use_param args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:false ~some:plan_expr_subqueries_use_param scrutinee
+    || List.exists
+         (fun (c, r) ->
+            plan_expr_subqueries_use_param c || plan_expr_subqueries_use_param r)
+         branches
+    || Option.fold ~none:false ~some:plan_expr_subqueries_use_param else_
+  | _ -> false
+;;
+
+(** #493: flatten a plan predicate's top-level [AND] spine.
+
+    [stream_filter] evaluates the conjuncts left to right and stops at the first
+    that is not truthy, so a correlated subquery written after a cheap
+    restriction — TPC-H Q4's shape exactly — is never run for a row the
+    restriction already rejected. Filtering is a two-valued decision (a row
+    passes iff every conjunct is truthy), so per-conjunct truthiness agrees with
+    [value_truthy] over the whole [AND] tree, NULL operands included. The
+    conjuncts are NOT reordered: only short-circuited in the order written. *)
+let rec plan_and_conjuncts : Plan.expr -> Plan.expr list = function
+  | Plan.P_binop (Plan.And, a, b) -> plan_and_conjuncts a @ plan_and_conjuncts b
+  | e -> [ e ]
 ;;
 
 (** #558: the message used when a subquery beside an aggregate cannot be
@@ -8436,7 +8623,7 @@ let binding_of_group_cols
       | None -> None
       | Some (m, off) ->
         let c : Row.column = List.nth m.Cat.columns (child_ord - off) in
-        Some (m.Cat.name, c.Row.name, agg_row.(i)))
+        Some (m.Cat.name, c.Row.name, Ast.E_lit (value_to_literal agg_row.(i))))
   in
   let entries = List.filter_map Fun.id (List.mapi entry group_cols) in
   { bind_qual =
@@ -8494,11 +8681,11 @@ let rec substitute_outer_in_expr
   match e with
   | Ast.E_tbl_col (tbl, col) when not (scope.has_table tbl) ->
     (match bnd.bind_qual tbl col with
-     | Some v -> Ast.E_lit (value_to_literal v)
+     | Some pinned -> pinned
      | None -> e)
   | Ast.E_col name when not (scope.has_col name) ->
     (match bnd.bind_unqual name with
-     | Some v -> Ast.E_lit (value_to_literal v)
+     | Some pinned -> pinned
      | None -> e)
   | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
   | Ast.E_not a -> Ast.E_not (go a)
@@ -8708,6 +8895,67 @@ let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_r
     Lwt.return scored
 ;;
 
+(** #493: bind and plan a subquery's [Ast.stmt], reusing the plan when this
+    query has already planned the same statement.
+
+    This is the "plan once, execute N times" half of #493. Before it, a
+    correlated subquery paid a full {!Sema.bind} + {!Planner.plan} — catalog
+    resolution, type checking, index-candidate enumeration — on every outer row.
+    The cache is installed by {!with_pull_context} only at the call sites that
+    substitute outer references as PARAMETERS, because only there is the
+    statement identical across rows; with no cache in scope this degrades to the
+    previous per-call bind+plan and nothing else changes.
+
+    [None] means the statement did not bind, which every caller reports by
+    leaving its expression unresolved, exactly as before. *)
+let plan_subquery_cached (cat : Cat.t) (inner_ast : Ast.stmt) : Plan.op option Lwt.t =
+  let cache = Lwt.get subplan_cache_key in
+  match Option.bind cache (fun tbl -> Hashtbl.find_opt tbl inner_ast) with
+  | Some op -> Lwt.return (Some op)
+  | None ->
+    let* bound_r = Sema.bind cat inner_ast in
+    (match bound_r with
+     | Error _ -> Lwt.return None
+     | Ok bound ->
+       let op = Planner.plan ~cat bound in
+       (match cache with
+        | Some tbl -> Hashtbl.replace tbl inner_ast op
+        | None -> ());
+       Lwt.return (Some op))
+;;
+
+(** #493: run a subquery's stream under a read transaction the CALLER owns, and
+    end it unconditionally.
+
+    This is the fix for the super-linear term the issue observed, and it is not
+    a cost optimisation so much as a leak repair. A leaf scanner in [Auto] mode
+    opens its own RO snapshot ([rh_begin] → [S.ro_begin]) and releases it from
+    the stream's [finish], which runs only when the stream is drained to
+    exhaustion or raises. An [EXISTS] subquery stops at the first row and
+    abandons the rest, so [finish] never ran: [S.ro_end] — and with it
+    [Pager.unpin_all] over that snapshot's pinned pages, the [active_readers]
+    decrement and [Rwlock.release_read] — was skipped once per outer row. The
+    pins are what make the cost super-linear: every page the abandoned scan
+    touched stays un-evictable for the rest of the query, so the pager's cache
+    grows monotonically with the number of outer rows and stops being a cache.
+    Blocked checkpoints and a read-lock count that never returns to zero are the
+    same bug's other two faces.
+
+    Opening the snapshot here instead makes the leaf scanners {i borrow} it
+    ([RH_borrowed_ro], whose [rh_finish] is a no-op), so abandoning the stream
+    releases nothing and [Lwt.finalize] releases everything.
+
+    #262 is preserved: when an explicit transaction is already active the
+    subquery keeps reading through it, so read-your-own-writes is unchanged and
+    the caller's transaction is never ended here. *)
+let with_subquery_txn (store : S.t) (f : txn_mode -> 'a Lwt.t) : 'a Lwt.t =
+  match current_txn_mode () with
+  | (In_txn _ | In_ro_txn _) as m -> f m
+  | Auto ->
+    let* tx = S.ro_begin store in
+    Lwt.finalize (fun () -> f (In_ro_txn tx)) (fun () -> S.ro_end tx)
+;;
+
 let rec pre_eval_subquery
           (clock : (unit -> float) option)
           (store : S.t)
@@ -8793,23 +9041,25 @@ and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
   match cat_opt with
   | None -> Lwt.return (Plan.P_lit Ast.L_null)
   | Some cat ->
-    let* bound_r = Sema.bind cat inner_ast in
-    (match bound_r with
-     | Error _ -> Lwt.return e
-     | Ok bound ->
-       let op = Planner.plan ~cat bound in
-       (* #262: run the subquery under the active txn (read-your-own-writes). *)
-       let* stream =
-         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
-       in
-       let* rows = Lwt_stream.to_list stream in
-       let v =
-         match rows with
-         | [] -> Ast.L_null
-         | row :: _ when Array.length row >= 1 -> value_to_literal row.(0)
-         | _ -> Ast.L_null
-       in
-       Lwt.return (Plan.P_lit v))
+    let* op_r = plan_subquery_cached cat inner_ast in
+    (match op_r with
+     | None -> Lwt.return e
+     | Some op ->
+       (* #262: run the subquery under the active txn (read-your-own-writes);
+          #493: or under one this call owns and ends. *)
+       with_subquery_txn store (fun mode ->
+         let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+         (* #493: a scalar subquery needs only its first row, and every stream
+            it pulls from is lazy, so [get] stops the inner scan there. Safe to
+            abandon the rest only because [with_subquery_txn] owns the snapshot
+            the abandoned stream would otherwise have leaked. *)
+         let* first = Lwt_stream.get stream in
+         let v =
+           match first with
+           | Some row when Array.length row >= 1 -> value_to_literal row.(0)
+           | _ -> Ast.L_null
+         in
+         Lwt.return (Plan.P_lit v)))
 
 (* EXISTS subquery: 1 if [inner_ast] yields any row, else 0. *)
 and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
@@ -8818,17 +9068,17 @@ and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
   match cat_opt with
   | None -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
   | Some cat ->
-    let* bound_r = Sema.bind cat inner_ast in
-    (match bound_r with
-     | Error _ -> Lwt.return e
-     | Ok bound ->
-       let op = Planner.plan ~cat bound in
-       (* #262: run the subquery under the active txn (read-your-own-writes). *)
-       let* stream =
-         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
-       in
-       let* first = Lwt_stream.get stream in
-       Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L))))
+    let* op_r = plan_subquery_cached cat inner_ast in
+    (match op_r with
+     | None -> Lwt.return e
+     | Some op ->
+       (* #262 / #493, as in [eval_scalar_subquery]. EXISTS pulls exactly one
+          row and abandons the stream; the owned snapshot is what makes that
+          safe rather than a per-outer-row page-pin leak. *)
+       with_subquery_txn store (fun mode ->
+         let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+         let* first = Lwt_stream.get stream in
+         Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L)))))
 
 (* IN (subquery): materialize [inner_ast]'s first column into the IN value list. *)
 and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
@@ -8837,16 +9087,18 @@ and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
   match cat_opt with
   | None -> Lwt.return (Plan.P_in (x, []))
   | Some cat ->
-    let* bound_r = Sema.bind cat inner_ast in
-    (match bound_r with
-     | Error _ -> Lwt.return e
-     | Ok bound ->
-       let op = Planner.plan ~cat bound in
-       (* #262: run the subquery under the active txn (read-your-own-writes). *)
-       let* stream =
-         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
+    let* op_r = plan_subquery_cached cat inner_ast in
+    (match op_r with
+     | None -> Lwt.return e
+     | Some op ->
+       (* #262 / #493. This one drains the stream, so it never leaked; it takes
+          the owned snapshot for the same reason the others do — one place
+          decides how a subquery gets its read transaction. *)
+       let* rows =
+         with_subquery_txn store (fun mode ->
+           let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+           Lwt_stream.to_list stream)
        in
-       let* rows = Lwt_stream.to_list stream in
        let vals =
          List.filter_map
            (fun row ->
@@ -9415,19 +9667,101 @@ and stream_filter clock params store mode cat pred child =
     match get_outer_scan_metas child with
     | None -> Lwt.fail_with (correlated_filter_refusal ())
     | Some metas ->
-      Lwt.return
-        (Lwt_stream.filter_s
-           (fun row ->
-              let bnd = binding_of_metas metas row in
-              let subst_pred = substitute_outer_in_plan_expr ~cat bnd pred' in
-              let* resolved =
-                with_pull_context ~stats:s_opt ~mode (fun () ->
-                  pre_eval_subquery clock store params cat subst_pred)
-              in
-              if plan_expr_has_subquery resolved
-              then Lwt.fail_with (correlated_filter_refusal ())
-              else Lwt.return (value_truthy (eval_expr clock params row resolved)))
-           child_stream))
+      (* #493, three changes, all inside this branch:
+
+         - the predicate is split into its top-level AND conjuncts and evaluated
+           left to right, stopping at the first that is not truthy, so a
+           correlated subquery written after a cheap restriction runs only for
+           the rows that restriction kept (TPC-H Q4 evaluated its EXISTS for
+           every row of [orders], date range or not);
+         - outer references are pinned as PARAMETERS rather than literals, which
+           makes the substituted inner statement identical for every row;
+         - which in turn lets one bind+plan per subquery site serve the whole
+           scan, through the cache [with_pull_context] installs.
+
+         The parameterized path is taken only when no inner statement carries
+         parameters of its own — see {!ast_stmt_uses_param}. Otherwise this
+         falls back to per-row literal substitution with no cache, which is
+         exactly the pre-#493 behaviour, and the short-circuit still applies. *)
+      let cs = plan_and_conjuncts pred' in
+      let parameterized = not (List.exists plan_expr_subqueries_use_param cs) in
+      let cache = if parameterized then Some (Hashtbl.create 4) else None in
+      let base = Array.length params in
+      let keep row =
+        let bnd =
+          if parameterized
+          then param_binding_of_metas ~base ~row_len:(Array.length row) metas
+          else binding_of_metas metas row
+        in
+        let row_params = if parameterized then Array.append params row else params in
+        correlated_row_passes
+          clock
+          params
+          store
+          mode
+          cat
+          ~s_opt
+          ~cache
+          ~bnd
+          ~row_params
+          row
+          cs
+      in
+      Lwt.return (Lwt_stream.filter_s keep child_stream))
+
+(* #493: does [row] satisfy every conjunct?  Evaluated left to right in the
+   order written — NOT reordered — and stopped at the first conjunct that is not
+   truthy, so the subquery in a later conjunct is never run for a row an earlier
+   one already rejected.
+
+   This agrees with the pre-#493 [value_truthy] over the whole AND tree: row
+   filtering is a two-valued decision (the row passes iff every conjunct is
+   truthy), so a NULL conjunct rejects the row either way. *)
+and correlated_row_passes
+      clock
+      params
+      store
+      mode
+      cat
+      ~s_opt
+      ~cache
+      ~bnd
+      ~row_params
+      (row : Row.t)
+      conjuncts
+  : bool Lwt.t
+  =
+  match conjuncts with
+  | [] -> Lwt.return true
+  | c :: rest ->
+    let* ok =
+      if not (plan_expr_has_subquery c)
+      then Lwt.return (value_truthy (eval_expr clock params row c))
+      else (
+        let subst = substitute_outer_in_plan_expr ~cat bnd c in
+        let* resolved =
+          with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+            pre_eval_subquery clock store row_params cat subst)
+        in
+        if plan_expr_has_subquery resolved
+        then Lwt.fail_with (correlated_filter_refusal ())
+        else Lwt.return (value_truthy (eval_expr clock params row resolved)))
+    in
+    if not ok
+    then Lwt.return false
+    else
+      correlated_row_passes
+        clock
+        params
+        store
+        mode
+        cat
+        ~s_opt
+        ~cache
+        ~bnd
+        ~row_params
+        row
+        rest
 
 and stream_expr_project clock params store mode cat exprs child =
   (* #257: as in [stream_filter], re-establish the stats scope around per-row
@@ -9448,17 +9782,29 @@ and stream_expr_project clock params store mode cat exprs child =
       let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
       Lwt.return (Lwt_stream.map eval_exprs inner)
     | Some metas ->
+      (* #493: same parameterize-and-cache treatment as [stream_filter]; there
+         is no AND spine to short-circuit in a projection. *)
+      let parameterized = not (List.exists plan_expr_subqueries_use_param exprs') in
+      let cache = if parameterized then Some (Hashtbl.create 4) else None in
+      let base = Array.length params in
       Lwt.return
         (Lwt_stream.map_s
            (fun row ->
-              let bnd = binding_of_metas metas row in
+              let bnd =
+                if parameterized
+                then param_binding_of_metas ~base ~row_len:(Array.length row) metas
+                else binding_of_metas metas row
+              in
+              let row_params =
+                if parameterized then Array.append params row else params
+              in
               let* vals =
                 Lwt_list.map_s
                   (fun e ->
                      let e_subst = substitute_outer_in_plan_expr ~cat bnd e in
                      let* resolved =
-                       with_pull_context ~stats:s_opt ~mode (fun () ->
-                         pre_eval_subquery clock store params cat e_subst)
+                       with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+                         pre_eval_subquery clock store row_params cat e_subst)
                      in
                      Lwt.return (eval_expr clock params row resolved))
                   exprs'
@@ -10366,8 +10712,12 @@ and stream_aggregate
         | None -> Lwt.fail_with (agg_subquery_refusal ())
         | Some metas ->
           let bnd = binding_of_group_cols metas group_cols agg_row in
+          (* #493: no cache here — this site still substitutes LITERALS, so the
+             substituted statement differs per aggregate output row and a cache
+             would only grow. The number of rows is bounded by the group count
+             rather than the input, so it was never the #493 hot path. *)
           let* r =
-            with_pull_context ~stats:s_opt ~mode (fun () ->
+            with_pull_context ~stats:s_opt ~mode ~cache:None (fun () ->
               pre_eval_subquery
                 clock
                 store
