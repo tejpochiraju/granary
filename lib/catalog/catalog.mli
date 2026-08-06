@@ -456,7 +456,15 @@ val rewrite_ident_in_sql : old_name:string -> new_name:string -> string -> strin
     the table name (left behind, the constraints load as absent on the next
     open), and re-points any child table whose [fk_parent_table] named it.
 
-    Returns [Error msg] if [old_name] does not exist or [new_name] already exists.
+    #609: REFUSED when a persisted view, reactive view or trigger names
+    [old_name]. Those are stored as raw [CREATE ...] SQL text, which this module
+    cannot re-render (the catalog sits below the parser), and a lexical rewrite
+    of a whole statement cannot be scoped to one table — so the rename is
+    rejected, naming the dependent objects, rather than left to break them
+    silently. Drop and recreate them to proceed.
+
+    Returns [Error msg] if [old_name] does not exist, [new_name] already exists,
+    or a stored definition depends on [old_name].
 
     [?txn] (#282): as for [add_column]. *)
 val rename_table
@@ -479,7 +487,13 @@ val rename_table
     that is a [Db.dump] which will not restore, since #533 made the DDL renderer
     read that index as the record of the table's key.
 
-    Returns [Error msg] if the table or column does not exist.
+    #609: REFUSED when a persisted view, reactive view or trigger names BOTH the
+    table and the column — see {!rename_table} for why those are not remapped.
+    Requiring both names is what keeps an unrelated definition using the same
+    column name over a different table from blocking the rename.
+
+    Returns [Error msg] if the table or column does not exist, or a stored
+    definition depends on the column.
 
     [?txn] (#282): as for [add_column]. *)
 val rename_column

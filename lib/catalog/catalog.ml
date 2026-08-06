@@ -3076,6 +3076,135 @@ let rewrite_ident_in_sql ~old_name ~new_name sql =
     Buffer.contents buf)
 ;;
 
+(* The string literal starting at [i] (its opening quote): the index just past
+   it.  [copy_sql_string] without the buffer — the detector below only needs to
+   step over a literal, never to reproduce it. *)
+let skip_sql_string sql i =
+  let n = String.length sql in
+  let q = sql.[i] in
+  let rec go k =
+    if k >= n
+    then k
+    else if sql.[k] <> q
+    then go (k + 1)
+    else if k + 1 < n && sql.[k + 1] = q
+    then go (k + 2)
+    else k + 1
+  in
+  go (i + 1)
+;;
+
+(* The delimited identifier starting at [i]: its undoubled body and the index
+   just past the closing delimiter.  An unterminated one yields the rest of the
+   text, which cannot equal any identifier we look for and so is simply skipped. *)
+let read_quoted_ident sql i =
+  let n = String.length sql in
+  let q = sql.[i] in
+  let body = Buffer.create 16 in
+  let rec go k =
+    if k >= n
+    then Buffer.contents body, k
+    else if sql.[k] <> q
+    then (
+      Buffer.add_char body sql.[k];
+      go (k + 1))
+    else if k + 1 < n && sql.[k + 1] = q
+    then (
+      Buffer.add_char body q;
+      go (k + 2))
+    else Buffer.contents body, k + 1
+  in
+  go (i + 1)
+;;
+
+(* #609: does [sql] name [ident] as an identifier token — bare or delimited,
+   anywhere outside a string literal?
+
+   This is a DETECTOR guarding a refusal, not a rewriter, and its two failure
+   modes are not symmetric: a false positive costs the user a rename they could
+   have had and tells them exactly why, a false negative silently leaves a view
+   or trigger naming a column that no longer exists.  So it deliberately differs
+   from {!rewrite_ident_in_sql} in two ways, both erring towards refusing:
+
+   - **Position-blind.**  [is_column_ref_at] excludes a word followed by ['.'],
+     which is precisely where a TABLE name stands ([v0.a]).  A detector wearing
+     the rewriter's column-position filter would miss every qualified reference
+     — the common spelling inside a view body.
+   - **Case-insensitive.**  The rewriter matches case-sensitively because every
+     other column lookup in this module does; a detector that did would let
+     [SELECT A FROM v0] through. *)
+let sql_mentions_ident ~ident sql =
+  let n = String.length sql in
+  let want = String.lowercase_ascii ident in
+  let hit s = String.equal (String.lowercase_ascii s) want in
+  let rec ident_end k = if k < n && is_ident_char sql.[k] then ident_end (k + 1) else k in
+  let rec go i =
+    if i >= n
+    then false
+    else (
+      let c = sql.[i] in
+      if c = '\''
+      then go (skip_sql_string sql i)
+      else if c = '"' || c = '`'
+      then (
+        let text, j = read_quoted_ident sql i in
+        hit text || go j)
+      else if is_ident_start c
+      then (
+        let j = ident_end i in
+        hit (String.sub sql i (j - i)) || go j)
+      else go (i + 1))
+  in
+  go 0
+;;
+
+(* #609: the stored view / reactive-view / trigger definitions that mention
+   EVERY identifier in [idents], described as ["view vv"] / ["trigger tr"].
+
+   Views and triggers are persisted as raw CREATE ... SQL TEXT (see
+   [sys_views_tid], [sys_reactive_views_tid], [sys_triggers_tid]) — there is no
+   AST here to walk and re-render, and the catalog sits BELOW the parser in the
+   dependency graph, so there cannot be one.  A lexical rewrite of that text
+   cannot scope a name to a table the way SQLite's does: a view body legitimately
+   names other tables' columns, and rewriting one of those turns a working view
+   into a wrong one silently.  So a rename that would touch such a definition is
+   REFUSED rather than guessed at.
+
+   Requiring every identifier — for a column rename, the table name AND the
+   column name — is what keeps the refusal from firing on an unrelated view that
+   merely happens to use the same column name over a different table.  It cannot
+   under-refuse: to reference a column of [t] a statement must name [t]
+   somewhere, and a definition that reaches it only through ANOTHER view is
+   blocked transitively, because that other view names [t] itself. *)
+let dependent_definitions_tx tx ~idents =
+  let scan tid kind =
+    let%lwt pairs = load_all_pairs_in_tx tx tid in
+    Lwt.return
+      (List.filter_map
+         (fun (name, sql) ->
+            if List.for_all (fun ident -> sql_mentions_ident ~ident sql) idents
+            then Some (Printf.sprintf "%s %s" kind name)
+            else None)
+         pairs)
+  in
+  let%lwt views = scan sys_views_tid "view" in
+  let%lwt rviews = scan sys_reactive_views_tid "reactive view" in
+  let%lwt triggers = scan sys_triggers_tid "trigger" in
+  Lwt.return (views @ rviews @ triggers)
+;;
+
+(* #609: the refusal message.  Names every dependent object, because the caller's
+   only way forward is to drop and recreate them. *)
+let dependents_error ~what ~deps =
+  Printf.sprintf
+    "cannot %s: it is referenced by %s; drop and recreate %s first"
+    what
+    (String.concat ", " deps)
+    (match deps with
+     | [ _ ] -> "it"
+     | _ -> "them")
+;;
+
 (* An index with [old_col] renamed to [new_col]: a plain column matches by name,
    an expression column and the partial WHERE by the lexical rewrite above. *)
 let rename_col_in_index ~old_col ~new_col (info : index_info) =
@@ -3250,6 +3379,24 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
   Lwt.return (Ok ())
 ;;
 
+(* The store half of [rename_table], lifted to the top level (#609) so the
+   dependency gate can sit in front of it without deepening the nesting. *)
+let rename_table_body t tx ~txn ~old_name ~new_name ~(meta : table_meta) =
+  (* Remove old sys_tables entry *)
+  let%lwt () = S.del tx sys_tables_tid (Bytes.of_string old_name) in
+  (* Insert new sys_tables entry *)
+  let%lwt () =
+    S.put tx sys_tables_tid (Bytes.of_string new_name) (encode_table_value meta)
+  in
+  (* Re-key all column entries; return Error if any entry is missing *)
+  let%lwt col_result =
+    rekey_table_columns tx ~old_name ~new_name ~n_cols:(List.length meta.columns)
+  in
+  match col_result with
+  | Error msg -> Lwt.return (Error msg)
+  | Ok () -> finish_rename t tx ~txn ~old_name ~new_name ~meta
+;;
+
 let rename_table ?txn t ~old_name ~new_name =
   match Schema_cache.find_table t.sc old_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" old_name))
@@ -3258,19 +3405,16 @@ let rename_table ?txn t ~old_name ~new_name =
     then Lwt.return (Error (Printf.sprintf "table already exists: %s" new_name))
     else (
       let body tx =
-        (* Remove old sys_tables entry *)
-        let%lwt () = S.del tx sys_tables_tid (Bytes.of_string old_name) in
-        (* Insert new sys_tables entry *)
-        let%lwt () =
-          S.put tx sys_tables_tid (Bytes.of_string new_name) (encode_table_value meta)
-        in
-        (* Re-key all column entries; return Error if any entry is missing *)
-        let%lwt col_result =
-          rekey_table_columns tx ~old_name ~new_name ~n_cols:(List.length meta.columns)
-        in
-        match col_result with
-        | Error msg -> Lwt.return (Error msg)
-        | Ok () -> finish_rename t tx ~txn ~old_name ~new_name ~meta
+        (* #609: a view or trigger naming this table stores raw SQL text that
+           still says [old_name] after the rename, so the rename is refused
+           rather than left to break it silently. *)
+        let%lwt deps = dependent_definitions_tx tx ~idents:[ old_name ] in
+        if deps = []
+        then rename_table_body t tx ~txn ~old_name ~new_name ~meta
+        else
+          Lwt.return
+            (Error
+               (dependents_error ~what:(Printf.sprintf "rename table %s" old_name) ~deps))
       in
       match txn with
       | Some tx -> body tx
@@ -3364,7 +3508,41 @@ let rewrite_indexes_tx tx ~table_name ~old_col ~new_col =
    was.  Leaving any of them behind leaves the catalog naming a column the table
    does not have; for the implicit PRIMARY KEY index that is a dump which will
    not restore, because since #533 the DDL renderer reads that index as the
-   record of the table's key. *)
+   record of the table's key.
+
+   #609: the two stored-SQL trees the remap does NOT reach — [sys_views_tid] and
+   [sys_triggers_tid], plus [sys_reactive_views_tid] — hold whole [CREATE ...]
+   statements as raw text, and a lexical rewrite of one of those cannot be
+   scoped to this table.  A rename that would touch one is therefore REFUSED by
+   [rename_column]'s gate below rather than guessed at; this function is the
+   store half that runs once the gate passes. *)
+let rename_column_body t tx ~table_name ~(meta : table_meta) ~col_k ~old_col ~new_col =
+  match%lwt S.get tx sys_columns_tid col_k with
+  | None -> Lwt.return (Error "column entry missing from catalog")
+  | Some _ ->
+    let%lwt () =
+      rewrite_columns_tx tx ~table_name ~columns:meta.columns ~old_col ~new_col
+    in
+    let new_meta =
+      { meta with
+        columns = List.map (rename_col_in_column ~old_col ~new_col) meta.columns
+      ; fk_constraints =
+          List.map
+            (rename_col_in_fk ~owner:table_name ~table:table_name ~old_col ~new_col)
+            meta.fk_constraints
+      }
+    in
+    let%lwt () =
+      if new_meta.fk_constraints = meta.fk_constraints
+      then Lwt.return_unit
+      else put_fks_tx tx ~table:table_name ~fks:new_meta.fk_constraints
+    in
+    let%lwt () = put_mirror_tx tx new_meta in
+    let%lwt children = rewrite_child_fks_tx t tx ~table_name ~old_col ~new_col in
+    let%lwt indexes = rewrite_indexes_tx tx ~table_name ~old_col ~new_col in
+    Lwt.return (Ok (new_meta, indexes, children))
+;;
+
 let rename_column ?txn t ~table_name ~old_col ~new_col =
   match Schema_cache.find_table t.sc table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
@@ -3374,34 +3552,19 @@ let rename_column ?txn t ~table_name ~old_col ~new_col =
      | Some i ->
        let col_k = column_key table_name i in
        let body tx =
-         match%lwt S.get tx sys_columns_tid col_k with
-         | None -> Lwt.return (Error "column entry missing from catalog")
-         | Some _ ->
-           let%lwt () =
-             rewrite_columns_tx tx ~table_name ~columns:meta.columns ~old_col ~new_col
-           in
-           let new_meta =
-             { meta with
-               columns = List.map (rename_col_in_column ~old_col ~new_col) meta.columns
-             ; fk_constraints =
-                 List.map
-                   (rename_col_in_fk
-                      ~owner:table_name
-                      ~table:table_name
-                      ~old_col
-                      ~new_col)
-                   meta.fk_constraints
-             }
-           in
-           let%lwt () =
-             if new_meta.fk_constraints = meta.fk_constraints
-             then Lwt.return_unit
-             else put_fks_tx tx ~table:table_name ~fks:new_meta.fk_constraints
-           in
-           let%lwt () = put_mirror_tx tx new_meta in
-           let%lwt children = rewrite_child_fks_tx t tx ~table_name ~old_col ~new_col in
-           let%lwt indexes = rewrite_indexes_tx tx ~table_name ~old_col ~new_col in
-           Lwt.return (Ok (new_meta, indexes, children))
+         (* #609: a view or trigger that names both this table and this column
+            stores raw SQL text that still says [old_col] after the rename.  The
+            catalog cannot re-render that text safely — see
+            [dependent_definitions_tx] — so the rename is refused instead. *)
+         let%lwt deps = dependent_definitions_tx tx ~idents:[ table_name; old_col ] in
+         if deps = []
+         then rename_column_body t tx ~table_name ~meta ~col_k ~old_col ~new_col
+         else
+           Lwt.return
+             (Error
+                (dependents_error
+                   ~what:(Printf.sprintf "rename column %s.%s" table_name old_col)
+                   ~deps))
        in
        let finalize (new_meta, indexes, children) =
          let put_table, put_index =
