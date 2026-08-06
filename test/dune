@@ -1346,3 +1346,11 @@
  (name test_wal_cache_e2e_611)
  (modules test_wal_cache_e2e_611)
  (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+; #585: Db.with_transaction — a scoped transaction extent carrying an owner
+; token.  Commit/rollback/re-raise, nesting refused, and the #555 poison and
+; its single ROLLBACK exit left intact.
+
+(test
+ (name test_with_transaction_585)
+ (modules test_with_transaction_585)
+ (libraries granary granary.unix alcotest lwt.unix))
