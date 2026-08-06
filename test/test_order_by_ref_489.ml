@@ -1,26 +1,33 @@
-(** #489: ORDER BY <ordinal> — an integer literal naming the Nth column of the
-    SELECT list — was silently ignored.
+(** #489 / #490: ORDER BY terms that name the SELECT list — an ordinal, or an
+    output alias.
 
-    It parsed, bound as an ordinary integer literal, and became a sort key with
-    the same constant value for every row, so the rows came back in scan order
-    with no ordering applied and no error raised. A silent wrong answer is the
-    worst of the three possible outcomes, and this is one of four the TPC-H
-    harness surfaced.
+    #489 was the worse of the two because it was silent. [ORDER BY 2] parsed,
+    bound as an ordinary integer literal, and became a sort key with the same
+    constant value for every row, so the rows came back in scan order with no
+    ordering applied and no error raised. #490 was loud but blocked five TPC-H
+    queries: [SELECT nm, COUNT(x) AS n ... ORDER BY n] answered
+    "unknown column: t.n", because ORDER BY resolved names against the base
+    tables only.
 
-    THE RULE this pins, which is SQL:92 and what SQLite does:
+    THE PRECEDENCE this pins, which is SQL:92 / SQL:2003 §7.13 and what SQLite
+    does:
 
     - a BARE INTEGER LITERAL is an ordinal, the 1-based position in the SELECT
       list; out of range (0, negative, past the end) is an ERROR, never a
       silent no-op;
+    - a BARE IDENTIFIER resolves to an output ALIAS FIRST and to an input
+      column only if no alias matches — so an alias shadowing a real column
+      name wins.  A QUALIFIED name is not a bare identifier and always means
+      the input column;
     - anything else is an expression, evaluated and never matched against the
       SELECT list: [ORDER BY 1+1] and [ORDER BY -1] are constants, not
       ordinals.
 
     Every test below asserts the actual ROW ORDER. A test that only counted
-    rows is exactly what let this ship: the buggy engine returned the right
+    rows is exactly what let #489 ship: the buggy engine returned the right
     rows in the wrong order. Where a case is about a term that is deliberately
-    NOT an ordinal (a constant expression), the constant is paired with a
-    second, real sort key, so the assertion stays deterministic without
+    NOT an output reference (a constant expression), the constant is paired
+    with a second, real sort key, so the assertion stays deterministic without
     depending on whether the sort is stable. *)
 
 module Db = Granary.Db
@@ -208,7 +215,117 @@ let test_aggregate_ordinal () =
     check_rows
       "grouping column key still remaps"
       [ "x|3"; "y|1"; "z|2" ]
-      (rows db "SELECT nm, COUNT(*) FROM g2 GROUP BY nm ORDER BY nm"))
+      (rows db "SELECT nm, COUNT(*) FROM g2 GROUP BY nm ORDER BY nm");
+    (* #490: the alias spelling of the same key, on the same collision. *)
+    check_rows
+      "alias key survives the post-aggregate remap"
+      [ "y|1"; "z|2"; "x|3" ]
+      (rows db "SELECT nm, COUNT(*) AS n FROM g2 GROUP BY nm ORDER BY n"))
+;;
+
+(* ── #490: output aliases ─────────────────────────── *)
+
+let test_490_repro () =
+  with_db (fun db ->
+    exec db "CREATE TABLE g (nm TEXT)";
+    List.iter
+      (fun v -> exec db (Printf.sprintf "INSERT INTO g VALUES ('%s')" v))
+      [ "x"; "y"; "x"; "z"; "x"; "z" ];
+    (* The issue's query: "sema error: unknown column: g.n" before the fix. *)
+    check_rows
+      "ORDER BY an aggregate alias"
+      [ "y|1"; "z|2"; "x|3" ]
+      (rows db "SELECT nm, COUNT(*) AS n FROM g GROUP BY nm ORDER BY n");
+    check_rows
+      "ORDER BY an aggregate alias, descending"
+      [ "x|3"; "z|2"; "y|1" ]
+      (rows db "SELECT nm, COUNT(*) AS n FROM g GROUP BY nm ORDER BY n DESC");
+    (* The ordinal spelling of the same thing (#489). *)
+    check_rows
+      "ORDER BY 2 DESC over an aggregate"
+      [ "x|3"; "z|2"; "y|1" ]
+      (rows db "SELECT nm, COUNT(*) AS n FROM g GROUP BY nm ORDER BY 2 DESC");
+    (* An alias that does not exist is still an unknown column, not a
+       mysterious no-op. *)
+    match run (Db.query db "SELECT nm, COUNT(*) AS n FROM g GROUP BY nm ORDER BY zz") with
+    | Ok _ -> Alcotest.fail "expected an error for an unknown ORDER BY name"
+    | Error _ -> ())
+;;
+
+let test_alias_over_expression () =
+  with_db (fun db ->
+    exec db "CREATE TABLE e (a INTEGER, b INTEGER)";
+    exec db "INSERT INTO e VALUES (1, 5)";
+    exec db "INSERT INTO e VALUES (2, 1)";
+    exec db "INSERT INTO e VALUES (3, 0)";
+    (* a+b = 6, 3, 3 *)
+    check_rows
+      "ORDER BY an expression alias"
+      [ "2|3"; "3|3"; "1|6" ]
+      (rows db "SELECT a, a + b AS s FROM e ORDER BY s, a");
+    check_rows
+      "ORDER BY an expression alias, descending"
+      [ "1|6"; "3|3"; "2|3" ]
+      (rows db "SELECT a, a + b AS s FROM e ORDER BY s DESC, a DESC");
+    (* The ordinal spelling of the same key. *)
+    check_rows
+      "ORDER BY 2 over the same expression"
+      [ "2|3"; "3|3"; "1|6" ]
+      (rows db "SELECT a, a + b AS s FROM e ORDER BY 2, 1"))
+;;
+
+(* THE PRECEDENCE CASE.  [b AS a] means the name [a] in ORDER BY refers to the
+   OUTPUT column (whose values are b's), not to the input column [a] it
+   shadows.  The two orders are exact reverses of each other here, so this
+   cannot pass by accident. *)
+let test_alias_shadows_a_real_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE sh (a INTEGER, b INTEGER)";
+    exec db "INSERT INTO sh VALUES (1, 30)";
+    exec db "INSERT INTO sh VALUES (2, 20)";
+    exec db "INSERT INTO sh VALUES (3, 10)";
+    (* Output row is (b, a).  ORDER BY a = the alias = b ascending. *)
+    check_rows
+      "output alias wins over the input column it shadows"
+      [ "10|3"; "20|2"; "30|1" ]
+      (rows db "SELECT b AS a, a AS b FROM sh ORDER BY a");
+    (* And symmetrically for the other name. *)
+    check_rows
+      "the other alias too"
+      [ "30|1"; "20|2"; "10|3" ]
+      (rows db "SELECT b AS a, a AS b FROM sh ORDER BY b");
+    (* A qualified reference is NOT a bare identifier, so it never matches an
+       alias and always names the input column. *)
+    check_rows
+      "a qualified name still means the input column"
+      [ "30|1"; "20|2"; "10|3" ]
+      (rows db "SELECT b AS a, a AS b FROM sh ORDER BY sh.a");
+    (* No alias to match: the input column, exactly as before. *)
+    check_rows
+      "no alias to match: input column"
+      [ "3|10"; "2|20"; "1|30" ]
+      (rows db "SELECT a, b FROM sh ORDER BY b"))
+;;
+
+(* ── Several keys at once, mixing all three kinds ── *)
+
+let test_mixed_keys () =
+  with_db (fun db ->
+    exec db "CREATE TABLE m (a INTEGER, b INTEGER, c INTEGER)";
+    exec db "INSERT INTO m VALUES (1, 1, 2)";
+    exec db "INSERT INTO m VALUES (1, 2, 1)";
+    exec db "INSERT INTO m VALUES (1, 1, 1)";
+    exec db "INSERT INTO m VALUES (2, 5, 5)";
+    (* ordinal, then alias DESC, then a plain input column. *)
+    check_rows
+      "ordinal + alias + column"
+      [ "1|2|1"; "1|1|1"; "1|1|2"; "2|5|5" ]
+      (rows db "SELECT a, b AS bb, c FROM m ORDER BY 1, bb DESC, c");
+    (* The same three keys, spelled the other way round. *)
+    check_rows
+      "column + ordinal DESC + ordinal"
+      [ "1|2|1"; "1|1|1"; "1|1|2"; "2|5|5" ]
+      (rows db "SELECT a, b AS bb, c FROM m ORDER BY a, 2 DESC, 3"))
 ;;
 
 (* ── Over a join ─────────────────────────────────── *)
@@ -224,7 +341,7 @@ let test_join_ordinal () =
     exec db "INSERT INTO dpt VALUES (20, 'ops')";
     let q order =
       Printf.sprintf
-        "SELECT enm, dnm FROM emp JOIN dpt ON emp.dno = dpt.dkey ORDER BY %s"
+        "SELECT enm, dnm AS d FROM emp JOIN dpt ON emp.dno = dpt.dkey ORDER BY %s"
         order
     in
     check_rows
@@ -235,11 +352,17 @@ let test_join_ordinal () =
       "join, ordinal over the left table's column"
       [ "amy|ops"; "bob|eng"; "zoe|eng" ]
       (rows db (q "1"));
+    (* #490 over a join: the issue reported "unknown column: supplier.numwait"
+       for exactly this shape. *)
+    check_rows
+      "join, alias then ordinal"
+      [ "amy|ops"; "bob|eng"; "zoe|eng" ]
+      (rows db (q "d DESC, 1"));
     (* An ordinal counts OUTPUT columns, not the combined join row's — the
        projection here is 2 wide even though the joined row is 5 wide. *)
     check_ordinal_error
       db
-      "SELECT enm, dnm FROM emp JOIN dpt ON emp.dno = dpt.dkey ORDER BY 3")
+      "SELECT enm, dnm AS d FROM emp JOIN dpt ON emp.dno = dpt.dkey ORDER BY 3")
 ;;
 
 (* ── Compound (UNION/…) ordinals ──────────────────────────────────── *)
@@ -266,7 +389,7 @@ let test_compound_ordinal () =
 
 let () =
   Alcotest.run
-    "order_by_ordinal_489"
+    "order_by_ref_489_490"
     [ ( "#489 ordinals"
       , [ Alcotest.test_case "issue repro" `Quick test_489_repro
         ; Alcotest.test_case "over SELECT *" `Quick test_ordinal_over_star
@@ -276,8 +399,19 @@ let () =
             `Quick
             test_expression_is_not_an_ordinal
         ; Alcotest.test_case "over an aggregate" `Quick test_aggregate_ordinal
-        ; Alcotest.test_case "over a join" `Quick test_join_ordinal
         ; Alcotest.test_case "compound" `Quick test_compound_ordinal
+        ] )
+    ; ( "#490 output aliases"
+      , [ Alcotest.test_case "issue repro" `Quick test_490_repro
+        ; Alcotest.test_case "expression alias" `Quick test_alias_over_expression
+        ; Alcotest.test_case
+            "alias shadows a column"
+            `Quick
+            test_alias_shadows_a_real_column
+        ] )
+    ; ( "combined"
+      , [ Alcotest.test_case "mixed key kinds" `Quick test_mixed_keys
+        ; Alcotest.test_case "over a join" `Quick test_join_ordinal
         ] )
     ]
 ;;

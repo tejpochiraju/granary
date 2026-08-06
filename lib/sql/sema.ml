@@ -2978,8 +2978,14 @@ let bind_select_having
    [ORDER BY 1+1] (an [E_binop]) constants rather than ordinals, exactly as in
    SQLite.
 
-   A bare identifier binds as an input column first and falls back to a
-   select-list output alias.
+   #490: a term that is a BARE IDENTIFIER resolves to a SELECT-list OUTPUT
+   ALIAS FIRST, and only then to an input column (SQL:2003 §7.13, and what
+   SQLite does).  So an alias that SHADOWS a real column name WINS —
+   [SELECT b AS a FROM t ORDER BY a] sorts by [b].  That is a deliberate
+   reversal of the order this used to use, which bound the input column first
+   and consulted the alias only when that failed; the two differ exactly on the
+   shadowing case.  A QUALIFIED name ([t.a]) is not a bare identifier, so it
+   always means the input column.
 
    [out_ref] turns a 1-based output position into the bound key for it and owns
    the range check; [out_aliases] lists the SELECT list's explicit aliases in
@@ -3006,14 +3012,12 @@ let bind_select_order
     match e with
     | Ast.E_lit (Ast.L_int n) -> out_ref n
     | Ast.E_col name ->
-      (* Alias-aware binder for both single-table and joined
-         queries; see comment in [bind_one] above. *)
-      (match bind_expr_join ~param_counter ~named_params ~tables e with
-       | Ok _ as ok -> ok
-       | Error _ as err ->
-         (match alias_pos name with
-          | Some pos -> out_ref pos
-          | None -> err))
+      (match alias_pos name with
+       | Some pos -> out_ref pos
+       | None ->
+         (* Alias-aware binder for both single-table and joined
+            queries; see comment in [bind_one] above. *)
+         bind_expr_join ~param_counter ~named_params ~tables e)
     | _ -> bind_expr_join ~param_counter ~named_params ~tables e
   in
   List.fold_left
