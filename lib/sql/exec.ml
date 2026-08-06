@@ -3592,10 +3592,21 @@ let index_is_conflict_target
      branch never calls [delete_replace_conflicts], so a non-empty [dels] there
      is a queued delete that never happens.
 
-   The DO UPDATE's own result is still checked against every other unique index
-   — by [write_row_rekeyed] → [check_index_unique_on_update], on the row that is
-   actually written. Nothing is skipped, it just moves to the write that
-   happens. *)
+   What is NOT true, and was claimed here in the first revision of #639: that
+   the DO UPDATE's result is re-checked against the other unique indexes.
+   [write_row_rekeyed] does no uniqueness probe at all — its index loop is an
+   unconditional [S.del] of the old key and [S.put] of the new one, and
+   [check_index_unique_on_update] is defined AFTER it in this file and is
+   reached only from [validate_update_unique], the plain-UPDATE pre-pass.
+
+   So discarding the other indexes' verdicts here loses a check that nothing
+   downstream replaces. That is sound for the verdicts this pass drops — they
+   were computed against the row being INSERTED, which is discarded, and the
+   DO UPDATE may not touch those columns at all — but a DO UPDATE that WRITES a
+   duplicate into another unique index is accepted silently. That gap is
+   pre-existing (it is the upsert path's share of "DO UPDATE is not
+   uniqueness-checked", true on main for the secondary-index shape) and is
+   tracked as #667. Do not read this pass as covering it. *)
 let check_insert_unique
       tx
       (table_meta : Cat.table_meta)
@@ -4313,22 +4324,34 @@ let execute_insert
        (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
          before extracting index keys so VIRTUAL cells contribute their value. *)
        let row_for_idx = with_computed_virtuals clock params table_meta row in
-       (* #639/#599: under [OR IGNORE] the modifier governs the INSERT half, so
-          a NOT NULL violation in the row being inserted skips it before any
-          conflict resolution is consulted — an ON CONFLICT clause only ever
-          intercepts a UNIQUENESS conflict, never a NOT NULL one.  Deciding it
-          here rather than in [execute_insert_write] is what makes the two
-          conflict shapes agree: an alias-PK conflict reaches that function and
-          would see its [null_skip], but a secondary-index conflict resolves to
-          [upsert_rowid] in [check_insert_unique] and never gets there, so the
-          same statement skipped or ran the DO UPDATE depending on which index
-          the row happened to collide with.  Guarded by [CA_ignore] so that no
-          other resolution's ordering changes: [not_null_skip_or_fail] raises
-          for those, and raising earlier here would turn a bare upsert that
-          currently updates into an error.  [execute_insert_write] does not
-          re-evaluate it — its [null_skip] is guarded by [not skip]. *)
+       (* #639/#599: an ON CONFLICT clause only ever intercepts a UNIQUENESS
+          conflict, never a NOT NULL one — the modifier governs the INSERT half.
+          So the row being inserted is checked for NULLs BEFORE any conflict
+          resolution is consulted, and the modifier decides what that means:
+          [OR IGNORE] skips the row, every other resolution raises.
+
+          Two entry conditions, and the second one is the review fix.
+          [CA_ignore] is there so `INSERT OR IGNORE` skips identically whichever
+          index the row collides with — the check used to live only in
+          [execute_insert_write], which an alias-PK conflict reaches and a
+          secondary-index conflict does not.  [Option.is_some upsert_update]
+          extends the same reasoning to the raising resolutions, which have the
+          same asymmetry for the same reason and which the alias pre-probe below
+          would otherwise route past [execute_insert_write] entirely: on `main`,
+          `INSERT INTO t VALUES (1, NULL_param) ON CONFLICT(k) DO UPDATE ...`
+          with row 1 present raised NOT NULL, and the pre-probe silently turned
+          that into a successful DO UPDATE.  It now raises again, and the
+          secondary-index shape — which never raised — agrees with it.
+
+          Deliberately NOT extended to plain INSERTs: with no upsert clause,
+          [execute_insert_write] still owns the check, so a statement without an
+          ON CONFLICT clause keeps `main`'s exact behaviour, including the
+          precedence between a UNIQUE error and a NOT NULL one.
+          [execute_insert_write] never double-evaluates — its [null_skip] is
+          guarded by [not skip], and for a raising resolution this call has
+          already raised. *)
        let null_skip =
-         on_conflict = Some Ast.CA_ignore
+         (on_conflict = Some Ast.CA_ignore || Option.is_some upsert_update)
          && not_null_skip_or_fail table_meta row ~on_conflict
        in
        (* #243 (T1): alias PK conflict detection is normally folded into put_x

@@ -380,9 +380,26 @@ EOF
   meaningless because the insert it was decided against is discarded, and
   `dels` **must** be empty because `execute_insert`'s upsert branch never calls
   `delete_replace_conflicts` — a non-empty `dels` there is a queued delete that
-  never happens. Nothing is lost: the DO UPDATE's own result is still checked
-  against every other unique index by `write_row_rekeyed` →
-  `check_index_unique_on_update`, on the row that is actually written.
+  never happens.
+
+  **What this pass does NOT do — and an earlier revision of this bullet claimed
+  it did — is hand the check downstream.** `write_row_rekeyed` performs *no*
+  uniqueness probe: its index loop is an unconditional `S.del` of the old key
+  and `S.put` of the new one. `check_index_unique_on_update` is defined after it
+  in `exec.ml` and is reached only from `validate_update_unique`, the
+  plain-`UPDATE` pre-pass. Discarding the other indexes' verdicts is still
+  sound — they were computed against the row being INSERTED, which is discarded,
+  and a `SET v = 42` does not touch the column they were about — but **a DO
+  UPDATE that writes a duplicate into another unique index is accepted
+  silently**. That is pre-existing (true on `main` for the secondary-index
+  shape) and is tracked as **#667**. Do not read the target pass as covering it.
+
+  One consequence of the target pass is a change for the *raising* modifiers:
+  bare / `OR ABORT` / `OR FAIL` / `OR ROLLBACK` used to report
+  `UNIQUE constraint failed` for a second index the discarded insert row
+  collided with, and now run the DO UPDATE. That was a false positive — the
+  conflicting row is never written — and it is pinned by
+  `raising_modifiers_no_longer_report_the_discarded_rows_conflict`.
 
   The **rowid-alias PK** is the other thing an ON CONFLICT clause can name, and
   it has no index, so it is invisible to that fold. When the clause names it,
@@ -393,6 +410,46 @@ EOF
   conflict afterwards). The probe is only paid when an upsert clause names the
   alias column, so #350's plain-INSERT path is untouched. The arm in
   `execute_insert_write` is kept as a backstop, not the primary path.
+
+  **Two things ride on that pre-probe, both decided rather than incidental**,
+  because routing a conflicting row to the upsert branch skips
+  `execute_insert_write` entirely and that function did more than one job:
+
+  - **The insert row's NOT NULL check moved up, for upserts only.** It is now in
+    `execute_insert`, entered when the statement is `OR IGNORE` *or* carries an
+    upsert clause. Without that, `INSERT INTO t VALUES (1, ?) ON CONFLICT(k) DO
+    UPDATE …` bound to NULL raised on `main` and silently became a successful DO
+    UPDATE. The rule stands: an `ON CONFLICT` clause never intercepts a NOT NULL
+    violation. The *secondary-index* shape is the one that changed to agree — it
+    never raised here — and a statement with **no** upsert clause is untouched,
+    including the precedence between a UNIQUE error and a NOT NULL one.
+  - **`last_insert_rowid()` is no longer set by a DO UPDATE.** No row was
+    inserted, so it should not move. Before #639 the alias-PK shape set it (it
+    returned through the INSERT branch) and the secondary-index shape never did —
+    the same "answer depends on which constraint you hit" split #639 is about.
+    `test_upsert_on_pk_last_rowid` in `test/test_rowid_alias.ml` asserted the old
+    answer **vacuously** (it seeded rowid 5 and upserted rowid 5, so the seed's
+    own value satisfied it); it now seeds 7, upserts 5, and pins the new one. The
+    comment it carried claimed SQLite parity for the opposite answer and was
+    never oracle-checked; the reasoning runs the other way (SQLite sets the value
+    at `OP_Insert` under `OPFLAG_LASTROWID`, and a DO UPDATE is generated as an
+    UPDATE). If the oracle disagrees, set it in **both** shapes — do not restore
+    the split.
+
+  **An unremarked improvement, recorded so nobody finds it by bisect:** the
+  pre-probe also removes a bogus #417 delta. The old alias-PK upsert path emitted
+  *both* an `Updated` and a phantom `Inserted { rowid; row }` — with `row` being
+  the *attempted insert* row, not the stored one — so any reactive view over the
+  table saw a row that was never written. The upsert branch emits only `Updated`.
+
+  **A conflict target that names no PRIMARY KEY or UNIQUE constraint is silently
+  ignored, where SQLite rejects the statement** ("ON CONFLICT clause does not
+  match any PRIMARY KEY or UNIQUE constraint"). Granary treats it as a plain
+  INSERT and drops the `DO UPDATE`. Pre-existing, pinned by
+  `a_non_unique_index_is_not_a_conflict_target`, and tracked as **#668** — it is
+  #639's failure mode reached through a schema mistake instead of a modifier.
+  `Exec.index_is_conflict_target` does require `idx_unique`, so a non-unique
+  index can never be *promoted* into a target; what is missing is the rejection.
 
   **`OR REPLACE` defers to the target too, and that is a decision, not a side
   effect of the arm order (#639, decided 2026-08-06).** `INSERT OR REPLACE ...

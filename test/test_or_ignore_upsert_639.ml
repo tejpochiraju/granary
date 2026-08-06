@@ -34,8 +34,8 @@
     its own probe before [check_insert_unique] runs at all.
 
     NOT NULL is {b not} a uniqueness conflict, so an ON CONFLICT clause never
-    intercepts it — the modifier does, exactly as #599 decided. Two consequences
-    are pinned here because they pull in opposite directions:
+    intercepts it — the modifier does, exactly as #599 decided. Three
+    consequences are pinned here because they pull in different directions:
 
     - a NULL in the row being {i inserted} skips under [OR IGNORE], and now does
       so for both conflict shapes ([not_null_upsert_skip_is_index_independent]).
@@ -43,10 +43,26 @@
       collision reached [execute_insert_write]'s [null_skip] and skipped, a
       secondary-index collision resolved to [upsert_rowid] first and ran the
       DO UPDATE.
+    - the same NULL under a {i raising} modifier raises, and it took a second
+      review to get that right: the alias pre-probe routes a conflicting row
+      past [execute_insert_write] altogether, which silently turned the raise
+      into a successful DO UPDATE. The check now sits in [execute_insert] for
+      any statement carrying an upsert clause.
+      [a_conflicting_insert_half_null_still_raises] covers both shapes with a
+      row that actually collides — [insert_half_null_still_raises_without_or_ignore]
+      does not, because it inserts a non-conflicting key, which is exactly how
+      the regression got in. [a_plain_insert_keeps_its_error_precedence] pins
+      the other side: with no upsert clause nothing moved.
     - a NULL {i assigned by the DO UPDATE} raises, because that write funnels
       through [write_row_rekeyed] → [enforce_not_null], which #599 requires to
       stay unconditional. That is the exact statement in the issue, and it is
       what the sqlite3 3.45.1 oracle reports.
+
+    {b What [write_row_rekeyed] does NOT do is check uniqueness.} Its index loop
+    is an unconditional del/put, and [check_index_unique_on_update] is reached
+    only from the plain-UPDATE pre-pass. So a DO UPDATE can write a duplicate
+    into a UNIQUE index — pre-existing, true on [main] too, tracked as #667, and
+    deliberately not pinned as correct anywhere below.
 
     {b #631 — a skipped row's trigger side effects survived a BEGIN.} A BEFORE
     INSERT trigger whose body performs nested DML, on a row then skipped by
@@ -407,6 +423,55 @@ let or_replace_with_a_second_conflict_displaces_nothing () =
       "SELECT * FROM m ORDER BY id")
 ;;
 
+(* The same collision under the RAISING modifiers, which is a behaviour change
+   from `main` and needs saying out loud.
+
+   On `main` the single fold reached `m_b`'s catch-all and raised
+   "UNIQUE constraint failed: m.b". With the target probed first the fold over
+   `others` is never entered, so the DO UPDATE runs. That is the right answer:
+   the `b` conflict belonged to the row being INSERTED, and that row is
+   discarded — row 1's own `b` is untouched by `SET v = 42`, so there is no
+   duplicate to report. `main` was raising a false positive.
+
+   What this does NOT establish is that the DO UPDATE's own writes are
+   uniqueness-checked. They are not — see #667. A `DO UPDATE SET b = 21` here
+   would silently write a duplicate into `m_b`, on this revision and on `main`
+   alike. Deliberately not pinned as correct: it is a pre-existing gap, not a
+   decision. *)
+let raising_modifiers_no_longer_report_the_discarded_rows_conflict () =
+  List.iter
+    (fun modifier ->
+       with_db (fun db ->
+         exec
+           db
+           "CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v INTEGER NOT \
+            NULL)";
+         exec db "CREATE UNIQUE INDEX m_a ON m (a)";
+         exec db "CREATE UNIQUE INDEX m_b ON m (b)";
+         exec db "INSERT INTO m VALUES (1, 10, 20, 5)";
+         exec db "INSERT INTO m VALUES (2, 11, 21, 6)";
+         let sql =
+           Printf.sprintf
+             "INSERT %sINTO m VALUES (3, 10, 21, 9) ON CONFLICT(a) DO UPDATE SET v = 42"
+             modifier
+         in
+         (match run_stmt db sql [] with
+          | Ok n ->
+            Alcotest.(check int) (Printf.sprintf "%S ran the DO UPDATE" modifier) 1 n
+          | Error e ->
+            Alcotest.failf
+              "%S raised on the discarded row's conflict: %a"
+              sql
+              Db.pp_error
+              e);
+         expect_rows
+           db
+           ~msg:(Printf.sprintf "%S updated row 1 and left row 2 alone" modifier)
+           [ "1|10|20|42"; "2|11|21|6" ]
+           "SELECT * FROM m ORDER BY id"))
+    [ ""; "OR ABORT "; "OR FAIL "; "OR ROLLBACK " ]
+;;
+
 (* The rowid-alias PK is the other shape an ON CONFLICT clause can name, and it
    carries no index, so [check_insert_unique] cannot see it. Without the
    pre-probe a secondary conflict decided first: under OR IGNORE the row was
@@ -464,7 +529,16 @@ let an_alias_pk_target_beats_a_secondary_conflict () =
 (* A non-unique index whose columns happen to match the ON CONFLICT list is NOT
    a conflict target — a target must name a uniqueness constraint. Pinned
    because [index_is_conflict_target] tests [idx_unique] and dropping that test
-   would silently turn any same-column index into one. *)
+   would silently turn any same-column index into one.
+
+   {b This pins a divergence from SQLite, which is recorded in CLAUDE.md rather
+   than assumed.} SQLite REJECTS the statement outright — "ON CONFLICT clause
+   does not match any PRIMARY KEY or UNIQUE constraint" — where granary treats
+   it as a plain INSERT and silently ignores the clause. The divergence is
+   pre-existing (nothing has ever validated a conflict target against the
+   schema) and #639 does not fix it; it is tracked as #668. What #639 does fix
+   is the part that mattered here: whatever the clause names, it cannot promote
+   a non-unique index into a target. *)
 let a_non_unique_index_is_not_a_conflict_target () =
   with_db (fun db ->
     exec db "CREATE TABLE n (id INTEGER PRIMARY KEY, a INTEGER, v INTEGER NOT NULL)";
@@ -606,6 +680,74 @@ let insert_half_null_still_raises_without_or_ignore () =
            [ "1|5" ]
            "SELECT * FROM t"))
     [ ""; "OR ABORT "; "OR FAIL "; "OR ROLLBACK "; "OR REPLACE " ]
+;;
+
+(* The same thing where the row DOES conflict, which is the case the test above
+   misses — it inserts k = 2, which collides with nothing, so it never reaches
+   the conflict machinery at all.
+
+   Caught in review of PR #652: the alias-PK pre-probe routes a conflicting row
+   straight to the upsert branch, bypassing [execute_insert_write] and therefore
+   its NOT NULL check, so this silently became a successful DO UPDATE for every
+   raising modifier. It raised on `main`. The check moved into [execute_insert]
+   under `Option.is_some upsert_update` so it raises again.
+
+   Both conflict shapes, because "the answer must not depend on which index the
+   row hit" is the whole point — and note the secondary shape NEVER raised here
+   on `main`, so it is the one changing to agree with the alias shape rather
+   than the other way round. *)
+let a_conflicting_insert_half_null_still_raises () =
+  List.iter
+    (fun modifier ->
+       (* alias PK: row 1 exists, so this conflicts on the named target *)
+       with_db (fun db ->
+         seed_alias db;
+         expect_error
+           db
+           ~needle:"NOT NULL constraint failed: t.v"
+           (Printf.sprintf
+              "INSERT %sINTO t VALUES (1, ?) ON CONFLICT(k) DO UPDATE SET v = 42"
+              modifier)
+           [ Db.V_null ];
+         expect_rows
+           db
+           ~msg:(Printf.sprintf "%S: alias-PK conflict, DO UPDATE did not run" modifier)
+           [ "1|5" ]
+           "SELECT * FROM t");
+       (* secondary index: k = 100 exists, so this conflicts on the named target *)
+       with_db (fun db ->
+         seed_secondary db;
+         expect_error
+           db
+           ~needle:"NOT NULL constraint failed: s.v"
+           (Printf.sprintf
+              "INSERT %sINTO s VALUES (2, 100, ?) ON CONFLICT(k) DO UPDATE SET v = 42"
+              modifier)
+           [ Db.V_null ];
+         expect_rows
+           db
+           ~msg:(Printf.sprintf "%S: secondary conflict, DO UPDATE did not run" modifier)
+           [ "1|100|5" ]
+           "SELECT * FROM s"))
+    [ ""; "OR ABORT "; "OR FAIL "; "OR ROLLBACK "; "OR REPLACE " ]
+;;
+
+(* A plain INSERT — no ON CONFLICT clause — keeps `main`'s behaviour exactly,
+   including the precedence between a UNIQUE error and a NOT NULL one. The
+   early check above is entered only when there is an upsert clause or
+   `OR IGNORE`, precisely so this case does not move. A row that violates NOT
+   NULL *and* collides with a secondary UNIQUE index still reports UNIQUE
+   first, because [check_insert_unique] runs before [execute_insert_write]'s
+   NOT NULL check and nothing was inserted ahead of it. *)
+let a_plain_insert_keeps_its_error_precedence () =
+  with_db (fun db ->
+    seed_secondary db;
+    expect_error
+      db
+      ~needle:"UNIQUE constraint failed"
+      "INSERT INTO s VALUES (2, 100, ?)"
+      [ Db.V_null ];
+    expect_rows db ~msg:"nothing written" [ "1|100|5" ] "SELECT * FROM s")
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -966,6 +1108,10 @@ let () =
             "a non-unique index is not a conflict target"
             `Quick
             a_non_unique_index_is_not_a_conflict_target
+        ; Alcotest.test_case
+            "raising modifiers no longer report the discarded row's conflict"
+            `Quick
+            raising_modifiers_no_longer_report_the_discarded_rows_conflict
         ] )
     ; ( "639-not-null"
       , [ Alcotest.test_case
@@ -984,6 +1130,14 @@ let () =
             "every other modifier still raises on the insert-half NULL"
             `Quick
             insert_half_null_still_raises_without_or_ignore
+        ; Alcotest.test_case
+            "a CONFLICTING insert-half NULL still raises (both shapes)"
+            `Quick
+            a_conflicting_insert_half_null_still_raises
+        ; Alcotest.test_case
+            "a plain INSERT keeps its error precedence"
+            `Quick
+            a_plain_insert_keeps_its_error_precedence
         ] )
     ; ( "639-statement-shapes"
       , [ Alcotest.test_case

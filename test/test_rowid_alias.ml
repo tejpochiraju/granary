@@ -240,17 +240,56 @@ let test_upsert_on_pk () =
        | _ -> "??"))
 ;;
 
-(* last_insert_rowid() must reflect the upserted row's id — the alias-PK
-   conflict is detected by put_x rather than a pre-read, and the result flows
-   back through set_last_inserted_rowid.  SQLite-correct behavior. *)
+(* An upsert that takes the DO UPDATE branch does NOT change
+   last_insert_rowid() — no row was inserted.  Decided during the review of PR
+   #652 (#639); see the CLAUDE.md #639 bullet.
+
+   This test used to assert the opposite, and it was VACUOUS: it seeded rowid 5
+   and upserted rowid 5, so the seed INSERT's own value satisfied the assertion
+   whatever the upsert did.  It never distinguished the two answers, which is
+   how the change slipped past it.  The seed is now rowid 7 and the upsert
+   targets rowid 5, so the two answers are 7 and 5 and the test has an opinion.
+
+   The behaviour it pinned was also only ever half the story: the SECONDARY-index
+   upsert shape has never set last_insert_rowid, on any revision, because it
+   returns through [execute_insert]'s upsert branch, which does not call
+   [Cat.set_last_inserted_rowid].  Before #639 the alias-PK shape returned
+   through the INSERT branch instead and did set it.  Same statement, two
+   answers, decided by which constraint the row collided with — the same class
+   of defect #639 is about.  They now agree.
+
+   The old comment claimed "SQLite-correct behavior" for the opposite answer.
+   That claim was never oracle-checked, and the reasoning points the other way:
+   SQLite sets the value at OP_Insert under OPFLAG_LASTROWID, and an upsert's
+   DO UPDATE is generated as an UPDATE, which does not carry that flag.
+   Re-confirming against a real sqlite3 is on the verification list; if it
+   disagrees, the fix is to set it in BOTH shapes, not to restore the split. *)
 let test_upsert_on_pk_last_rowid () =
   with_db (fun db ->
     exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
-    exec db "INSERT INTO t VALUES (5, 'a')";
-    exec db "INSERT INTO t VALUES (5, 'b') ON CONFLICT(id) DO UPDATE SET v = 'updated'";
+    exec db "INSERT INTO t VALUES (7, 'a')";
+    exec db "INSERT INTO t VALUES (5, 'seed')";
     Alcotest.(check int64)
-      "last_insert_rowid is 5 after alias-PK upsert"
+      "the seed INSERT set it"
       5L
+      (scalar_int db "SELECT last_insert_rowid()");
+    exec db "INSERT INTO t VALUES (7, 'b') ON CONFLICT(id) DO UPDATE SET v = 'updated'";
+    Alcotest.(check int64)
+      "the DO UPDATE left last_insert_rowid alone (no row was inserted)"
+      5L
+      (scalar_int db "SELECT last_insert_rowid()");
+    Alcotest.(check string)
+      "and it really did update row 7"
+      "updated"
+      (match query_rows db "SELECT v FROM t WHERE id = 7" with
+       | [ [| Db.V_text s |] ] -> s
+       | _ -> "??");
+    (* An upsert whose target does NOT conflict is a real insert, and still
+       sets it — the change is about the DO UPDATE branch only. *)
+    exec db "INSERT INTO t VALUES (9, 'c') ON CONFLICT(id) DO UPDATE SET v = 'updated'";
+    Alcotest.(check int64)
+      "the non-conflicting upsert inserted, so it did set it"
+      9L
       (scalar_int db "SELECT last_insert_rowid()"))
 ;;
 
