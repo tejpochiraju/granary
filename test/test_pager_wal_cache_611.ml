@@ -32,6 +32,14 @@
       looks up the older frame, and the newest reader's entry is invisible to
       it in both directions and in either arrival order.
 
+    A fourth hazard is not a trigger but a {b window}: [sync_wal_epoch] runs
+    before the [wal_read_frame] yield and the [cache_add] after it, so a
+    checkpoint landing inside that window could install a dead generation's
+    frame that no later purge would ever remove. [read_and_cache_frame] carries
+    an [expected_epoch] guard for it — the same one [Wal.cache_frame] already
+    carries a layer down (reviews #209/#210) — and the stub's [during_read]
+    hook forces the interleaving deterministically.
+
     Every trigger is exercised on the copying path ([Pager.read]) and the
     zero-copy borrow path ([Pager.read_borrow]), because they resolve through
     two different functions. *)
@@ -80,9 +88,15 @@ type stub =
   { mutable frames : (int64 * Cstruct.t) array
   ; mutable epoch : int64
   ; mutable frame_reads : int (* how many times [wal_read_frame] ran *)
+  ; mutable during_read : (unit -> unit Lwt.t) option
+    (** The I/O yield inside [wal_read_frame], made explicit. A real
+        [Wal.read_frame] suspends there on a device read plus an AES-GCM
+        decrypt whenever its own #246 frame cache misses; this hook is what
+        lets a test run a checkpoint {e inside} that window. One-shot, so a
+        hook that itself resolves a page does not re-enter. *)
   }
 
-let new_stub () = { frames = [||]; epoch = 0L; frame_reads = 0 }
+let new_stub () = { frames = [||]; epoch = 0L; frame_reads = 0; during_read = None }
 
 (* Append one frame for [pid] holding [byte]; returns its frame index. *)
 let append stub pid byte =
@@ -116,11 +130,19 @@ let callbacks (s : stub) : Pager.wal_callbacks =
   in
   let read_frame i =
     s.frame_reads <- s.frame_reads + 1;
+    (* Resolve the buffer BEFORE yielding: a real WAL reads the bytes at the
+       index the caller asked for, and whatever the hook does to [s.frames]
+       afterwards cannot retroactively change what was read. *)
     let _, page = s.frames.(i) in
     (* Return the stub's own buffer: [Wal.read_frame] may hand back a buffer it
        retains in its decrypted-frame cache (#246), and the pager must be
        correct against that stronger case, not only against a fresh copy. *)
-    Lwt.return_ok page
+    match s.during_read with
+    | None -> Lwt.return_ok page
+    | Some f ->
+      s.during_read <- None;
+      let* () = f () in
+      Lwt.return_ok page
   in
   let append_commit _ = Lwt.return_ok () in
   { wal_find_page = find_page
@@ -326,6 +348,86 @@ let test_recycled_frame_index_on_borrow_path () =
      ignore (append stub 5L 0x5F);
      let* b2 = borrow_byte pager 5L in
      check_int "borrow does not serve the recycled frame stale" 0x5F b2;
+     Lwt.return_unit)
+;;
+
+(* ---- the concurrent window, not just the ordering ------------------- *)
+
+(* {b The interleaving [sync_wal_epoch] alone does not cover} (review of
+   PR #649). The epoch pull happens BEFORE the [wal_read_frame] yield and the
+   [cache_add] happens AFTER it, so a checkpoint landing inside that window
+   would let a late arrival install a dead generation's bytes over an entry a
+   second fiber had already purged and correctly repopulated — and since
+   [t.wal_epoch] is by then already the NEW epoch, no later purge would ever
+   remove it. Permanently poisoned, silently wrong for every reader after.
+
+   [Store.checkpoint_unlocked]'s reader gate is [ro_readers_below]
+   ([m < target]), so a reader at the WAL head is not gated and genuinely runs
+   concurrently with [Wal.reset]. This is the exact hazard [Wal.cache_frame]
+   already carries [~expected_epoch] for (reviews #209/#210); the pager now
+   carries the same guard.
+
+   The two tests below force the interleaving deterministically through the
+   stub's [during_read] hook — the ordering-only tests above cannot see it,
+   because a synchronous stub has no yield to interleave with. *)
+let test_checkpoint_during_the_read_yield_does_not_poison_the_cache () =
+  Lwt_main.run
+    (let pager, stub, _ = make_pager () in
+     ignore (append stub 1L 0x10);
+     (* Fiber A is about to resolve page 1 at frame 0 of generation e.  While
+        it is suspended inside [wal_read_frame], a checkpoint completes and
+        fiber B resolves the SAME page at the SAME recycled index in
+        generation e+1 — so B's entry and A's late arrival collide on one
+        cache key. *)
+     stub.during_read
+     <- Some
+          (fun () ->
+            let* () = migrate pager 1L 0x10 in
+            checkpoint stub;
+            ignore (append stub 1L 0x99);
+            let* rb = Pager.read pager 1L in
+            check_int "fiber B sees the new generation" 0x99 (byte_of rb);
+            check_int "fiber B's entry is cached" 1 (Pager.wal_cached_count pager);
+            Lwt.return_unit);
+     let* ra = Pager.read pager 1L in
+     (* A's own answer is the bytes it read, from the index its snapshot
+        resolved before the checkpoint.  That is unchanged pre-#611 behaviour
+        and matches [Wal.read_frame], which also returns what it read and
+        merely declines to cache it. *)
+     check_int "fiber A returns the bytes it actually read" 0x10 (byte_of ra);
+     (* The assertion that matters: A did NOT overwrite B's entry. *)
+     check_int "the late arrival cached nothing" 1 (Pager.wal_cached_count pager);
+     let* rc = Pager.read pager 1L in
+     check_int "the cache was not poisoned by the late arrival" 0x99 (byte_of rc);
+     Lwt.return_unit)
+;;
+
+(* Same window with no second fiber: A alone must not install the dead
+   generation's frame, because after it does [t.wal_epoch] would already have
+   moved and no later [sync_wal_epoch] would purge it. *)
+let test_checkpoint_during_the_read_yield_on_borrow_path () =
+  Lwt_main.run
+    (let pager, stub, _ = make_pager () in
+     ignore (append stub 4L 0x40);
+     stub.during_read
+     <- Some
+          (fun () ->
+            let* () = migrate pager 4L 0x40 in
+            checkpoint stub;
+            ignore (append stub 4L 0x4F);
+            Lwt.return_unit);
+     let* ba = borrow_byte pager 4L in
+     check_int "the borrower gets the bytes it read" 0x40 ba;
+     check_int
+       "nothing from the dead generation was cached"
+       0
+       (Pager.wal_cached_count pager);
+     (* And the next reader gets the new generation, whether or not a purge
+        was still owed. *)
+     let* bb = borrow_byte pager 4L in
+     check_int "the next borrower sees the new generation" 0x4F bb;
+     let* rc = Pager.read pager 4L in
+     check_int "and so does the copying path" 0x4F (byte_of rc);
      Lwt.return_unit)
 ;;
 
@@ -592,6 +694,14 @@ let () =
             "a recycled frame index is not served stale on the borrow path"
             `Quick
             test_recycled_frame_index_on_borrow_path
+        ; Alcotest.test_case
+            "a checkpoint during the read yield does not poison the cache"
+            `Quick
+            test_checkpoint_during_the_read_yield_does_not_poison_the_cache
+        ; Alcotest.test_case
+            "a checkpoint during the read yield, borrow path"
+            `Quick
+            test_checkpoint_during_the_read_yield_on_borrow_path
         ; Alcotest.test_case
             "repeated checkpoints stay correct"
             `Quick

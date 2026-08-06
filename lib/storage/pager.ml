@@ -408,15 +408,48 @@ let cstruct_dup src =
 
 (* #611: read frame [frame_idx], publish it under [key] (unless the caller
    asked to bypass the cache), and hand back the very buffer [wal_read_frame]
-   returned. *)
+   returned.
+
+   [expected_epoch] is the whole subtlety, and it is the SAME guard the layer
+   below already carries — see [Wal.cache_frame]'s [~expected_epoch] and
+   [read_committed_frame]'s deliberate refusal to prime the frame cache
+   (reviews #209/#210).  [sync_wal_epoch] runs BEFORE the yield in
+   [wal_read_frame]; a checkpoint that lands DURING that yield would otherwise
+   let this [cache_add] install a dead generation's bytes AFTER a later fiber
+   had already purged and repopulated the same [key], and — because
+   [t.wal_epoch] would by then already be the new epoch — no later
+   [sync_wal_epoch] would ever purge it again.  The result is a permanently
+   poisoned entry and a silent wrong answer for every subsequent reader.  The
+   window is real: [Store.checkpoint_unlocked]'s reader gate is
+   [ro_readers_below] ([m < target]), so a reader at the WAL head is not gated
+   and runs concurrently with [Wal.reset].
+
+   Both conjuncts are checked deliberately.  [t.wal_epoch] cannot currently
+   differ from [cb.wal_epoch ()] here without the first conjunct also failing
+   (epochs are monotone and [t.wal_epoch] is only ever assigned from
+   [cb.wal_epoch ()]), so the second is redundant today — but it is what keeps
+   this correct if the pager's own epoch bookkeeping ever gains another writer,
+   and it costs an [Int64] compare on a path that has just done device I/O.
+
+   The frame's BYTES are still returned to the caller when the epoch moved.
+   That is unchanged pre-#611 behaviour and matches [Wal.read_frame], which
+   also returns what it read and merely declines to cache it: the resolving
+   reader picked [frame_idx] under its own snapshot before the checkpoint, and
+   deciding what a reader at the head owes a concurrent checkpoint is #555/#585
+   territory, not this cache's. *)
 let read_and_cache_frame ~bypass_cache t cb ~page_id ~frame_idx ~key =
   let open Lwt.Syntax in
+  let expected_epoch = cb.wal_epoch () in
   let* r = cb.wal_read_frame frame_idx in
   match r with
   | Error s -> Lwt.return_error (Block_error s)
   | Ok page ->
     emit_wal_read t page_id;
-    if not bypass_cache then cache_add t key page;
+    if
+      (not bypass_cache)
+      && Int64.equal (cb.wal_epoch ()) expected_epoch
+      && Int64.equal t.wal_epoch expected_epoch
+    then cache_add t key page;
     Lwt.return_ok page
 ;;
 
