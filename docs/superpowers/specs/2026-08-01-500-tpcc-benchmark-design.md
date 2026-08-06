@@ -168,14 +168,20 @@ running each profile against the engine, never predicted from reading the AST.
 Every departure from TPC-C as written lives here, so the history is in one place
 rather than scattered across module comments.
 
-**StockLevel is `Rewritten` (#491).** granary's parser rejects `DISTINCT` as an
-aggregate argument, so the spec's `COUNT(DISTINCT s_i_id)` is a parse error, and
-there are no derived tables to wrap it in. The join, the 20-order window, the
-`s_quantity` threshold and the duplicate elimination all still run in the engine as
-`SELECT DISTINCT s_i_id`; only the final `COUNT` of the deduplicated ids is taken
-client-side as the row count. The spec's comma-join is also spelled `INNER JOIN`,
-since granary's `FROM` clause takes one table plus explicit joins. No other profile
-deviates: the remaining four are `Native`.
+**StockLevel is `Rewritten` (#486).** The spec's comma-join is spelled
+`INNER JOIN`, since granary's `FROM` clause takes one table plus explicit joins.
+StockLevel is the only profile with a join at all, which is why it is the only one
+carrying a rewrite. No other profile deviates: the remaining four are `Native`.
+
+> **Superseded, 2026-08-06.** As written, this deviation had a second half:
+> granary's parser rejected `DISTINCT` as an aggregate argument, so the spec's
+> `COUNT(DISTINCT s_i_id)` was a parse error and there were no derived tables to
+> wrap it in. The join, the 20-order window, the `s_quantity` threshold and the
+> duplicate elimination ran in the engine as `SELECT DISTINCT s_i_id`, and only
+> the final `COUNT` of the deduplicated ids was taken client-side as the row
+> count. **#491 is fixed and that half is withdrawn** — the distinct count now
+> runs in the engine. Only the `INNER JOIN` spelling remains, hence the citation
+> change above.
 
 **The NURand run constants are per-use, and the `c_last` run constant is derived
 from `C_LOAD` rather than equal to it.** An earlier version of `Tpcc_txn.gen_input`

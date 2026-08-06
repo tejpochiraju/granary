@@ -612,24 +612,74 @@ let test_order_status_empty_lines_raises () =
       (contains "order_line" why)
 ;;
 
+(* The canned answer to the low-stock read is now a SINGLE row carrying the
+   engine's count — [[ "7" ]] — not a projection of seven ids.  Before #491 the
+   two were indistinguishable to this test: the profile took [List.length] over
+   whatever rows came back, so one row meant a count of 1 and the row's contents
+   were never looked at.  Now the arity and the contents both matter, which is
+   what the two tests below pin. *)
 let test_stock_level_is_read_only () =
-  let ops, log = mock ~rows:[ [ [ "3001" ] ]; [ [ "10" ]; [ "20" ]; [ "30" ] ] ] in
+  let ops, log = mock ~rows:[ [ [ "3001" ] ]; [ [ "7" ] ] ] in
   Lwt_main.run (T.run ops (T.Stock_level_input { w_id = 1; d_id = 3; threshold = 15 }));
   let log = log () in
   check_transactional "stock_level" log;
   Alcotest.(check bool)
     "reads d_next_o_id then the low-stock items of the last 20 orders"
     true
-    (in_order [ "BEGIN"; "SELECT d_next_o_id"; "SELECT DISTINCT s_i_id"; "COMMIT" ] log);
+    (in_order [ "BEGIN"; "SELECT d_next_o_id"; "COUNT(DISTINCT s_i_id)"; "COMMIT" ] log);
   Alcotest.(check bool)
     "windows the last 20 orders below d_next_o_id"
     true
     (issued "ol_o_id < 3001 AND ol_o_id >= 2981" log);
   Alcotest.(check bool) "applies the threshold" true (issued "s_quantity < 15" log);
+  (* #491: the duplicate elimination AND the count both run in the engine.  The
+     withdrawn workaround is spelled out as a negative rather than left implicit,
+     because the statement text of the fixed shape contains [DISTINCT s_i_id] as
+     a substring of the aggregate argument — only the projection spelling
+     distinguishes them. *)
+  Alcotest.(check bool)
+    "no client-side dedup projection"
+    false
+    (issued "SELECT DISTINCT s_i_id" log);
+  Alcotest.(check int)
+    "BEGIN, the district read, the one aggregate read, COMMIT — nothing else"
+    4
+    (List.length log);
   List.iter
     (fun forbidden ->
        Alcotest.(check bool) ("read-only: no " ^ forbidden) false (issued forbidden log))
     [ "INSERT"; "UPDATE"; "DELETE" ]
+;;
+
+(* The other half of "the count is the engine's": an aggregate with no GROUP BY
+   returns exactly one row whatever the data, so ZERO rows can only mean the read
+   broke — where under the old client-side dedup zero rows was the legitimate
+   answer "no low-stock items".  A profile that answered 0 here would be
+   reporting a broken join as a plausible number. *)
+let test_stock_level_empty_count_raises () =
+  let ops, log = mock ~rows:[ [ [ "3001" ] ]; [] ] in
+  let raised =
+    try
+      Lwt_main.run
+        (T.run ops (T.Stock_level_input { w_id = 1; d_id = 3; threshold = 15 }));
+      None
+    with
+    | T.Missing_value why -> Some why
+  in
+  match raised with
+  | None -> Alcotest.fail "a zero-row COUNT(DISTINCT ...) was read as a count of 0"
+  | Some why ->
+    Alcotest.(check bool)
+      (Printf.sprintf "the failure names the aggregate (%s)" why)
+      true
+      (contains "count(distinct s_i_id)" why);
+    let log = log () in
+    Alcotest.(check bool)
+      "rolls back before raising"
+      true
+      (starts_with "ROLLBACK" (last log));
+    Alcotest.(check bool) "and does not commit" false (issued "COMMIT" log);
+    check_transactional "stock_level" log
 ;;
 
 let run_profile_ignoring_failure ops input =
@@ -927,7 +977,12 @@ let () =
             test_delivery_empty_result_raises
         ] )
     ; ( "stock_level"
-      , [ Alcotest.test_case "read-only" `Quick test_stock_level_is_read_only ] )
+      , [ Alcotest.test_case "read-only" `Quick test_stock_level_is_read_only
+        ; Alcotest.test_case
+            "empty count raises"
+            `Quick
+            test_stock_level_empty_count_raises
+        ] )
     ; ( "all profiles"
       , [ Alcotest.test_case
             "wrapped in a transaction"

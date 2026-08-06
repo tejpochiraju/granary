@@ -46,9 +46,14 @@ type profile =
     runs each profile against a loaded W=1 granary database and checks the
     four clause-3.3 consistency conditions afterwards. New_order, Payment,
     Order_status and Delivery are {!Native} — they run the spec's statements
-    untouched. Stock_level is {!Rewritten}: [COUNT(DISTINCT s_i_id)] is a
-    granary parse error ({b #491}), so the engine returns the deduplicated
-    ids and the count is taken client-side. No profile is {!Skipped}. *)
+    untouched. Stock_level is {!Rewritten}, and for one reason only: the spec's
+    comma-join is spelled [INNER JOIN], since granary's FROM clause takes a
+    single table plus explicit joins ({b #486}). It is the only profile with a
+    join at all, which is why it is the only one carrying a rewrite. It used to
+    carry a second one — [COUNT(DISTINCT s_i_id)] was a granary parse error
+    ({b #491}), so the engine returned the deduplicated ids and the count was
+    taken client-side — but #491 is fixed and the distinct count now runs in
+    the engine. No profile is {!Skipped}. *)
 val all : profile list
 
 (** [verdict_label v] is the CSV token: ["native"], ["rewritten"], or
