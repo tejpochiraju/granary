@@ -8504,6 +8504,23 @@ let correlated_filter_refusal () =
    in scope under (#635)."
 ;;
 
+(** #626: the projection's counterpart to {!correlated_filter_refusal}.
+
+    [stream_expr_project] used to keep a non-raising fallback when the
+    correlation source could not be located: every such subquery evaluated to
+    [Row.V_null]. A NULL there is indistinguishable from a legitimately-NULL
+    aggregate, so the caller could not tell "no matching rows" from "the engine
+    could not resolve this correlation" — the #592 failure mode wearing a
+    different hat, a column of plausible NULLs instead of zero rows. The same
+    shape in a WHERE or an ON clause was already refused, so the two spellings
+    disagreed about the same unresolvable reference. *)
+let correlated_projection_refusal () =
+  "Exec: a correlated subquery in this projection cannot be resolved — its outer column \
+   reference has no source in the rows being projected (#626). Rewrite it as an \
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
+;;
+
 (** #592: what the {i inner} SELECT already has in scope, so a reference the
     subquery owns can be told apart from an outer one. SQL resolves
     innermost-first, and both halves of that matter:
@@ -9522,10 +9539,11 @@ and stream_expr_project clock params store mode cat exprs child =
     let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
     Lwt.return (Lwt_stream.map eval_exprs inner))
   else (
+    (* #626: what cannot be resolved is refused, exactly as [stream_filter]
+       refuses it. The fallback this replaces answered [Row.V_null] for every
+       such expression — silent, and indistinguishable from a legitimate NULL. *)
     match get_outer_scan_metas child with
-    | None ->
-      let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
-      Lwt.return (Lwt_stream.map eval_exprs inner)
+    | None -> Lwt.fail_with (correlated_projection_refusal ())
     | Some metas ->
       Lwt.return
         (Lwt_stream.map_s
@@ -9539,7 +9557,12 @@ and stream_expr_project clock params store mode cat exprs child =
                        with_pull_context ~stats:s_opt ~mode (fun () ->
                          pre_eval_subquery clock store params cat e_subst)
                      in
-                     Lwt.return (eval_expr clock params row resolved))
+                     (* A subquery that survives the substitution named an outer
+                        column no input carries, or an ambiguous one. Refuse
+                        rather than let [eval_expr] answer NULL for it. *)
+                     if plan_expr_has_subquery resolved
+                     then Lwt.fail_with (correlated_projection_refusal ())
+                     else Lwt.return (eval_expr clock params row resolved))
                   exprs'
               in
               Lwt.return (Array.of_list vals))
