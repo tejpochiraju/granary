@@ -3509,9 +3509,93 @@ let unique_constraint_failed_msg ~(table : string) ~(columns : string list) : st
     (String.concat ", " (List.map (fun c -> table ^ "." ^ c) columns))
 ;;
 
-(* UNIQUE pre-check for INSERT: fold over [idxs] returning (skip, rowids to
-   delete for REPLACE, optional rowid to update for UPSERT). Raises on a plain
-   UNIQUE violation. *)
+(* Probe ONE unique index for a conflict with [row_for_idx], returning the
+   conflicting row's rowid.  [None] means "no conflict", which includes the two
+   cases that exempt the row from the probe entirely: a partial index whose
+   WHERE the row does not match, and #290's NULL exemption (SQLite treats every
+   NULL as distinct in a UNIQUE index — such a row is still written to the index
+   tree, it just never conflicts).  Callers must have checked [idx_unique]. *)
+let probe_unique_conflict
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row_for_idx : Row.t)
+      (idx : Cat.index_info)
+  : int64 option Lwt.t
+  =
+  if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
+  then Lwt.return_none
+  else (
+    let key_vals = get_index_key_values clock params idx table_meta.columns row_for_idx in
+    if any_null_val key_vals
+    then Lwt.return_none
+    else (
+      let iks = List.map row_value_to_index_value key_vals in
+      let prefix, plen = encode_index_key_prefix iks in
+      let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+      (* O(log n) native probe: only the first entry >= seek_key is needed to
+         detect a duplicate prefix — never drain the whole index (#229). *)
+      let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
+      let* first = S.seek_next cur in
+      let conflict_rowid_opt =
+        match first with
+        | None -> None
+        | Some (ikey, _) ->
+          if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+          then (
+            let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
+            Some (Rowid.decode rid_bytes))
+          else None
+      in
+      S.seek_close cur;
+      Lwt.return conflict_rowid_opt))
+;;
+
+(* #639: does this index carry the constraint an ON CONFLICT clause names?
+   [idx_unique] is part of the test on purpose — a conflict target must name a
+   uniqueness constraint, so a non-unique index with the same column list is not
+   one, and falls through to the modifier like any other index. *)
+let index_is_conflict_target
+      (idx : Cat.index_info)
+      ~(upsert_update : (string list * (int * Plan.expr) list) option)
+  : bool
+  =
+  match upsert_update with
+  | None -> false
+  | Some (conflict_cols, _) ->
+    idx.Cat.idx_unique
+    && List.sort String.compare idx.Cat.idx_columns
+       = List.sort String.compare conflict_cols
+;;
+
+(* UNIQUE pre-check for INSERT: returns (skip, rowids to delete for REPLACE,
+   optional rowid to update for UPSERT). Raises on a plain UNIQUE violation.
+
+   #639: the conflict TARGET is probed first, in its own pass, and supersedes
+   everything else when it hits. That is not a micro-optimisation — it is what
+   makes the answer well-defined. The single fold this replaced let a conflict
+   on ANY index decide, so with two unique indexes and a row conflicting on
+   both, the outcome depended on the order [Cat.indexes_for_table] happened to
+   return them in (newest-first, i.e. on `CREATE UNIQUE INDEX` order): the
+   target seen first gave an upsert, the other seen first gave a skip under
+   [CA_ignore]. Same schema, same statement, two answers.
+
+   When the target hits, the accumulator is reset to [(false, [], Some rid)]:
+
+   - [skip] must be false. The upsert supersedes the insert, and a skip decided
+     against a row that is no longer being inserted is meaningless.
+   - [dels] must be EMPTY. Those rowids were queued for deletion because they
+     conflicted with the row being INSERTED — and that row is discarded in
+     favour of updating [rid], so nothing should be displaced. Dropping them
+     silently would be worse than either answer: [execute_insert]'s upsert
+     branch never calls [delete_replace_conflicts], so a non-empty [dels] there
+     is a queued delete that never happens.
+
+   The DO UPDATE's own result is still checked against every other unique index
+   — by [write_row_rekeyed] → [check_index_unique_on_update], on the row that is
+   actually written. Nothing is skipped, it just moves to the write that
+   happens. *)
 let check_insert_unique
       tx
       (table_meta : Cat.table_meta)
@@ -3523,67 +3607,46 @@ let check_insert_unique
       (idxs : Cat.index_info list)
   : (bool * int64 list * int64 option) Lwt.t
   =
-  Lwt_list.fold_left_s
-    (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
-       if skip || not idx.idx_unique
-       then Lwt.return (skip, dels, upsert_rid)
-       else if
-         not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
-       then Lwt.return (skip, dels, upsert_rid)
-       else (
-         let key_vals =
-           get_index_key_values clock params idx table_meta.columns row_for_idx
-         in
-         (* #290: SQLite treats every NULL as distinct in a UNIQUE index — a row
-            whose key has ANY NULL column is exempt from the uniqueness probe (it
-            is still inserted into the index tree, it just never conflicts). *)
-         if any_null_val key_vals
-         then Lwt.return (false, dels, upsert_rid)
-         else (
-           let iks = List.map row_value_to_index_value key_vals in
-           let prefix, plen = encode_index_key_prefix iks in
-           let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-           (* O(log n) native probe: only the first entry >= seek_key is needed
-            to detect a duplicate prefix — never drain the whole index (#229). *)
-           let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
-           let* first = S.seek_next cur in
-           let conflict_rowid_opt =
-             match first with
-             | None -> None
-             | Some (ikey, _) ->
-               if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-               then (
-                 let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
-                 Some (Rowid.decode rid_bytes))
-               else None
+  let targets, others =
+    List.partition (fun idx -> index_is_conflict_target idx ~upsert_update) idxs
+  in
+  let* target_hit =
+    Lwt_list.fold_left_s
+      (fun acc idx ->
+         match acc with
+         | Some _ -> Lwt.return acc
+         | None -> probe_unique_conflict tx table_meta ~clock ~params ~row_for_idx idx)
+      None
+      targets
+  in
+  match target_hit with
+  | Some old_rowid -> Lwt.return (false, [], Some old_rowid)
+  | None ->
+    (* No target conflict (or no target at all): the modifier governs, exactly
+       as it did before #639. [upsert_rid] can only stay [None] here — every
+       index that could have set it is in [targets]. *)
+    Lwt_list.fold_left_s
+      (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
+         if skip || not idx.idx_unique
+         then Lwt.return (skip, dels, upsert_rid)
+         else
+           let* conflict =
+             probe_unique_conflict tx table_meta ~clock ~params ~row_for_idx idx
            in
-           S.seek_close cur;
-           match conflict_rowid_opt with
-           | None -> Lwt.return (false, dels, upsert_rid)
+           match conflict with
+           | None -> Lwt.return (skip, dels, upsert_rid)
            | Some old_rowid ->
-             (* #639: the explicit ON CONFLICT target wins over the statement's
-                conflict-resolution modifier FOR THE INDEX IT NAMES.  This arm
-                used to sit below [CA_ignore], so `INSERT OR IGNORE ... ON
-                CONFLICT(k) DO UPDATE` silently skipped instead of running the
-                DO UPDATE — a caller who wrote both got "insert, or do nothing".
-                The modifier still governs every OTHER index: a conflict on an
-                index the ON CONFLICT clause does not name falls through to
-                [CA_ignore]/[CA_replace] exactly as before. *)
-             (match on_conflict, upsert_update with
-              | _, Some (conflict_cols, _)
-                when List.sort String.compare idx.idx_columns
-                     = List.sort String.compare conflict_cols ->
-                Lwt.return (false, dels, Some old_rowid)
-              | Some Ast.CA_ignore, _ ->
+             (match on_conflict with
+              | Some Ast.CA_ignore ->
                 Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
-              | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
+              | Some Ast.CA_replace -> Lwt.return (false, old_rowid :: dels, upsert_rid)
               | _ ->
                 Lwt.fail_with
                   (unique_constraint_failed_msg
                      ~table:table_meta.Cat.name
-                     ~columns:idx.idx_columns)))))
-    (false, [], None)
-    idxs
+                     ~columns:idx.idx_columns)))
+      (false, [], None)
+      others
 ;;
 
 (* Write [row]'s index entries (honoring each index's WHERE predicate). *)
@@ -3979,7 +4042,16 @@ let execute_insert_write
          clause naming this alias PK beats the statement's modifier, so
          `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` runs the DO UPDATE
          instead of silently skipping.  A modifier still governs a conflict the
-         ON CONFLICT clause does not name (it falls through to the arms below). *)
+         ON CONFLICT clause does not name (it falls through to the arms below).
+
+         BACKSTOP, not the primary path: since the review of PR #652 the
+         alias-PK target is probed in [execute_insert] BEFORE
+         [check_insert_unique], because a secondary-index conflict resolved here
+         would otherwise have already set [skip] or run
+         [delete_replace_conflicts] by the time [put_x] discovers this one.  The
+         arm is kept because it costs nothing and its absence would turn any
+         hole in that probe into a bare "UNIQUE constraint failed" rather than
+         the DO UPDATE the caller asked for. *)
       (match on_conflict, upsert_update with
        | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
          (* Alias PK is always a single column, so single-element equality
@@ -4259,9 +4331,52 @@ let execute_insert
          on_conflict = Some Ast.CA_ignore
          && not_null_skip_or_fail table_meta row ~on_conflict
        in
+       (* #243 (T1): alias PK conflict detection is normally folded into put_x
+          inside execute_insert_write (#350) — no pre-read needed. *)
+       let alias_col_name =
+         match alias_idx with
+         | Some i when alias_explicit -> Some (List.nth table_meta.columns i).Row.name
+         | _ -> None
+       in
+       (* #639: the rowid-alias PK is the OTHER thing an ON CONFLICT clause can
+          name, and when it names that one the target has to be resolved before
+          [check_insert_unique] gets a say — for exactly the reason spelled out
+          there. The alias PK has no index, so it is invisible to that fold: a
+          secondary conflict would set [skip] (under [OR IGNORE], losing the DO
+          UPDATE the caller asked for) or queue deletes (under [OR REPLACE],
+          displacing rows for an insert that then never happens, since
+          [delete_replace_conflicts] runs before [put_x] discovers the alias
+          conflict). Both are the same defect as the multi-index case, mirrored.
+
+          The probe costs one [S.get] and is only paid when an ON CONFLICT
+          clause actually names the alias column — never on the plain INSERT
+          path #350 optimised, which has no upsert clause at all. When it hits,
+          the result is the same shape the secondary-index target produces:
+          [(false, [], Some rowid)], with [old_rowid = rowid] by the alias-PK
+          invariant (the conflict is on this very key). *)
+       let alias_is_conflict_target =
+         match upsert_update, alias_col_name with
+         | Some (conflict_cols, _), Some name -> conflict_cols = [ name ]
+         | _ -> false
+       in
+       let* alias_target_hit =
+         if null_skip || not alias_is_conflict_target
+         then Lwt.return false
+         else
+           let* existing =
+             S.get
+               tx
+               (let x, _, _, _ = Cat.row_storage table_meta in
+                x)
+               (Rowid.encode rowid)
+           in
+           Lwt.return (Option.is_some existing)
+       in
        let* skip, to_delete, upsert_rowid =
          if null_skip
          then Lwt.return (true, [], None)
+         else if alias_target_hit
+         then Lwt.return (false, [], Some rowid)
          else
            check_insert_unique
              tx
@@ -4273,13 +4388,12 @@ let execute_insert
              ~upsert_update
              idxs
        in
-       (* #243 (T1): alias PK conflict detection is now folded into put_x
-          inside execute_insert_write (#350) — no pre-read needed. *)
-       let alias_col_name =
-         match alias_idx with
-         | Some i when alias_explicit -> Some (List.nth table_meta.columns i).Row.name
-         | _ -> None
-       in
+       (* #639 (review): [skip] and [to_delete] are BOTH meaningless when
+          [upsert_rowid] is [Some _], and the branch below discards them. That is
+          sound only because every producer of a [Some] returns [(false, [], _)]
+          — [check_insert_unique]'s target pass and the alias probe above. Do not
+          reintroduce a path that sets [upsert_rowid] alongside a live [skip] or
+          a non-empty [to_delete]: the delete would be queued and never run. *)
        match upsert_update, upsert_rowid with
        | Some (_, assigns), Some old_rowid ->
          (* Secondary-index upsert conflict: update the conflicting row.

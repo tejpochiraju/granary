@@ -18,6 +18,21 @@
     the issue did not name and which is pinned deliberately rather than left to
     the arm ordering.
 
+    {b The target is resolved in its own pass, before the modifier sees
+    anything}, and the tests that matter most here are the ones that pin why.
+    The first cut of this fix merely reordered the match arms inside a single
+    fold over the unique indexes, which left the answer depending on the order
+    [Cat.indexes_for_table] happened to return them in — i.e. on [CREATE UNIQUE
+    INDEX] order — whenever a row conflicted on the target {i and} on another
+    index at once. Under [OR IGNORE] one order ran the DO UPDATE and the other
+    silently skipped; under [OR REPLACE] one order queued a delete that
+    [execute_insert]'s upsert branch then threw away. Those are
+    [a_conflict_on_the_target_and_another_index_is_order_independent],
+    [or_replace_with_a_second_conflict_displaces_nothing] and
+    [an_alias_pk_target_beats_a_secondary_conflict] — the last because the
+    rowid-alias PK carries no index and so is invisible to that fold, and needs
+    its own probe before [check_insert_unique] runs at all.
+
     NOT NULL is {b not} a uniqueness conflict, so an ON CONFLICT clause never
     intercepts it — the modifier does, exactly as #599 decided. Two consequences
     are pinned here because they pull in opposite directions:
@@ -308,6 +323,167 @@ let the_modifier_still_governs_other_indexes () =
       ~msg:"the named-index conflict updated"
       [ "1|10|20|42" ]
       "SELECT * FROM m")
+;;
+
+(* The case the reorder NEWLY created, caught in review of PR #652: a row that
+   conflicts on the named index AND on another one at the same time. Before the
+   target got its own pass, [check_insert_unique] folded over every unique index
+   and let whichever conflicted first decide — and [Schema_cache.by_table_add]
+   prepends, so [indexes_for_table] is newest-index-first, i.e. the fold order is
+   [CREATE UNIQUE INDEX] order reversed.
+
+   So the SAME schema and the SAME statement gave two answers depending on which
+   index was created last: target first → [upsert_rid] set, then the other index
+   set [skip], which [execute_insert]'s upsert branch discarded, and the DO
+   UPDATE ran; other index first → [skip] won, [upsert_rid] stayed [None], and
+   the row was silently skipped — #639 unfixed.
+
+   Both creation orders are run below and must agree. The order is the whole
+   point of the test, so it must not be "tidied" into one. *)
+let a_conflict_on_the_target_and_another_index_is_order_independent () =
+  let setup db ~target_index_last =
+    exec
+      db
+      "CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v INTEGER NOT NULL)";
+    if target_index_last
+    then (
+      exec db "CREATE UNIQUE INDEX m_b ON m (b)";
+      exec db "CREATE UNIQUE INDEX m_a ON m (a)")
+    else (
+      exec db "CREATE UNIQUE INDEX m_a ON m (a)";
+      exec db "CREATE UNIQUE INDEX m_b ON m (b)");
+    exec db "INSERT INTO m VALUES (1, 10, 20, 5)"
+  in
+  List.iter
+    (fun target_index_last ->
+       let label =
+         if target_index_last then "target index created last" else "target index first"
+       in
+       with_db (fun db ->
+         setup db ~target_index_last;
+         (* Conflicts on BOTH a (the named target) and b. The target wins. *)
+         (match
+            run_stmt
+              db
+              "INSERT OR IGNORE INTO m VALUES (2, 10, 20, 9) ON CONFLICT(a) DO UPDATE \
+               SET v = 42"
+              []
+          with
+          | Ok n -> Alcotest.(check int) (label ^ ": the DO UPDATE ran") 1 n
+          | Error e -> Alcotest.failf "%s: raised: %a" label Db.pp_error e);
+         expect_rows
+           db
+           ~msg:(label ^ ": updated in place, whichever order the indexes were built")
+           [ "1|10|20|42" ]
+           "SELECT * FROM m"))
+    [ false; true ]
+;;
+
+(* The same collision under OR REPLACE, which is where the discarded accumulator
+   cost a DELETE rather than an UPDATE. With rows (1,10,20,5) and (2,11,21,6), a
+   row conflicting with row 1 on the named index [a] and with row 2 on [b] used
+   to queue row 2 for deletion and then take the upsert branch — which never
+   calls [delete_replace_conflicts], so the delete was silently dropped.
+
+   The answer the fix pins is that NOTHING is displaced: the target supersedes
+   the insert, so the row that would have conflicted with row 2 is never
+   written, and row 2 has no reason to go. *)
+let or_replace_with_a_second_conflict_displaces_nothing () =
+  with_db (fun db ->
+    exec
+      db
+      "CREATE TABLE m (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v INTEGER NOT NULL)";
+    exec db "CREATE UNIQUE INDEX m_a ON m (a)";
+    exec db "CREATE UNIQUE INDEX m_b ON m (b)";
+    exec db "INSERT INTO m VALUES (1, 10, 20, 5)";
+    exec db "INSERT INTO m VALUES (2, 11, 21, 6)";
+    exec
+      db
+      "INSERT OR REPLACE INTO m VALUES (3, 10, 21, 9) ON CONFLICT(a) DO UPDATE SET v = 42";
+    expect_rows
+      db
+      ~msg:"row 1 updated in place and row 2 was NOT deleted"
+      [ "1|10|20|42"; "2|11|21|6" ]
+      "SELECT * FROM m ORDER BY id")
+;;
+
+(* The rowid-alias PK is the other shape an ON CONFLICT clause can name, and it
+   carries no index, so [check_insert_unique] cannot see it. Without the
+   pre-probe a secondary conflict decided first: under OR IGNORE the row was
+   skipped and the DO UPDATE lost, under OR REPLACE the secondary row was
+   deleted before [put_x] even discovered the alias conflict. *)
+let an_alias_pk_target_beats_a_secondary_conflict () =
+  let setup db =
+    exec db "CREATE TABLE w (k INTEGER PRIMARY KEY, b INTEGER, v INTEGER NOT NULL)";
+    exec db "CREATE UNIQUE INDEX w_b ON w (b)";
+    exec db "INSERT INTO w VALUES (1, 20, 5)";
+    exec db "INSERT INTO w VALUES (2, 21, 6)"
+  in
+  (* Conflicts on the alias PK (k=1, the named target) AND on w_b against row 2. *)
+  with_db (fun db ->
+    setup db;
+    (match
+       run_stmt
+         db
+         "INSERT OR IGNORE INTO w VALUES (1, 21, 9) ON CONFLICT(k) DO UPDATE SET v = 42"
+         []
+     with
+     | Ok n -> Alcotest.(check int) "the DO UPDATE ran, not the skip" 1 n
+     | Error e ->
+       Alcotest.failf "alias target lost to a secondary conflict: %a" Db.pp_error e);
+    expect_rows
+      db
+      ~msg:"row 1 updated, row 2 untouched"
+      [ "1|20|42"; "2|21|6" ]
+      "SELECT * FROM w ORDER BY k");
+  (* Same collision under OR REPLACE: row 2 must NOT be displaced. *)
+  with_db (fun db ->
+    setup db;
+    exec
+      db
+      "INSERT OR REPLACE INTO w VALUES (1, 21, 9) ON CONFLICT(k) DO UPDATE SET v = 42";
+    expect_rows
+      db
+      ~msg:"row 1 updated in place and row 2 survives"
+      [ "1|20|42"; "2|21|6" ]
+      "SELECT * FROM w ORDER BY k");
+  (* And the alias target with NO secondary conflict still upserts — the probe
+     must not have broken the plain case. *)
+  with_db (fun db ->
+    setup db;
+    exec
+      db
+      "INSERT OR IGNORE INTO w VALUES (1, 22, 9) ON CONFLICT(k) DO UPDATE SET v = 42";
+    expect_rows
+      db
+      ~msg:"plain alias-PK upsert still works"
+      [ "1|20|42"; "2|21|6" ]
+      "SELECT * FROM w ORDER BY k")
+;;
+
+(* A non-unique index whose columns happen to match the ON CONFLICT list is NOT
+   a conflict target — a target must name a uniqueness constraint. Pinned
+   because [index_is_conflict_target] tests [idx_unique] and dropping that test
+   would silently turn any same-column index into one. *)
+let a_non_unique_index_is_not_a_conflict_target () =
+  with_db (fun db ->
+    exec db "CREATE TABLE n (id INTEGER PRIMARY KEY, a INTEGER, v INTEGER NOT NULL)";
+    exec db "CREATE INDEX n_a ON n (a)";
+    exec db "INSERT INTO n VALUES (1, 10, 5)";
+    (* No uniqueness on a, so nothing conflicts: this is a plain insert. *)
+    (match
+       run_stmt
+         db
+         "INSERT OR IGNORE INTO n VALUES (2, 10, 9) ON CONFLICT(a) DO UPDATE SET v = 42"
+         []
+     with
+     | Ok n -> Alcotest.(check int) "inserted, not upserted" 1 n
+     | Error e -> Alcotest.failf "raised: %a" Db.pp_error e);
+    expect_rows
+      db
+      ~msg:"both rows present; no DO UPDATE ran"
+      [ "1|10|5"; "2|10|9" ]
+      "SELECT * FROM n ORDER BY id")
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -774,6 +950,22 @@ let () =
             "the modifier still governs indexes the clause does not name"
             `Quick
             the_modifier_still_governs_other_indexes
+        ; Alcotest.test_case
+            "a conflict on the target AND another index is order-independent"
+            `Quick
+            a_conflict_on_the_target_and_another_index_is_order_independent
+        ; Alcotest.test_case
+            "OR REPLACE with a second conflict displaces nothing"
+            `Quick
+            or_replace_with_a_second_conflict_displaces_nothing
+        ; Alcotest.test_case
+            "an alias-PK target beats a secondary conflict"
+            `Quick
+            an_alias_pk_target_beats_a_secondary_conflict
+        ; Alcotest.test_case
+            "a non-unique index is not a conflict target"
+            `Quick
+            a_non_unique_index_is_not_a_conflict_target
         ] )
     ; ( "639-not-null"
       , [ Alcotest.test_case
