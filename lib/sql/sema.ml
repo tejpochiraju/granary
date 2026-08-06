@@ -138,6 +138,14 @@ type bound_expr =
   | BE_window_slot of int
   (** Reference to the i-th window function result appended after input columns by Op_window. *)
   | BE_collate of bound_expr * Ast.collation (** expr COLLATE collation_name *)
+  | BE_out_col of int
+  (** #489/#490: reference to the i-th (0-based) column of the SELECT's OUTPUT
+      row, not of its input row.  Produced only for an ORDER BY term that names
+      a select-list position (an ordinal) or an output alias, and only where the
+      sort runs AFTER projection — an aggregated SELECT and a compound's
+      post-set-op sort.  Every other shape sorts BEFORE projection, so there the
+      term is resolved to the select item's own input-row expression instead and
+      this constructor never appears. *)
 
 type bound_order_key =
   { key : bound_expr
@@ -1132,6 +1140,7 @@ let rec expr_has_subquery = function
   | BE_collate (e, _) -> expr_has_subquery e
   | BE_excluded_col _ -> false
   | BE_window_slot _ -> false
+  | BE_out_col _ -> false
 ;;
 
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
@@ -2955,34 +2964,57 @@ let bind_select_having
       | Ok (be, hagg) -> Ok (Some be, hagg))
 ;;
 
-(* Bind ORDER BY keys, resolving projection aliases as a fallback. *)
+(* Bind ORDER BY keys, resolving select-list references.
+
+   #489: a term that is a BARE INTEGER LITERAL is an ORDINAL — the 1-based
+   position of a column in the SELECT list (SQL:92).  Out of range (0,
+   negative, or past the end) is an ERROR.  Before this, the literal simply
+   bound as a constant, so every row got the same sort key and the rows came
+   back in scan order with no error at all: a silent wrong answer.
+
+   ANYTHING ELSE that is not a bare identifier is an ordinary expression and is
+   evaluated, never matched against the SELECT list.  Only the *bare* literal
+   form is an ordinal, which is what keeps [ORDER BY -1] (an [E_neg]) and
+   [ORDER BY 1+1] (an [E_binop]) constants rather than ordinals, exactly as in
+   SQLite.
+
+   A bare identifier binds as an input column first and falls back to a
+   select-list output alias.
+
+   [out_ref] turns a 1-based output position into the bound key for it and owns
+   the range check; [out_aliases] lists the SELECT list's explicit aliases in
+   output order ([None] where an item has none, [[]] when the projection cannot
+   carry aliases at all). *)
 let bind_select_order
       ~param_counter
       ~named_params
       ~(tables : (Cat.table_meta * int * string option) list)
-      ~(proj_exprs : (bound_expr * string option) list)
+      ~(out_aliases : string option list)
+      ~(out_ref : int64 -> (bound_expr, error) result)
       order
   =
-  let alias_map : (string * bound_expr) list =
-    List.filter_map
-      (fun (be, alias_opt) -> Option.map (fun a -> a, be) alias_opt)
-      proj_exprs
+  (* 1-based position of the output column carrying alias [name], if any. *)
+  let alias_pos name =
+    let rec go i = function
+      | [] -> None
+      | Some a :: _ when String.equal a name -> Some (Int64.of_int (i + 1))
+      | _ :: rest -> go (i + 1) rest
+    in
+    go 0 out_aliases
   in
-  let bind_order_expr e =
-    let base_result =
+  let bind_order_expr (e : Ast.expr) =
+    match e with
+    | Ast.E_lit (Ast.L_int n) -> out_ref n
+    | Ast.E_col name ->
       (* Alias-aware binder for both single-table and joined
          queries; see comment in [bind_one] above. *)
-      bind_expr_join ~param_counter ~named_params ~tables e
-    in
-    match base_result with
-    | Ok _ -> base_result
-    | Error _ ->
-      (match e with
-       | Ast.E_col name ->
-         (match List.assoc_opt name alias_map with
-          | Some be -> Ok be
-          | None -> base_result)
-       | _ -> base_result)
+      (match bind_expr_join ~param_counter ~named_params ~tables e with
+       | Ok _ as ok -> ok
+       | Error _ as err ->
+         (match alias_pos name with
+          | Some pos -> out_ref pos
+          | None -> err))
+    | _ -> bind_expr_join ~param_counter ~named_params ~tables e
   in
   List.fold_left
     (fun acc (ok : Ast.order_key) ->
@@ -3077,8 +3109,45 @@ let bind_select_resolved
       having
   in
   let all_aggs = proj_aggs @ having_aggs in
+  (* #489/#490: the SELECT list as ORDER BY sees it.  [out_aliases] is the
+     explicit aliases in output order; only an `Exprs projection can carry any.
+     [out_ref] maps a 1-based output position to the key that reads it, and the
+     mapping depends on WHERE the sort runs (see [Planner.plan_select]):
+     an aggregated SELECT sorts AFTER projection, so the key addresses the
+     output row directly ([BE_out_col]); every other shape sorts BEFORE
+     projection, so the key must be the select item's own input-row
+     expression. *)
+  let out_aliases : string option list =
+    match proj with
+    | `Exprs es -> List.map snd es
+    | `All | `Cols _ -> []
+  in
+  let out_arity =
+    if is_aggregated
+    then List.length agg_proj_items
+    else if proj_exprs <> []
+    then List.length proj_exprs
+    else List.length proj_ords
+  in
+  let out_ref (n : int64) : (bound_expr, error) result =
+    if n < 1L || n > Int64.of_int out_arity
+    then
+      Error
+        (Unsupported
+           (Printf.sprintf
+              "ORDER BY position %Ld is not in the SELECT list (expected 1..%d)"
+              n
+              out_arity))
+    else (
+      let i = Int64.to_int n - 1 in
+      if is_aggregated
+      then Ok (BE_out_col i)
+      else if proj_exprs <> []
+      then Ok (fst (List.nth proj_exprs i))
+      else Ok (BE_col (List.nth proj_ords i)))
+  in
   let$ bound_order =
-    bind_select_order ~param_counter ~named_params ~tables ~proj_exprs order
+    bind_select_order ~param_counter ~named_params ~tables ~out_aliases ~out_ref order
   in
   let$ valid_limit, valid_offset = validate_limit_offset ~limit ~offset in
   Lwt.return
@@ -3226,6 +3295,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
        | Ast.Ty_blob -> Row.Blob)
   | BE_excluded_col _ -> None (* type of excluded col unknown at bind time *)
   | BE_window_slot _ -> None (* type of window func result unknown at bind time *)
+  | BE_out_col _ -> None (* output-row column: type is the select item's, not a col's *)
   | BE_collate (e, _) -> infer_type cols e (* collation doesn't change type *)
 ;;
 
@@ -3331,6 +3401,49 @@ let bind_order_keys
        | Error _ as e -> e
        | Ok acc ->
          (match bind_expr ~param_counter ~named_params meta ok.Ast.expr with
+          | Error e -> Error e
+          | Ok be -> Ok (acc @ [ { key = be; dir = ok.Ast.dir; nulls = ok.Ast.nulls } ])))
+    (Ok [])
+    oks
+;;
+
+(* #489: like {!bind_order_keys}, but for a compound (UNION/INTERSECT/EXCEPT)
+   ORDER BY, where a bare integer literal is the SQL:92 ordinal — the 1-based
+   position of a column in the compound's OUTPUT row.  That output row is
+   exactly what the post-set-op sort sees, so the ordinal becomes a
+   [BE_out_col] and needs no table at all.  Everything else still binds against
+   the leftmost arm's [meta], since a compound takes its column names from the
+   leftmost SELECT.  Output ALIASES are not resolved here (#490 covers the
+   plain-SELECT path only); a compound arm's aliases are not carried this far. *)
+let bind_compound_order_keys
+      ~param_counter
+      ~named_params
+      ~n_out
+      (meta : Cat.table_meta)
+      oks
+  =
+  let ordinal n =
+    if n < 1L || n > Int64.of_int n_out
+    then
+      Error
+        (Unsupported
+           (Printf.sprintf
+              "ORDER BY position %Ld is not in the SELECT list (expected 1..%d)"
+              n
+              n_out))
+    else Ok (BE_out_col (Int64.to_int n - 1))
+  in
+  List.fold_left
+    (fun acc_r (ok : Ast.order_key) ->
+       match acc_r with
+       | Error _ as e -> e
+       | Ok acc ->
+         let key_r =
+           match ok.Ast.expr with
+           | Ast.E_lit (Ast.L_int n) -> ordinal n
+           | e -> bind_expr ~param_counter ~named_params meta e
+         in
+         (match key_r with
           | Error e -> Error e
           | Ok be -> Ok (acc @ [ { key = be; dir = ok.Ast.dir; nulls = ok.Ast.nulls } ])))
     (Ok [])
@@ -4277,7 +4390,8 @@ and bind_compound
         then Ok []
         else (
           match leftmost_table_meta l with
-          | Some meta -> bind_order_keys ~param_counter ~named_params meta order
+          | Some meta ->
+            bind_compound_order_keys ~param_counter ~named_params ~n_out:n_left meta order
           | None ->
             (* No underlying table (e.g. const_select compound). *)
             Ok [])

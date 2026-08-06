@@ -51,6 +51,14 @@ type bound_expr =
   | BE_window_slot of int
   (** Reference to the i-th window function result appended after input columns by Op_window. *)
   | BE_collate of bound_expr * Ast.collation (** expr COLLATE collation_name *)
+  | BE_out_col of int
+  (** #489/#490: the i-th (0-based) column of a SELECT's OUTPUT row, not of its
+      input row.  Produced only for an ORDER BY term naming a select-list
+      position (an ordinal) or an output alias, and only where the sort runs
+      AFTER projection: an aggregated SELECT, and a compound's post-set-op
+      sort.  Shapes that sort BEFORE projection resolve such a term to the
+      select item's own input-row expression instead, so this constructor
+      never reaches them. *)
 
 type bound_order_key =
   { key : bound_expr
