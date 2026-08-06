@@ -156,6 +156,7 @@ type window_sema =
 type agg_spec =
   { func : Ast.agg_func
   ; col_ord : int option
+  ; distinct : bool
   }
 
 type agg_proj_item =
@@ -711,7 +712,7 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
        in
        Ok (BE_in (bx', ok_vals)))
   | Ast.E_param p -> Ok (BE_param (resolve_param ~param_counter ~named_params p))
-  | Ast.E_agg _ -> Error (Unsupported "aggregate in WHERE")
+  | Ast.E_agg _ | Ast.E_agg_distinct _ -> Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
     bind_func ~bind:(bind_expr ~param_counter ~named_params meta) func args
   | Ast.E_match _ ->
@@ -844,7 +845,7 @@ let rec bind_expr_join
        in
        Ok (BE_in (bx', ok_vals)))
   | Ast.E_param p -> Ok (BE_param (resolve_param ~param_counter ~named_params p))
-  | Ast.E_agg _ -> Error (Unsupported "aggregate in WHERE")
+  | Ast.E_agg _ | Ast.E_agg_distinct _ -> Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
     bind_func ~bind:(bind_expr_join ~param_counter ~named_params ~tables) func args
   | Ast.E_match _ -> Error (Unsupported "MATCH in JOIN context")
@@ -1068,7 +1069,11 @@ let bind_expr_agg
     | Ast.E_agg (func, arg_opt) ->
       (match agg_col_ord ~resolver func arg_opt with
        | Error e -> Error e
-       | Ok col_ord -> Ok (BE_col (add_agg { func; col_ord })))
+       | Ok col_ord -> Ok (BE_col (add_agg { func; col_ord; distinct = false })))
+    | Ast.E_agg_distinct (func, arg) ->
+      (match agg_col_ord ~resolver func (Some arg) with
+       | Error e -> Error e
+       | Ok col_ord -> Ok (BE_col (add_agg { func; col_ord; distinct = true })))
     | Ast.E_func (func, args) -> bind_func ~bind:go func args
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
@@ -1136,7 +1141,7 @@ let rec expr_has_subquery = function
 
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
-  | Ast.E_agg _ -> true
+  | Ast.E_agg _ | Ast.E_agg_distinct _ -> true
   | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
   | Ast.E_subquery _ | Ast.E_exists _ -> false
   | Ast.E_in_select (x, _) -> expr_has_agg x
@@ -1199,6 +1204,7 @@ let rec expr_has_window = function
    forms (aggregates, subqueries, params, windows, FTS) that cannot be. *)
 let rec check_expr_unsupported = function
   | Ast.E_agg _
+  | Ast.E_agg_distinct _
   | Ast.E_match _
   | Ast.E_subquery _
   | Ast.E_exists _
@@ -2517,12 +2523,15 @@ let bind_post_agg
       (match col_ord_result with
        | Error e -> Error e
        | Ok co ->
-         let spec = { func; col_ord = co } in
+         let spec = { func; col_ord = co; distinct = false } in
          let rec find_slot i = function
            | [] ->
              acc_aggs := !acc_aggs @ [ spec ];
              List.length !acc_aggs - 1
-           | s :: _ when s.func = spec.func && s.col_ord = spec.col_ord -> i
+           | s :: _
+             when s.func = spec.func
+                  && s.col_ord = spec.col_ord
+                  && s.distinct = spec.distinct -> i
            | _ :: rest -> find_slot (i + 1) rest
          in
          let slot = find_slot 0 !acc_aggs in
@@ -2540,6 +2549,10 @@ let bind_post_agg
        | Ok ba, Ok bb -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
        | Error e, _ | _, Error e -> Error e)
     | Ast.E_window _ -> Error (Unsupported "nested window functions not supported")
+    (* #491: a DISTINCT aggregate deduplicates per GROUP, which has no meaning
+       inside a window function's per-frame argument. *)
+    | Ast.E_agg_distinct _ ->
+      Error (Unsupported "DISTINCT aggregate in a window function argument")
     | _ ->
       Error
         (Unsupported
@@ -2643,6 +2656,7 @@ let project_agg
       ~(tables : (Cat.table_meta * int * string option) list)
       ~meta
       ~add_agg
+      ~(distinct : bool)
       func
       arg_opt
   : (agg_proj_item, error) result
@@ -2650,7 +2664,7 @@ let project_agg
   match agg_col_ord ~resolver:(agg_arg_resolver ~tables ~meta) func arg_opt with
   | Error e -> Error e
   | Ok co ->
-    let slot = add_agg { func; col_ord = co } in
+    let slot = add_agg { func; col_ord = co; distinct } in
     Ok (AP_agg_slot slot)
 ;;
 
@@ -2772,7 +2786,10 @@ let project_agg_item
           Error
             (Unsupported
                (Printf.sprintf "column '%s.%s' must appear in GROUP BY clause" t c))))
-  | Ast.E_agg (func, arg_opt) -> project_agg ~tables ~meta ~add_agg func arg_opt
+  | Ast.E_agg (func, arg_opt) ->
+    project_agg ~tables ~meta ~add_agg ~distinct:false func arg_opt
+  | Ast.E_agg_distinct (func, arg) ->
+    project_agg ~tables ~meta ~add_agg ~distinct:true func (Some arg)
   | Ast.E_window { func; args; window } ->
     project_window
       ~tables

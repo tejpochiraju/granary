@@ -496,4 +496,7 @@ and proj_item =
 and agg_spec =
   { func : Ast.agg_func
   ; col_ord : int option (** [None] means COUNT-star *)
+  ; distinct : bool
+    (** #491: the argument list carried [DISTINCT]; the aggregate consumes each
+            distinct input value once. Always [false] for a COUNT-star. *)
   }

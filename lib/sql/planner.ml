@@ -1644,7 +1644,7 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
 ;;
 
 let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
-  { Plan.func = a.func; col_ord = a.col_ord }
+  { Plan.func = a.func; col_ord = a.col_ord; distinct = a.distinct }
 ;;
 
 let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function

@@ -998,6 +998,7 @@ let rec map_expr f e =
   | Sql.Ast.E_in (x, vs) -> Sql.Ast.E_in (go x, List.map go vs)
   | Sql.Ast.E_func (fn, args) -> Sql.Ast.E_func (fn, List.map go args)
   | Sql.Ast.E_agg (fn, arg) -> Sql.Ast.E_agg (fn, Option.map go arg)
+  | Sql.Ast.E_agg_distinct (fn, arg) -> Sql.Ast.E_agg_distinct (fn, go arg)
   | Sql.Ast.E_case { scrutinee; branches; else_ } ->
     Sql.Ast.E_case
       { scrutinee = Option.map go scrutinee

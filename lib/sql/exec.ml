@@ -9920,8 +9920,31 @@ and agg_sum group_rows i : Row.value =
     in
     Row.V_int s)
 
+(* #491: [DISTINCT] inside an aggregate's argument list.  The dedup key is
+   [row_key]'s rendering of the single argument value, which is what SELECT
+   DISTINCT and the hash joins already use — so all NaNs collapse to one and
+   none collapses into NULL (#536), rather than introducing a fifth value
+   comparator.  NULL survives the dedup as one entry and is then dropped by the
+   aggregate's own NULL handling, exactly as [COUNT(x)] drops it. *)
+and dedup_group_on_col (i : int) (group_rows : Row.t list) : Row.t list =
+  let seen = Hashtbl.create 64 in
+  List.filter
+    (fun (r : Row.t) ->
+       let k = row_key [| r.(i) |] in
+       if Hashtbl.mem seen k
+       then false
+       else (
+         Hashtbl.replace seen k ();
+         true))
+    group_rows
+
 (* Evaluate one aggregate [spec] over the rows of a group. *)
 and aggregate_one (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
+  let group_rows =
+    match spec.distinct, spec.col_ord with
+    | true, Some i -> dedup_group_on_col i group_rows
+    | true, None | false, _ -> group_rows
+  in
   match spec.func, spec.col_ord with
   | Ast.Agg_count, None -> Row.V_int (Int64.of_int (List.length group_rows))
   | Ast.Agg_count, Some i ->
@@ -10055,6 +10078,32 @@ and aggregate_apply_windows clock params agg_windows after_having =
    which makes the caller fall back to the general [stream_aggregate] path.  The
    per-type logic here MUST stay byte-identical to [aggregate_one]/[agg_sum]. *)
 and make_agg_acc (spec : Plan.agg_spec) : ((Row.t -> unit) * (unit -> Row.value)) option =
+  match spec.Plan.distinct, spec.Plan.col_ord with
+  (* #491: a DISTINCT aggregate keeps the fast path — it is the shape TPC-C's
+     StockLevel runs — by filtering the row stream through the same [row_key]
+     dedup [aggregate_one] uses and feeding the survivors to the plain
+     accumulator underneath.  A DISTINCT with no column is not a shape the
+     grammar can produce; refusing it here falls back to the general path
+     rather than silently ignoring the modifier. *)
+  | true, Some i ->
+    (match make_agg_acc { spec with Plan.distinct = false } with
+     | None -> None
+     | Some (update, finalize) ->
+       let seen = Hashtbl.create 64 in
+       Some
+         ( (fun (row : Row.t) ->
+             let k = row_key [| row.(i) |] in
+             if not (Hashtbl.mem seen k)
+             then (
+               Hashtbl.replace seen k ();
+               update row))
+         , finalize ))
+  | true, None -> None
+  | false, _ -> make_agg_acc_plain spec
+
+and make_agg_acc_plain (spec : Plan.agg_spec)
+  : ((Row.t -> unit) * (unit -> Row.value)) option
+  =
   match spec.Plan.func, spec.Plan.col_ord with
   | Ast.Agg_count, None ->
     let c = ref 0 in

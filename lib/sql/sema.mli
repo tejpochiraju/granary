@@ -73,6 +73,9 @@ type window_sema =
 type agg_spec =
   { func : Ast.agg_func
   ; col_ord : int option
+  ; distinct : bool
+    (** #491: the argument list carried [DISTINCT], so the aggregate consumes
+        each distinct input value once. Always [false] for a COUNT-star. *)
   }
 
 (** Projection item in an aggregated SELECT.  The output row of
