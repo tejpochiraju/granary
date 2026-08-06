@@ -163,19 +163,27 @@ let test_worker_created_after_vacuum_is_live () =
 ;;
 
 (* The rowid counter across the VACUUM boundary, in the style of
-   [test_worker_handle_589.ml]: a plain rowid table (no INTEGER PRIMARY KEY) is
-   the shape whose counter is recomputed from the data tree at open time, so it
-   is the one that shows whether the rebuilt file's allocator picked up where
-   the old one left off.  VACUUM preserves tree ids ([copy_all_trees] writes
-   each tid to the same tid), so the "counters are keyed by tree id" rule is not
-   disturbed — the whole counter TABLE is replaced, not remapped. *)
+   [test_worker_handle_589.ml] and [test_rowid_counter_ownership_632.ml]: a
+   plain rowid table (no INTEGER PRIMARY KEY) is the shape whose counter is
+   recomputed from the data tree at open time, so it is the one that shows
+   whether the rebuilt file's allocator picked up where the old one left off.
+   VACUUM preserves tree ids ([copy_all_trees] writes each tid to the same tid),
+   so the "counters are keyed by tree id" rule is not disturbed — the whole
+   counter TABLE is replaced, not remapped.
+
+   The rowid of a plain table is NOT projectable — this engine has no
+   [SELECT rowid] — so the assertion is made on the LABELS, which is strictly
+   stronger than counting: a reused rowid OVERWRITES the row that held it rather
+   than duplicating it, so a restarted allocator loses 'x' (and the row count
+   with it), while a count alone could be fooled by a compensating insert.  The
+   [INTEGER PRIMARY KEY] companion below then shows the continuation directly,
+   in the one spelling that makes a rowid visible. *)
 let test_rowid_counter_survives_vacuum () =
   let db, _path = fresh_file_db () in
   exec db "CREATE TABLE t (b TEXT)";
   exec db "INSERT INTO t (b) VALUES ('x')";
   exec db "INSERT INTO t (b) VALUES ('y')";
-  let before = rows db "SELECT rowid, b FROM t ORDER BY rowid ASC" in
-  check "two rows before" [ "1|x"; "2|y" ] before;
+  check "two rows before" [ "x"; "y" ] (rows db "SELECT b FROM t ORDER BY b ASC");
   let dead = run (Db.create_worker_handle db) in
   exec db "VACUUM";
   check_stale
@@ -183,10 +191,46 @@ let test_rowid_counter_survives_vacuum () =
     (run (Db.execute dead "INSERT INTO t (b) VALUES ('dead')"));
   let fresh = run (Db.create_worker_handle db) in
   exec fresh "INSERT INTO t (b) VALUES ('z')";
+  (* If the rebuilt file's allocator had restarted at 1, 'z' would have taken
+     the rowid 'x' holds and overwritten it: two rows, no 'x'. *)
+  check
+    "every label survives, so no rowid was reused"
+    [ "x"; "y"; "z" ]
+    (rows db "SELECT b FROM t ORDER BY b ASC");
+  check "three rows" [ "3" ] (rows db "SELECT COUNT(*) FROM t");
+  check
+    "and the fresh worker agrees"
+    [ "x"; "y"; "z" ]
+    (rows fresh "SELECT b FROM t ORDER BY b ASC");
+  run (Db.close dead);
+  run (Db.close fresh);
+  run (Db.close db)
+;;
+
+(* The same counter, over an [INTEGER PRIMARY KEY] alias column so the allocated
+   rowid is visible as a value: it must CONTINUE at 3 rather than restart at 1.
+   The label check above proves nothing was lost; this one proves the sequence
+   the allocator handed out. *)
+let test_rowid_counter_continues_across_vacuum () =
+  let db, _path = fresh_file_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "INSERT INTO t (b) VALUES ('x')";
+  exec db "INSERT INTO t (b) VALUES ('y')";
+  check "1 and 2 before" [ "1|x"; "2|y" ] (rows db "SELECT a, b FROM t ORDER BY a ASC");
+  let dead = run (Db.create_worker_handle db) in
+  exec db "VACUUM";
+  check_stale
+    "stale worker cannot allocate a rowid"
+    (run (Db.execute dead "INSERT INTO t (b) VALUES ('dead')"));
+  let fresh = run (Db.create_worker_handle db) in
+  exec fresh "INSERT INTO t (b) VALUES ('z')";
+  exec db "INSERT INTO t (b) VALUES ('w')";
   check
     "the post-VACUUM allocator continued at 3, and nothing was overwritten"
-    [ "1|x"; "2|y"; "3|z" ]
-    (rows db "SELECT rowid, b FROM t ORDER BY rowid ASC");
+    [ "1|x"; "2|y"; "3|z"; "4|w" ]
+    (rows db "SELECT a, b FROM t ORDER BY a ASC");
+  check "max is 4" [ "4" ] (rows db "SELECT MAX(a) FROM t");
+  check "four rows" [ "4" ] (rows db "SELECT COUNT(*) FROM t");
   run (Db.close dead);
   run (Db.close fresh);
   run (Db.close db)
@@ -419,6 +463,10 @@ let () =
             "plain rowid counter survives"
             `Quick
             test_rowid_counter_survives_vacuum
+        ; Alcotest.test_case
+            "rowid alias continues across VACUUM"
+            `Quick
+            test_rowid_counter_continues_across_vacuum
         ; Alcotest.test_case
             "AUTOINCREMENT high-water survives"
             `Quick
