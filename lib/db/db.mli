@@ -2,8 +2,20 @@
 
 type t
 
+(** #634: the invalidation cohort shared by every handle over one
+    {!Granary_store.Store.t}.  {!vacuum} closes that store and swaps a rebuilt
+    one into the handle that ran it; every other handle in the cohort is thereby
+    dead, and is marked so its next statement is refused with an error naming
+    VACUUM rather than failing later on a closed store or a stale rowid counter.
+    Opaque; obtained from {!cohort} and passed to {!of_store}. *)
+type store_cohort
+
 (** Pretty-print a summary: path, active schema, savepoint depth, total changes. *)
 val pp : Format.formatter -> t -> unit
+
+(** #634: this handle's invalidation cohort, to pass to {!of_store} for a second
+    handle over the same store.  {!create_worker_handle} does it for you. *)
+val cohort : t -> store_cohort
 
 (** Re-export value type for convenience. *)
 type value = Granary_encoding.Row.value =
@@ -90,11 +102,19 @@ val open_block
     there is no longer an argument to pass, and therefore none to forget.  (It
     used to be [?rowid_counters], and forgetting it cost silent row loss plus
     durable index corruption.)  {!create_worker_handle} remains the intended way
-    in, because it is about more than the allocator. *)
+    in, because it is about more than the allocator.
+
+    [cohort] (#634) joins the new handle to an existing handle's invalidation
+    cohort, and IS still owed by any caller reaching [of_store] over a store that
+    is already open: {!vacuum} closes the store and swaps in a rebuilt one, so
+    every OTHER handle over that store is left pointing at a closed store.
+    Handles in one cohort are invalidated together and report it through
+    {!stale_after_vacuum}; a handle opened without [cohort] starts its own. *)
 val of_store
   :  ?clock:(unit -> float)
   -> ?durability:Granary_store.Store.durability
   -> ?file_path:string
+  -> ?cohort:store_cohort
   -> Granary_store.Store.t
   -> t Lwt.t
 
@@ -155,7 +175,15 @@ val close : t -> unit Lwt.t
       per-handle; a worker handle starts with none of the parent's.
     - Write transactions {b serialize} on the shared [Rwlock] rather than
       overlapping, and read-only transactions do not overlap a writer either.
-      Genuine concurrency needs #555 option 1. *)
+      Genuine concurrency needs #555 option 1.
+    - {b A {!vacuum} on ANY handle over this store kills every other one} (#634).
+      VACUUM closes the store and swaps in a rebuilt file, which the siblings
+      cannot follow. Since #634 that is loud rather than silent: the surviving
+      handles are refused with an error naming VACUUM, {!stale_after_vacuum}
+      reports it, and the only thing left to do with one is {!close} it and take
+      a fresh worker off the handle that ran the VACUUM.
+
+    Raises [Failure] if [t] is itself stale (see {!stale_after_vacuum}). *)
 val create_worker_handle : t -> t Lwt.t
 
 (** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL
@@ -199,9 +227,38 @@ val catalog : t -> Granary_catalog.Catalog.t
     {!set_file_provider}).
 
     Must not be called inside an explicit transaction.  Any open
-    prepared statements created from the previous file will continue
-    to work logically but observe the recompacted file.  Phase 37 / #120. *)
+    prepared statements created from the previous file {b on this handle} will
+    continue to work logically but observe the recompacted file.  Phase 37 /
+    #120.
+
+    {b #634: every OTHER handle over the same store dies here.}  VACUUM closes
+    the store and opens the rebuilt file into {e this} handle only, so any handle
+    from {!create_worker_handle} — and any statement prepared on one — is left
+    over a closed store and a pre-VACUUM rowid allocator.  They are now marked
+    stale: every statement on them is refused with an error naming VACUUM,
+    {!stale_after_vacuum} answers [true], and {!close} on one is a safe no-op
+    (the store is already closed).  There is no ROLLBACK recovery, unlike #555's
+    poison — the caller must take a fresh worker handle off {e this} one.  Called
+    on a handle that is itself stale, VACUUM raises [Failure]. *)
 val vacuum : t -> unit Lwt.t
+
+(** #634: whether this handle — or any ATTACHed schema on it — has been
+    invalidated by a {!vacuum} run on a {e sibling} handle over the same store.
+
+    VACUUM rebuilds the database file and re-seats only the handle that ran it.
+    Every other handle in the cohort ({!create_worker_handle}, or {!of_store}
+    passed [~cohort]) still points at the store VACUUM closed, and its catalog's
+    rowid counters describe the pre-VACUUM file.  Rather than let that surface
+    later as a closed-store failure or a rowid collision, such a handle is marked
+    stale and refuses everything: reads, writes, DDL, prepared [run]/[iter],
+    [BEGIN], [COMMIT] {e and} [ROLLBACK].
+
+    The [ROLLBACK] exemption that makes {!transaction_poisoned} recoverable
+    deliberately does {e not} apply: there is no state to roll back to, the store
+    is gone.  {!close} is the only supported operation on a stale handle, and it
+    is a no-op on the already-closed store.  Get a fresh handle from the one that
+    ran the VACUUM. *)
+val stale_after_vacuum : t -> bool
 
 (** #555: whether this connection has been {e poisoned} by an overlapping
     explicit transaction — either the top-level handle or any ATTACHed schema.

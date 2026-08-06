@@ -1291,6 +1291,12 @@
   alcotest
   lwt.unix
   unix))
+; #634: VACUUM invalidates every other handle over the store, loudly.
+
+(test
+ (name test_vacuum_worker_634)
+ (modules test_vacuum_worker_634)
+ (libraries granary granary.unix alcotest lwt.unix unix))
 
 ; #598: routing statements refused while any schema holds a transaction.
 
