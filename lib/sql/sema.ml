@@ -172,6 +172,7 @@ type agg_proj_item =
 type bound_join =
   { kind : Ast.join_kind
   ; right_meta : Cat.table_meta
+  ; right_alias : string option
   ; on : bound_expr
   ; right_col_offset : int
   }
@@ -221,6 +222,10 @@ type bound_stmt =
   | BS_select of
       { distinct : bool
       ; table_meta : Cat.table_meta
+      ; table_alias : string option
+        (** #635: the FROM item's alias for [table_meta], carried through to the
+            plan's leaf scan so a correlated subquery's outer reference can
+            resolve against it. *)
       ; proj : int list
       ; expr_proj : (bound_expr * string option) list
         (** Non-empty when projection contains scalar functions (Phase 5)
@@ -748,6 +753,20 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
 (* Right table ordinal i becomes absolute ordinal [right_offset + i].  *)
 (* ------------------------------------------------------------------ *)
 
+(* #635: the scope identifier of one FROM/JOIN item — the alias where one is
+   given, otherwise the table name.  An alias REPLACES the table name rather
+   than adding to it, so [FROM t s] puts [s] in scope and leaves [t.x]
+   unresolvable, which is what sqlite3 does ("no such column: t.x").
+
+   Until #635 both spellings resolved here, while [Exec.inner_scope_of] already
+   implemented the replacing rule for a subquery's own FROM.  The two levels
+   disagreeing was the hazard: the binder runs first, so it resolved an
+   alias-hidden name INWARD, the subquery was never recognised as correlated,
+   and rows were silently lost (#635 comment). *)
+let from_ident ((tm : Cat.table_meta), _base, alias_opt) =
+  Option.value alias_opt ~default:tm.Cat.name
+;;
+
 let rec bind_expr_join
           ~param_counter
           ~named_params
@@ -770,16 +789,7 @@ let rec bind_expr_join
        Error (Unknown_column { table = tm0.Cat.name; column = name })
      | _ :: _ -> Error (Ambiguous_column name))
   | Ast.E_tbl_col (tbl, name) ->
-    (match
-       List.find_opt
-         (fun (tm, _, alias_opt) ->
-            String.equal tm.Cat.name tbl
-            ||
-            match alias_opt with
-            | Some a -> String.equal tbl a
-            | None -> false)
-         tables
-     with
+    (match List.find_opt (fun t -> String.equal (from_ident t) tbl) tables with
      | None -> Error (Unknown_table tbl)
      | Some (tm, base, _) ->
        (match col_index tm.Cat.columns name with
@@ -2164,16 +2174,8 @@ let select_proj_lookup
 let select_qual_lookup ~(tables : (Cat.table_meta * int * string option) list) t c
   : (int, error) result
   =
-  match
-    List.find_opt
-      (fun (tm, _, alias_opt) ->
-         String.equal tm.Cat.name t
-         ||
-         match alias_opt with
-         | Some a -> String.equal t a
-         | None -> false)
-      tables
-  with
+  (* #635: alias replaces name — see {!from_ident}. *)
+  match List.find_opt (fun item -> String.equal (from_ident item) t) tables with
   | None -> Error (Unknown_table t)
   | Some (tm, base, _) ->
     (match col_index tm.Cat.columns c with
@@ -2878,7 +2880,12 @@ let bind_select_joins
        | Error e -> Error e
        | Ok be ->
          let bj =
-           { kind = jc.Ast.kind; right_meta = rm; on = be; right_col_offset = offset }
+           { kind = jc.Ast.kind
+           ; right_meta = rm
+           ; right_alias = jc.Ast.alias
+           ; on = be
+           ; right_col_offset = offset
+           }
          in
          go (bj :: acc) tables_so_far (offset + List.length rm.Cat.columns) rest)
   in
@@ -3086,6 +3093,7 @@ let bind_select_resolved
        (BS_select
           { distinct
           ; table_meta = meta
+          ; table_alias
           ; proj = proj_ords
           ; expr_proj = proj_exprs
           ; where = bound_where

@@ -457,7 +457,7 @@ let plan_seqscan_tree_id () =
   in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_project { child = Plan.Op_seq_scan { table_meta }; _ } ->
+  | Plan.Op_project { child = Plan.Op_seq_scan { table_meta; _ }; _ } ->
     (* First user table gets tree_id = 16 per catalog comment *)
     let tid, _, _, _ = Cat.row_storage table_meta in
     Alcotest.(check int) "tree_id" 16 tid
@@ -483,7 +483,7 @@ let plan_seqscan_columns () =
   in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_project { child = Plan.Op_seq_scan { table_meta }; _ } ->
+  | Plan.Op_project { child = Plan.Op_seq_scan { table_meta; _ }; _ } ->
     Alcotest.(check int) "column count" 2 (List.length table_meta.columns);
     Alcotest.(check string) "col 0 name" "id" (List.nth table_meta.columns 0).Row.name;
     Alcotest.(check string) "col 1 name" "name" (List.nth table_meta.columns 1).Row.name

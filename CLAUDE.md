@@ -389,6 +389,55 @@ EOF
   in `test/test_not_null_599.ml` pins all four spellings together for that
   reason.
 
+- **One rule resolves a correlated subquery's outer references (#635/#626/#615, 2026-08-06).**
+  An input's **scope identifier** is its FROM item's alias where it has one and
+  its table name otherwise — an alias *replaces* the name. A qualified outer
+  reference names a scope identifier; an unqualified one names a column exactly
+  one input carries; **anything else is an error, never a silent empty or NULL
+  result.** That rule holds at any nesting depth and in every clause a
+  correlated subquery can sit in — WHERE, an INNER or OUTER join's ON,
+  a projection, and HAVING.
+
+  It is implemented at **three** levels and they must not be allowed to drift
+  apart again, because each pair that disagreed produced a different silent
+  wrong answer:
+  - `Sema.from_ident` for the binder's two qualified lookups (`bind_expr_join`,
+    `select_qual_lookup`);
+  - `Exec.inner_scope_of` for a subquery's *own* FROM (this one was always
+    right);
+  - `Exec.scan_ident` / `get_outer_scan_metas` for the outer inputs, which
+    needs `alias` on `Plan.Op_seq_scan` / `Op_col_seq_scan` /
+    `Op_index_lookup` / `Op_rowid_lookup` and `right_alias` on
+    `Op_nested_loop_join`, carried from `Sema.BS_select.table_alias` and
+    `Sema.bound_join.right_alias`.
+
+  Consequences worth knowing before editing this area:
+  - **`SELECT t.x FROM t s` is now an error**, matching sqlite3. It used to
+    answer rows, and that is what made an alias-hidden name inside a subquery
+    resolve *inward*: the subquery was never recognised as correlated, was
+    folded to a constant, and rows were lost with no error (#635's comment).
+  - The duplicate guard in `get_outer_scan_metas` is by **identifier**, not by
+    table name. `FROM l AS x JOIN l AS y` therefore resolves; the unaliased
+    `FROM l JOIN l` still cannot and is still refused. #592's
+    `self_join_is_refused_not_emptied` was rewritten to the unaliased spelling
+    for exactly this reason — a green suite on the aliased one would now mean
+    the opposite of what it used to.
+  - `substitute_outer_in_expr` descends into nested `E_subquery` / `E_exists` /
+    `E_in_select` carrying the **union** of every enclosing subquery's scope.
+    Carrying only the innermost scope is the obvious implementation and is
+    wrong: it rewrites an *intermediate* subquery's own column from the outer
+    row.
+  - **#566's refusal of a correlated ON subquery in an OUTER join is
+    reopened (#615).** Its stated blocker — no correlation source over a join
+    node — was removed by #592, so the `Left` arm now substitutes per (left,
+    right) *pair* inside the join. It has to be per pair, not per surviving
+    row: for an outer join the ON predicate **is** the match test, and a filter
+    above the join rejects the null-extended row it must emit (#552). The pure
+    pairing loop is kept as the arm taken when no subquery survives.
+  - `Op_nested_loop_join` cannot carry a subquery in its probe through the
+    planner, but it is a public constructor, so `stream_nested_loop_join`
+    refuses one explicitly rather than encoding it as NULL.
+
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
 ### A failing autocheckpoint is surfaced, never raised (#638)

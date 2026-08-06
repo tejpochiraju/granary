@@ -174,7 +174,23 @@ type op =
       ; source : op
       ; on_conflict : Ast.conflict_action option
       }
-  | Op_seq_scan of { table_meta : Cat.table_meta }
+  | Op_seq_scan of
+      { table_meta : Cat.table_meta
+      ; alias : string option
+        (** #635: the FROM item's alias, when it has one.
+
+            An alias {b replaces} the table name as this input's scope
+            identifier rather than adding to it, exactly as it does inside a
+            subquery's own FROM ([Exec.inner_scope_of]).  So [FROM l AS x] makes
+            an outer reference [x.a] resolvable and [l.a] {i not} — which is
+            what sqlite3 does, and what lets a self-join with distinct aliases
+            be resolved where a self-join without them still cannot be.
+
+            Before #635 the alias existed only in the [Ast] and in [Sema]'s
+            [tables]; it was dropped at plan construction, so
+            [Exec.get_outer_scan_metas] could only match on
+            [table_meta.name]. *)
+      }
   | Op_filter of
       { pred : expr
       ; child : op
@@ -226,15 +242,19 @@ type op =
             [keys], narrowing the span the seek scans.  See {!range} — it never
             replaces the predicate. *)
       ; table_meta : Cat.table_meta (** for row decoding *)
+      ; alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
       }
   | Op_rowid_lookup of
       { table_meta : Cat.table_meta
       ; lookup_val : expr
         (** #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — a
             single table-tree seek by the integer key, no index. *)
+      ; alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
       }
-  | Op_col_seq_scan of { table_meta : Cat.table_meta }
-  (** Scan a columnar table; emits one [Row.t] per stored row. *)
+  | Op_col_seq_scan of
+      { table_meta : Cat.table_meta
+      ; alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
+      } (** Scan a columnar table; emits one [Row.t] per stored row. *)
   | Op_update of
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)
@@ -264,6 +284,7 @@ type op =
   | Op_nested_loop_join of
       { left : op (** left input (any op stream) *)
       ; right_meta : Cat.table_meta (** right table for row decode *)
+      ; right_alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
       ; idx_tree : int (** right-side index tree id *)
       ; probe : probe_part list
         (** the probe key, in index-column order, covering a leading prefix of

@@ -514,22 +514,27 @@ let recognise_eq_col_col = function
 (* Negative [tree_id]s are sentinels for synthesized scans with no real B-tree:
    -1 = CTE, -2 = sqlite_master, -3 = sqlite_sequence.  Each is materialized by a
    dedicated plan op rather than a [Op_seq_scan] over a stored tree. *)
-let make_scan (meta : Cat.table_meta) : Plan.op =
+(* #635: [alias] is the FROM item's alias, carried onto the leaf scan so
+   [Exec.get_outer_scan_metas] can resolve an alias-qualified outer reference.
+   The three synthesized scans below take no alias because none of them decodes
+   a base table an outer reference could name. *)
+let make_scan ~alias (meta : Cat.table_meta) : Plan.op =
   match meta.Cat.storage with
-  | Cat.Columnar _ -> Plan.Op_col_seq_scan { table_meta = meta }
+  | Cat.Columnar _ -> Plan.Op_col_seq_scan { table_meta = meta; alias }
   | Cat.Row { tree_id = -1; _ } ->
     Plan.Op_cte_scan { cte_name = meta.Cat.name; n_cols = List.length meta.Cat.columns }
   | Cat.Row { tree_id = -2; _ } -> Plan.Op_sqlite_master
   | Cat.Row { tree_id = -3; _ } -> Plan.Op_sqlite_sequence
-  | Cat.Row _ -> Plan.Op_seq_scan { table_meta = meta }
+  | Cat.Row _ -> Plan.Op_seq_scan { table_meta = meta; alias }
 ;;
 
 (* Realise a chosen seek as the base-table plan op it reads through. *)
-let seek_op (table_meta : Cat.table_meta) = function
-  | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val }
+let seek_op ~alias (table_meta : Cat.table_meta) = function
+  | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val; alias }
   | Plan.Seek_index { idx_tree; keys; range } ->
     let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
-    Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; range; table_meta }
+    Plan.Op_index_lookup
+      { table_tree = tree_id_pl; idx_tree; keys; range; table_meta; alias }
 ;;
 
 (* #508: pick an access path from already-recognised equalities.  [eqs] is the
@@ -1048,7 +1053,7 @@ let estimate_rows cat (op : Plan.op) =
         | None -> unbounded_rows)
     in
     min seek (table_rows_estimate table_meta)
-  | Plan.Op_seq_scan { table_meta } -> table_rows_estimate table_meta
+  | Plan.Op_seq_scan { table_meta; _ } -> table_rows_estimate table_meta
   | _ -> unbounded_rows
 ;;
 
@@ -1437,12 +1442,12 @@ let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
     {!access_path_for_eqs} itself, which covers this caller and the base-scan and
     DML-seek ones at once.  Two independent copies of the same guard is precisely
     what let #551 exist unnoticed while this one was correct. *)
-let build_side cat (right_meta : Cat.table_meta) ~right_eqs ~right_ranges =
+let build_side cat (right_meta : Cat.table_meta) ~alias ~right_eqs ~right_ranges =
   let eqs = List.mapi (fun pos (col_idx, v) -> pos, col_idx, v) right_eqs in
   match access_path_for_eqs cat right_meta ~eqs ~range_conjuncts:right_ranges with
   | Some (seek, _consumed) when build_side_seek_is_unambiguous cat right_meta seek ->
-    seek_op right_meta seek
-  | Some _ | None -> make_scan right_meta
+    seek_op ~alias right_meta seek
+  | Some _ | None -> make_scan ~alias right_meta
 ;;
 
 (** #520: is a nested-loop probe worth it, given [driving_rows] estimated left
@@ -1558,7 +1563,9 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
   (* #528: the build side of a hash join, narrowed by the same WHERE equalities
      that would complete a probe key.  It does not depend on the strategy chosen
      — but the cost model's [right_rows] depends on IT, so build it first. *)
-  let right_op = build_side cat bj.right_meta ~right_eqs ~right_ranges in
+  let right_op =
+    build_side cat bj.right_meta ~alias:bj.Sema.right_alias ~right_eqs ~right_ranges
+  in
   (* #520: neither side of the cost comparison depends on which strategy is
      chosen or on which column the ON predicate resolves to — compute both once,
      outside the match. *)
@@ -1615,6 +1622,7 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
       Plan.Op_nested_loop_join
         { left = left_op
         ; right_meta = bj.right_meta
+        ; right_alias = bj.Sema.right_alias
         ; idx_tree = idx.Cat.idx_tree_id
         ; probe
         ; probe_range
@@ -1784,24 +1792,25 @@ let base_only_conjuncts ~n_base cs =
    post-join filter already covers every conjunct, including the consumed ones)
    and why it plans only from [base_only_conjuncts]: it is a pure restriction of
    the base input, exactly like the #508 DML seek. *)
-let plan_base cat ~table_meta ~where ~has_joins =
+let plan_base cat ~table_meta ~alias ~where ~has_joins =
   match where with
-  | None -> make_scan table_meta
+  | None -> make_scan ~alias table_meta
   | Some e ->
     let cs = conjuncts e in
     if has_joins
     then (
       let n_base = List.length table_meta.Cat.columns in
       match choose_access_path cat table_meta (base_only_conjuncts ~n_base cs) with
-      | None -> make_scan table_meta
-      | Some (seek, _consumed) -> seek_op table_meta seek)
+      | None -> make_scan ~alias table_meta
+      | Some (seek, _consumed) -> seek_op ~alias table_meta seek)
     else (
       let fallback () =
-        Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta }
+        Plan.Op_filter { pred = plan_expr e; child = make_scan ~alias table_meta }
       in
       match choose_access_path cat table_meta cs with
       | None -> fallback ()
-      | Some (seek, consumed) -> residual_filter ~consumed cs (seek_op table_meta seek))
+      | Some (seek, consumed) ->
+        residual_filter ~consumed cs (seek_op ~alias table_meta seek))
 ;;
 
 (* #508: the narrowing path for a DML WHERE clause.  Unlike [plan_base] this
@@ -1970,8 +1979,8 @@ let chain_joins cat ~(table_meta : Cat.table_meta) ~base ~joins ~where =
 
 (* No-catalog path: chain joins as hash joins, recognising equi-join keys and
    falling back to a cartesian product + filter. *)
-let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
-  let base = make_scan table_meta in
+let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~table_alias ~joins =
+  let base = make_scan ~alias:table_alias table_meta in
   fst
     (List.fold_left
        (fun (op, n_left) (bj : Sema.bound_join) ->
@@ -1987,7 +1996,7 @@ let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
             | Some (a, b) when a < n_left && b >= right_offset ->
               Plan.Op_hash_join
                 { left = op
-                ; right = make_scan bj.right_meta
+                ; right = make_scan ~alias:bj.Sema.right_alias bj.right_meta
                 ; left_key = a
                 ; right_key = b - right_offset
                 ; on_pred = None
@@ -1998,7 +2007,7 @@ let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
             | Some (a, b) when b < n_left && a >= right_offset ->
               Plan.Op_hash_join
                 { left = op
-                ; right = make_scan bj.right_meta
+                ; right = make_scan ~alias:bj.Sema.right_alias bj.right_meta
                 ; left_key = b
                 ; right_key = a - right_offset
                 ; on_pred = None
@@ -2011,7 +2020,7 @@ let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
                  because it had the same shape. *)
               general_on_join
                 ~left_op:op
-                ~right_op:(make_scan bj.right_meta)
+                ~right_op:(make_scan ~alias:bj.Sema.right_alias bj.right_meta)
                 ~on:bj.on
                 ~join_kind
                 ~right_offset
@@ -2025,6 +2034,7 @@ let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
 let plan_select
       cat
       ~table_meta
+      ~table_alias
       ~proj
       ~expr_proj
       ~where
@@ -2049,7 +2059,7 @@ let plan_select
         0
         joins
   in
-  let base = plan_base cat ~table_meta ~where ~has_joins in
+  let base = plan_base cat ~table_meta ~alias:table_alias ~where ~has_joins in
   let after_where = chain_joins cat ~table_meta ~base ~joins ~where in
   let is_aggregated = aggs <> [] || group_by <> [] in
   (* Insert Op_window after scan+filter+joins when windows are present. *)
@@ -2194,6 +2204,7 @@ let plan_delete cat ~table_meta ~where ~order ~limit ~offset ~returning =
    builds a hash-join + filter chain manually. *)
 let plan_select_no_cat
       ~table_meta
+      ~table_alias
       ~proj
       ~expr_proj
       ~where
@@ -2209,7 +2220,7 @@ let plan_select_no_cat
       ~windows
       ~agg_windows
   =
-  let after_joins = chain_joins_no_cat ~table_meta ~joins in
+  let after_joins = chain_joins_no_cat ~table_meta ~table_alias ~joins in
   let filtered =
     match where with
     | None -> after_joins
@@ -2420,6 +2431,7 @@ let rec plan ?cat = function
   | Sema.BS_select
       { distinct
       ; table_meta
+      ; table_alias
       ; proj
       ; expr_proj
       ; where
@@ -2439,6 +2451,7 @@ let rec plan ?cat = function
        plan_select
          cat
          ~table_meta
+         ~table_alias
          ~proj
          ~expr_proj
          ~where
@@ -2458,6 +2471,7 @@ let rec plan ?cat = function
           (for JOIN) no index-based NLJ. *)
        plan_select_no_cat
          ~table_meta
+         ~table_alias
          ~proj
          ~expr_proj
          ~where
