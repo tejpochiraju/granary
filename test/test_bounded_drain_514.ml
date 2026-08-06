@@ -248,21 +248,44 @@ let single_row_match_buffers_one () =
    say that — a statement the planner sent to the scan branch reports 0/0/0 too
    — so this runs on disk and pins the access path physically: the no-match
    seek must touch far fewer pages than the same statement spelled so the
-   planner cannot use the index. *)
+   planner cannot use the index.
+
+   The [+ 0] foil is the non-vacuity guard for that comparison, and it is only
+   a guard while it genuinely reads pages.  Since #611 the pager cache serves
+   WAL-resolved pages, so a foil whose whole table fits in the cache — which is
+   what this case used to be — scans the table without emitting a single
+   [Page_read]/[Wal_read], and "the seek read far fewer pages" degenerates into
+   "0 < 0".  It measured exactly 0 on the batch that merged #611.
+
+   The fix is structural rather than a bigger constant: the cache is pinned at
+   [cache_pages] and the table is sized to spill well past it (8 000 rows ≈ 84
+   table pages, measured), so a full scan CANNOT be served from cache however
+   good the cache gets.  The floor below is stated as a multiple of the cache
+   rather than as a bare number for the same reason — it is derived from the
+   thing that makes it true.  Do not raise the floor to make a failure go away;
+   if the foil stops reading, the working set has stopped exceeding the cache
+   and the comparison beneath it has stopped meaning anything. *)
+let cache_pages = 16
+
 let zero_row_match_walks_nothing () =
-  with_file_db (fun db ->
-    seed db ~n_w:2 ~n_i:2000;
+  with_file_db ~page_cache:cache_pages (fun db ->
+    seed db ~n_w:2 ~n_i:4000;
     let st = exec_stats db "DELETE FROM t WHERE w = 1 AND i = 99999" in
     Alcotest.(check int) "no candidates" 0 st.Exec.dss_candidates;
     Alcotest.(check int) "no fetches" 0 st.Exec.dss_fetched;
     Alcotest.(check int) "nothing buffered" 0 st.Exec.dss_peak_buffered;
-    Alcotest.(check int) "4000 rows left" 4000 (one_int db "SELECT COUNT(*) FROM t");
+    Alcotest.(check int) "8000 rows left" 8000 (one_int db "SELECT COUNT(*) FROM t");
     let seek_reads = reads_during db "DELETE FROM t WHERE w = 1 AND i = 99998" in
     let scan_reads = reads_during db "DELETE FROM t WHERE w + 0 = 1 AND i + 0 = 99998" in
+    (* ~84 pages measured against a 16-page cache; 3x the cache leaves room for
+       a much better cache without leaving room for a table-sized one. *)
     Alcotest.(check bool)
-      (Printf.sprintf "foil really scans (got %d reads)" scan_reads)
+      (Printf.sprintf
+         "foil really scans (%d reads, needs > %d)"
+         scan_reads
+         (3 * cache_pages))
       true
-      (scan_reads > 50);
+      (scan_reads > 3 * cache_pages);
     Alcotest.(check bool)
       (Printf.sprintf "seek beats the scan (%d vs %d reads)" seek_reads scan_reads)
       true
