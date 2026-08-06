@@ -2198,20 +2198,63 @@ let bind_select_agg_star_non_count_rejected () =
   | _ -> Alcotest.fail "expected Unsupported for SUM(*)"
 ;;
 
-let bind_select_agg_complex_arg_rejected () =
-  (* Aggregate argument must be a column reference, not e.g. a binop. *)
+(* Helper: a one-aggregate projection over [users] with no GROUP BY. *)
+let agg_proj_stmt arg =
+  Ast.S_select
+    { distinct = false
+    ; proj = `Exprs [ Ast.E_agg (Ast.Agg_sum, Some arg), None ]
+    ; table = "users"
+    ; table_alias = None
+    ; joins = []
+    ; where = None
+    ; group_by = []
+    ; having = None
+    ; order = []
+    ; limit = None
+    ; offset = None
+    }
+;;
+
+(* #488: an aggregate argument is a general expression.  This case used to
+   assert the opposite — that anything but a bare column reference was
+   [Unsupported] — so it now pins the NEW rule: the binop binds, and it binds
+   as an [arg_expr] with no column ordinal (there is no stored column for a
+   computed argument to name). *)
+let bind_select_agg_expr_arg_accepted_488 () =
   let cat = two_col_cat () in
   let stmt =
+    agg_proj_stmt (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)))
+  in
+  match bind cat stmt with
+  | Ok
+      (Sema.BS_select
+         { aggs =
+             [ { func = Ast.Agg_sum; col_ord = None; arg_expr = Some _; distinct = false }
+             ]
+         ; _
+         }) -> ()
+  | _ -> Alcotest.fail "expected Ok with SUM(id + 1) bound as an expression arg (#488)"
+;;
+
+(* The half of the old guarantee that survives #488: an aggregate argument the
+   binder cannot bind is still refused rather than silently mis-bound.  Two
+   shapes are still refused by [Sema.bind_agg_arg] — a nested aggregate and a
+   subquery — and both are checked here, at the binder level, because the
+   end-to-end SQL spellings live in test_agg_expr_495_488.ml. *)
+let bind_select_agg_nested_agg_arg_rejected_488 () =
+  let cat = two_col_cat () in
+  let stmt = agg_proj_stmt (Ast.E_agg (Ast.Agg_count, Some (Ast.E_col "id"))) in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for a nested aggregate arg (#488)"
+;;
+
+let bind_select_agg_subquery_arg_rejected_488 () =
+  let cat = two_col_cat () in
+  let inner =
     Ast.S_select
       { distinct = false
-      ; proj =
-          `Exprs
-            [ ( Ast.E_agg
-                  ( Ast.Agg_sum
-                  , Some (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)))
-                  )
-              , None )
-            ]
+      ; proj = `Exprs [ Ast.E_lit (Ast.L_int 1L), None ]
       ; table = "users"
       ; table_alias = None
       ; joins = []
@@ -2223,9 +2266,12 @@ let bind_select_agg_complex_arg_rejected () =
       ; offset = None
       }
   in
+  let stmt =
+    agg_proj_stmt (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_subquery inner))
+  in
   match bind cat stmt with
   | Error (Sema.Unsupported _) -> ()
-  | _ -> Alcotest.fail "expected Unsupported for complex agg arg"
+  | _ -> Alcotest.fail "expected Unsupported for a subquery inside an agg arg (#488)"
 ;;
 
 let bind_select_col_not_in_group_by_rejected () =
@@ -3879,32 +3925,50 @@ let bind_select_having_agg_with_qual_arg_error () =
   | _ -> Alcotest.fail "expected Unknown_table for ghost in HAVING agg qual"
 ;;
 
-(** bind_expr_agg complex agg arg (line 293) — agg arg not col reference
-    inside HAVING. *)
-let bind_select_having_agg_complex_arg () =
+(* Helper: GROUP BY id with the given HAVING expression. *)
+let having_agg_stmt having =
+  Ast.S_select
+    { distinct = false
+    ; proj = `Exprs [ Ast.E_col "id", None; Ast.E_agg (Ast.Agg_count, None), None ]
+    ; table = "users"
+    ; table_alias = None
+    ; joins = []
+    ; where = None
+    ; group_by = [ "id", None ]
+    ; having = Some having
+    ; order = []
+    ; limit = None
+    ; offset = None
+    }
+;;
+
+(** #488: HAVING goes through the same [Sema.bind_agg_arg] as a projection, so
+    an expression argument binds there too.  This case used to assert
+    [Unsupported] for exactly this statement. *)
+let bind_select_having_agg_expr_arg_accepted_488 () =
   let cat = two_col_cat () in
   let stmt =
-    Ast.S_select
-      { distinct = false
-      ; proj = `Exprs [ Ast.E_col "id", None; Ast.E_agg (Ast.Agg_count, None), None ]
-      ; table = "users"
-      ; table_alias = None
-      ; joins = []
-      ; where = None
-      ; group_by = [ "id", None ]
-      ; having =
-          Some
-            (Ast.E_agg
-               ( Ast.Agg_sum
-               , Some (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L))) ))
-      ; order = []
-      ; limit = None
-      ; offset = None
-      }
+    having_agg_stmt
+      (Ast.E_agg
+         ( Ast.Agg_sum
+         , Some (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L))) ))
+  in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { having = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with SUM(id + 1) in HAVING (#488)"
+;;
+
+(** The surviving half in HAVING: an argument [bind_agg_arg] cannot bind is
+    still refused there, not only in the projection. *)
+let bind_select_having_agg_nested_agg_arg_rejected_488 () =
+  let cat = two_col_cat () in
+  let stmt =
+    having_agg_stmt
+      (Ast.E_agg (Ast.Agg_sum, Some (Ast.E_agg (Ast.Agg_count, Some (Ast.E_col "id")))))
   in
   match bind cat stmt with
   | Error (Sema.Unsupported _) -> ()
-  | _ -> Alcotest.fail "expected Unsupported for complex agg arg in HAVING"
+  | _ -> Alcotest.fail "expected Unsupported for a nested aggregate in HAVING (#488)"
 ;;
 
 (** bind_expr_agg non-COUNT agg without args inside HAVING (line 284). *)
@@ -5938,9 +6002,17 @@ let () =
             `Quick
             bind_select_agg_star_non_count_rejected
         ; Alcotest.test_case
-            "bind_select_agg_complex_arg_rejected"
+            "bind_select_agg_expr_arg_accepted_488"
             `Quick
-            bind_select_agg_complex_arg_rejected
+            bind_select_agg_expr_arg_accepted_488
+        ; Alcotest.test_case
+            "bind_select_agg_nested_agg_arg_rejected_488"
+            `Quick
+            bind_select_agg_nested_agg_arg_rejected_488
+        ; Alcotest.test_case
+            "bind_select_agg_subquery_arg_rejected_488"
+            `Quick
+            bind_select_agg_subquery_arg_rejected_488
         ; Alcotest.test_case
             "bind_select_col_not_in_group_by_rejected"
             `Quick
@@ -6140,9 +6212,13 @@ let () =
             `Quick
             bind_select_having_agg_with_qual_arg_error
         ; Alcotest.test_case
-            "bind_select_having_agg_complex_arg"
+            "bind_select_having_agg_expr_arg_accepted_488"
             `Quick
-            bind_select_having_agg_complex_arg
+            bind_select_having_agg_expr_arg_accepted_488
+        ; Alcotest.test_case
+            "bind_select_having_agg_nested_agg_arg_rejected_488"
+            `Quick
+            bind_select_having_agg_nested_agg_arg_rejected_488
         ; Alcotest.test_case
             "bind_select_having_sum_star_rejected"
             `Quick
