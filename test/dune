@@ -1257,3 +1257,21 @@
  (name test_checkpoint_reopen_562)
  (modules test_checkpoint_reopen_562)
  (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+
+; #639: an explicit ON CONFLICT target beats the statement's conflict-resolution
+; modifier, so INSERT OR IGNORE ... DO UPDATE runs the update instead of
+; silently skipping.  #631: a skipped row's BEFORE INSERT trigger side effects
+; are undone inside an explicit transaction too, not only in autocommit.
+
+(test
+ (name test_or_ignore_upsert_639)
+ (modules test_or_ignore_upsert_639)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
