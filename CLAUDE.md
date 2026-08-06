@@ -366,10 +366,45 @@ EOF
   a secondary UNIQUE index and `execute_insert_write`'s `put_x` arm for the
   rowid-alias PK — so `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` silently
   skipped for *any* conflict: a caller who wrote both got "insert, or do
-  nothing". The reorder applies to `OR REPLACE` too, which is a **behaviour
-  change wider than the issue**: `INSERT OR REPLACE ... ON CONFLICT(k) DO
-  UPDATE` now updates the conflicting row in place instead of deleting and
-  re-inserting it.
+  nothing".
+
+  **The target is resolved in its own pass, before the modifier sees anything,
+  and that is what makes the answer well-defined rather than a micro-
+  optimisation.** `check_insert_unique` used to fold over every unique index in
+  one pass and let whichever conflicted first decide. With two unique indexes
+  and a row conflicting on both, the outcome then depended on the order
+  `Cat.indexes_for_table` returned them in — newest-first, i.e. on `CREATE
+  UNIQUE INDEX` order: target first gave an upsert, the other first gave a skip
+  under `OR IGNORE`. Same schema, same statement, two answers. When the target
+  hits, the accumulator is reset to `(false, [], Some rid)`: `skip` is
+  meaningless because the insert it was decided against is discarded, and
+  `dels` **must** be empty because `execute_insert`'s upsert branch never calls
+  `delete_replace_conflicts` — a non-empty `dels` there is a queued delete that
+  never happens. Nothing is lost: the DO UPDATE's own result is still checked
+  against every other unique index by `write_row_rekeyed` →
+  `check_index_unique_on_update`, on the row that is actually written.
+
+  The **rowid-alias PK** is the other thing an ON CONFLICT clause can name, and
+  it has no index, so it is invisible to that fold. When the clause names it,
+  `execute_insert` probes the row key with one `S.get` *before*
+  `check_insert_unique` — otherwise a secondary conflict would set `skip`
+  (losing the DO UPDATE) or run `delete_replace_conflicts` (displacing rows for
+  an insert that then never happens, because `put_x` discovers the alias
+  conflict afterwards). The probe is only paid when an upsert clause names the
+  alias column, so #350's plain-INSERT path is untouched. The arm in
+  `execute_insert_write` is kept as a backstop, not the primary path.
+
+  **`OR REPLACE` defers to the target too, and that is a decision, not a side
+  effect of the arm order (#639, decided 2026-08-06).** `INSERT OR REPLACE ...
+  ON CONFLICT(k) DO UPDATE` now updates the conflicting row in place instead of
+  deleting it and inserting the new one. The alternative — `CA_replace` keeping
+  precedence over the named target — reproduces #639 exactly, for `REPLACE`
+  instead of `IGNORE`: the caller writes an explicit `DO UPDATE` and the engine
+  silently does something else with it. One rule for all six modifiers is the
+  only reading under which writing both clauses means anything. This is
+  **believed** to match SQLite but was **not oracle-checked**; if the oracle
+  disagrees, the divergence is deliberate under "inspired by, not a port" and
+  whoever changes it is re-deciding, not fixing an oversight.
 
   **NOT NULL is not a uniqueness conflict, so an `ON CONFLICT` clause never
   intercepts it** — the modifier does, per #599 above. The two directions
@@ -388,9 +423,16 @@ EOF
   error** rather than a silently-dropped clause — that would be #639 again in
   a new place.
 
-- **A skipped `INSERT` leaves nothing behind, including its BEFORE INSERT
-  trigger's nested DML, in an explicit transaction as well as in autocommit
-  (#631, fixed 2026-08-06).** The undo used to be `if owned then S.rollback`,
+- **A skipped `INSERT` leaves nothing behind in the STORE and the CATALOG,
+  including its BEFORE INSERT trigger's nested DML, in an explicit transaction
+  as well as in autocommit (#631, fixed 2026-08-06).** Read the scope literally:
+  the two things it does *not* revert are the #240 dirty-table set and the #417
+  row-level change feed. A spurious dirty mark is over-invalidation of an
+  external cache and is safe; a stale `record_change` delta is a phantom row for
+  a reactive view whose base table the trigger wrote to. **Neither is a
+  regression** — autocommit's `S.rollback` never cleared them either — but the
+  invariant above is about `Store` and `Schema_cache` state only. Tracked as
+  #666. The undo used to be `if owned then S.rollback`,
   keyed on *who owns the transaction* rather than on *what the statement
   decided*, so the same statement left a trace or not depending on whether the
   caller had opened a `BEGIN`. It is now a statement-level savepoint
