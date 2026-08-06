@@ -196,6 +196,13 @@ type bound_stmt =
       ; windows : window_sema list
       ; agg_windows : window_sema list
         (** Window functions computed AFTER aggregation, over the aggregated output rows. *)
+      ; agg_order_keys : bound_order_key list
+        (** #495: ORDER BY keys of an aggregated SELECT, bound over the
+            AGGREGATE OUTPUT row ([group_cols @ aggs]) exactly as [having] is,
+            because the sort runs on the post-aggregation rows.  Non-empty only
+            when the ORDER BY clause mentions an aggregate; in that case
+            [order] is empty, and the planner appends each key to the aggregate
+            projection as a hidden column, sorts on it, and trims it away. *)
       }
   | BS_create_index of
       { name : string

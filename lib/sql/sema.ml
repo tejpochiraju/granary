@@ -243,6 +243,11 @@ type bound_stmt =
       ; windows : window_sema list
       ; agg_windows : window_sema list
         (** Window functions computed AFTER aggregation, over aggregated output rows. *)
+      ; agg_order_keys : bound_order_key list
+        (** #495: ORDER BY keys bound over the AGGREGATE OUTPUT row
+            ([group_cols @ aggs]) rather than the input row.  Non-empty only
+            when the clause mentions an aggregate, and then [order] is empty:
+            the two are alternatives, never both. *)
       }
   | BS_create_index of
       { name : string
@@ -3060,6 +3065,118 @@ let bind_select_order
     order
 ;;
 
+(* #495: the AST expression an ORDER BY key really names.  A bare name that
+   matches a select-list alias stands for that select-list expression, which is
+   the spelling every TPC-H query uses ([ORDER BY revenue DESC]); SQL:92 also
+   allows repeating the aggregate itself, and both must reach the same place. *)
+let order_key_ast ~alias_map (e : Ast.expr) =
+  match e with
+  | Ast.E_col name -> Option.value (List.assoc_opt name alias_map) ~default:e
+  | _ -> e
+;;
+
+let order_mentions_agg ~alias_map (order : Ast.order_key list) =
+  List.exists
+    (fun (ok : Ast.order_key) -> expr_has_agg (order_key_ast ~alias_map ok.Ast.expr))
+    order
+;;
+
+(* #495: bind the ORDER BY of an aggregated SELECT whose clause mentions an
+   aggregate.  The sort runs on the POST-aggregation rows, so a key cannot be
+   bound against the input row the way [bind_select_order] does — it is bound
+   in aggregate-output space, on exactly the resolver discipline HAVING uses:
+   a bare column reference must be a GROUP BY column, while inside an
+   aggregate's arguments any table column is legal.
+
+   Aggregates met here are appended to the statement's aggregate list AFTER the
+   projection's and HAVING's (hence [offset]), which is what keeps the
+   post-aggregate window slots — which sit after every aggregate — where the
+   planner and executor expect them.  Repeating an aggregate that the select
+   list already computes registers a second slot for it rather than sharing
+   one; that costs an accumulator, not a wrong answer, and matches what HAVING
+   has always done.
+
+   The whole clause takes this path or none of it does (see
+   [order_mentions_agg]): mixing the two spaces in one clause would leave the
+   planner remapping some keys and not others against the same row. *)
+let bind_select_order_agg
+      ~param_counter
+      ~named_params
+      ~(tables : (Cat.table_meta * int * string option) list)
+      ~(meta : Cat.table_meta)
+      ~group_cols
+      ~offset
+      ~alias_map
+      order
+  : (bound_order_key list * agg_spec list, error) result
+  =
+  let grouped lookup what =
+    match lookup with
+    | Error e -> Error e
+    | Ok i ->
+      (match select_find_pos group_cols i with
+       | Some pos -> Ok pos
+       | None ->
+         Error
+           (Unsupported
+              (Printf.sprintf "ORDER BY references non-grouped column '%s'" what)))
+  in
+  let resolver =
+    { resolve_unqual = (fun n -> grouped (select_proj_lookup ~tables ~meta n) n)
+    ; resolve_qual = (fun t c -> grouped (select_qual_lookup ~tables t c) (t ^ "." ^ c))
+    ; resolve_agg_arg = select_proj_lookup ~tables ~meta
+    ; resolve_agg_arg_qual = select_qual_lookup ~tables
+    ; agg_arg_col_ty = agg_arg_col_ty_of_tables ~tables
+    }
+  in
+  let aggs = ref [] in
+  let register spec =
+    let idx = offset + List.length !aggs in
+    aggs := !aggs @ [ spec ];
+    idx
+  in
+  let bind e = bind_expr_agg ~param_counter ~named_params ~register ~resolver ~offset e in
+  (* A name that is not a column of the FROM list may still be a select-list
+     alias.  The alias is tried only after the plain binding fails, so a real
+     column keeps winning — the precedence [bind_select_order] already had. *)
+  let alias_of = function
+    | Ast.E_col name -> List.assoc_opt name alias_map
+    | _ -> None
+  in
+  let retry_alias e err =
+    match alias_of e with
+    | None -> Error err
+    | Some ast ->
+      (match bind ast with
+       | Ok (be, _) -> Ok be
+       | Error _ -> Error err)
+  in
+  let bind_key (e : Ast.expr) =
+    let saved = !aggs in
+    match bind e with
+    | Ok (be, _) -> Ok be
+    | Error err ->
+      (* discard whatever the failed attempt registered *)
+      aggs := saved;
+      retry_alias e err
+  in
+  let keys_result =
+    List.fold_left
+      (fun acc (ok : Ast.order_key) ->
+         match acc with
+         | Error _ -> acc
+         | Ok keys ->
+           (match bind_key ok.Ast.expr with
+            | Error e -> Error e
+            | Ok key -> Ok (keys @ [ { key; dir = ok.Ast.dir; nulls = ok.Ast.nulls } ])))
+      (Ok [])
+      order
+  in
+  match keys_result with
+  | Error e -> Error e
+  | Ok keys -> Ok (keys, !aggs)
+;;
+
 (* Validate LIMIT/OFFSET are non-negative. *)
 let validate_limit_offset ~limit ~offset =
   match limit with
@@ -3140,10 +3257,38 @@ let bind_select_resolved
       ~is_aggregated
       having
   in
-  let all_aggs = proj_aggs @ having_aggs in
-  let$ bound_order =
-    bind_select_order ~param_counter ~named_params ~tables ~proj_exprs order
+  let pre_order_aggs = proj_aggs @ having_aggs in
+  (* #495: an ORDER BY that mentions an aggregate is bound over the aggregate
+     OUTPUT row instead, and lands in [agg_order_keys]; [order] then stays
+     empty.  Everything else keeps the input-row binding unchanged. *)
+  let alias_map =
+    match proj with
+    | `Exprs es -> List.filter_map (fun (e, alias) -> Option.map (fun a -> a, e) alias) es
+    | `All | `Cols _ -> []
   in
+  let$ bound_order, agg_order_keys, order_aggs =
+    if is_aggregated && order_mentions_agg ~alias_map order
+    then (
+      let offset = offset_for_aggs + List.length pre_order_aggs in
+      match
+        bind_select_order_agg
+          ~param_counter
+          ~named_params
+          ~tables
+          ~meta
+          ~group_cols
+          ~offset
+          ~alias_map
+          order
+      with
+      | Error e -> Error e
+      | Ok (keys, order_aggs) -> Ok ([], keys, order_aggs))
+    else (
+      match bind_select_order ~param_counter ~named_params ~tables ~proj_exprs order with
+      | Error e -> Error e
+      | Ok keys -> Ok (keys, [], []))
+  in
+  let all_aggs = pre_order_aggs @ order_aggs in
   let$ valid_limit, valid_offset = validate_limit_offset ~limit ~offset in
   Lwt.return
     (Ok
@@ -3163,6 +3308,7 @@ let bind_select_resolved
           ; agg_proj = agg_proj_items
           ; windows = proj_windows
           ; agg_windows = agg_wins
+          ; agg_order_keys
           }))
 ;;
 

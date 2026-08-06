@@ -1819,6 +1819,27 @@ let plan_dml_seek cat ~table_meta ~where =
   | _ -> None
 ;;
 
+(* #495: the sort direction and NULL placement of one bound ORDER BY key.  A
+   missing NULLS clause follows the direction: NULLs first ascending, last
+   descending. *)
+let order_dir_nulls (bkey : Sema.bound_order_key) =
+  let dir =
+    match bkey.Sema.dir with
+    | Ast.Asc -> `Asc
+    | Ast.Desc -> `Desc
+  in
+  let nulls =
+    match bkey.Sema.nulls with
+    | Some `Nulls_first -> `Nulls_first
+    | Some `Nulls_last -> `Nulls_last
+    | None ->
+      (match dir with
+       | `Asc -> `Nulls_first
+       | `Desc -> `Nulls_last)
+  in
+  dir, nulls
+;;
+
 (* Build ORDER BY sort keys, substituting window slots into the key
    expressions when window functions are present. *)
 let plan_sort_keys ~order ~windows ~n_input_cols =
@@ -1886,9 +1907,50 @@ let plan_projection
   else Plan.Op_project { ordinals = proj; child = after_sort }
 ;;
 
+(* #495: ORDER BY over an aggregate expression.  Sema bound these keys over the
+   aggregate OUTPUT row ([group_cols @ aggs]), but the sort runs over the
+   PROJECTED row, which need not contain the aggregate at all
+   ([... GROUP BY k ORDER BY SUM(v)] projects no SUM).  So each key is appended
+   to [Op_aggregate]'s own projection as a hidden column — where its ordinals
+   mean what they were bound to mean — sorted on by position, and trimmed away
+   again by an [Op_project] wrapped around the sort.
+
+   Trimming here, before [finalize_select] applies DISTINCT and LIMIT, is what
+   keeps the hidden columns invisible to everything downstream; the statement's
+   output width comes from [Sema]'s [agg_proj] and never sees them.
+
+   This path is taken for the WHOLE clause or none of it, which is why the
+   [remap_e] below cannot collide with it: a key bound in output space would be
+   indistinguishable from a pre-aggregation ordinal that happens to have the
+   same number. *)
+let plan_agg_order_hidden ~agg_order_keys ~projected =
+  match projected with
+  | Plan.Op_aggregate r ->
+    let n_visible = List.length r.proj in
+    let hidden =
+      List.map
+        (fun (bkey : Sema.bound_order_key) -> Plan.PI_expr (plan_expr bkey.Sema.key))
+        agg_order_keys
+    in
+    let child = Plan.Op_aggregate { r with proj = r.proj @ hidden } in
+    let keys =
+      List.mapi
+        (fun j bkey ->
+           let dir, nulls = order_dir_nulls bkey in
+           Plan.P_col (n_visible + j), dir, nulls)
+        agg_order_keys
+    in
+    Plan.Op_project
+      { ordinals = List.init n_visible Fun.id; child = Plan.Op_sort { keys; child } }
+  | other ->
+    (* Unreachable: [agg_order_keys] is non-empty only for an aggregated
+       SELECT, whose projection is always an [Op_aggregate]. *)
+    other
+;;
+
 (* Post-aggregation ORDER BY: ORDER BY col indices are in pre-aggregation
    space, so remap each P_col to its position in the aggregated output. *)
-let plan_post_agg_sort ~group_by ~agg_proj ~order ~projected =
+let plan_post_agg_sort_input_space ~group_by ~agg_proj ~order ~projected =
   let plan_proj = List.map sema_agg_proj_to_plan agg_proj in
   let find_idx pred lst =
     let rec go k = function
@@ -1937,6 +1999,15 @@ let plan_post_agg_sort ~group_by ~agg_proj ~order ~projected =
       order
   in
   if keys = [] then projected else Plan.Op_sort { keys; child = projected }
+;;
+
+(* The post-aggregation sort: #495's output-space keys when the ORDER BY
+   mentioned an aggregate, the pre-aggregation-space remap otherwise.  Sema
+   guarantees the two lists are never both non-empty. *)
+let plan_post_agg_sort ~group_by ~agg_proj ~order ~agg_order_keys ~projected =
+  if agg_order_keys <> []
+  then plan_agg_order_hidden ~agg_order_keys ~projected
+  else plan_post_agg_sort_input_space ~group_by ~agg_proj ~order ~projected
 ;;
 
 (* Apply DISTINCT then LIMIT/OFFSET to a planned SELECT body. *)
@@ -2044,6 +2115,7 @@ let plan_select
       ~distinct
       ~windows
       ~agg_windows
+      ~agg_order_keys
   =
   let has_joins = joins <> [] in
   let n_input_cols =
@@ -2091,7 +2163,7 @@ let plan_select
   (* Post-aggregation sort (only for aggregated queries). *)
   let sorted =
     if is_aggregated
-    then plan_post_agg_sort ~group_by ~agg_proj ~order ~projected
+    then plan_post_agg_sort ~group_by ~agg_proj ~order ~agg_order_keys ~projected
     else projected
   in
   finalize_select ~distinct ~limit ~offset sorted
@@ -2213,6 +2285,7 @@ let plan_select_no_cat
       ~distinct
       ~windows
       ~agg_windows
+      ~agg_order_keys
   =
   let after_joins = chain_joins_no_cat ~table_meta ~joins in
   let filtered =
@@ -2260,7 +2333,13 @@ let plan_select_no_cat
       ~windows
       ~n_input_cols:n_input_cols_no_cat
   in
-  let sorted = if is_aggregated then make_sort projected else projected in
+  let sorted =
+    if not is_aggregated
+    then projected
+    else if agg_order_keys <> []
+    then plan_agg_order_hidden ~agg_order_keys ~projected
+    else make_sort projected
+  in
   finalize_select ~distinct ~limit ~offset sorted
 ;;
 
@@ -2436,6 +2515,7 @@ let rec plan ?cat = function
       ; agg_proj
       ; windows
       ; agg_windows
+      ; agg_order_keys
       } ->
     (match cat with
      | Some cat ->
@@ -2456,6 +2536,7 @@ let rec plan ?cat = function
          ~distinct
          ~windows
          ~agg_windows
+         ~agg_order_keys
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ. *)
@@ -2474,7 +2555,8 @@ let rec plan ?cat = function
          ~agg_proj
          ~distinct
          ~windows
-         ~agg_windows)
+         ~agg_windows
+         ~agg_order_keys)
   | Sema.BS_create_index
       { name
       ; table_meta
