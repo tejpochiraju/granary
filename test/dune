@@ -1065,6 +1065,13 @@
   lwt.unix
   unix))
 
+; #609: RENAME COLUMN / RENAME TO must not silently break a view or trigger.
+
+(test
+ (name test_rename_deps_609)
+ (modules test_rename_deps_609)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
 ; #513: join must not discard the driving table's access path.
 
 (test
