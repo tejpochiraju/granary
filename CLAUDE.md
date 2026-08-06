@@ -444,12 +444,43 @@ EOF
     `FROM l JOIN l` still cannot and is still refused. #592's
     `self_join_is_refused_not_emptied` was rewritten to the unaliased spelling
     for exactly this reason — a green suite on the aliased one would now mean
-    the opposite of what it used to.
+    the opposite of what it used to. `test/test_refusal_error_627.ml` was
+    written in parallel and had to be rewritten for the same reason, in two of
+    its four categories: it provoked #627's refusals with the *aliased*
+    self-join and with a plain correlated ON in an outer join, and #635 and
+    #615 respectively turned both into answers. They are now the unaliased
+    self-join and `l.a` under `FROM l AS x` in an outer join's ON. **Anything
+    that resolves those spellings too must replace them again, not delete the
+    row** — #627 covers seven public surfaces, and a category that quietly
+    stops firing takes all seven with it.
   - `substitute_outer_in_expr` descends into nested `E_subquery` / `E_exists` /
     `E_in_select` carrying the **union** of every enclosing subquery's scope.
     Carrying only the innermost scope is the obvious implementation and is
     wrong: it rewrites an *intermediate* subquery's own column from the outer
     row.
+  - **That descent is necessary but was not sufficient, and the missing half is
+    "what counts as correlated".** `Sema` treats `E_subquery` / `E_exists` /
+    `E_in_select` as opaque leaves and never descends into them, so a statement
+    whose correlation sits TWO levels down *binds cleanly*. Every caller read
+    "it bound" as "it is uncorrelated" and evaluated it eagerly, before any
+    outer row existed to substitute from; the reference was then met for the
+    first time by the intermediate query's own `stream_filter`, whose inputs are
+    the intermediate FROM, and refused there. So the two-level shape
+    `FROM l AS x WHERE EXISTS (SELECT 1 FROM r WHERE EXISTS (… v < x.a))` was
+    refused with the descent in place — the descent was correct but never ran.
+    `Exec.stmt_has_free_column_ref` answers the second question and is consulted
+    at the one chokepoint all four callers share, `plan_subquery_cached`, so
+    `refuse_unresolved_correlation` and the three `eval_*_subquery` functions
+    cannot disagree about which statements are correlated. It is implemented by
+    *running* `substitute_outer_in_stmt` with a binding that resolves nothing and
+    records that it was asked, so the detector and the substituter agree by
+    construction about which references are free — the same discipline the two
+    binders are held to, and the reason not to hand-write a second walker
+    (`substitute_outer_in_plan_expr` is already the odd member of a four-walker
+    set, #670). It can only move a statement from "evaluate eagerly" to "treat
+    as correlated", and `inner_scope_of` answers "owned" for everything it
+    cannot resolve, so an unresolvable FROM never manufactures a free reference.
+    Pinned by `two_nesting_levels` in `test/test_alias_outer_ref_635.ml`.
   - **#566's refusal of a correlated ON subquery in an OUTER join is
     reopened (#615).** Its stated blocker — no correlation source over a join
     node — was removed by #592, so the `Left` arm now substitutes per (left,

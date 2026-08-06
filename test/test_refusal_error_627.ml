@@ -202,16 +202,41 @@ let seed db =
 ;;
 
 (* One row per refusal category: a label, the read spelling, and the write
-   spelling that reaches the same site through [Op_insert_select]. *)
+   spelling that reaches the same site through [Op_insert_select].
+
+   {b Two of these shapes were rewritten on 2026-08-06.} #627 was written in
+   parallel with #635 and #615, and both of those turned a refusal into an
+   answer:
+
+   - the ALIASED self-join
+     [FROM l AS x JOIN l AS y ON EXISTS (… v < x.a)] now RESOLVES — #635 moved
+     the duplicate guard in [get_outer_scan_metas] from "two inputs share a
+     table name" to "two inputs share a scope IDENTIFIER", and two aliases are
+     two identifiers. The unaliased spelling below is what still trips that
+     guard, and it is the spelling #592's own
+     [self_join_is_refused_not_emptied] was rewritten to for the same reason;
+   - a correlated subquery in an OUTER join's ON now RESOLVES — that was the
+     whole of #615, which reopened #566 once #592 gave the join node a
+     correlation source. The site is still a refusal site, so the category is
+     kept, but it has to be reached with a reference that genuinely cannot be
+     resolved: [l.a] under [FROM l AS x], where the alias has taken the table
+     name out of scope (#635).
+
+   Neither rewrite weakens the category. Both still enter execution with a
+   planned statement and refuse from inside a stream, which is the only
+   property #627 is about; what changed is which correlation is unresolvable,
+   not whether an unresolvable one is refused. If a future change resolves
+   these spellings too, replace them again rather than deleting the row — a
+   surface that stops being covered must be noticed. *)
 let categories =
-  [ ( "#592 unresolvable correlation (self-join)"
-    , "SELECT x.a, y.a FROM l AS x JOIN l AS y ON EXISTS (SELECT 1 FROM k WHERE v < x.a)"
-    , "INSERT INTO cap2 SELECT x.a, y.a FROM l AS x JOIN l AS y ON EXISTS (SELECT 1 FROM \
-       k WHERE v < x.a)" )
-  ; ( "#566 correlated subquery in an outer join's ON"
-    , "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < a)"
-    , "INSERT INTO cap2 SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < \
-       a)" )
+  [ ( "#592/#635 unresolvable correlation (unaliased self-join)"
+    , "SELECT l.a FROM l JOIN l ON EXISTS (SELECT 1 FROM k WHERE v < l.a)"
+    , "INSERT INTO cap1 SELECT l.a FROM l JOIN l ON EXISTS (SELECT 1 FROM k WHERE v < \
+       l.a)" )
+  ; ( "#615/#635 unresolvable correlation in an outer join's ON"
+    , "SELECT x.a, b FROM l AS x LEFT JOIN r ON b > (SELECT v FROM k WHERE v < l.a)"
+    , "INSERT INTO cap2 SELECT x.a, b FROM l AS x LEFT JOIN r ON b > (SELECT v FROM k \
+       WHERE v < l.a)" )
   ; ( "#558 ungrouped correlation beside an aggregate"
     , "SELECT a, COUNT(*) + (SELECT COUNT(*) FROM u WHERE u.a > t.x) FROM t GROUP BY a"
     , "INSERT INTO cap2 SELECT a, COUNT(*) + (SELECT COUNT(*) FROM u WHERE u.a > t.x) \
@@ -364,8 +389,7 @@ let query_as_of_surfaces_runtime () =
          query_as_of_outcome
            db
            (`Txn t1)
-           "SELECT x.a, y.a FROM l AS x JOIN l AS y ON EXISTS (SELECT 1 FROM k WHERE v < \
-            x.a)"
+           "SELECT l.a FROM l JOIN l ON EXISTS (SELECT 1 FROM k WHERE v < l.a)"
        in
        (try run (Db.close db) with
         | _ -> ());
