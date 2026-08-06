@@ -601,6 +601,21 @@
  (modules test_scan_alloc)
  (libraries granary.store granary.unix alcotest lwt.unix unix))
 
+; #481: the storage cursor borrows leaf pages instead of copying them, and a
+; key-discarding scan never materialises the key.
+
+(test
+ (name test_scan_borrow_481)
+ (modules test_scan_borrow_481)
+ (libraries
+  granary
+  granary.store
+  granary.unix
+  granary.encoding
+  alcotest
+  lwt.unix
+  unix))
+
 (test
  (name test_attach)
  (modules test_attach)

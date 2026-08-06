@@ -9367,12 +9367,15 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
     Lwt_stream.from (fun () ->
       Lwt.catch
         (fun () ->
-           let* kv = S.seek_next cur in
+           (* #481: [seek_next_value], not [seek_next] — this scan binds the key
+              as [_key] and drops it, and materialising it cost a [Bytes.create]
+              + blit out of the leaf page on EVERY row of EVERY table scan. *)
+           let* kv = S.seek_next_value cur in
            match kv with
            | None ->
              let%lwt () = finish () in
              Lwt.return_none
-           | Some (_key, vbytes) ->
+           | Some vbytes ->
              incr_examined s_opt;
              let row = decode_with_virtual clock params table_meta vbytes in
              Lwt.return_some row)

@@ -318,6 +318,13 @@ val seek_ge : _ txn -> tree_id -> bytes -> seek_cursor Lwt.t
     (the first with key [>=] the seek key), not the one after it. *)
 val seek_next : seek_cursor -> (bytes * bytes) option Lwt.t
 
+(** #481: {!seek_next} without the key.  Same traversal, same values, same
+    stack-bounding pause schedule (the two share one call counter, so they may
+    be mixed on one cursor); the B+-tree backend simply never copies the entry
+    key out of the leaf page.  Use it wherever the key is discarded — the
+    sequential table scan and every aggregate over it. *)
+val seek_next_value : seek_cursor -> bytes option Lwt.t
+
 (** Release any resources held by a {!seek_cursor}. *)
 val seek_close : seek_cursor -> unit
 

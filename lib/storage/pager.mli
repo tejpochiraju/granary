@@ -100,6 +100,28 @@ val read_borrow
   -> (Cstruct.t -> 'a Lwt.t)
   -> ('a, error) result Lwt.t
 
+(** #481: like {!read}, but for callers that RETAIN the page buffer past a
+    single scope and only ever read it — the shape {!read_borrow}'s callback
+    cannot express (a B+-tree cursor holds one leaf across the many
+    [cursor_next] calls that consume it).  Returns the pager's own cache or
+    WAL-frame buffer with no defensive copy, saving a full page copy per leaf
+    advance.
+
+    The caller MUST treat the result as read-only.  Sound because cache and
+    WAL-frame buffers are immutable once stored and eviction only drops the
+    hashtbl entry, so a retained buffer stays live and stays correct.
+
+    Dirty pages are still copied: a dirty buffer is the one the writer may
+    mutate in place (see {!dirty_buffer}), so on the writer path this is
+    byte-for-byte {!read}. *)
+val read_shared
+  :  ?snapshot_frames:int
+  -> ?pin_set:(int64, unit) Hashtbl.t
+  -> ?bypass_cache:bool
+  -> t
+  -> int64
+  -> (Cstruct.t, error) result Lwt.t
+
 (** Write [buf] to [page_id] (defensive copy). *)
 val write : t -> int64 -> Cstruct.t -> unit
 

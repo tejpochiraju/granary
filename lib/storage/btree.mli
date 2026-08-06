@@ -119,6 +119,12 @@ val cursor_seek
     Returns [None] when the cursor has passed the last entry. *)
 val cursor_next : cursor -> ((bytes * bytes) option, error) result Lwt.t
 
+(** #481: {!cursor_next} without materialising the key.  Same traversal, same
+    values, same errors — it simply never copies the entry key out of the leaf
+    page.  Use it for scans that discard the key (aggregates, a bare COUNT, the
+    sequential table scan), which is the majority of them. *)
+val cursor_next_value : cursor -> (bytes option, error) result Lwt.t
+
 (** Cursor is purely in-memory state — close is a no-op for now but kept
     for API symmetry / future resource management. *)
 val cursor_close : cursor -> unit
