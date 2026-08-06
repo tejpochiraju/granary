@@ -23,7 +23,17 @@
       accepts the pairing. *)
 
 open Lwt.Syntax
-module Db = Granary.Db
+
+(* The file constructors live in the [granary.unix] driver library, not in
+   [Granary.Db] — the core carries no unix dependency (#170, db.mli:62). Every
+   test that opens a file aliases them by hand; this is the same shim as
+   [test/test_txn.ml:5-9]. *)
+module Db = struct
+  include Granary.Db
+
+  let open_file = Granary_unix.open_file
+end
+
 module Row = Granary_encoding.Row
 
 let run = Lwt_main.run
@@ -192,6 +202,19 @@ let renames_an_aggregate_projection () =
     Alcotest.check pair_list "aggregate columns renamed" [ 1, 10; 2, 20; 3, 30 ] got)
 ;;
 
+(* A compound select takes its column names from its left arm, so that is where
+   the list lands. *)
+let renames_a_compound_body () =
+  with_db (fun db ->
+    seed db;
+    exec db "CREATE VIEW v (k, val_) AS SELECT a, x FROM t UNION ALL SELECT a, x FROM t";
+    let got = ints_in_order (query db "SELECT k FROM v ORDER BY k") in
+    Alcotest.(check (list int))
+      "compound body renamed, both arms present"
+      [ 1; 1; 2; 2; 3; 3 ]
+      got)
+;;
+
 (* TPC-H Q15's own view, spelled the way the spec spells it. Its column list is
    why this half of #491 was filed. *)
 let tpch_q15_view_shape () =
@@ -261,6 +284,32 @@ let too_many_names_rejected () =
       (String.length msg > 0))
 ;;
 
+(* A WITH-bodied view is a syntax error, WITH OR WITHOUT a column list: the
+   [create_view] production takes a [compound_select], and [with_cte] is a
+   sibling alternative of [compound_select] under [stmt], not a case of it.
+   Both spellings are pinned together because the point is that the column list
+   changes nothing here — [Ast.rename_view_columns] deliberately has no
+   [S_with_cte] arm, since an arm that can never be reached would advertise
+   support the grammar cannot express. If this test ever starts failing on the
+   bare spelling, the grammar has been widened and the arm should come back
+   (see the note at the bottom of [rename_view_columns]). *)
+let with_bodied_view_is_refused_either_way () =
+  with_db (fun db ->
+    seed db;
+    let bare =
+      exec_err db "CREATE VIEW v AS WITH c AS (SELECT a, x FROM t) SELECT a, x FROM c"
+    in
+    let listed =
+      exec_err
+        db
+        "CREATE VIEW v (k, w) AS WITH c AS (SELECT a, x FROM t) SELECT a, x FROM c"
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "refused either way (%S / %S)" bare listed)
+      true
+      (String.length bare > 0 && String.length listed > 0))
+;;
+
 let star_projection_rejected () =
   with_db (fun db ->
     seed db;
@@ -299,6 +348,7 @@ let () =
             `Quick
             column_list_overrides_the_body_alias
         ; Alcotest.test_case "aggregate projection" `Quick renames_an_aggregate_projection
+        ; Alcotest.test_case "compound body" `Quick renames_a_compound_body
         ; Alcotest.test_case "TPC-H Q15's view" `Quick tpch_q15_view_shape
         ; Alcotest.test_case "survives a reopen" `Quick renamed_columns_survive_a_reopen
         ; Alcotest.test_case "bare form still works" `Quick bare_create_view_still_works
@@ -307,6 +357,7 @@ let () =
       , [ Alcotest.test_case "too few names" `Quick too_few_names_rejected
         ; Alcotest.test_case "too many names" `Quick too_many_names_rejected
         ; Alcotest.test_case "SELECT *" `Quick star_projection_rejected
+        ; Alcotest.test_case "WITH body" `Quick with_bodied_view_is_refused_either_way
         ] )
     ]
 ;;

@@ -765,10 +765,17 @@ let rec rename_view_columns (names : string list) (q : stmt) : (stmt, string) re
     Result.map
       (fun left' -> S_compound { r with left = left' })
       (rename_view_columns names r.left)
-  | S_with_cte r ->
-    Result.map
-      (fun query' -> S_with_cte { r with query = query' })
-      (rename_view_columns names r.query)
+  (* There is deliberately NO [S_with_cte] arm.  The [create_view] production
+     takes a [compound_select], and [with_cte] is a sibling alternative of
+     [compound_select] under [stmt] rather than a case of it, so
+     [CREATE VIEW v (a, b) AS WITH c AS (...) SELECT ...] is a syntax error
+     before it ever reaches here — with or without a column list.  An arm here
+     would have been a silent no-op advertising support the grammar cannot
+     express: it would rewrite the inner SELECT, and the names would then be
+     thrown away again downstream unless [Sema.col_names_of_ast_stmt] grew a
+     matching [S_with_cte] arm.  That arm now exists (#491), so if the grammar
+     is ever widened to admit a WITH body, reinstating this one is the whole
+     change — but it must not be reinstated before the grammar is. *)
   | _ -> Error "CREATE VIEW column list: unsupported view body"
 ;;
 

@@ -26,12 +26,14 @@
       (right', s.order, s.limit, s.offset)
     | _ -> (right, [], None, None)
 
-  (* #491: DISTINCT inside an aggregate's argument list.  The arguments are
-     parsed as a LIST so that the multi-argument spelling — [COUNT(DISTINCT a,
-     b)], [GROUP_CONCAT(DISTINCT x, ',')] — gets a real message instead of a
-     bare "syntax error"; SQL allows exactly one.  A DISTINCT aggregate is also
-     refused as a window function, where the argument would have to be
-     deduplicated per frame rather than per group. *)
+  (* #491: DISTINCT inside an aggregate's argument list.  For the aggregates
+     that take exactly one value — COUNT, SUM, AVG, MIN, MAX — the arguments
+     are parsed as a LIST so that [COUNT(DISTINCT a, b)] gets a real message
+     instead of a bare "syntax error".  GROUP_CONCAT and STRING_AGG do NOT come
+     through here: their optional separator is not a second aggregated value,
+     so they mirror their own non-distinct arities instead.  A DISTINCT
+     aggregate is also refused as a window function, where the argument would
+     have to be deduplicated per frame rather than per group. *)
   let agg_distinct_arg fname args ow =
     match ow with
     | Some _ ->
@@ -1128,12 +1130,21 @@ agg_or_window_expr:
     { E_agg (Agg_group_concat None, Some e) }
   | GROUP_CONCAT LPAREN e = expr COMMA sep = STRING_LIT RPAREN
     { E_agg (Agg_group_concat (Some sep), Some e) }
-  | GROUP_CONCAT LPAREN DISTINCT args = agg_distinct_args RPAREN
-    { E_agg_distinct (Agg_group_concat None, agg_distinct_arg "GROUP_CONCAT" args None) }
+  (* The two concatenating aggregates take their DISTINCT productions by
+     MIRRORING their own non-distinct arities rather than through
+     [agg_distinct_args], for two reasons.  A separator argument is not a
+     second aggregated value, so the "exactly one argument" rule does not
+     apply to it — SQLite 3.44+ accepts GROUP_CONCAT(DISTINCT x, sep) and so
+     does this.  And mirroring keeps the arities symmetric: STRING_AGG has no
+     one-argument form, so it must not acquire one under DISTINCT. *)
+  | GROUP_CONCAT LPAREN DISTINCT e = expr RPAREN
+    { E_agg_distinct (Agg_group_concat None, e) }
+  | GROUP_CONCAT LPAREN DISTINCT e = expr COMMA sep = STRING_LIT RPAREN
+    { E_agg_distinct (Agg_group_concat (Some sep), e) }
   | STRING_AGG LPAREN e = expr COMMA sep = STRING_LIT RPAREN
     { E_agg (Agg_group_concat (Some sep), Some e) }
-  | STRING_AGG LPAREN DISTINCT args = agg_distinct_args RPAREN
-    { E_agg_distinct (Agg_group_concat None, agg_distinct_arg "STRING_AGG" args None) }
+  | STRING_AGG LPAREN DISTINCT e = expr COMMA sep = STRING_LIT RPAREN
+    { E_agg_distinct (Agg_group_concat (Some sep), e) }
 
 window_spec:
   | LPAREN pb = partition_clause ob = order_by_clause fs = option(frame_spec) RPAREN

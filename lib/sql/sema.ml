@@ -3877,6 +3877,20 @@ let rec col_names_of_ast_stmt = function
                | _ -> Printf.sprintf "col_%d" (i + 1)))
          items)
   | Ast.S_compound { left; _ } -> col_names_of_ast_stmt left
+  (* #491: mirror [col_names_of_bound_stmt]'s [BS_with_cte] arm, which this
+     function is the AST-side twin of. Without it a WITH-bodied statement
+     produced NO ast names at all, so [output_column_names] fell back entirely
+     to the bound names — and for an AGGREGATED select those are the positional
+     [col_1], [col_2]. Every alias, hand-written or put there by a CREATE VIEW
+     column list, was dropped on the floor.
+
+     No path reaches this arm today: the two callers pass a CTE's [def] or a
+     view's stored body, and both are [compound_select] in the grammar, which
+     does not include [with_cte]. It is here because it is what the twin
+     already does, and because it is the prerequisite for ever letting a view
+     body be a WITH — see the note at the bottom of [Ast.rename_view_columns],
+     which explains why that function deliberately has no matching arm. *)
+  | Ast.S_with_cte { query; _ } -> col_names_of_ast_stmt query
   | Ast.S_const_select { exprs } ->
     List.mapi
       (fun i (expr, alias_opt) ->

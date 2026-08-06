@@ -364,19 +364,55 @@ let distinct_over_an_empty_table () =
 let multiple_arguments_rejected () =
   with_db (fun db ->
     seed db;
-    let msg = query_err db "SELECT COUNT(DISTINCT a, x) FROM t" in
+    List.iter
+      (fun sql ->
+         let msg = query_err db sql in
+         Alcotest.(check bool)
+           (Printf.sprintf "%s names the arity rule, got %S" sql msg)
+           true
+           (contains_sub ~needle:"exactly one argument" msg))
+      [ "SELECT COUNT(DISTINCT a, x) FROM t"
+      ; "SELECT SUM(DISTINCT a, x) FROM t"
+      ; "SELECT MIN(DISTINCT a, x) FROM t"
+      ])
+;;
+
+(* GROUP_CONCAT and STRING_AGG are the exception, and deliberately so: their
+   second argument is a SEPARATOR, not a second aggregated value, so the
+   one-argument rule does not apply to it. Their DISTINCT productions mirror
+   their own non-distinct arities — which also means STRING_AGG does not
+   acquire a one-argument form under DISTINCT that it does not have without
+   it. *)
+let concatenating_aggregates_keep_their_separator () =
+  with_db (fun db ->
+    seed db;
+    let parts sql =
+      match one_value (query db sql) with
+      | Row.V_text s -> List.sort compare (String.split_on_char '-' s)
+      | _ -> Alcotest.failf "expected TEXT from %S" sql
+    in
+    Alcotest.(check (list string))
+      "GROUP_CONCAT(DISTINCT x, sep) — accepted, as in SQLite 3.44+"
+      [ "10"; "20"; "5" ]
+      (parts "SELECT GROUP_CONCAT(DISTINCT x, '-') FROM t");
+    Alcotest.(check (list string))
+      "STRING_AGG(DISTINCT x, sep)"
+      [ "10"; "20"; "5" ]
+      (parts "SELECT STRING_AGG(DISTINCT x, '-') FROM t"))
+;;
+
+(* STRING_AGG has no one-argument form. It must not gain one just because
+   DISTINCT is present — that asymmetry is what a bare argument-list production
+   would have introduced. *)
+let string_agg_arity_is_symmetric () =
+  with_db (fun db ->
+    seed db;
+    let plain = query_err db "SELECT STRING_AGG(x) FROM t" in
+    let distinct = query_err db "SELECT STRING_AGG(DISTINCT x) FROM t" in
     Alcotest.(check bool)
-      (Printf.sprintf "names the arity rule, got %S" msg)
+      (Printf.sprintf "both spellings refused (%S / %S)" plain distinct)
       true
-      (contains_sub ~needle:"exactly one argument" msg);
-    (* GROUP_CONCAT is the one aggregate with a legal two-argument form, so its
-       DISTINCT spelling is the one a bare grammar would have accepted by
-       accident. *)
-    let msg = query_err db "SELECT GROUP_CONCAT(DISTINCT x, '-') FROM t" in
-    Alcotest.(check bool)
-      (Printf.sprintf "GROUP_CONCAT(DISTINCT x, sep) refused, got %S" msg)
-      true
-      (contains_sub ~needle:"exactly one argument" msg))
+      (String.length plain > 0 && String.length distinct > 0))
 ;;
 
 let distinct_window_function_rejected () =
@@ -407,7 +443,7 @@ let prop_matches_model =
   QCheck.Test.make
     ~count:60
     ~name:"COUNT(DISTINCT x) equals the cardinality of the non-null value set"
-    QCheck.(list_of_size Gen.(int_range 0 40) (option (int_range (-5) 5)))
+    QCheck.(list_size Gen.(int_range 0 40) (option (int_range (-5) 5)))
     (fun values ->
        with_db (fun db ->
          exec db "CREATE TABLE p (x INTEGER)";
@@ -457,6 +493,14 @@ let () =
         ] )
     ; ( "rejected"
       , [ Alcotest.test_case "multiple arguments" `Quick multiple_arguments_rejected
+        ; Alcotest.test_case
+            "GROUP_CONCAT/STRING_AGG separator"
+            `Quick
+            concatenating_aggregates_keep_their_separator
+        ; Alcotest.test_case
+            "STRING_AGG arity symmetry"
+            `Quick
+            string_agg_arity_is_symmetric
         ; Alcotest.test_case "window function" `Quick distinct_window_function_rejected
         ; Alcotest.test_case "in WHERE" `Quick distinct_aggregate_in_where_rejected
         ] )
