@@ -3561,14 +3561,22 @@ let check_insert_unique
            match conflict_rowid_opt with
            | None -> Lwt.return (false, dels, upsert_rid)
            | Some old_rowid ->
+             (* #639: the explicit ON CONFLICT target wins over the statement's
+                conflict-resolution modifier FOR THE INDEX IT NAMES.  This arm
+                used to sit below [CA_ignore], so `INSERT OR IGNORE ... ON
+                CONFLICT(k) DO UPDATE` silently skipped instead of running the
+                DO UPDATE — a caller who wrote both got "insert, or do nothing".
+                The modifier still governs every OTHER index: a conflict on an
+                index the ON CONFLICT clause does not name falls through to
+                [CA_ignore]/[CA_replace] exactly as before. *)
              (match on_conflict, upsert_update with
-              | Some Ast.CA_ignore, _ ->
-                Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
-              | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
               | _, Some (conflict_cols, _)
                 when List.sort String.compare idx.idx_columns
                      = List.sort String.compare conflict_cols ->
                 Lwt.return (false, dels, Some old_rowid)
+              | Some Ast.CA_ignore, _ ->
+                Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
+              | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
               | _ ->
                 Lwt.fail_with
                   (unique_constraint_failed_msg
@@ -3967,7 +3975,33 @@ let execute_insert_write
          put_x returns a sentinel [Some Bytes.empty] — callers that need the
          old row bytes (CA_replace) fetch them via S.get below. *)
       let col_name = Option.value alias_col_name ~default:"rowid" in
+      (* #639: same reorder as [check_insert_unique] — an explicit ON CONFLICT
+         clause naming this alias PK beats the statement's modifier, so
+         `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` runs the DO UPDATE
+         instead of silently skipping.  A modifier still governs a conflict the
+         ON CONFLICT clause does not name (it falls through to the arms below). *)
       (match on_conflict, upsert_update with
+       | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
+         (* Alias PK is always a single column, so single-element equality
+            suffices — no sort needed.  Fire AFTER DELETE for any secondary
+            REPLACE displaced rows before handing off to the upsert path. *)
+         let* () =
+           match on_replace_delete with
+           | None -> Lwt.return_unit
+           | Some f -> Lwt_list.iter_s (fun r -> f ~tx ~old_row:r) displaced_rows
+         in
+         execute_upsert_update
+           tx
+           cat
+           table_meta
+           ~clock
+           ~params
+           ~owned
+           ~row
+           ~assigns
+           ~old_rowid:rowid
+           ~on_upsert_update_before
+           ~on_upsert_update
        | Some Ast.CA_ignore, _ ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.return false
@@ -4034,27 +4068,6 @@ let execute_insert_write
          in
          let* () = release_txn ~cat tx owned in
          Lwt.return true
-       | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
-         (* Alias PK is always a single column, so single-element equality
-            suffices — no sort needed.  Fire AFTER DELETE for any secondary
-            REPLACE displaced rows before handing off to the upsert path. *)
-         let* () =
-           match on_replace_delete with
-           | None -> Lwt.return_unit
-           | Some f -> Lwt_list.iter_s (fun r -> f ~tx ~old_row:r) displaced_rows
-         in
-         execute_upsert_update
-           tx
-           cat
-           table_meta
-           ~clock
-           ~params
-           ~owned
-           ~row
-           ~assigns
-           ~old_rowid:rowid
-           ~on_upsert_update_before
-           ~on_upsert_update
        | _ ->
          Lwt.fail_with
            (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name))
@@ -4148,16 +4161,37 @@ let execute_insert
        (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
          before extracting index keys so VIRTUAL cells contribute their value. *)
        let row_for_idx = with_computed_virtuals clock params table_meta row in
+       (* #639/#599: under [OR IGNORE] the modifier governs the INSERT half, so
+          a NOT NULL violation in the row being inserted skips it before any
+          conflict resolution is consulted — an ON CONFLICT clause only ever
+          intercepts a UNIQUENESS conflict, never a NOT NULL one.  Deciding it
+          here rather than in [execute_insert_write] is what makes the two
+          conflict shapes agree: an alias-PK conflict reaches that function and
+          would see its [null_skip], but a secondary-index conflict resolves to
+          [upsert_rowid] in [check_insert_unique] and never gets there, so the
+          same statement skipped or ran the DO UPDATE depending on which index
+          the row happened to collide with.  Guarded by [CA_ignore] so that no
+          other resolution's ordering changes: [not_null_skip_or_fail] raises
+          for those, and raising earlier here would turn a bare upsert that
+          currently updates into an error.  [execute_insert_write] does not
+          re-evaluate it — its [null_skip] is guarded by [not skip]. *)
+       let null_skip =
+         on_conflict = Some Ast.CA_ignore
+         && not_null_skip_or_fail table_meta row ~on_conflict
+       in
        let* skip, to_delete, upsert_rowid =
-         check_insert_unique
-           tx
-           table_meta
-           ~clock
-           ~params
-           ~row_for_idx
-           ~on_conflict
-           ~upsert_update
-           idxs
+         if null_skip
+         then Lwt.return (true, [], None)
+         else
+           check_insert_unique
+             tx
+             table_meta
+             ~clock
+             ~params
+             ~row_for_idx
+             ~on_conflict
+             ~upsert_update
+             idxs
        in
        (* #243 (T1): alias PK conflict detection is now folded into put_x
           inside execute_insert_write (#350) — no pre-read needed. *)
