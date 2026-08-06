@@ -22,8 +22,6 @@
     describes: the statements either succeed against a dead store or fail with
     an error that says nothing about VACUUM. *)
 
-open Lwt.Syntax
-
 module Db = struct
   include Granary.Db
 

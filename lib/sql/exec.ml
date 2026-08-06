@@ -10859,7 +10859,13 @@ and stream_hash_join
         let matches_s joined =
           let bnd = binding_of_metas inputs joined in
           let* resolved =
-            with_pull_context ~stats:s_opt ~mode (fun () ->
+            (* #493 + #615: [binding_of_metas] pins literals, so the substituted
+               statement differs on every (left, right) pair and a cache would
+               only grow — same reasoning as the aggregate site below.  The
+               parameterized spelling is not available here: the ON predicate is
+               the match test, so it is evaluated per pair rather than per
+               surviving row (#552). *)
+            with_pull_context ~stats:s_opt ~mode ~cache:None (fun () ->
               pre_eval_subquery
                 clock
                 store

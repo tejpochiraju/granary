@@ -40,7 +40,7 @@ let read_byte = function
 type stub =
   { mutable frames : (int64 * Cstruct.t) array
   ; mutable committed : int
-  ; mutable epoch : int64 (* #611: bumped by a simulated checkpoint *)
+  ; epoch : int64 (* #611: bumped by a simulated checkpoint; replaced, not mutated *)
   }
 
 let make_stub_callbacks (s : stub) : Pager.wal_callbacks =

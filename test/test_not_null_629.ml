@@ -530,7 +530,7 @@ let prop_or_ignore_keeps_exactly_the_computable_rows =
   QCheck.Test.make
     ~count:60
     ~name:"#629: OR IGNORE keeps exactly the rows whose generated value is non-NULL"
-    QCheck.(small_list (option (int_range (-1000) 1000)))
+    QCheck.(list_small (option (int_range (-1000) 1000)))
     (fun vs ->
        with_db (fun db ->
          create_stored db;

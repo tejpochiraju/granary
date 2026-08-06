@@ -30,11 +30,9 @@
 
 open Lwt.Syntax
 
-module Db = struct
-  include Granary.Db
-
-  let open_file = Granary_unix.open_file
-end
+(* No [open_file] shim here: every case in this file builds its handle through
+   [Granary.Db.open_in_memory] or [create_worker_handle]. *)
+module Db = Granary.Db
 
 let () = Granary_unix.install ()
 let run = Lwt_main.run

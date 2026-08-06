@@ -102,7 +102,7 @@ type t =
         been freed.  [alloc] consults this pool before the main
         freelist. *)
   ; mutable wal : wal_callbacks option
-  ; mutable wal_epoch : int64
+  ; mutable cached_wal_epoch : int64
     (** #611: the WAL generation every WAL-keyed entry currently in [cache] was
         built under.  [sync_wal_epoch] compares it against the live
         [wal_epoch ()] on every WAL resolution and purges the WAL-keyed
@@ -159,7 +159,7 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   ; n_pages_at_rw_begin = 0L
   ; txn_owned_pool = []
   ; wal = None
-  ; wal_epoch = 0L
+  ; cached_wal_epoch = 0L
   ; write_tag = 0l
   ; on_page_event = None
   }
@@ -261,12 +261,16 @@ let purge_wal_cache t =
    BEFORE the cache is consulted on every WAL resolution, so a stale entry
    cannot be served even once.  Cost on the hot path: one closure call and an
    [Int64] compare. *)
-let sync_wal_epoch t cb =
+(* [cb] is annotated because {!wal_callbacks} and the pager's own [t] both
+   carry a [wal_epoch] field — the callback (unit -> int64) and the cached
+   generation (int64).  Without the annotation OCaml resolves the label to the
+   later-defined record, [t], and the call does not typecheck. *)
+let sync_wal_epoch t (cb : wal_callbacks) =
   let e = cb.wal_epoch () in
-  if not (Int64.equal e t.wal_epoch)
+  if not (Int64.equal e t.cached_wal_epoch)
   then (
     purge_wal_cache t;
-    t.wal_epoch <- e)
+    t.cached_wal_epoch <- e)
 ;;
 
 let set_wal t cb =
@@ -284,10 +288,10 @@ let set_wal t cb =
    | None, Some _ -> purge_wal_cache t
    | None, None -> ());
   t.wal <- cb;
-  t.wal_epoch
+  t.cached_wal_epoch
   <- (match cb with
       | None -> 0L
-      | Some c -> c.wal_epoch ())
+      | Some (c : wal_callbacks) -> c.wal_epoch ())
 ;;
 
 let wal_mode t = t.wal <> None
@@ -417,16 +421,16 @@ let cstruct_dup src =
    [wal_read_frame]; a checkpoint that lands DURING that yield would otherwise
    let this [cache_add] install a dead generation's bytes AFTER a later fiber
    had already purged and repopulated the same [key], and — because
-   [t.wal_epoch] would by then already be the new epoch — no later
+   [t.cached_wal_epoch] would by then already be the new epoch — no later
    [sync_wal_epoch] would ever purge it again.  The result is a permanently
    poisoned entry and a silent wrong answer for every subsequent reader.  The
    window is real: [Store.checkpoint_unlocked]'s reader gate is
    [ro_readers_below] ([m < target]), so a reader at the WAL head is not gated
    and runs concurrently with [Wal.reset].
 
-   Both conjuncts are checked deliberately.  [t.wal_epoch] cannot currently
+   Both conjuncts are checked deliberately.  [t.cached_wal_epoch] cannot currently
    differ from [cb.wal_epoch ()] here without the first conjunct also failing
-   (epochs are monotone and [t.wal_epoch] is only ever assigned from
+   (epochs are monotone and [t.cached_wal_epoch] is only ever assigned from
    [cb.wal_epoch ()]), so the second is redundant today — but it is what keeps
    this correct if the pager's own epoch bookkeeping ever gains another writer,
    and it costs an [Int64] compare on a path that has just done device I/O.
@@ -448,7 +452,7 @@ let read_and_cache_frame ~bypass_cache t cb ~page_id ~frame_idx ~key =
     if
       (not bypass_cache)
       && Int64.equal (cb.wal_epoch ()) expected_epoch
-      && Int64.equal t.wal_epoch expected_epoch
+      && Int64.equal t.cached_wal_epoch expected_epoch
     then cache_add t key page;
     Lwt.return_ok page
 ;;
