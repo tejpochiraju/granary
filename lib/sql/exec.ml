@@ -9327,6 +9327,57 @@ and substitute_outer_in_plan_expr
   | _ -> e
 ;;
 
+(** #635: does [s] carry a {b free} column reference — a name no scope inside
+    [s] owns, which can therefore only come from an enclosing query?
+
+    That is the definition of "this subquery is correlated", and it is the
+    question {!Sema.bind} cannot answer. [Sema] treats [E_subquery] / [E_exists]
+    / [E_in_select] as opaque leaves: it never descends into a nested subquery,
+    so a reference buried TWO levels down is invisible to it and the enclosing
+    statement binds cleanly. The callers below read "it bound" as "it is
+    uncorrelated" and evaluate it eagerly — before any outer row exists to
+    substitute from. The reference is then met for the first time by the
+    intermediate query's own [stream_filter], whose inputs are the intermediate
+    FROM, and refused there (#592) because the outermost input is nowhere in
+    sight.
+
+    That is what made
+    [... FROM l AS x WHERE EXISTS (SELECT 1 FROM r WHERE EXISTS (SELECT 1 FROM k
+    WHERE v < x.a))] a refusal even after #635 taught
+    {!substitute_outer_in_expr} to descend through nesting: the descent was
+    correct but never ran, because nothing had classified the middle subquery as
+    correlated.
+
+    It is deliberately implemented by RUNNING {!substitute_outer_in_stmt} with a
+    binding that resolves nothing and records that it was asked. The detector
+    and the substituter therefore agree by construction about which references
+    are free — the same discipline the two binders are held to. A hand-written
+    second walker would be one more member of a set that already disagrees
+    (#670).
+
+    It can only ever move a statement from "evaluate eagerly" to "treat as
+    correlated": when it answers [false] the caller does exactly what it did
+    before, and when a statement it flags turns out to have no resolvable outer
+    source, the refusal it eventually raises is the one that was raised before.
+    [inner_scope_of] answers "owned" for everything it cannot resolve, so an
+    unresolvable FROM never manufactures a free reference. *)
+let stmt_has_free_column_ref (cat : Cat.t option) (s : Ast.stmt) : bool =
+  let seen = ref false in
+  let probe : outer_binding =
+    { bind_qual =
+        (fun _ _ ->
+          seen := true;
+          None)
+    ; bind_unqual =
+        (fun _ ->
+          seen := true;
+          None)
+    }
+  in
+  ignore (substitute_outer_in_stmt ~cat ~enclosing:no_inner_scope probe s : Ast.stmt);
+  !seen
+;;
+
 let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) : Plan.op =
   let go = substitute_cte ~cte_name ~rows in
   match op with
@@ -9425,8 +9476,17 @@ let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_r
     statement identical across rows; with no cache in scope this degrades to the
     previous per-call bind+plan and nothing else changes.
 
-    [None] means the statement did not bind, which every caller reports by
-    leaving its expression unresolved, exactly as before.
+    [None] means the statement cannot stand on its own, which every caller
+    reports by leaving its expression unresolved, exactly as before.
+
+    #635: "cannot stand on its own" is two questions, and {!Sema.bind} answers
+    only the first. It does not descend into a nested subquery, so a statement
+    whose correlation sits TWO levels down binds cleanly and would be evaluated
+    eagerly, before any outer row exists to substitute from — see
+    {!stmt_has_free_column_ref}, which answers the second. Both are asked here,
+    at the one chokepoint all four callers share, so
+    {!refuse_unresolved_correlation} and the three [eval_*_subquery] functions
+    cannot disagree about which statements are correlated.
 
     The FAILURE is memoized too (the cache holds [Plan.op option], not
     [Plan.op]). A statement that will not bind is the #592 unresolvable
@@ -9439,14 +9499,19 @@ let plan_subquery_cached (cat : Cat.t) (inner_ast : Ast.stmt) : Plan.op option L
   match Option.bind cache (fun tbl -> Hashtbl.find_opt tbl inner_ast) with
   | Some cached -> Lwt.return cached
   | None ->
-    (* Counted here and nowhere else: this is the branch a cache hit skips, so
-       the counter measures exactly "how many times did we pay bind+plan". *)
-    incr subquery_plans_built_ref;
-    let* bound_r = Sema.bind cat inner_ast in
-    let result =
-      match bound_r with
-      | Error _ -> None
-      | Ok bound -> Some (Planner.plan ~cat bound)
+    let* result =
+      if stmt_has_free_column_ref (Some cat) inner_ast
+      then Lwt.return None
+      else (
+        (* Counted here and nowhere else: this is the branch a cache hit skips,
+           so the counter measures exactly "how many times did we pay
+           bind+plan". A statement rejected above pays neither. *)
+        incr subquery_plans_built_ref;
+        let* bound_r = Sema.bind cat inner_ast in
+        Lwt.return
+          (match bound_r with
+           | Error _ -> None
+           | Ok bound -> Some (Planner.plan ~cat bound)))
     in
     (match cache with
      | Some tbl -> Hashtbl.replace tbl inner_ast result
