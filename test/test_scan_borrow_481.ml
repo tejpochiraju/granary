@@ -32,19 +32,33 @@
       scan never reads.  This is the machine-independent form of Finding 4:
       three copies of the payload per row show up as a slope near 3, one copy as
       a slope near 1.  It uses [Gc.allocated_bytes], an exact counter, so a
-      loaded runner cannot move it (the same reason [test_not_null_600]'s heap
-      gate runs armed everywhere).
+      loaded runner cannot move it.  {b It is DISARMED by default} — the ceiling
+      has a derivation but no measurement yet; see [max_payload_slope] below for
+      why that matters and what the benchmark pass should do with it.
     - {b value-only < key-and-value} — [seek_next_value] must allocate strictly
-      less per row than [seek_next] over the same tree.  True by construction,
-      and it is the assertion that fails if someone re-adds the key copy.
+      less per row than [seek_next] over the same tree.  ARMED: it contains no
+      constant to calibrate, and it is the assertion that fails if someone
+      re-adds the key copy.
 
     Correctness is pinned separately and more strictly than allocation is: the
     borrowed path must return byte-identical values to the copying path for
     full scans, mid-tree seeks, overflow (out-of-line) values, a scan long
-    enough that its own leaves are evicted from the pager cache underneath it,
-    and a read-your-own-writes scan inside an open RW transaction (the one path
-    where {!read_shared} deliberately still copies, because a dirty page is
-    mutated in place). *)
+    enough that its own leaves are evicted underneath it — run over BOTH a WAL
+    store and a plaintext one, because {!Granary_storage.Pager.read_shared} has
+    two distinct borrow sources — and a read-your-own-writes scan inside an open
+    RW transaction (the one path where [read_shared] deliberately still copies,
+    because a dirty page is mutated in place).
+
+    {b Deliberately NOT tested here: a checkpoint landing mid-scan.}  It is the
+    one remaining way a retained WAL-frame buffer could in principle be
+    invalidated, and review traced it as sound ([Wal.reset] resets the frame
+    hashtable and never mutates a buffer, and the retained plaintext frame is
+    byte-equal to the checkpointed main-DB page).  Writing the test needs a
+    checkpoint to run concurrently with a live cursor holding an RO snapshot,
+    and a checkpoint that parks on that snapshot would hang the suite — not
+    something to introduce in a branch that has never been compiled.  The
+    benchmark/verification pass should add it; it is listed as an open item on
+    the PR. *)
 
 open Lwt.Syntax
 
@@ -98,6 +112,14 @@ let with_store_gen ~open_db ~f =
 
 let with_wal_store ~f =
   with_store_gen ~open_db:(fun ~path () -> S.open_file_wal ~path ()) ~f
+;;
+
+(* Plaintext file, no WAL: every leaf resolves through
+   [Pager.load_main_page_borrow] and the pager's own [t.cache], which is the
+   borrow source a WAL store may never touch.  See
+   [scan_outlives_page_eviction]. *)
+let with_plain_store ~f =
+  with_store_gen ~open_db:(fun ~path () -> S.open_file ~path ()) ~f
 ;;
 
 let populate s ~tid ~n ~width =
@@ -299,10 +321,21 @@ let test_mixed_inline_and_overflow () =
    holding are certainly evicted from the cache mid-scan — the exact condition
    under which a borrowed buffer that were reused or invalidated would return
    another page's bytes.  Every value is checked, so a single wrong page shows
-   up as a wrong value rather than a crash. *)
-let test_scan_outlives_page_eviction () =
+   up as a wrong value rather than a crash.
+
+   RUN OVER BOTH STORE FLAVOURS, because [Pager.read_shared] has TWO borrow
+   sources and only one of them is a WAL store's.  On a WAL store every leaf
+   resolves through [resolve_wal_page_borrow] → [Wal.read_frame] and comes from
+   the WAL's own bounded frame cache; the pager's [t.cache] is only reached once
+   a checkpoint has moved the page to the main file, which an
+   auto-checkpoint may or may not have done by the time this runs.  The
+   plaintext-file store has no WAL at all, so every leaf necessarily comes from
+   [load_main_page_borrow] — that arm's retention is pinned only by the non-WAL
+   run.  (Found in review: every store in the first draft of this file was a WAL
+   store, so the [t.cache] arm was untested.) *)
+let scan_outlives_page_eviction with_store_of_flavour () =
   run
-    (with_wal_store ~f:(fun s ->
+    (with_store_of_flavour ~f:(fun s ->
        let tid = 0 in
        (* ~420 B/entry over 4080 usable bytes ≈ 9-10 rows per leaf, so 20 000
           rows need ~2100 leaves against a default 1024-page cache. *)
@@ -401,28 +434,55 @@ let test_read_your_own_writes_in_rw_txn () =
 
 (* Bytes allocated per row, per byte of payload the scan never looks at.
 
-   Pre-fix there were THREE copies of every value on the scan path — the
-   [leaf_entry_at] value copy, [decode_leaf_value]'s tag-strip copy, and the
-   per-leaf 4 KB page dup, which amortises to almost exactly one payload copy
-   per row because a leaf holds a page's worth of payload.  That predicts a
-   slope near 3, and #481's own Finding 4 measured 0.514 WORDS per payload byte
-   = ~4.1 bytes per payload byte through the SQL pipeline.
+   THE UNIT IS "COPIES OF THE PAYLOAD".  Copying an [n]-byte payload out of the
+   page allocates [n] bytes rounded up to a word plus a header, so over a
+   384-byte spread the rounding contributes at most ~8 bytes/row ≈ 0.02 to the
+   slope.  The quantity is therefore very nearly an integer and means exactly
+   what it says: 1.0 = the payload is copied once, 3.0 = three times.
 
-   Post-fix exactly one copy remains: [Page.copy_span] lifting the payload out
-   of the leaf, which is the copy the caller actually asked for.  That predicts
-   a slope near 1.
+   Pre-fix it was copied THREE times on the scan path — the [leaf_entry_at]
+   value copy, [decode_leaf_value]'s tag-strip copy, and the per-leaf 4 KB page
+   dup, which amortises to almost exactly one payload copy per row because a
+   leaf holds a page's worth of payload.  #481's Finding 4 measured 0.514 WORDS
+   per payload byte ≈ 4.1 bytes/byte through the SQL pipeline, i.e. those three
+   plus something else the SQL layer adds.  Post-fix exactly one copy remains:
+   [Page.copy_span] lifting the payload out of the leaf, which is the copy the
+   caller actually asked for.
 
-   The gate is 2.0 — between the two, ~1.5x under the buggy slope and ~2x over
-   the fixed one.  [GRANARY_MEM_MAX_PAYLOAD_SLOPE] raises it for a platform with
-   a different allocator or word size, the same escape hatch
-   [GRANARY_MEM_MAX_WORDS_PER_ROW] is for [test_not_null_600]; reach for it only
-   after ruling out a reintroduced copy, because that is the thing it guards. *)
+   So the ceiling below is not a tuned magic number: 2.0 means "fewer than TWO
+   copies of the payload per row", the smallest integer boundary that separates
+   correct from regressed, and word-size/allocator differences cannot move a
+   quantity by a whole copy.
+
+   {b It is nevertheless DISARMED by default, and that is the point.}  This
+   branch has never been built, let alone measured, so the derivation above is
+   reasoning and not evidence — and CLAUDE.md is explicit that
+   [test_not_null_600] earns its always-armed status by having been measured
+   across three runs.  An unmeasured gate armed in `ci.yml` / `coverage.yml` /
+   `cross-arch.yml` would make the first CI run a coin flip for every open PR,
+   and would then be quietly neutralized — the honour system #549 removed.
+
+   Unarmed, the test still measures and PRINTS the slope, and still asserts
+   every correctness property around it; it just does not block.  It is armed
+   in exactly one place, `.forgejo/workflows/bench-nightly.yml`, which sets
+   [GRANARY_MEM_MAX_PAYLOAD_SLOPE=2.0] — the job that reports via an auto-filed
+   issue rather than failing a PR, which is the right blast radius for a
+   ceiling whose first real measurement has not happened yet.
+
+   {b For whoever runs the deferred benchmark pass:} read the printed slope.  If
+   it is near 1, promote this to armed-by-default (flip [None -> Some 2.0]
+   below) and add the row to CLAUDE.md's non-wall-clock gate table next to
+   [GRANARY_MEM_MAX_WORDS_PER_ROW].  If it is near 3, a copy came back and the
+   PR did not do what it claims.  Do NOT widen the ceiling to make it pass. *)
 let max_payload_slope =
   match Sys.getenv_opt "GRANARY_MEM_MAX_PAYLOAD_SLOPE" with
+  | None | Some "" -> None
+  | Some ("off" | "0") -> None
   | Some s ->
-    (try float_of_string s with
-     | _ -> 2.0)
-  | None -> 2.0
+    (match float_of_string_opt s with
+     | Some f -> Some f
+     | None ->
+       Alcotest.failf "GRANARY_MEM_MAX_PAYLOAD_SLOPE=%S is not a number (or \"off\")" s)
 ;;
 
 let narrow_width = 16
@@ -445,30 +505,43 @@ let test_count_is_flat_in_unread_payload_width () =
      let slope = (wide -. narrow) /. float_of_int (wide_width - narrow_width) in
      Printf.eprintf
        "[#481] count-only allocation: %d B payload -> %.0f B/row, %d B payload -> %.0f \
-        B/row; slope %.2f bytes allocated per unread payload byte (ceiling %.2f)\n\
+        B/row; slope %.2f copies of the payload per row (%s)\n\
         %!"
        narrow_width
        narrow
        wide_width
        wide
        slope
-       max_payload_slope;
-     Alcotest.(check bool)
-       (Printf.sprintf
-          "counting rows must not pay for columns it never reads (slope %.2f, ceiling \
-           %.2f)"
-          slope
-          max_payload_slope)
-       true
-       (slope < max_payload_slope);
+       (match max_payload_slope with
+        | None ->
+          "REPORT-ONLY: unarmed, set GRANARY_MEM_MAX_PAYLOAD_SLOPE to gate; expect ~1, \
+           ~3 means a copy came back"
+        | Some c -> Printf.sprintf "ARMED, ceiling %.2f" c);
+     (match max_payload_slope with
+      | None -> ()
+      | Some ceiling ->
+        Alcotest.(check bool)
+          (Printf.sprintf
+             "counting rows must not pay for columns it never reads (slope %.2f, ceiling \
+              %.2f)"
+             slope
+             ceiling)
+          true
+          (slope < ceiling));
      Lwt.return_unit)
 ;;
 
 (* The direct assertion that the key copy is gone: over the SAME tree,
-   [seek_next_value] must allocate strictly less per row than [seek_next].  The
-   difference is one 12-byte key per row (a [Bytes.create] plus its header), so
-   the margin is small but the counter is exact and the comparison is
-   self-calibrating — no absolute number to drift. *)
+   [seek_next_value] must allocate strictly less per row than [seek_next].
+
+   THIS ONE IS ARMED, and unlike the slope above it does not need a measurement
+   first, because it contains no constant to calibrate.  It compares two numbers
+   produced by the same process, over the same warm tree, from the same exact
+   counter, by two code paths that differ only in one [Page.copy_span] of the
+   12-byte key.  There is no ceiling to guess and nothing for a different
+   allocator or word size to shift: a platform on which copying a key allocates
+   nothing at all is not one this codebase runs on.  If it ever does fail, the
+   key copy is back — that is the only thing it can mean. *)
 let test_value_only_allocates_less_than_key_and_value () =
   run
     (with_wal_store ~f:(fun s ->
@@ -627,9 +700,13 @@ let () =
             `Quick
             test_mixed_inline_and_overflow
         ; Alcotest.test_case
-            "scan outlives eviction of the leaves it borrowed"
+            "scan outlives eviction of the leaves it borrowed (WAL frame cache)"
             `Slow
-            test_scan_outlives_page_eviction
+            (scan_outlives_page_eviction with_wal_store)
+        ; Alcotest.test_case
+            "scan outlives eviction of the leaves it borrowed (pager page cache)"
+            `Slow
+            (scan_outlives_page_eviction with_plain_store)
         ; Alcotest.test_case
             "in-txn scan sees its own writes (dirty pages still copied)"
             `Quick

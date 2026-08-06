@@ -119,8 +119,23 @@ jobs:
         # (test_fts_scaling default 9, bench_wal_fsync_overlap default 3).
         # 15 was measured to buy nothing over 9 on a *loaded* 8-core box, so
         # on a genuinely quiet runner it is headroom rather than a requirement.
+        #
+        # GRANARY_MEM_MAX_PAYLOAD_SLOPE (#481) is a GATE, not a knob, and this
+        # is the only place it is armed. test_scan_borrow_481 measures how many
+        # bytes a table scan allocates per byte of payload it never reads: 1 =
+        # the one copy the caller asked for, 3 = the three #481 removed. The
+        # ceiling has a derivation (it is a count of copies, so the boundary is
+        # an integer) but no measurement yet, which is exactly why it is armed
+        # HERE — this job reports via an auto-filed issue instead of failing a
+        # PR — and left unarmed in ci.yml / coverage.yml / cross-arch.yml.
+        # Unarmed the test still prints the slope and still asserts every
+        # correctness property; it just does not block. Once the benchmark pass
+        # produces a real number, promote it to armed-by-default in the test and
+        # add the row to CLAUDE.md's gate table. Do not widen it to green a
+        # nightly.
         env:
           GRANARY_BENCH_TRIALS: "15"
+          GRANARY_MEM_MAX_PAYLOAD_SLOPE: "2.0"
         # -j 1: the suite must not contend with itself. A parallel `dune
         # runtest` is exactly the co-scheduling that produced the false 10.5x
         # in #529 and the 1.70 overlap ratio in #538.

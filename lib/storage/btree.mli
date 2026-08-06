@@ -116,13 +116,28 @@ val cursor_seek
   -> ([ `Found | `Not_found_after of bytes ], error) result Lwt.t
 
 (** Return the entry at the current cursor position and advance.
-    Returns [None] when the cursor has passed the last entry. *)
+    Returns [None] when the cursor has passed the last entry.
+
+    {b At most one {!cursor_next} / {!cursor_next_value} may be in flight per
+    cursor.}  Since #481 the entry's key/value extents live in cursor-level
+    mutable state that is filled before a possible [Lwt] yield and read in the
+    continuation after it, so a second overlapping call would overwrite the
+    first's description and hand it a value from the wrong entry.  Before #481
+    the key and value were copied out synchronously, so overlapping pulls
+    produced out-of-order or skipped rows but never a torn one — this is
+    therefore a NEW requirement, not a restatement of an old one.  No consumer
+    in the tree does this today ([Store.seek_next]/[seek_next_value] pull
+    serially); a cursor is not a concurrency primitive, open one per fiber. *)
 val cursor_next : cursor -> ((bytes * bytes) option, error) result Lwt.t
 
 (** #481: {!cursor_next} without materialising the key.  Same traversal, same
     values, same errors — it simply never copies the entry key out of the leaf
     page.  Use it for scans that discard the key (aggregates, a bare COUNT, the
-    sequential table scan), which is the majority of them. *)
+    sequential table scan), which is the majority of them.
+
+    Subject to the same one-call-in-flight-per-cursor requirement as
+    {!cursor_next}, and it counts against the same cursor: mixing the two still
+    means at most one of EITHER in flight. *)
 val cursor_next_value : cursor -> (bytes option, error) result Lwt.t
 
 (** Cursor is purely in-memory state — close is a no-op for now but kept

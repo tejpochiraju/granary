@@ -322,7 +322,14 @@ val seek_next : seek_cursor -> (bytes * bytes) option Lwt.t
     stack-bounding pause schedule (the two share one call counter, so they may
     be mixed on one cursor); the B+-tree backend simply never copies the entry
     key out of the leaf page.  Use it wherever the key is discarded — the
-    sequential table scan and every aggregate over it. *)
+    sequential table scan and every aggregate over it.
+
+    Like {!seek_next}, at most ONE call may be in flight per cursor — mixing the
+    two still means one of either.  Since #481 the B+-tree backend describes the
+    current entry in cursor-level mutable state across a possible yield, so
+    overlapping pulls on one cursor can return a value from the wrong entry
+    (before #481 they could only reorder or skip). Give each fiber its own
+    cursor. *)
 val seek_next_value : seek_cursor -> bytes option Lwt.t
 
 (** Release any resources held by a {!seek_cursor}. *)

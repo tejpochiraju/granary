@@ -1621,7 +1621,18 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
    [cursor_next] did before decoding.
 
    Shared by [cursor_next] and [cursor_next_value] so the two can never drift
-   in how they walk leaves, skip empty ones, or bound the walk. *)
+   in how they walk leaves, skip empty ones, or bound the walk.
+
+   REQUIRES at most one [cursor_next]/[cursor_next_value] in flight per cursor,
+   and this function is why.  It can yield (a leaf miss in [read_cur_leaf], or
+   [advance_to_next_leaf]), and its callers read [c.c_span] in the continuation
+   AFTER that yield; a second overlapping call's [leaf_span_at] would overwrite
+   the span first and the earlier continuation would then copy the wrong
+   entry's bytes.  Before #481 the copies happened synchronously inside
+   [Page.leaf_entry_at], so overlapping pulls could reorder or skip rows but
+   never tear one.  Documented on [cursor_next] in the .mli; if a consumer ever
+   needs overlapping pulls, give each its own cursor rather than making the
+   span a return value again (that would put the per-row allocation back). *)
 let rec cursor_step c : (Cstruct.t option, error) result Lwt.t =
   if c.finished
   then return_ok None

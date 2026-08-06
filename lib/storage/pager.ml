@@ -466,7 +466,22 @@ let read_borrow ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id f =
    exactly that right (#356), and the B+-tree insert path uses it.  Handing a
    retaining reader the live dirty buffer would let a writer shift entries
    under a positioned cursor.  Copying keeps this function's observable
-   behaviour identical to [read] on the writer path. *)
+   behaviour identical to [read] on the writer path.
+
+   WHAT THIS ADDS TO THE INVARIANT ANY FUTURE WAL CHANGE MUST KEEP.  Retention
+   is unbounded in time, so "immutable once stored" now has to hold for the
+   whole life of a scan, not just the extent of a [read_borrow] callback.  Two
+   changes in flight touch exactly that: #611 (PR #649) caches WAL-resolved
+   frames in the pager, and #612 (PR #644) truncates the WAL at checkpoint.
+   Both are fine as long as they keep dropping-and-rebuilding rather than
+   recycling: a retained borrower keeps its buffer alive through the GC, so
+   evicting a cache entry, resetting a hashtable or truncating the WAL file
+   costs it nothing.  What would break it is REUSING a frame or page buffer for
+   different content — reading a new frame into a buffer some cache still
+   hands out, or writing a checkpointed page back into the buffer a cursor is
+   mid-leaf on.  That was already forbidden by [read_borrow]'s contract; this
+   function widens the window in which violating it is observable from
+   microseconds to the length of a table scan. *)
 let read_shared ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
   let open Lwt.Syntax in
   let load_after_wal finder =
