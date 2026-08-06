@@ -368,15 +368,41 @@ EOF
   classes — at bind time neither has a value. It keeps its literal-NULL error for
   every other column.
 
+  Two neighbouring binders were out of step with that and had to move too, or
+  the headline symptom survived the fix. `bind_insert`'s **implicit column list**
+  now omits generated columns, so bare `INSERT INTO g VALUES (…)` works — before,
+  it was `Arity_mismatch` with one value per base column and "cannot INSERT into
+  generated column" when padded out. That was not a new divergence decision: the
+  `INSERT … SELECT` binder's `columns = []` arm already applied exactly that
+  filter, and `Db.dump` already emits an explicit list that omits them; the
+  VALUES binder was the odd one out. And `bind_upsert_assignments` now refuses
+  `DO UPDATE SET <generated> = …` the way `bind_update_assignments` always did —
+  it was the third assignment spelling and the only unguarded one, so the
+  assignment bound fine and `compute_stored_generated_cols` overwrote the column
+  immediately after, making the statement silently do nothing.
+
   The runtime half had the mirror-image gap. `Exec.not_null_exempt_col` exempted
   VIRTUAL generated columns outright (#567's reasoning: their stored cell is
   `V_null` by design), which meant a NOT NULL VIRTUAL column was *unenforceable*.
   `Exec.not_null_violation` now recomputes the virtuals into a copy of the row
   before judging it, and consults the exemption only when it cannot — a row that
   does not cover every column, where evaluating the generated expression would
-  raise. **The exemption is the degraded mode; do not re-broaden it.** STORED
-  columns were always fine: `compute_stored_generated_cols` materialises them
-  before every enforcement site.
+  raise. **The exemption is the degraded mode; do not re-broaden it.**
+
+  **STORED columns rest on an ordering claim, and the claim covers the
+  ROW-STORE sites only** — do not restate it as "every enforcement site", which
+  is how it shipped and is false. `compute_stored_generated_cols` runs before
+  the check at `execute_insert`, `execute_upsert_update`, `update_col_in_tx` and
+  `apply_update_row`. It is **not** called on either columnar arm: both build the
+  row with `Array.make n_cols Row.V_null` and pass it straight to
+  `not_null_skip_or_fail`. Nor does `stream_col_seq_scan` recompute VIRTUAL ones
+  on the way out. So a generated column on a columnstore table read NULL forever
+  in **both** classes, silently. `Sema.bind_create` now **refuses** a GENERATED
+  column on a `USING COLUMNSTORE` table (#660) — which is what makes the ordering
+  question not arise at those two sites, rather than a claim that it was already
+  answered there. Wiring the computation into the write arms alone was rejected:
+  it fixes STORED and leaves VIRTUAL reading NULL, deepening the asymmetry. If
+  #660 lifts the refusal, both halves are owed at once.
 
   Consequences worth knowing: a generated expression that genuinely evaluates to
   NULL is still rejected — on INSERT (skipped under `OR IGNORE`, per #599, since

@@ -2249,7 +2249,21 @@ let not_null_exempt_col (col : Row.column) : bool =
    still caught.  Both are optional and default to the same values
    [compute_stored_generated_cols] is already called with elsewhere in this
    module ([None], [[||]]); a generated expression is DDL and cannot reference
-   a parameter, so the default is only ever wrong for a clock-dependent one. *)
+   a parameter, so the default is only ever wrong for a clock-dependent one.
+
+   The STORED half of #629 rests on an ordering claim, and the claim is about
+   the ROW-STORE sites only — stating it as "every enforcement site" was wrong
+   when this shipped, so here it is enumerated.  [compute_stored_generated_cols]
+   runs before the check at [execute_insert] (feeding [execute_insert_write]),
+   [execute_upsert_update], [update_col_in_tx] and [apply_update_row] (feeding
+   [write_row_rekeyed]).  It is NOT called on either columnar arm: both build
+   the row with [Array.make n_cols Row.V_null] and pass it straight to
+   [not_null_skip_or_fail].  That is sound only because
+   [Sema.bind_create] now refuses a GENERATED column on a COLUMNSTORE table
+   outright (#660) — no generated column can reach those two sites, so the
+   ordering question does not arise there.  If that refusal is ever lifted, the
+   two arms need the call before the check, and the VIRTUAL read path needs a
+   recompute, or a columnar generated column reads NULL forever. *)
 let not_null_violation
       ?(clock : (unit -> float) option = None)
       ?(params : Row.value array = [||])

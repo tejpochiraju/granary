@@ -25,7 +25,9 @@
       for every other column, which stays the earlier and better-located one.
     - [Exec.not_null_violation] now recomputes VIRTUAL generated columns into a
       copy of the row before judging it, instead of exempting them wholesale as
-      #567 did. A STORED column was already materialised before the check ran.
+      #567 did. A STORED column was already materialised before the check ran —
+      on the ROW-STORE paths, which is the whole of that claim; see
+      [columnstore_refuses_generated_columns] for where it does not hold.
 
     So the enforcement moved to where the computed value exists rather than
     disappearing, and the negative cases below are what prove it: a generated
@@ -33,7 +35,21 @@
     rejected — on INSERT, on UPDATE of the base column it reads, and for both
     storage classes. Under [OR IGNORE] it is skipped instead, per #599's
     decided semantics, because that decision lives at the runtime call site and
-    the row now reaches it. *)
+    the row now reaches it.
+
+    Three neighbouring binders had to move with it, or the headline symptom
+    ("the table is uninsertable") survived the fix in one spelling or another:
+
+    - [bind_insert]'s IMPLICIT column list now omits generated columns, so bare
+      [INSERT INTO g VALUES (…)] works. Its [INSERT … SELECT] sibling already
+      applied exactly that filter, as does [Db.dump]; the VALUES binder was the
+      odd one out.
+    - [bind_upsert_assignments] now refuses [DO UPDATE SET <generated> = …], the
+      third assignment spelling and the only unguarded one — it bound fine and
+      was then silently overwritten by [compute_stored_generated_cols].
+    - [bind_create] refuses a generated column on a [USING COLUMNSTORE] table
+      (#660): nothing on the columnar path ever computes one, in either storage
+      class, so it read NULL forever with no error ever raised. *)
 
 open Lwt.Syntax
 module Db = Granary.Db
@@ -153,11 +169,9 @@ let virtual_generated_not_null_accepts_a_good_row () =
       (texts db "SELECT k, v, w FROM gv"))
 ;;
 
-(* The column list may be omitted only if the table has no generated column, so
-   the reachable spellings are the ones that name the base columns.  Both must
-   work, and a multi-row VALUES list must not be an exception — the static check
-   fired per STATEMENT, so before the fix one bad row was never the issue: every
-   row died. *)
+(* Every spelling, including a multi-row VALUES list — the static check fired
+   per STATEMENT, so before the fix one bad row was never the issue: every row
+   died. *)
 let every_reachable_insert_spelling_works () =
   with_db (fun db ->
     create_stored db;
@@ -179,8 +193,48 @@ let every_reachable_insert_spelling_works () =
       (texts db "SELECT k, v, w FROM g ORDER BY k"))
 ;;
 
+(* The bare spelling — no column list at all — is the commonest of the lot, and
+   exempting the column in [bind_insert_row] was not enough to reach it: the
+   implicit column list was every table column, so this was [Arity_mismatch]
+   with two values and "cannot INSERT into generated column" with three. #629's
+   headline is "the table is uninsertable", so this had to work too.
+
+   One value per BASE column is what SQLite accepts here, what the
+   [INSERT ... SELECT] binder's implicit ordinal list already produced, and what
+   [Db.dump] already emits. Padding it out to include the generated column is
+   still refused — the arity is now the base-column count. *)
+let bare_insert_without_a_column_list_works () =
+  with_db (fun db ->
+    create_stored db;
+    create_virtual db;
+    exec db "INSERT INTO g VALUES (1, 10)";
+    exec db "INSERT INTO gv VALUES (1, 10)";
+    Alcotest.(check (list string))
+      "STORED: bare spelling computed w"
+      [ "1|10|11" ]
+      (texts db "SELECT k, v, w FROM g");
+    Alcotest.(check (list string))
+      "VIRTUAL: bare spelling computed w"
+      [ "1|10|11" ]
+      (texts db "SELECT k, v, w FROM gv");
+    (* supplying a third value is an arity error against the BASE columns *)
+    expect_error
+      db
+      "INSERT INTO g VALUES (2, 20, 21)"
+      ~needle:"arity mismatch: expected 2, got 3";
+    (* the NOT NULL still bites through the bare spelling *)
+    expect_error
+      db
+      "INSERT INTO g VALUES (3, NULL)"
+      ~needle:"NOT NULL constraint failed: g.w")
+;;
+
 (* Writing the generated column is still refused — the fix exempts it from the
-   NOT NULL check, it does not make it assignable. *)
+   NOT NULL check, it does not make it assignable. All THREE assignment
+   spellings, which is the point: INSERT and plain UPDATE were already guarded,
+   but [bind_upsert_assignments] was not, so `DO UPDATE SET w = 99` bound fine
+   and [compute_stored_generated_cols] then overwrote w immediately after the
+   assigns were applied — the statement silently did nothing. *)
 let generated_column_is_still_unassignable () =
   with_db (fun db ->
     create_stored db;
@@ -189,7 +243,61 @@ let generated_column_is_still_unassignable () =
       "INSERT INTO g (k, v, w) VALUES (1, 1, 2)"
       ~needle:"cannot INSERT into generated column";
     exec db "INSERT INTO g (k, v) VALUES (1, 1)";
-    expect_error db "UPDATE g SET w = 99" ~needle:"cannot UPDATE generated column")
+    expect_error db "UPDATE g SET w = 99" ~needle:"cannot UPDATE generated column";
+    expect_error
+      db
+      "INSERT INTO g (k, v) VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET w = 99"
+      ~needle:"cannot UPDATE generated column";
+    (* the refused DO UPDATE changed nothing *)
+    Alcotest.(check (list string))
+      "row untouched by the refused upsert"
+      [ "1|1|2" ]
+      (texts db "SELECT k, v, w FROM g");
+    (* and the legal DO UPDATE spelling — assigning the BASE column — recomputes *)
+    exec db "INSERT INTO g (k, v) VALUES (1, 5) ON CONFLICT (k) DO UPDATE SET v = 5";
+    Alcotest.(check (list string))
+      "DO UPDATE on the base column recomputes w"
+      [ "1|5|6" ]
+      (texts db "SELECT k, v, w FROM g"))
+;;
+
+(* A COLUMNSTORE table may not declare a generated column at all, and that is
+   what makes #629's STORED ordering claim hold at the two columnar enforcement
+   sites rather than merely be asserted there. Nothing on the columnar path
+   computes a generated column: both write arms build the row with
+   [Array.make n_cols Row.V_null] and never call
+   [Exec.compute_stored_generated_cols], and [stream_col_seq_scan] returns
+   [Col_store.to_row_seq] rows verbatim with no VIRTUAL recompute. So the column
+   read NULL forever, in BOTH storage classes, with no error ever raised — and a
+   NOT NULL one left the table uninsertable even after this PR, the error merely
+   moving from bind time to runtime. Refused at DDL now; #660 tracks supporting
+   them properly. *)
+let columnstore_refuses_generated_columns () =
+  with_db (fun db ->
+    List.iter
+      (fun storage ->
+         expect_error
+           db
+           (Printf.sprintf
+              "CREATE TABLE ct (k INTEGER, v INTEGER, w INTEGER NOT NULL GENERATED \
+               ALWAYS AS (v + 1) %s) USING COLUMNSTORE"
+              storage)
+           ~needle:"GENERATED column 'w' in a COLUMNSTORE table")
+      [ "STORED"; "VIRTUAL" ];
+    (* a nullable one is refused for the same reason — it read NULL forever too,
+       which is a wrong answer rather than an error, so it is the worse case *)
+    expect_error
+      db
+      "CREATE TABLE ct2 (v INTEGER, w INTEGER GENERATED ALWAYS AS (v * 2) STORED) USING \
+       COLUMNSTORE"
+      ~needle:"GENERATED column 'w' in a COLUMNSTORE table";
+    (* an ordinary columnstore table is unaffected *)
+    exec db "CREATE TABLE ct3 (k INTEGER, v INTEGER NOT NULL) USING COLUMNSTORE";
+    exec db "INSERT INTO ct3 VALUES (1, 2)";
+    Alcotest.(check (list string))
+      "plain columnstore still works"
+      [ "1|2" ]
+      (texts db "SELECT k, v FROM ct3"))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -462,9 +570,19 @@ let () =
             `Quick
             every_reachable_insert_spelling_works
         ; Alcotest.test_case
-            "the column is still unassignable"
+            "the bare spelling (no column list) works"
+            `Quick
+            bare_insert_without_a_column_list_works
+        ; Alcotest.test_case
+            "the column is still unassignable (all three spellings)"
             `Quick
             generated_column_is_still_unassignable
+        ] )
+    ; ( "columnstore"
+      , [ Alcotest.test_case
+            "a COLUMNSTORE table refuses a generated column (#660)"
+            `Quick
+            columnstore_refuses_generated_columns
         ] )
     ; ( "enforcement-moved-not-dropped"
       , [ Alcotest.test_case
