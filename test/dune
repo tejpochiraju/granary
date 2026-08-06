@@ -634,6 +634,16 @@
  (modules test_pager_versioned_cache)
  (libraries granary.storage alcotest lwt.unix))
 
+; #611: the pager cache participates for WAL-resolved pages.  The whole risk
+; of that change is invalidation — a stale frame is a silent wrong answer —
+; so this pins all three triggers (newer frame, checkpoint/Wal.reset, older
+; snapshot) on both the copying and the borrow read paths.
+
+(test
+ (name test_pager_wal_cache_611)
+ (modules test_pager_wal_cache_611)
+ (libraries granary.storage alcotest lwt.unix unix))
+
 (test
  (name test_pager_snapshot_pin)
  (modules test_pager_snapshot_pin)
@@ -1256,4 +1266,12 @@
 (test
  (name test_checkpoint_reopen_562)
  (modules test_checkpoint_reopen_562)
+ (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+
+; #611: end-to-end — the pager cache participates inside a LIVE WAL
+; generation, and a checkpoint does not let it answer from a dead one.
+
+(test
+ (name test_wal_cache_e2e_611)
+ (modules test_wal_cache_e2e_611)
  (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))

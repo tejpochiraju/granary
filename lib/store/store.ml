@@ -1063,6 +1063,14 @@ let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
           match r with
           | Ok () -> Lwt.return_ok ()
           | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e))
+    ; (* #611: the pager caches WAL-resolved pages keyed by frame index and
+         needs to know when a checkpoint has recycled those indices.  [Wal.reset]
+         bumps [epoch] on both of its success arms and on neither failure path,
+         and nothing else in [Wal] ever clears the index — so this is exactly
+         the "frame indices no longer mean what they meant" signal, and the
+         pager reads it itself rather than trusting the three [Wal.reset] call
+         sites to notify it. *)
+      wal_epoch = (fun () -> Wal.epoch wal)
     }
   in
   Pager.set_wal pager (Some cb)
