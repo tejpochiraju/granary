@@ -83,17 +83,18 @@ val open_block
     open time without needing a raw store handle afterwards.  Used by the
     [granary.unix] driver and by ATTACH.
 
-    [rowid_counters] (#589) shares an existing catalog's rowid allocator with the
-    new handle, and must be passed whenever [store] is already open under another
-    [Db.t] — otherwise the two handles allocate rowids independently over one set
-    of data trees and silently overwrite each other's rows.
-    {!create_worker_handle} is the intended way in; a caller reaching for
-    [of_store] over a store that is already open owes the same argument. *)
+    #589/#633: it is safe to call this over a store that is ALREADY open under
+    another [Db.t].  The rowid allocator lives on the
+    {!Granary_store.Store.t} ({!Granary_store.Store.rowid_counters}), so the two
+    handles share one allocator over the one set of data trees by construction —
+    there is no longer an argument to pass, and therefore none to forget.  (It
+    used to be [?rowid_counters], and forgetting it cost silent row loss plus
+    durable index corruption.)  {!create_worker_handle} remains the intended way
+    in, because it is about more than the allocator. *)
 val of_store
   :  ?clock:(unit -> float)
   -> ?durability:Granary_store.Store.durability
   -> ?file_path:string
-  -> ?rowid_counters:Granary_catalog.Catalog.rowid_counters
   -> Granary_store.Store.t
   -> t Lwt.t
 
@@ -124,9 +125,10 @@ val set_file_provider : file_provider -> unit
 val close : t -> unit Lwt.t
 
 (** Create a lightweight worker handle sharing the same underlying store.
-    Equivalent to [of_store ~rowid_counters:(Catalog.rowid_counters (catalog t))
-    (store t)]. Used by Jepsen-style concurrent workloads where each worker needs
-    its own [explicit_txn] without exposing the raw store.
+    Equivalent to [of_store (store t)] — since #633 the rowid allocator comes
+    from the store itself, so the two handles share it automatically. Used by
+    Jepsen-style concurrent workloads where each worker needs its own
+    [explicit_txn] without exposing the raw store.
 
     #555: this is the supported way to run explicit transactions from more than
     one fiber. Each handle gets its own transaction slot, and because they share

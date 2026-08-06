@@ -308,8 +308,17 @@ type backend =
   | Mem of (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t
   | Btree of bt_state
 
+(* #589/#633: the rowid allocator's live state, keyed by TREE ID.  It hangs off
+   the store because a tree id only identifies a data tree within ONE store, and
+   because every catalog opened over this store must share exactly one
+   allocator — see the long note in catalog.ml's [Schema_cache] for what two
+   counters over one tree cost.  Owning it here is what makes that hold by
+   construction instead of by remembering to pass an argument. *)
+type rowid_counters = (tree_id, int64) Hashtbl.t
+
 type t =
   { backend : backend
+  ; rowid_counters : rowid_counters
   ; lock : Rwlock.t
   ; (* Shadow copies of Mem backend tree contents for the active RW txn.
        Writes during the txn go to the shadow — the live tree is NEVER
@@ -341,6 +350,10 @@ let geometry t =
   | Mem _ -> Geometry.default
   | Btree st -> Pager.geom st.pager
 ;;
+
+(* #633: the one accessor.  Handing the table out rather than wrapping it keeps
+   the catalog's [patch]/[publish] hot path a plain [Hashtbl] lookup. *)
+let rowid_counters t = t.rowid_counters
 
 type ro_snapshot =
   { rs_store : t
@@ -656,6 +669,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 
 let create () : t =
   { backend = Mem (Hashtbl.create 16)
+  ; rowid_counters = Hashtbl.create 16
   ; lock = Rwlock.create ()
   ; mem_rw_shadow = None
   ; mem_savepoints = []
@@ -733,6 +747,7 @@ let make_btree_store
     }
   in
   { backend = Btree st
+  ; rowid_counters = Hashtbl.create 16
   ; lock = Rwlock.create ()
   ; mem_rw_shadow = None
   ; mem_savepoints = []

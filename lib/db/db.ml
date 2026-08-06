@@ -345,14 +345,14 @@ let load_triggers_into_hashtbl store trig_tbl =
    (Some for file-backed handles, None for in-memory / arbitrary devices).
    [durability] sets the database-wide durability knob on the store before
    loading the catalog. *)
-let of_store ?clock ?durability ?file_path ?rowid_counters store =
+let of_store ?clock ?durability ?file_path store =
   (match clock with
    | Some c -> S.set_clock store c
    | None -> ());
   (match durability with
    | Some d -> S.set_durability store d
    | None -> ());
-  let* catalog = Cat.open_ ?rowid_counters store in
+  let* catalog = Cat.open_ store in
   (* Load persisted columnar data for columnar tables. *)
   let* () = Cat.load_columnar_stores catalog store in
   let views = Hashtbl.create 4 in
@@ -433,10 +433,14 @@ let close t =
    catalogs sit over one [Store.t] and therefore over one set of data trees, and
    two counters over one tree hand the same rowid out twice: the second write
    silently overwrites the first (and, on a [TEXT PRIMARY KEY] table, leaves the
-   index pointing at the wrong row).  Sharing the allocator is the whole fix. *)
+   index pointing at the wrong row).  Sharing the allocator is the whole fix.
+
+   #633: that sharing is no longer this function's doing — the allocator hangs
+   off [Store.t], so naming the same store IS sharing it.  This call site is
+   therefore no longer special, and neither is any future one. *)
 let create_worker_handle t =
   let* () = Lwt.return_unit in
-  of_store ~rowid_counters:(Cat.rowid_counters t.catalog) t.store
+  of_store t.store
 ;;
 
 let wal_sync_count t = S.wal_sync_count t.store

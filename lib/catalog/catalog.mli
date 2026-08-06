@@ -143,26 +143,19 @@ type fts_table_meta =
   ; fts_columns : string list
   }
 
-(** #589: the live rowid-allocator state, which two catalogs over the SAME store
-    must share or they will hand out the same rowid twice and silently overwrite
-    each other's rows.  Opaque; obtained from {!rowid_counters} and passed to
-    {!open_}. *)
-type rowid_counters
-
-(** This catalog's rowid-allocator state, to pass to {!open_} for a second
-    catalog over the same store (that is what {!Granary.Db.create_worker_handle}
-    does). *)
-val rowid_counters : t -> rowid_counters
-
 (** Open (or initialise) a catalog on the given store.
     Loads all existing table metadata and index metadata from the store.
 
-    [?rowid_counters] shares another catalog's rowid allocator (#589).  Pass it
-    if and only if the other catalog is open over the SAME [Store.t]: the
-    counters are keyed by tree id, which only identifies a data tree within one
-    store.  Counters already live in the shared state win over the values read
-    from disk, since disk is never fresher than the running allocator. *)
-val open_ : ?rowid_counters:rowid_counters -> Granary_store.Store.t -> t Lwt.t
+    #589/#633: the live rowid-allocator state, which every catalog over the SAME
+    store must share or two of them will hand out the same rowid twice and
+    silently overwrite each other's rows, is taken from
+    [Granary_store.Store.rowid_counters] of this store.  There is nothing to pass
+    and nothing to forget: opening a second catalog over an already-open store
+    (that is what {!Granary.Db.create_worker_handle} does) shares the allocator
+    automatically, and opening over a different store — an ATTACHed schema, say —
+    necessarily does not.  Counters already live win over the values read from
+    disk, since disk is never fresher than a running allocator. *)
+val open_ : Granary_store.Store.t -> t Lwt.t
 
 (** Read the user_version from the sys_meta tree inside an already-open
     transaction (RO or RW).  Returns 0 if not yet set. *)
@@ -262,7 +255,20 @@ val persist_dirty_columnar_stores
 val load_columnar_stores : t -> Granary_store.Store.t -> unit Lwt.t
 
 (** Allocate and return the next rowid for a table, incrementing the counter.
-    Raises [Failure] if the table does not exist. *)
+    Raises [Failure] (synchronously) if the table does not exist.
+
+    Autocommit: this takes the store's writer lock itself, so it must NOT be
+    called with an RW transaction already held — use {!next_rowid_in_txn} there
+    or the nested [rw_begin] self-deadlocks.
+
+    #632: the whole read-modify-write happens under that lock — the counter is
+    read, the new value published to the shared allocator, and only THEN is the
+    transaction committed.  Publishing after the commit would be outside the
+    lock, because [Store.commit] releases the writer lock before its promise
+    resolves; a continuation of it runs once another fiber can already have
+    allocated, leaving the shared counter too low and handing the same rowid out
+    twice.  The accepted residual is the other direction: a failed commit leaves
+    the counter too high, which only skips ids. *)
 val next_rowid : t -> name:string -> int64 Lwt.t
 
 (** Like [next_rowid] but operates within an already-held RW transaction.
