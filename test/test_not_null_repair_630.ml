@@ -23,6 +23,16 @@
       (957 reads sorted versus 21 685 unsorted). Streaming that half would trade
       a bounded buffer for unbounded I/O. It is deliberately NOT changed here.
 
+    {b Two fixtures, and the difference is load-bearing.} The memory
+    measurement and the row-level assertions use the #548 recipe, which
+    REGISTERS an implicit-PK index without writing its entries — a file that is
+    inconsistent before anything here runs, which is exactly the "index entry
+    absent" case the delete path has to survive. Anything asserting that the
+    file is still CONSISTENT must instead pass [?entries] and start from a
+    consistent one, or the assertion is unsatisfiable regardless of how the
+    repair behaves. That is what [PRAGMA integrity_check] is comparing: index
+    entries against rows.
+
     The gate and the knob are the ones [test_not_null_600.ml] established —
     marginal peak live major-heap words per added row, ceiling 4, escape hatch
     [GRANARY_MEM_MAX_WORDS_PER_ROW]. It measures allocation rather than wall
@@ -32,6 +42,7 @@ open Lwt.Syntax
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
 module Row = Granary_encoding.Row
+module Index_key = Granary_encoding.Index_key
 
 let run = Lwt_main.run
 
@@ -76,10 +87,18 @@ let close_db db =
 
 (* The #563/#548/#600 fixture recipe: rows go in while the column is genuinely
    nullable, then an implicit-PK index is REGISTERED in the catalog, which is
-   what [Catalog.open_] re-derives NOT NULL from on the next open (#533).  No
-   index ENTRIES are written, so the repair's delete path exercises the
-   "index entry absent" case; [test_not_null_567.ml] covers a populated one. *)
-let register_implicit_pk_index path ~table ~cols =
+   what [Catalog.open_] re-derives NOT NULL from on the next open (#533).
+
+   [Cat.create_index] only REGISTERS the index — population lives in
+   [Exec.execute_create_index], which is not exported — so without [?entries]
+   the index TREE is left empty while the table holds rows.  That is a
+   deliberately INCONSISTENT file: [PRAGMA integrity_check] compares entries
+   against rows and reports the mismatch, before anything here touches the
+   table.  It is fine for the memory measurement and for the pure row-level
+   assertions, but a test that wants to say anything about the file staying
+   consistent must pass [?entries] and start from a consistent one — see
+   [test_not_null_567.ml], whose fixture writes them the same way. *)
+let register_implicit_pk_index ?(entries = []) path ~table ~cols =
   run
     (let* store =
        let* r = Granary_unix.Store.open_file ~path () in
@@ -101,7 +120,25 @@ let register_implicit_pk_index path ~table ~cols =
      in
      match r with
      | Error m -> Alcotest.failf "create_index: %s" m
-     | Ok _ -> Granary_store.Store.close store)
+     | Ok (idx : Cat.index_info) ->
+       let* () =
+         if entries = []
+         then Lwt.return_unit
+         else
+           let* tx = Granary_store.Store.rw_begin store in
+           let* () =
+             Lwt_list.iter_s
+               (fun (rowid, key_vals) ->
+                  Granary_store.Store.put
+                    tx
+                    idx.Cat.idx_tree_id
+                    (Index_key.encode key_vals ~rowid)
+                    Bytes.empty)
+               entries
+           in
+           Granary_store.Store.commit tx
+       in
+       Granary_store.Store.close store)
 ;;
 
 let with_temp_path f =
@@ -240,7 +277,14 @@ let repair_scan_does_not_materialise_the_table () =
    the old shape carried is re-pinned here rather than assumed. *)
 
 (* Exactly the violators go, and every other row survives with its values
-   unchanged — not merely its count. *)
+   unchanged — not merely its count.
+
+   The index is POPULATED here ([?entries]), which is what lets the last two
+   assertions mean anything: the file starts consistent, so a mismatch
+   afterwards is the repair's doing.  With the unpopulated fixture the index
+   tree holds 0 entries against 5 rows before the repair runs, and
+   [integrity_check] rightly says so — an assertion that the file is still
+   consistent is then unsatisfiable no matter how the repair behaves. *)
 let repair_deletes_exactly_the_violators () =
   with_temp_path (fun path ->
     let db = open_db path in
@@ -251,15 +295,35 @@ let repair_deletes_exactly_the_violators () =
     exec db "INSERT INTO t VALUES (4, NULL, 'd')";
     exec db "INSERT INTO t VALUES (5, 50, 'e')";
     close_db db;
-    register_implicit_pk_index path ~table:"t" ~cols:[ "v" ];
+    register_implicit_pk_index
+      path
+      ~table:"t"
+      ~cols:[ "v" ]
+      ~entries:
+        [ 1L, [ Index_key.IK_int 10L ]
+        ; 2L, [ Index_key.IK_null ]
+        ; 3L, [ Index_key.IK_int 30L ]
+        ; 4L, [ Index_key.IK_null ]
+        ; 5L, [ Index_key.IK_int 50L ]
+        ];
     let db = open_db path in
     Fun.protect
       ~finally:(fun () -> close_db db)
       (fun () ->
          Alcotest.(check (list string))
+           "the fixture starts consistent — one index entry per row"
+           [ "ok" ]
+           (texts db "PRAGMA integrity_check");
+         Alcotest.(check (list string))
            "the report sees both"
            [ "t|v|2" ]
            (texts db "PRAGMA not_null_check");
+         (* #600's count-only path is strictly read-only: it must not have
+            disturbed the entries it just walked past. *)
+         Alcotest.(check (list string))
+           "and reporting changed nothing"
+           [ "ok" ]
+           (texts db "PRAGMA integrity_check");
          Alcotest.(check (list string))
            "and the repair deletes both"
            [ "t|v|2" ]
@@ -274,6 +338,78 @@ let repair_deletes_exactly_the_violators () =
            (texts db "PRAGMA not_null_check");
          Alcotest.(check (list string))
            "and the file is still consistent"
+           [ "ok" ]
+           (texts db "PRAGMA integrity_check");
+         (* Entries-versus-rows is a count; that the SURVIVORS' entries are the
+            ones left is not.  A seek through the key index proves it. *)
+         Alcotest.(check (list string))
+           "and a surviving key still seeks to its row"
+           [ "3|30|c" ]
+           (texts db "SELECT * FROM t WHERE v = 30")))
+;;
+
+(* A SECONDARY index — an ordinary UNIQUE one the engine itself built and
+   populated — must lose exactly the deleted rows' entries too.  The victim
+   list is deduplicated since #630, so a row is handed to [apply_delete_row]
+   once; index maintenance is per (row, index), not per (row, violated
+   column), and this pins that the two are independent. *)
+let secondary_unique_index_entries_go_with_the_rows () =
+  with_temp_path (fun path ->
+    let db = open_db path in
+    exec db "CREATE TABLE t (k INTEGER PRIMARY KEY, v INTEGER, w TEXT)";
+    exec db "INSERT INTO t VALUES (1, 10, 'a')";
+    exec db "INSERT INTO t VALUES (2, NULL, 'b')";
+    exec db "INSERT INTO t VALUES (3, 30, 'c')";
+    exec db "INSERT INTO t VALUES (4, NULL, 'd')";
+    exec db "INSERT INTO t VALUES (5, 50, 'e')";
+    (* Built by the engine while the rows are already there, so its entries
+       are real ones rather than hand-written. *)
+    exec db "CREATE UNIQUE INDEX ix_t_w ON t (w)";
+    close_db db;
+    register_implicit_pk_index
+      path
+      ~table:"t"
+      ~cols:[ "v" ]
+      ~entries:
+        [ 1L, [ Index_key.IK_int 10L ]
+        ; 2L, [ Index_key.IK_null ]
+        ; 3L, [ Index_key.IK_int 30L ]
+        ; 4L, [ Index_key.IK_null ]
+        ; 5L, [ Index_key.IK_int 50L ]
+        ];
+    let db = open_db path in
+    Fun.protect
+      ~finally:(fun () -> close_db db)
+      (fun () ->
+         Alcotest.(check (list string))
+           "both indexes start consistent"
+           [ "ok" ]
+           (texts db "PRAGMA integrity_check");
+         Alcotest.(check (list string))
+           "the repair deletes both violators"
+           [ "t|v|2" ]
+           (texts db "PRAGMA not_null_repair");
+         Alcotest.(check (list string))
+           "and both indexes are still consistent afterwards"
+           [ "ok" ]
+           (texts db "PRAGMA integrity_check");
+         Alcotest.(check (list string))
+           "the deleted row's secondary key no longer resolves"
+           []
+           (texts db "SELECT * FROM t WHERE w = 'b'");
+         Alcotest.(check (list string))
+           "a survivor's does"
+           [ "3|30|c" ]
+           (texts db "SELECT * FROM t WHERE w = 'c'");
+         (* And the freed key is genuinely free — a stale UNIQUE entry would
+            reject this insert. *)
+         exec db "INSERT INTO t VALUES (6, 60, 'b')";
+         Alcotest.(check (list string))
+           "and the freed unique key can be reused"
+           [ "6|60|b" ]
+           (texts db "SELECT * FROM t WHERE w = 'b'");
+         Alcotest.(check (list string))
+           "with the file still consistent"
            [ "ok" ]
            (texts db "PRAGMA integrity_check")))
 ;;
@@ -449,6 +585,10 @@ let () =
             "exactly the violating rows are deleted"
             `Quick
             repair_deletes_exactly_the_violators
+        ; Alcotest.test_case
+            "a secondary unique index loses exactly the deleted rows' entries"
+            `Quick
+            secondary_unique_index_entries_go_with_the_rows
         ; Alcotest.test_case
             "a row violating two columns is counted twice, deleted once"
             `Quick
