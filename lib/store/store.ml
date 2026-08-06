@@ -267,6 +267,20 @@ type bt_state =
        this to 0 (together with [sink_ships_in_flight]) before fd teardown.
        Distinct from [autockpt_in_flight], which is dispatch-intent (coalescing)
        only. *)
+  ; mutable last_checkpoint_error : string option
+    (* #638: message of the most recent checkpoint failure, or [None] when no
+       checkpoint has failed since the last one that completed.  Sticky across
+       commits so an operator can read it long after the failing commit
+       returned; cleared by a checkpoint that completes, or by
+       [clear_checkpoint_error]. *)
+  ; mutable checkpoint_failures_total : int
+    (* #638: count of checkpoint failures since open.  Never reset by a
+       successful checkpoint — it is the "has this store ever been unable to
+       truncate its WAL" signal. *)
+  ; mutable consecutive_checkpoint_failures : int
+    (* #638: failures since the last checkpoint that completed.  This is the one
+       that says "the WAL is growing right now": a nonzero value means every
+       attempt since then has left the WAL un-truncated. *)
   ; mutable sink_ships_in_flight : int
     (* #337: count of async sink ships dispatched but not yet completed.  The
        ship callback reads WAL frame payloads LAZILY ([Wal.read_frame]); a
@@ -713,6 +727,9 @@ let make_btree_store
     ; sink_ships_in_flight = 0
     ; closing = false
     ; ckpt_io_in_flight = 0
+    ; last_checkpoint_error = None
+    ; checkpoint_failures_total = 0
+    ; consecutive_checkpoint_failures = 0
     }
   in
   { backend = Btree st
@@ -1386,6 +1403,42 @@ let emit_event (st : bt_state) (ev : Store_event.t) =
      | _ -> ())
 ;;
 
+(* #638: a checkpoint failure used to be discarded whole by the two auto paths,
+   so a repeatedly-failing autocheckpoint was completely invisible: the WAL grew
+   without bound, nothing was logged and nothing was counted.  Record it on the
+   store (sticky, so it outlives the commit that triggered it) AND emit a
+   [Checkpoint_failed] event so a live observer sees it at the moment it
+   happens.
+
+   Deliberately NOT an error to the caller: the commit that triggered the
+   autocheckpoint has already succeeded and its frames are still valid WAL
+   frames, so failing it would turn a deferrable maintenance problem into
+   spurious transaction failures (#638 asks for visibility, not abort). *)
+let note_checkpoint_failure (st : bt_state) ~(target : int) (exn : exn) : unit =
+  let message =
+    match exn with
+    | Failure m -> m
+    | e -> Printexc.to_string e
+  in
+  st.checkpoint_failures_total <- st.checkpoint_failures_total + 1;
+  st.consecutive_checkpoint_failures <- st.consecutive_checkpoint_failures + 1;
+  st.last_checkpoint_error <- Some message;
+  emit_event
+    st
+    (Store_event.Checkpoint_failed
+       { target_frames = target
+       ; consecutive = st.consecutive_checkpoint_failures
+       ; message
+       })
+;;
+
+(* #638: a checkpoint that ran to completion clears the "WAL is growing"
+   signal.  [checkpoint_failures_total] is intentionally NOT cleared. *)
+let note_checkpoint_success (st : bt_state) : unit =
+  st.consecutive_checkpoint_failures <- 0;
+  st.last_checkpoint_error <- None
+;;
+
 (* The id the currently-active rw txn will commit as.  The header is not bumped
    until commit, so every event of one txn shares this id (one writer at a time
    under the write lock). *)
@@ -1731,6 +1784,9 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
               Read [Wal.epoch] AFTER reset for the new epoch. *)
            emit_event st (Store_event.Wal_reset { epoch = Wal.epoch wal });
            emit_event st (Store_event.Checkpoint_end { pages_migrated = !migrated });
+           (* #638: the WAL has actually been truncated — clear the sticky
+              failure signal. *)
+           note_checkpoint_success st;
            (* #298/#1: checkpoint is a full-sync durability anchor — everything
             is now durable and the WAL starts a fresh epoch at frame 0.  Reset
             the sink ship counter (new epoch) and the batched durability counters
@@ -1762,8 +1818,10 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
 
 (** Called from [commit] while [lock] is still held (exclusive). If the WAL has
     grown past the per-connection threshold, migrate it inline so
-    subsequent commits start fresh. Best-effort: a checkpoint failure
-    is swallowed (the commit itself already succeeded). *)
+    subsequent commits start fresh. Best-effort: a checkpoint failure does not
+    fail the commit (which already succeeded) — but since #638 it is no longer
+    discarded either: it is counted on the store and emitted as
+    [Store_event.Checkpoint_failed]. *)
 let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
   match st.wal with
   | None -> Lwt.return_unit
@@ -1773,7 +1831,17 @@ let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
     then Lwt.return_unit
     else if Wal.committed_frames wal < thr
     then Lwt.return_unit
-    else Lwt.catch (fun () -> checkpoint_unlocked st wal) (fun _ -> Lwt.return_unit)
+    else (
+      (* Read the target BEFORE the attempt: a failure past [Wal.reset] would
+         leave [committed_frames] at 0 and the event would report target=0. *)
+      let target = Wal.committed_frames wal in
+      Lwt.catch
+        (fun () -> checkpoint_unlocked st wal)
+        (fun exn ->
+           (* #638: record + emit rather than discard.  Still does not fail the
+              commit that got us here. *)
+           note_checkpoint_failure st ~target exn;
+           Lwt.return_unit))
 ;;
 
 (* Group-commit coordinator (#77, #151).  One fiber per [commit_queue]
@@ -1970,6 +2038,12 @@ let maybe_autockpt_after_commit t st =
   then Lwt.return_unit
   else (
     st.autockpt_in_flight <- true;
+    (* #638: captured before the attempt — see [maybe_autocheckpoint]. *)
+    let target =
+      match st.wal with
+      | Some w -> Wal.committed_frames w
+      | None -> 0
+    in
     Lwt.async (fun () ->
       Lwt.finalize
         (fun () ->
@@ -1984,7 +2058,12 @@ let maybe_autockpt_after_commit t st =
                   (fun () ->
                      Rwlock.release_write t.lock;
                      Lwt.return_unit))
-             (fun _ -> Lwt.return_unit))
+             (fun exn ->
+                (* #638: this is the background path — nobody is awaiting this
+                   fiber, so discarding here was the most invisible failure in
+                   the engine. *)
+                note_checkpoint_failure st ~target exn;
+                Lwt.return_unit))
         (fun () ->
            st.autockpt_in_flight <- false;
            (* #338: wake a [close] awaiting the in-flight checkpoint to drain. *)
@@ -2240,11 +2319,48 @@ let checkpoint (t : t) : unit Lwt.t =
      | None -> Lwt.return_unit
      | Some wal ->
        let* () = Rwlock.acquire_write t.lock in
+       (* Read under the lock, and before the attempt: a failure past
+          [Wal.reset] would leave [committed_frames] at 0. *)
+       let target = Wal.committed_frames wal in
        Lwt.finalize
-         (fun () -> checkpoint_unlocked st wal)
+         (fun () ->
+            (* #638: an explicit checkpoint already surfaces its failure by
+               raising, so this path was never silent — but it feeds the same
+               counters so [checkpoint_health] describes the store, not just its
+               automatic path.  The exception is re-raised unchanged. *)
+            Lwt.catch
+              (fun () -> checkpoint_unlocked st wal)
+              (fun exn ->
+                 note_checkpoint_failure st ~target exn;
+                 Lwt.fail exn))
          (fun () ->
             Rwlock.release_write t.lock;
             Lwt.return_unit))
+;;
+
+(** #638: the checkpoint-failure signal. *)
+type checkpoint_health =
+  { last_error : string option
+  ; total_failures : int
+  ; consecutive_failures : int
+  }
+
+let checkpoint_health (t : t) : checkpoint_health =
+  match t.backend with
+  | Mem _ -> { last_error = None; total_failures = 0; consecutive_failures = 0 }
+  | Btree st ->
+    { last_error = st.last_checkpoint_error
+    ; total_failures = st.checkpoint_failures_total
+    ; consecutive_failures = st.consecutive_checkpoint_failures
+    }
+;;
+
+let clear_checkpoint_error (t : t) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st ->
+    st.last_checkpoint_error <- None;
+    st.consecutive_checkpoint_failures <- 0
 ;;
 
 let wal_autocheckpoint (t : t) : int =

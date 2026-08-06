@@ -357,6 +357,46 @@ EOF
 
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
+### A failing autocheckpoint is surfaced, never raised (#638)
+
+Both auto paths used to run the checkpoint under
+`Lwt.catch … (fun _ -> Lwt.return_unit)`, so every failure was discarded whole.
+The background one (`maybe_autockpt_after_commit`) was the worse of the two —
+nobody awaits that fiber — and a checkpoint that failed on every attempt was
+completely invisible: the WAL grew without bound with no counter, no event and
+no log, and the first symptom was a full disk or a very slow recovery. On a long
+TPC-C run that reads as a performance cliff.
+
+Since #638 a failure is **recorded and emitted, and still not raised to the
+caller of the commit that triggered it**. That asymmetry is the decision, not an
+oversight: the commit has already succeeded and its WAL frames are still valid
+frames, so failing it would convert a deferrable maintenance problem into
+spurious transaction failures. Three surfaces, all fed from the one
+`Store.note_checkpoint_failure` chokepoint:
+
+- `Store_event.Checkpoint_failed { target_frames; consecutive; message }` — the
+  live signal, and the thing that finally balances the `Checkpoint_begin` an
+  aborting checkpoint used to leave dangling.
+- `Store.checkpoint_health` — sticky, so an operator can read it long after the
+  failing commit returned. `consecutive_failures` (and `last_error`) are cleared
+  by any checkpoint that completes and by `Store.clear_checkpoint_error`;
+  `total_failures` is never cleared by success, because "this store has been
+  unable to truncate its WAL at least once" is a different question from "is it
+  failing right now".
+- `PRAGMA checkpoint_status` — one row of
+  `(total_failures, consecutive_failures, last_error)`; `last_error` is NULL
+  when nothing has failed since the last completing checkpoint.
+
+The **explicit** `Store.checkpoint` path already surfaced its failure by
+raising, and still does — it merely feeds the same counters, so
+`checkpoint_health` describes the store rather than only its automatic path. Do
+not "fix" the remaining silence by making the auto path raise; the escalation
+this issue asks for is visibility. `test/test_checkpoint_failure_638.ml` pins
+both halves (observable, and the triggering commit still succeeds with its data
+readable) by failing the main-file `write_page` — in WAL mode the main file is
+written *only* by a checkpoint, so commits keep succeeding while every
+checkpoint fails.
+
 ### One `Db.t`, one explicit transaction (#555)
 
 A `Db.t` carries a single explicit-transaction slot and every statement resolves

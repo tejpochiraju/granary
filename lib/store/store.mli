@@ -330,6 +330,31 @@ val wal_mode : t -> bool
     internally so it serialises with commits. *)
 val checkpoint : t -> unit Lwt.t
 
+(** #638: the checkpoint-failure signal.  [last_error] is the message of the
+    most recent failure and [consecutive_failures] the number of failures since
+    the last checkpoint that completed — both cleared by a completing
+    checkpoint, so a nonzero [consecutive_failures] means the WAL is growing
+    right now.  [total_failures] counts every failure since open and is never
+    cleared by success. *)
+type checkpoint_health =
+  { last_error : string option
+  ; total_failures : int
+  ; consecutive_failures : int
+  }
+
+(** Current checkpoint-failure state (#638).  An {i auto}checkpoint failure is
+    not raised to any caller — the commit that triggered it already succeeded
+    and its WAL frames are still valid — so this (together with
+    {!Store_event.Checkpoint_failed}) is how a failing checkpoint becomes
+    observable at all.  Returns the all-clear on the in-memory backend, which
+    has no WAL. *)
+val checkpoint_health : t -> checkpoint_health
+
+(** Clear the sticky checkpoint-failure signal ([last_error] and
+    [consecutive_failures]); [total_failures] is left alone.  For an operator
+    who has acknowledged the condition.  No-op on the in-memory backend. *)
+val clear_checkpoint_error : t -> unit
+
 (** #298: per-deployment durability mode (analogue of SQLite [synchronous]).
     [Full] fsyncs the WAL on every group-commit before acking (the default,
     unchanged behaviour).  [Batched] acks immediately and defers the fsync

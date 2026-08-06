@@ -25,7 +25,12 @@ let test_label_and_txn_id () =
   Alcotest.(check (option int64))
     "wal_read txn"
     (Some 9L)
-    (Ev.txn_id (Ev.Wal_read { txn_id = 9L; tree = 16; page = 1L }))
+    (Ev.txn_id (Ev.Wal_read { txn_id = 9L; tree = 16; page = 1L }));
+  (* #638 *)
+  let fail = Ev.Checkpoint_failed { target_frames = 3; consecutive = 1; message = "x" } in
+  Alcotest.(check string) "ckpt_fail label" "CKPT_FAIL" (Ev.label fail);
+  Alcotest.(check (option int64)) "ckpt_fail has no txn" None (Ev.txn_id fail);
+  Alcotest.(check (option int)) "ckpt_fail has no tree" None (Ev.tree_id_of fail)
 ;;
 
 let test_pp_roundtrip_nonempty () =
@@ -49,6 +54,10 @@ let test_pp_all_constructors () =
   check "WAL_RESET epoch=11" (Ev.Wal_reset { epoch = 11L });
   check "CKPT_BEGIN target=12" (Ev.Checkpoint_begin { target_frames = 12 });
   check "CKPT_END migrated=13" (Ev.Checkpoint_end { pages_migrated = 13 });
+  check
+    "CKPT_FAIL target=14 consecutive=2 msg=checkpoint write: boom"
+    (Ev.Checkpoint_failed
+       { target_frames = 14; consecutive = 2; message = "checkpoint write: boom" });
   check
     "PAGE_READ txn=1 tree=16 page=7"
     (Ev.Page_read { txn_id = 1L; tree = 16; page = 7L });

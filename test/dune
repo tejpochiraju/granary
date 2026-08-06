@@ -1257,3 +1257,11 @@
  (name test_checkpoint_reopen_562)
  (modules test_checkpoint_reopen_562)
  (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+
+; #638: an autocheckpoint failure must be observable — event, sticky counters
+; and PRAGMA checkpoint_status — rather than discarded by the catch-all.
+
+(test
+ (name test_checkpoint_failure_638)
+ (modules test_checkpoint_failure_638)
+ (libraries granary granary.store granary.encoding alcotest lwt.unix unix))
