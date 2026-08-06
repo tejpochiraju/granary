@@ -6642,8 +6642,22 @@ let current_txn_mode () =
    subquery site.
 
    Anything that reinstates literal substitution at a cached site MUST pass
-   [~cache:None] there, or the cache becomes a per-row memory leak. *)
-type subplan_cache = (Ast.stmt, Plan.op) Hashtbl.t
+   [~cache:None] there, or the cache becomes a per-row memory leak.
+
+   The value is an OPTION so that a statement which does not bind — the #592
+   unresolvable correlation — is remembered as such rather than re-bound per
+   row.
+
+   KNOWN LIMIT (#493 review): the table is created inside [stream_filter] /
+   [stream_expr_project], which run once per [to_stream].  For a NESTED
+   correlated subquery — an EXISTS inside an EXISTS — [to_stream] on the cached
+   outer plan is invoked once per outer row, so the inner [stream_filter]
+   allocates a fresh table each time and the innermost subquery still pays a
+   full bind+plan per outer row.  Correct, just not accelerated; it is the one
+   shape where "plan once, execute N times" does not apply.  Lifting the table
+   to the whole query (a [Lwt.with_value] at [query]) would fix it, and is
+   deliberately out of scope here. *)
+type subplan_cache = (Ast.stmt, Plan.op option) Hashtbl.t
 
 let subplan_cache_key : subplan_cache Lwt.key = Lwt.new_key ()
 
@@ -8575,6 +8589,38 @@ let rec plan_expr_subqueries_use_param : Plan.expr -> bool = function
   | _ -> false
 ;;
 
+(** #493: every [Ast.stmt] a plan expression carries in a subquery position.
+
+    Used by {!refuse_unresolved_correlation} to decide the #592 refusal from the
+    PLAN rather than from a row. Only the top level is collected — a subquery
+    nested inside one of these statements is resolved by that statement's own
+    [stream_filter] when it runs, which is exactly where the pre-#493 per-row
+    check placed it too. *)
+let rec plan_expr_embedded_stmts : Plan.expr -> Ast.stmt list = function
+  | Plan.P_subquery s | Plan.P_exists s -> [ s ]
+  | Plan.P_in_select (x, s) -> s :: plan_expr_embedded_stmts x
+  | Plan.P_binop (_, a, b) -> plan_expr_embedded_stmts a @ plan_expr_embedded_stmts b
+  | Plan.P_not e
+  | Plan.P_is_null e
+  | Plan.P_is_not_null e
+  | Plan.P_neg e
+  | Plan.P_bitnot e
+  | Plan.P_cast (e, _)
+  | Plan.P_collate (e, _) -> plan_expr_embedded_stmts e
+  | Plan.P_between (x, lo, hi) ->
+    plan_expr_embedded_stmts x @ plan_expr_embedded_stmts lo @ plan_expr_embedded_stmts hi
+  | Plan.P_in (x, vs) ->
+    plan_expr_embedded_stmts x @ List.concat_map plan_expr_embedded_stmts vs
+  | Plan.P_func (_, args) -> List.concat_map plan_expr_embedded_stmts args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:[] ~some:plan_expr_embedded_stmts scrutinee
+    @ List.concat_map
+        (fun (c, r) -> plan_expr_embedded_stmts c @ plan_expr_embedded_stmts r)
+        branches
+    @ Option.fold ~none:[] ~some:plan_expr_embedded_stmts else_
+  | _ -> []
+;;
+
 (** #493: flatten a plan predicate's top-level [AND] spine.
 
     [stream_filter] evaluates the conjuncts left to right and stops at the first
@@ -8785,6 +8831,15 @@ let rec substitute_outer_in_plan_expr
       ; else_ = Option.map go else_
       }
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
+  (* #493 review: [P_collate] was missing here while {!plan_expr_has_subquery},
+     {!plan_expr_subqueries_use_param} and {!plan_expr_embedded_stmts} all
+     recurse into it — a three-way divergence over one node set, which is one
+     more than the two that existed before this PR. The consequence was small
+     but real: a correlated subquery under a COLLATE ([x = (SELECT …) COLLATE
+     NOCASE]) fell to the catch-all with its outer reference unsubstituted, so
+     it was refused rather than answered. Aligning the four walkers is the fix;
+     if this arm is ever removed, remove it from the other three too. *)
+  | Plan.P_collate (e, c) -> Plan.P_collate (go e, c)
   | _ -> e
 
 (** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST stmt. *)
@@ -8907,21 +8962,68 @@ let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_r
     previous per-call bind+plan and nothing else changes.
 
     [None] means the statement did not bind, which every caller reports by
-    leaving its expression unresolved, exactly as before. *)
+    leaving its expression unresolved, exactly as before.
+
+    The FAILURE is memoized too (the cache holds [Plan.op option], not
+    [Plan.op]). A statement that will not bind is the #592 unresolvable
+    correlation, and re-running {!Sema.bind} on it once per outer row only to
+    reach the same refusal is pure waste. {!refuse_unresolved_correlation}
+    normally raises on the first row, but the negative entry keeps the cost
+    bounded on any path that does not. *)
 let plan_subquery_cached (cat : Cat.t) (inner_ast : Ast.stmt) : Plan.op option Lwt.t =
   let cache = Lwt.get subplan_cache_key in
   match Option.bind cache (fun tbl -> Hashtbl.find_opt tbl inner_ast) with
-  | Some op -> Lwt.return (Some op)
+  | Some cached -> Lwt.return cached
   | None ->
     let* bound_r = Sema.bind cat inner_ast in
-    (match bound_r with
-     | Error _ -> Lwt.return None
-     | Ok bound ->
-       let op = Planner.plan ~cat bound in
-       (match cache with
-        | Some tbl -> Hashtbl.replace tbl inner_ast op
-        | None -> ());
-       Lwt.return (Some op))
+    let result =
+      match bound_r with
+      | Error _ -> None
+      | Ok bound -> Some (Planner.plan ~cat bound)
+    in
+    (match cache with
+     | Some tbl -> Hashtbl.replace tbl inner_ast result
+     | None -> ());
+    Lwt.return result
+;;
+
+(** #493 review: decide #592's "an unresolvable correlation is refused, not
+    silently answered" ONCE, over EVERY correlated conjunct, before any row is
+    filtered.
+
+    The AND short-circuit introduced by #493 made that invariant
+    data-dependent: [correlated_row_passes] returns [false] the moment a
+    conjunct is not truthy, so a refusal sitting in a LATER conjunct was only
+    reached for rows that passed every earlier one. On TPC-H Q4's own shape —
+    a cheap date restriction written before the [EXISTS] —
+    [WHERE a.x = -1 AND EXISTS (<unresolvable>)] with no row satisfying
+    [a.x = -1] returned an empty result set and no error at all. That is
+    precisely the "empty result that reads as a legitimate nothing-matched"
+    #592 removed, reintroduced through the back door.
+
+    Resolvability is a property of the PLAN, not of the row: the substitution
+    decides what to pin from the column NAMES in [metas] and [inner_scope_of]
+    plus the row's WIDTH, none of which vary across the rows of one scan — only
+    the pinned VALUES do. So one probe, on the first row pulled, settles it for
+    the whole stream, and the short-circuit can then never suppress a refusal.
+
+    The probe binds and plans; it does not execute. It also warms the plan
+    cache, so the row that triggers it pays nothing extra. An empty child
+    stream probes nothing and raises nothing — as it did before #493, since
+    [Lwt_stream.filter_s] over an empty stream never ran the check either. *)
+let refuse_unresolved_correlation (cat : Cat.t option) (substituted : Plan.expr list)
+  : unit Lwt.t
+  =
+  match cat with
+  | None -> Lwt.return_unit
+  | Some c ->
+    Lwt_list.iter_s
+      (fun s ->
+         let* op = plan_subquery_cached c s in
+         if Option.is_none op
+         then Lwt.fail_with (correlated_filter_refusal ())
+         else Lwt.return_unit)
+      (List.concat_map plan_expr_embedded_stmts substituted)
 ;;
 
 (** #493: run a subquery's stream under a read transaction the CALLER owns, and
@@ -9663,7 +9765,13 @@ and stream_filter clock params store mode cat pred child =
 
        [get_outer_scan_metas] now resolves the correlation source over a join
        (that was the whole of #566's and #592's blocker), so the common shapes
-       evaluate. What is still unresolvable is refused rather than answered. *)
+       evaluate. What is still unresolvable is refused rather than answered —
+       and since #493 added the AND short-circuit below, that refusal is decided
+       by {!refuse_unresolved_correlation} over EVERY conjunct on the first row
+       pulled, not by whichever conjunct a given row happened to reach. Deciding
+       it per row would have made the invariant data-dependent: a refusal behind
+       a cheap restriction that no row satisfies would never fire, and the
+       silent empty result would be back. *)
     match get_outer_scan_metas child with
     | None -> Lwt.fail_with (correlated_filter_refusal ())
     | Some metas ->
@@ -9687,6 +9795,22 @@ and stream_filter clock params store mode cat pred child =
       let parameterized = not (List.exists plan_expr_subqueries_use_param cs) in
       let cache = if parameterized then Some (Hashtbl.create 4) else None in
       let base = Array.length params in
+      let correlated_cs = List.filter plan_expr_has_subquery cs in
+      (* Decided once, over every correlated conjunct — see
+         {!refuse_unresolved_correlation}. The first row pulled settles it,
+         because resolvability depends on the substituted NAMES and the row
+         WIDTH, neither of which varies across one scan. *)
+      let refusal_decided = ref false in
+      let decide_refusal bnd =
+        if !refusal_decided
+        then Lwt.return_unit
+        else (
+          refusal_decided := true;
+          with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+            refuse_unresolved_correlation
+              cat
+              (List.map (substitute_outer_in_plan_expr ~cat bnd) correlated_cs)))
+      in
       let keep row =
         let bnd =
           if parameterized
@@ -9694,6 +9818,7 @@ and stream_filter clock params store mode cat pred child =
           else binding_of_metas metas row
         in
         let row_params = if parameterized then Array.append params row else params in
+        let* () = decide_refusal bnd in
         correlated_row_passes
           clock
           params
@@ -9743,6 +9868,13 @@ and correlated_row_passes
           with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
             pre_eval_subquery clock store row_params cat subst)
         in
+        (* A backstop, not the guarantee. {!refuse_unresolved_correlation} has
+           already decided the refusal over EVERY conjunct on the first row, so
+           an unresolved subquery cannot reach here — which is the point: with
+           only this check, whether a refusal fired depended on how many
+           conjuncts the row got past. Kept because answering [V_null] for an
+           unresolved subquery is the silent-wrong-answer failure #592 was
+           about, and it should never be reachable by any route. *)
         if plan_expr_has_subquery resolved
         then Lwt.fail_with (correlated_filter_refusal ())
         else Lwt.return (value_truthy (eval_expr clock params row resolved)))

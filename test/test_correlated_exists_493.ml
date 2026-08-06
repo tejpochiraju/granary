@@ -47,12 +47,27 @@
       evaluated left to right — in the order written, never reordered — and stop
       at the first that is not truthy.
 
+    {1 The scaling assertion}
+
+    #493's defining symptom is super-linearity, so
+    {!live_snapshots_do_not_accumulate_with_outer_rows} asserts on it directly:
+    quadruple the outer rows and the PEAK number of live RO snapshots must not
+    quadruple. Leaked, it tracked the probe count exactly; repaired, it is a
+    small constant. That is an integer count, not a wall clock, so it needs no
+    `GRANARY_BENCH_*` neutralizer and does not move with machine load — the same
+    reasoning that makes `test_not_null_600`'s words-per-row gate run armed
+    everywhere. `GRANARY_MAX_LIVE_READERS` raises the ceiling without disabling
+    the ratio beside it.
+
     {1 What these tests can and cannot see}
 
-    "Planned once" has no in-tree observable; it must be confirmed by a
-    benchmark. What is observable is asserted here: the leak (store counters),
-    the seek (index_entries / rows_examined), and the short-circuit
-    (rows_examined against the same query without its cheap restriction).
+    "Planned once" is still the one claim with no in-tree observable; it needs
+    the benchmark. Everything else is asserted: the leak (store counters), its
+    scaling (peak live snapshots at 1x and 4x the outer rows), the seek
+    (index_entries / rows_examined), the short-circuit (rows_examined against
+    the same query without its cheap restriction), and — because the
+    short-circuit could have weakened it — #592's refusal invariant under three
+    conjunct arrangements.
 
     Every correctness case is a before-and-after invariant: the answers must not
     move, whichever substitution path a query takes. *)
@@ -314,6 +329,141 @@ let scalar_and_in_subqueries_leave_nothing_behind () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* 1b. The scaling assertion                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* #493 is a 400,000x issue whose defining symptom is SUPER-LINEARITY: 10x the
+   rows gave ~400,000x the time, not the ~100x a re-scan-per-outer-row
+   implementation predicts. The per-outer-row cost was itself growing. That is
+   the claim this PR makes, and it needs evidence rather than argument.
+
+   Wall-clock cannot supply it here (the benchmark pass is deferred, and a
+   timing gate would need a GRANARY_BENCH_* neutralizer on every shared runner —
+   see CLAUDE.md). So this asserts on the ACCUMULATION instead, in the spirit of
+   test_not_null_600's words-per-row gate: the quantity that grew per outer row
+   was live RO snapshots, one leaked per EXISTS probe, each pinning the pages it
+   touched. [Store.active_reader_count] counts exactly that, is an integer, and
+   does not move with machine load — so no neutralizer, and no flakiness.
+
+   Quadruple the outer rows and the peak must NOT quadruple. With the leak it
+   tracked the number of probes exactly (n and 4n); repaired, it is bounded by
+   the number of snapshots genuinely live at once, which is a small constant.
+
+   ON DISK, necessarily: the [Mem] backend answers 0 for all three reader
+   counters unconditionally, so an in-memory version of this passes vacuously
+   whether or not anything leaks. *)
+
+let env_int name default =
+  match Sys.getenv_opt name with
+  | None -> default
+  | Some s -> Option.value ~default (int_of_string_opt s)
+;;
+
+(* The escape hatch, in the spirit of GRANARY_MEM_MAX_WORDS_PER_ROW: it raises
+   the ceiling without disabling the scaling assertion beside it. Reach for it
+   only after ruling out the leak it guards — a leaked run reports a peak equal
+   to the outer row count, which is nowhere near this. *)
+let max_live_readers = env_int "GRANARY_MAX_LIVE_READERS" 8
+
+let seed_scaling db ~n =
+  exec db "CREATE TABLE outer_t (k INTEGER PRIMARY KEY, tag INTEGER)";
+  exec db "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, fk INTEGER, v INTEGER)";
+  exec db "CREATE INDEX idx_inner_fk ON inner_t (fk)";
+  exec db "BEGIN";
+  for k = 1 to n do
+    exec db (Printf.sprintf "INSERT INTO outer_t VALUES (%d, %d)" k (k mod 7));
+    exec db (Printf.sprintf "INSERT INTO inner_t VALUES (%d, %d, 1)" ((k * 2) - 1) k);
+    exec db (Printf.sprintf "INSERT INTO inner_t VALUES (%d, %d, 2)" (k * 2) k)
+  done;
+  exec db "COMMIT"
+;;
+
+(* Every outer row probes, and every probe finds a match on its first pull and
+   abandons the rest of the stream — the leak's worst case, and EXISTS's normal
+   case. *)
+let scaling_query =
+  "SELECT k FROM outer_t WHERE EXISTS (SELECT * FROM inner_t WHERE fk = outer_t.k AND v \
+   > 0)"
+;;
+
+(* Drain row by row, sampling the counter between rows. Under the leak the count
+   only ever rises, so the last sample is the peak; sampling throughout costs
+   nothing and catches a repaired-but-bursty implementation too. *)
+let peak_live_readers db store sql =
+  let peak = ref (Store.active_reader_count store) in
+  let sample () =
+    let n = Store.active_reader_count store in
+    if n > !peak then peak := n
+  in
+  let n_rows =
+    match run (Db.query db sql) with
+    | Error e -> Alcotest.failf "query %S: %a" sql Db.pp_error e
+    | Ok stream ->
+      run
+        (let rec drain acc =
+           let* r = Lwt_stream.get stream in
+           sample ();
+           match r with
+           | None -> Lwt.return acc
+           | Some _ -> drain (acc + 1)
+         in
+         drain 0)
+  in
+  n_rows, !peak
+;;
+
+let measure_peak ~n =
+  let path = fresh_path () in
+  cleanup path;
+  let store =
+    match run (Granary_unix.Store.open_file ~path ()) with
+    | Ok s -> s
+    | Error e -> Alcotest.failf "open_file: %a" Store.pp_error e
+  in
+  let db = run (Db.of_store ~file_path:path store) in
+  Fun.protect
+    ~finally:(fun () ->
+      (try run (Db.close db) with
+       | _ -> ());
+      cleanup path)
+    (fun () ->
+       seed_scaling db ~n;
+       let rows, peak = peak_live_readers db store scaling_query in
+       Alcotest.(check int) (Printf.sprintf "every outer row qualifies (n=%d)" n) n rows;
+       peak)
+;;
+
+let n_small = 100
+let n_large = 400
+
+let live_snapshots_do_not_accumulate_with_outer_rows () =
+  let peak_small = measure_peak ~n:n_small in
+  let peak_large = measure_peak ~n:n_large in
+  let report =
+    Printf.sprintf
+      "peak live RO snapshots: %d at %d outer rows, %d at %d (%dx the rows)"
+      peak_small
+      n_small
+      peak_large
+      n_large
+      (n_large / n_small)
+  in
+  (* The scaling assertion. Leaked: peak tracks the probe count, so this is
+     ~4x. Repaired: both are a small constant and the ratio is ~1. The slack
+     absorbs a genuinely concurrent snapshot or two, not a trend. *)
+  Alcotest.(check bool)
+    (Printf.sprintf "%s — must not grow with the outer row count" report)
+    true
+    (peak_large <= peak_small + 2);
+  (* The absolute ceiling, which is what actually fails loudly on a leak: a
+     leaked run reports ~400 here. *)
+  Alcotest.(check bool)
+    (Printf.sprintf "%s — must stay bounded (<= %d)" report max_live_readers)
+    true
+    (peak_large <= max_live_readers)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* 2. Seek, not drain                                                   *)
 (* ------------------------------------------------------------------ *)
 
@@ -382,6 +532,102 @@ let conjuncts_are_short_circuited_not_reordered () =
         in_range_date
     in
     check_rows ~label:"subquery-first spelling" expected_q4 (rows_of db sql))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* 3b. The short-circuit must not weaken #592's refusal                 *)
+(* ------------------------------------------------------------------ *)
+
+(* An outer reference to a table that is not in the query at all cannot be
+   resolved — #592's own shape (test_join_subquery_592.ml:341). It must be
+   REFUSED, never answered as an empty result set, because an empty result from
+   a correlated query reads as a legitimate "nothing matched".
+
+   Short-circuiting the AND spine put that invariant at risk: if the refusal is
+   decided per row, a cheap conjunct that rejects every row means the refusal is
+   never reached and the query answers empty with no error. That is the shape
+   below — and it is TPC-H Q4's own shape, cheap restriction written first.
+   [refuse_unresolved_correlation] decides it from the plan on the first row
+   pulled instead, so the outcome no longer depends on the data. *)
+let err_of db sql =
+  (* A refusal surfaces either as a [Db.error] or as an exception, and either
+     while the plan is built or while the stream is pulled. All four are the
+     same outcome: the query did not answer. *)
+  try
+    match run (Db.query db sql) with
+    | Error e -> Format.asprintf "%a" Db.pp_error e
+    | Ok stream ->
+      ignore (run (Lwt_stream.to_list stream));
+      ""
+  with
+  | Failure m -> m
+  | e -> Printexc.to_string e
+;;
+
+let seed_unresolvable db =
+  exec db "CREATE TABLE a (k INTEGER PRIMARY KEY, x INTEGER)";
+  exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)";
+  (* [z] exists but is not in any query below, so [z.zz] resolves nowhere. *)
+  exec db "CREATE TABLE z (zz INTEGER)";
+  exec db "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)";
+  exec db "INSERT INTO b VALUES (1, 10)";
+  exec db "INSERT INTO z VALUES (1)"
+;;
+
+(* No row satisfies [a.x = -1], so before the refusal was hoisted the EXISTS was
+   never evaluated and this returned an empty result set with no error. *)
+let an_unresolvable_correlation_is_refused_behind_a_failing_conjunct () =
+  with_mem_db (fun db ->
+    seed_unresolvable db;
+    let msg =
+      err_of
+        db
+        "SELECT k FROM a WHERE a.x = -1 AND EXISTS (SELECT * FROM b WHERE b.y = z.zz)"
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "refused rather than answered empty (got %S)" msg)
+      true
+      (msg <> ""))
+;;
+
+(* The control: the same unresolvable subquery with a conjunct every row passes
+   was refused before this PR and must still be. If only this one passed, the
+   refusal would merely have become data-dependent. *)
+let an_unresolvable_correlation_is_refused_behind_a_passing_conjunct () =
+  with_mem_db (fun db ->
+    seed_unresolvable db;
+    let msg =
+      err_of
+        db
+        "SELECT k FROM a WHERE a.x > 0 AND EXISTS (SELECT * FROM b WHERE b.y = z.zz)"
+    in
+    Alcotest.(check bool) (Printf.sprintf "refused (got %S)" msg) true (msg <> ""))
+;;
+
+(* ... and with no conjunct in front of it at all. Three spellings, one
+   outcome: whether a refusal fires must not depend on the data. *)
+let an_unresolvable_correlation_is_refused_alone () =
+  with_mem_db (fun db ->
+    seed_unresolvable db;
+    let msg =
+      err_of db "SELECT k FROM a WHERE EXISTS (SELECT * FROM b WHERE b.y = z.zz)"
+    in
+    Alcotest.(check bool) (Printf.sprintf "refused (got %S)" msg) true (msg <> ""))
+;;
+
+(* The documented boundary: an EMPTY outer input probes nothing, so it raises
+   nothing. That was true before #493 too — [Lwt_stream.filter_s] over an empty
+   stream never ran the per-row check either — and the hoisted probe keeps it,
+   because it runs on the first row pulled. Recorded so the difference between
+   "no rows to check" and "rows that were short-circuited past" stays explicit. *)
+let an_empty_outer_input_refuses_nothing () =
+  with_mem_db (fun db ->
+    seed_unresolvable db;
+    exec db "DELETE FROM a";
+    let msg =
+      err_of db "SELECT k FROM a WHERE EXISTS (SELECT * FROM b WHERE b.y = z.zz)"
+    in
+    Alcotest.(check string) "an empty input answers empty, as it always did" "" msg)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -578,6 +824,14 @@ let () =
             `Quick
             scalar_and_in_subqueries_leave_nothing_behind
         ] )
+    ; ( "scaling: the per-outer-row cost must not accumulate"
+      , [ Alcotest.test_case
+            (* [`Quick] deliberately: this is the PR's headline evidence, and a
+               [`Slow] case is skipped under alcotest's -q. *)
+            "live RO snapshots do not grow with the outer row count"
+            `Quick
+            live_snapshots_do_not_accumulate_with_outer_rows
+        ] )
     ; ( "seek, not drain"
       , [ Alcotest.test_case
             "the inner subquery seeks its index"
@@ -593,6 +847,24 @@ let () =
             "conjuncts are short-circuited, not reordered"
             `Quick
             conjuncts_are_short_circuited_not_reordered
+        ] )
+    ; ( "the short-circuit must not weaken #592's refusal"
+      , [ Alcotest.test_case
+            "refused behind a conjunct NO row satisfies"
+            `Quick
+            an_unresolvable_correlation_is_refused_behind_a_failing_conjunct
+        ; Alcotest.test_case
+            "refused behind a conjunct every row satisfies"
+            `Quick
+            an_unresolvable_correlation_is_refused_behind_a_passing_conjunct
+        ; Alcotest.test_case
+            "refused with no conjunct in front of it"
+            `Quick
+            an_unresolvable_correlation_is_refused_alone
+        ; Alcotest.test_case
+            "an empty outer input refuses nothing (unchanged)"
+            `Quick
+            an_empty_outer_input_refuses_nothing
         ] )
     ; ( "the answers must not move"
       , [ Alcotest.test_case
