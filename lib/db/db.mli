@@ -344,17 +344,40 @@ val transaction_poisoned : t -> bool
       prescribed exit itself, applied to this scope's own transaction, not an
       additional one.
 
+    One consequence of that last point is worth stating, because "this scope's
+    own transaction" is not the whole truth: [ROLLBACK] clears the {e handle's}
+    poison flag unconditionally (#555 made it unconditional so a handle can
+    never be stranded), and the poison is connection state rather than
+    transaction state. So if another fiber's [BEGIN] collided and poisoned the
+    handle while this scope was running, and this scope's body then {e raises},
+    the rollback it issues also clears the poison that fiber was told to recover
+    from — and that fiber's own recovery [ROLLBACK] then answers
+    ["no active transaction"]. Nothing is lost or committed wrongly; the
+    recovering fiber is simply told the handle is already clean, which it is.
+    Making the clear conditional would strand the handle instead, so this is
+    inherited from #555 rather than introduced here.
+
     {2 #584 is narrowed here, not closed}
 
-    If another fiber's [ROLLBACK] aborts this scope's transaction and then opens
-    its own in the freed slot, the token no longer matches the slot. This
-    combinator detects that at scope exit and issues {b neither} [COMMIT] nor
-    [ROLLBACK], returning [Error] instead — either would have acted on the other
-    fiber's transaction, which is exactly #584's failure. That covers the
-    scope's own boundaries. It does {b not} cover statements {e inside} [body]:
-    those still resolve the transaction from the handle's mutable slot, so a
-    displaced scope's writes land in the other fiber's transaction before the
-    boundary check reports the loss.
+    If another fiber's [ROLLBACK] aborts this scope's transaction — whether it
+    then opens its own in the freed slot or leaves it empty — the scope's owner
+    token no longer matches the handle. This combinator detects that at scope
+    exit and issues {b neither} [COMMIT] nor [ROLLBACK], returning [Error]
+    instead: either would have acted on state that is no longer this scope's,
+    which is exactly #584's failure.
+
+    The detection holds for {e both} spellings of the displacing fiber — a bare
+    [Db.execute db "BEGIN"] and a second [with_transaction] — because the token
+    is invalidated by every path that ends a transaction, not merely by this
+    combinator's own exit. A [BEGIN] (and [SAVEPOINT]'s auto-begin) clears it
+    when it fills the slot; [COMMIT], [ROLLBACK], the internal forced rollback
+    and [RELEASE]'s auto-commit clear it when they empty it. A token therefore
+    never outlives the transaction it names.
+
+    That covers the scope's own boundaries. It does {b not} cover statements
+    {e inside} [body]: those still resolve the transaction from the handle's
+    mutable slot, so a displaced scope's writes land in the other fiber's
+    transaction before the boundary check reports the loss.
 
     So this is not permission to share a handle across fibers. Use
     {!create_worker_handle}, which gives each fiber its own slot and blocks on
@@ -363,30 +386,39 @@ val transaction_poisoned : t -> bool
     {2 The body must not manage the transaction itself}
 
     [body] owns the statements, not the transaction. A [BEGIN] inside it fails
-    and poisons; a [COMMIT] or [ROLLBACK] inside it empties the slot, after which
-    this combinator's own [COMMIT] reports [Error (Runtime "no active
-    transaction")] even though the body's work was committed. Neither is guarded
-    against — the slot is shared mutable state and there is nothing to guard it
-    with until #555 option 1. [SAVEPOINT] and friends are fine.
+    and poisons. A [COMMIT] or [ROLLBACK] inside it empties the slot {e and}
+    clears the scope's owner token, so the scope exit takes the displacement
+    branch above: [Error], and no second [COMMIT] is issued. The body's work is
+    committed (or discarded) exactly as the body asked, but the [Error] is the
+    caller's only signal that the scope did not end the way it looks like it
+    did. That is the intended outcome rather than a wart — the alternative would
+    be a blind [COMMIT] of whatever now occupies the slot. [SAVEPOINT] /
+    [RELEASE] / [ROLLBACK TO] are fine and leave the transaction in place.
 
     {2 ATTACH}
 
     The [BEGIN] routes to the active schema, as it always does, so the
-    transaction belongs to that schema's sub-handle. The owner token is held on
-    the top-level handle [t] the call was made on, so nesting is refused per
-    connection rather than per schema. Since #598 refuses a
-    [PRAGMA active_database] switch while any schema holds a transaction, the
-    routing cannot move under an open scope. *)
+    transaction belongs to that schema's sub-handle — and the owner token is
+    stamped on {e that} sub-handle, not on the top-level handle the call was
+    made on, because the sub-handle is the one whose slot the begin/commit/
+    rollback paths maintain. Since #598 refuses a [PRAGMA active_database]
+    switch while any schema holds a transaction, the routing cannot move under
+    an open scope, so the handle the token lives on is stable for the whole
+    extent. A consequence: nesting is refused per {e schema}, so a scope open on
+    ["main"] does not by itself refuse one on an attached ["aux"] — but reaching
+    ["aux"] would need the routing switch #598 already refuses. *)
 val with_transaction : t -> (t -> 'a Lwt.t) -> ('a, error) result Lwt.t
 
 (** #585: whether the {e calling fiber} is inside a {!with_transaction} extent
     that currently owns [t]'s explicit-transaction slot.
 
     True only when the fiber's inherited owner token equals the token stored on
-    the handle, so it answers [false] for a fiber that never entered a scope, for
-    a fiber whose scope has exited, and for a fiber whose scope was displaced by
-    another's transaction (#584). It also answers [false] inside a transaction
-    opened by a bare [BEGIN] — an unscoped transaction has no owner to report.
+    the handle the active schema routes to, so it answers [false] for a fiber
+    that never entered a scope, for a fiber whose scope has exited, and for a
+    fiber whose scope was displaced by another's transaction (#584). It also
+    answers [false] inside a transaction opened by a bare [BEGIN] — an unscoped
+    transaction has no owner to report, and a [BEGIN] arriving in the slot
+    actively clears whatever token was there.
 
     This is the observable half of the owner token, exposed for tests and for
     library code that needs to know whether it may open a transaction or is

@@ -17,6 +17,14 @@
       {e shared} handle still fails and still poisons, [with_transaction] issues
       no [ROLLBACK] of its own on that path, and [ROLLBACK] remains the sole
       exit;
+    - the #584 displacement guard, in {b all three} shapes the slot can be left
+      in (refilled by a raw [BEGIN], refilled by another scope, left empty) and
+      on {b both} exit arms (commit and rollback). The raw-[BEGIN] shape is the
+      one #584 is written in and the one the first cut of this feature got
+      wrong: the owner token was written only by [with_transaction], so it
+      outlived its transaction and the guard false-matched, committing the other
+      fiber's work and returning [Ok]. These four cases exist because a guard
+      that only fires for the spelling nobody uses is worse than no guard;
     - that two fibers with their own {!Db.create_worker_handle} handles both run
       scoped transactions to completion. *)
 
@@ -284,7 +292,16 @@ let test_nested_scope_refused () =
 
 (* The token is inherited through [Lwt] storage, so a fiber spawned INSIDE the
    body is the owner too and gets the same clean refusal — not the #555 poison
-   a genuinely foreign fiber would get. *)
+   a genuinely foreign fiber would get.
+
+   This has to be a REAL fiber boundary to prove anything. An [Lwt.join] over a
+   list literal built inside the body evaluates its elements eagerly, on the
+   body's own stack, so it would run in the same dynamic extent as
+   [nested_scope_refused] and say nothing about [Lwt.with_value] propagation.
+   Here the work is detached with [Lwt.async] AND resumed after [Lwt.pause], so
+   the continuation that calls [with_transaction] is invoked by the scheduler
+   from outside the [with_value] stack frame — which is exactly the propagation
+   mechanism (storage captured when a callback is registered) under test. *)
 let test_nested_scope_from_spawned_fiber_refused () =
   let db = seed (fresh_db ()) in
   let inner = ref (Ok ()) in
@@ -295,12 +312,15 @@ let test_nested_scope_from_spawned_fiber_refused () =
        (Db.with_transaction db (fun db ->
           let* r = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
           ok_exn "outer insert" r;
-          Lwt.join
-            [ (inner_sees_scope := Db.in_transaction_scope db;
-               let* nested = Db.with_transaction db (fun _ -> Lwt.return_unit) in
-               inner := nested;
-               Lwt.return_unit)
-            ])));
+          let inner_done, wake_inner = Lwt.wait () in
+          Lwt.async (fun () ->
+            let* () = Lwt.pause () in
+            inner_sees_scope := Db.in_transaction_scope db;
+            let* nested = Db.with_transaction db (fun _ -> Lwt.return_unit) in
+            inner := nested;
+            Lwt.wakeup wake_inner ();
+            Lwt.return_unit);
+          inner_done)));
   Alcotest.(check bool) "spawned fiber inherits the token" true !inner_sees_scope;
   Alcotest.(check bool) "and is refused, not poisoned" true (is_runtime_err !inner);
   Alcotest.(check bool) "handle not poisoned" false (Db.transaction_poisoned db);
@@ -409,6 +429,199 @@ let test_shared_handle_across_fibers_still_poisons () =
   ok_exn "ROLLBACK is still the sole exit" (run (Db.execute db "ROLLBACK"));
   Alcotest.(check bool) "poison cleared" false (Db.transaction_poisoned db);
   Alcotest.(check (list int)) "nothing committed" [] (ns db)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #584 displacement — the boundary guard                               *)
+(* ------------------------------------------------------------------ *)
+
+(* #584's own sequence, with A on the combinator and B on RAW STATEMENTS. This
+   is the spelling the issue is written in and the one the guard originally did
+   NOT catch: [txn_scope] was written only by [with_transaction], so after B's
+   ROLLBACK freed the slot and B's second BEGIN refilled it, A's token still
+   equalled the handle's and A's scope exit COMMITTED B's transaction and
+   returned [Ok]. The fix invalidates the token from [begin_txn] /
+   [force_rollback_txn] / [commit_txn] / [rollback_txn] as well.
+
+   What must happen now: A's scope issues neither COMMIT nor ROLLBACK, reports
+   [Error] naming #584, and B's transaction is left open and still B's. *)
+let test_displacement_by_raw_begin_is_caught () =
+  let db = seed (fresh_db ()) in
+  let a_inside, wake_a_inside = Lwt.wait () in
+  let b_done, wake_b_done = Lwt.wait () in
+  let a_result = ref (Ok ()) in
+  run
+    (Lwt.join
+       [ (let* r =
+            Db.with_transaction db (fun db ->
+              let* r = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
+              ok_exn "A insert" r;
+              Lwt.wakeup wake_a_inside ();
+              b_done)
+          in
+          a_result := r;
+          Lwt.return_unit)
+       ; (let* () = a_inside in
+          let* r = Db.execute db "BEGIN" in
+          Alcotest.(check bool) "B's BEGIN collides and poisons" true (is_runtime_err r);
+          let* r = Db.execute db "ROLLBACK" in
+          ok_exn "B recovers, aborting A's transaction" r;
+          let* r = Db.execute db "BEGIN" in
+          ok_exn "B opens its own transaction in the freed slot" r;
+          let* r = Db.execute db "INSERT INTO t (id, n) VALUES (99, 99)" in
+          ok_exn "B insert" r;
+          Lwt.wakeup wake_b_done ();
+          Lwt.return_unit)
+       ]);
+  Alcotest.(check bool)
+    "A's displaced scope refused to commit"
+    true
+    (is_runtime_err !a_result);
+  Alcotest.(check bool)
+    "and says which hazard it is (#584)"
+    true
+    (contains ~needle:"#584" (err_msg !a_result));
+  (* A issued NEITHER statement, so B's transaction is untouched: still open,
+     still B's, and B can commit it itself. Before the fix, A's scope had
+     already committed it. *)
+  ok_exn "B's transaction is still open and still B's" (run (Db.execute db "COMMIT"));
+  Alcotest.(check (list int))
+    "only B's row - A's was aborted by B's ROLLBACK"
+    [ 99 ]
+    (ns db)
+;;
+
+(* The other spelling: the displacing fiber also uses [with_transaction]. Before
+   the fix this was the ONLY spelling [stolen_txn_msg] fired for, which is why
+   the hole survived. Both spellings must now behave identically. *)
+let test_displacement_by_scope_is_caught () =
+  let db = seed (fresh_db ()) in
+  let a_inside, wake_a_inside = Lwt.wait () in
+  let b_done, wake_b_done = Lwt.wait () in
+  let a_result = ref (Ok ()) in
+  let b_result = ref (Ok ()) in
+  run
+    (Lwt.join
+       [ (let* r =
+            Db.with_transaction db (fun db ->
+              let* r = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
+              ok_exn "A insert" r;
+              Lwt.wakeup wake_a_inside ();
+              b_done)
+          in
+          a_result := r;
+          Lwt.return_unit)
+       ; (let* () = a_inside in
+          let* r = Db.execute db "BEGIN" in
+          Alcotest.(check bool) "B's BEGIN collides and poisons" true (is_runtime_err r);
+          let* r = Db.execute db "ROLLBACK" in
+          ok_exn "B recovers, aborting A's transaction" r;
+          let* r =
+            Db.with_transaction db (fun db ->
+              let* r = Db.execute db "INSERT INTO t (id, n) VALUES (99, 99)" in
+              ok_exn "B insert" r;
+              Lwt.return_unit)
+          in
+          b_result := r;
+          Lwt.wakeup wake_b_done ();
+          Lwt.return_unit)
+       ]);
+  ok_exn "B's own scope committed normally" !b_result;
+  Alcotest.(check bool)
+    "A's displaced scope refused to commit"
+    true
+    (is_runtime_err !a_result);
+  Alcotest.(check bool)
+    "same error as the raw-BEGIN spelling"
+    true
+    (contains ~needle:"#584" (err_msg !a_result));
+  Alcotest.(check (list int)) "only B's row committed" [ 99 ] (ns db);
+  Alcotest.(check bool)
+    "no transaction left behind"
+    true
+    (is_runtime_err (run (Db.execute db "COMMIT")))
+;;
+
+(* The empty-slot half of the same guard: B rolls A's transaction back and does
+   NOT open one of its own, so A's scope exits onto an empty slot. It must still
+   refuse rather than fall through to a COMMIT that would report
+   "no active transaction" (or, worse, autocommit something). *)
+let test_displacement_into_empty_slot_is_caught () =
+  let db = seed (fresh_db ()) in
+  let a_inside, wake_a_inside = Lwt.wait () in
+  let b_done, wake_b_done = Lwt.wait () in
+  let a_result = ref (Ok ()) in
+  run
+    (Lwt.join
+       [ (let* r =
+            Db.with_transaction db (fun db ->
+              let* r = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
+              ok_exn "A insert" r;
+              Lwt.wakeup wake_a_inside ();
+              b_done)
+          in
+          a_result := r;
+          Lwt.return_unit)
+       ; (let* () = a_inside in
+          let* r = Db.execute db "BEGIN" in
+          Alcotest.(check bool) "B's BEGIN collides and poisons" true (is_runtime_err r);
+          let* r = Db.execute db "ROLLBACK" in
+          ok_exn "B recovers, aborting A's transaction" r;
+          Lwt.wakeup wake_b_done ();
+          Lwt.return_unit)
+       ]);
+  Alcotest.(check bool) "A's scope refused, slot empty" true (is_runtime_err !a_result);
+  Alcotest.(check bool)
+    "reported as displacement, not as 'no active transaction'"
+    true
+    (contains ~needle:"#584" (err_msg !a_result));
+  Alcotest.(check (list int)) "nothing committed" [] (ns db);
+  Alcotest.(check bool) "handle clean and usable" false (Db.transaction_poisoned db)
+;;
+
+(* The failure arm of the same guard. A displaced scope whose body then RAISES
+   must not issue its ROLLBACK either — that statement would abort the other
+   fiber's transaction, destroying committed-intent work that has nothing to do
+   with the exception. The exception must still propagate. *)
+let test_displaced_scope_does_not_roll_back_the_other_fiber () =
+  let db = seed (fresh_db ()) in
+  let a_inside, wake_a_inside = Lwt.wait () in
+  let b_done, wake_b_done = Lwt.wait () in
+  let a_raised = ref false in
+  run
+    (Lwt.join
+       [ Lwt.catch
+           (fun () ->
+              Lwt.map
+                ignore
+                (Db.with_transaction db (fun db ->
+                   let* r = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
+                   ok_exn "A insert" r;
+                   Lwt.wakeup wake_a_inside ();
+                   let* () = b_done in
+                   Lwt.fail Boom)))
+           (function
+             | Boom ->
+               a_raised := true;
+               Lwt.return_unit
+             | exn -> Lwt.fail exn)
+       ; (let* () = a_inside in
+          let* r = Db.execute db "BEGIN" in
+          Alcotest.(check bool) "B's BEGIN collides and poisons" true (is_runtime_err r);
+          let* r = Db.execute db "ROLLBACK" in
+          ok_exn "B recovers, aborting A's transaction" r;
+          let* r = Db.execute db "BEGIN" in
+          ok_exn "B opens its own transaction" r;
+          let* r = Db.execute db "INSERT INTO t (id, n) VALUES (99, 99)" in
+          ok_exn "B insert" r;
+          Lwt.wakeup wake_b_done ();
+          Lwt.return_unit)
+       ]);
+  Alcotest.(check bool) "A's exception still propagates" true !a_raised;
+  (* If A had issued its ROLLBACK, B's row would be gone and this COMMIT would
+     answer "no active transaction". *)
+  ok_exn "B's transaction survived A's unwind" (run (Db.execute db "COMMIT"));
+  Alcotest.(check (list int)) "B's row intact" [ 99 ] (ns db)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -537,6 +750,24 @@ let () =
             "shared_handle_across_fibers_still_poisons"
             `Quick
             test_shared_handle_across_fibers_still_poisons
+        ] )
+    ; ( "displacement_584"
+      , [ Alcotest.test_case
+            "displacement_by_raw_begin_is_caught"
+            `Quick
+            test_displacement_by_raw_begin_is_caught
+        ; Alcotest.test_case
+            "displacement_by_scope_is_caught"
+            `Quick
+            test_displacement_by_scope_is_caught
+        ; Alcotest.test_case
+            "displacement_into_empty_slot_is_caught"
+            `Quick
+            test_displacement_into_empty_slot_is_caught
+        ; Alcotest.test_case
+            "displaced_scope_does_not_roll_back_the_other_fiber"
+            `Quick
+            test_displaced_scope_does_not_roll_back_the_other_fiber
         ] )
     ; ( "worker_handles"
       , [ Alcotest.test_case

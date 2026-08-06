@@ -730,6 +730,13 @@ let begin_txn t =
        already cleared by every commit/rollback path; this just hardens it.) *)
     Cat.commit_schema_changes t.catalog;
     t.explicit_txn <- Some tx;
+    (* #585: a transaction opened here has NO owner until someone stamps one.
+       [with_transaction] assigns its token immediately after this returns, so
+       clearing here is invisible to it — but for a bare BEGIN it is what stops a
+       previous scope's token from surviving into a transaction that is not that
+       scope's.  Without this the #584 boundary guard false-matches and commits
+       the new transaction on the old scope's behalf. *)
+    t.txn_scope <- None;
     Lwt.return (Ok ())
 ;;
 
@@ -753,6 +760,11 @@ let force_rollback_txn t tx =
      correct after a full rollback. *)
   let* () = Cat.load_columnar_stores t.catalog t.store in
   t.explicit_txn <- None;
+  (* #585: the transaction this token named no longer exists.  Kept adjacent to
+     the [explicit_txn] reset on purpose — the token is only meaningful while the
+     slot holds the transaction it was minted for, so the two must always be
+     cleared together or the boundary guard starts matching a dead token. *)
+  t.txn_scope <- None;
   t.savepoint_names <- [];
   t.auto_began <- false;
   Cat.clear_pending_fk_checks t.catalog;
@@ -856,6 +868,8 @@ let commit_txn t =
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
          t.explicit_txn <- None;
+         (* #585: cleared with the slot — see [force_rollback_txn]. *)
+         t.txn_scope <- None;
          t.savepoint_names <- [];
          t.auto_began <- false;
          Cat.set_defer_fks_pragma t.catalog false;
@@ -881,6 +895,11 @@ let rollback_txn t =
   t.txn_poisoned <- false;
   match t.explicit_txn with
   | None ->
+    (* #585: no transaction left, so no owner either.  The [Some] arm below
+       clears it through [force_rollback_txn]; this arm covers the degenerate
+       poison-with-no-transaction case so no path out of [ROLLBACK] can leave a
+       token behind. *)
+    t.txn_scope <- None;
     if was_poisoned
     then Lwt.return (Ok ())
     else Lwt.return (Error (Runtime "no active transaction"))
@@ -904,6 +923,10 @@ let savepoint_txn t name =
          savepoint transaction never inherits a prior transaction's state. *)
       Cat.commit_schema_changes t.catalog;
       t.explicit_txn <- Some tx;
+      (* #585: an auto-begun transaction has no owner — same reasoning as
+         [begin_txn]'s [None] arm.  Only reachable when the slot was empty, so
+         it cannot be clearing a live scope's token. *)
+      t.txn_scope <- None;
       t.auto_began <- true;
       Lwt.return tx
   in
@@ -953,6 +976,8 @@ let release_savepoint t name =
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;
         t.explicit_txn <- None;
+        (* #585: cleared with the slot — see [force_rollback_txn]. *)
+        t.txn_scope <- None;
         t.auto_began <- false;
         Lwt.return (Ok ()))
     else Lwt.return (Ok ())
@@ -2156,29 +2181,50 @@ let nested_txn_msg =
 ;;
 
 (* #585: the scope's transaction is no longer the one in the handle's slot.
-   Only reachable through #584: another fiber's ROLLBACK aborted this scope's
-   transaction and then opened its own in the freed slot.  Neither COMMIT nor
-   ROLLBACK is issued here — both would act on the OTHER fiber's transaction,
-   which is precisely the contamination #584 describes. *)
+   Reachable through #584: another fiber's ROLLBACK aborted this scope's
+   transaction, after which the slot was either left empty or refilled by that
+   fiber's own BEGIN.  Neither COMMIT nor ROLLBACK is issued here — both would
+   act on state that is no longer this scope's, which is precisely the
+   contamination #584 describes.
+
+   The guard only works because the token is invalidated by every path that ends
+   a transaction, not just by this combinator's own exit: [begin_txn] and
+   [savepoint_txn]'s auto-begin clear it when they fill the slot, and
+   [force_rollback_txn], [commit_txn], [rollback_txn] and [release_savepoint]'s
+   auto-commit clear it when they empty it.  Before those clears existed the
+   token outlived its transaction, so [Some 1 = Some 1] matched a slot holding
+   somebody else's transaction and this scope cheerfully COMMITted it — #584
+   verbatim, with an [Ok] returned to the caller. *)
 let stolen_txn_msg =
   "Db.with_transaction: the transaction this scope opened is gone - another fiber's \
-   ROLLBACK aborted it and the handle's transaction slot now holds a different \
-   transaction (#584).  This scope's writes are lost.  Neither COMMIT nor ROLLBACK was \
-   issued, because either would have acted on the other fiber's transaction.  Give each \
-   fiber its own handle with Db.create_worker_handle."
+   ROLLBACK aborted it, and the handle's transaction slot is now either empty or holding \
+   a different transaction (#584).  This scope's writes are lost.  Neither COMMIT nor \
+   ROLLBACK was issued, because either would have acted on state that is no longer this \
+   scope's.  Give each fiber its own handle with Db.create_worker_handle."
 ;;
+
+(* #585: the handle whose transaction slot a scope's BEGIN actually lands in.
+   Under ATTACH that is the active schema's sub-handle, not the top-level handle
+   the caller holds — and it is the sub-handle whose [txn_scope] the
+   begin/commit/rollback paths clear, so the token must be stamped and checked
+   there or the guard reads a field nothing maintains.  Stable for the scope's
+   whole extent: since #598 a [PRAGMA active_database] switch is refused while
+   any schema holds a transaction. *)
+let scope_handle t = active_handle t
 
 (* Drop the token only if it is still ours: a scope that was displaced (#584)
    must not clear the token of the transaction that displaced it. *)
-let clear_txn_scope t token = if t.txn_scope = Some token then t.txn_scope <- None
+let clear_txn_scope owner token =
+  if owner.txn_scope = Some token then owner.txn_scope <- None
+;;
 
 let in_transaction_scope t =
-  match t.txn_scope, Lwt.get txn_scope_key with
-  | Some owner, Some tok -> Int.equal owner tok
+  match (scope_handle t).txn_scope, Lwt.get txn_scope_key with
+  | Some held, Some tok -> Int.equal held tok
   | _, _ -> false
 ;;
 
-let owns_txn_scope t token = t.txn_scope = Some token
+let owns_txn_scope owner token = owner.txn_scope = Some token
 
 (* Success arm: COMMIT, then release the scope.  A COMMIT error is reported as
    [Error] and no compensating ROLLBACK is issued — [commit_txn] already rolls
@@ -2186,12 +2232,12 @@ let owns_txn_scope t token = t.txn_scope = Some token
    deferred-FK violation), and on a poisoned handle (#555) ROLLBACK is the
    caller's prescribed single exit, not this combinator's to take on their
    behalf. *)
-let scoped_commit t token v =
-  if not (owns_txn_scope t token)
+let scoped_commit t owner token v =
+  if not (owns_txn_scope owner token)
   then Lwt.return (Error (Runtime stolen_txn_msg))
   else
     let* cr = execute t "COMMIT" in
-    clear_txn_scope t token;
+    clear_txn_scope owner token;
     match cr with
     | Ok () -> Lwt.return (Ok v)
     | Error e -> Lwt.return (Error e)
@@ -2200,22 +2246,24 @@ let scoped_commit t token v =
 (* Failure arm: ROLLBACK, release the scope, re-raise the original exception.
    The ROLLBACK's own result is discarded on purpose — the exception the body
    raised is the interesting one, and swallowing it to report a rollback error
-   would hide the cause. *)
-let scoped_rollback t token exn =
-  if not (owns_txn_scope t token)
+   would hide the cause.  Skipped entirely when the scope was displaced (#584):
+   there is nothing of ours left to roll back and the statement would abort
+   whatever replaced it. *)
+let scoped_rollback t owner token exn =
+  if not (owns_txn_scope owner token)
   then Lwt.fail exn
   else
     let* _ = execute t "ROLLBACK" in
-    clear_txn_scope t token;
+    clear_txn_scope owner token;
     Lwt.fail exn
 ;;
 
-let run_txn_scope t token body =
+let run_txn_scope t owner token body =
   Lwt.catch
     (fun () ->
        let* v = Lwt.with_value txn_scope_key (Some token) (fun () -> body t) in
-       scoped_commit t token v)
-    (fun exn -> scoped_rollback t token exn)
+       scoped_commit t owner token v)
+    (fun exn -> scoped_rollback t owner token exn)
 ;;
 
 let with_transaction t body =
@@ -2232,8 +2280,11 @@ let with_transaction t body =
     | Ok () ->
       incr txn_scope_counter;
       let token = !txn_scope_counter in
-      t.txn_scope <- Some token;
-      run_txn_scope t token body
+      (* Stamped AFTER the BEGIN, which clears the slot's token as it fills it —
+         so this is the re-stamp that makes the scope the owner. *)
+      let owner = scope_handle t in
+      owner.txn_scope <- Some token;
+      run_txn_scope t owner token body
 ;;
 
 let execute_change_count top sql =
