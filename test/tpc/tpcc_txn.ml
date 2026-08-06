@@ -26,13 +26,13 @@ type profile =
    StockLevel needed a documented rewrite. *)
 let stock_level_verdict =
   Rewritten
-    "#491: granary's parser rejects DISTINCT as an aggregate argument, so the spec's \
-     COUNT(DISTINCT s_i_id) is a parse error and there are no derived tables to wrap it \
-     in. The join, the 20-order window, the s_quantity threshold and the duplicate \
-     elimination all still run in the engine as SELECT DISTINCT s_i_id; only the final \
-     COUNT of the deduplicated ids is taken client-side as the row count. The spec's \
-     comma-join is also spelled INNER JOIN, since granary's FROM clause takes one table \
-     plus explicit joins."
+    "one rewrite left: the spec's comma-join is spelled INNER JOIN, since granary's \
+     FROM clause takes one table plus explicit joins (#486). StockLevel is the only \
+     profile with a join at all, which is why it is the only one carrying a rewrite. \
+     The distinct count is no longer one of them — #491 taught the parser DISTINCT as \
+     an aggregate argument, so the spec's COUNT(DISTINCT s_i_id) now runs in the engine \
+     and the count is the engine's answer, not a client-side row count over a SELECT \
+     DISTINCT projection."
 ;;
 
 let all =
@@ -996,19 +996,17 @@ let run_delivery ops ~w_id ~carrier_id = delivery_from ops ~w_id ~carrier_id ~d_
 
 (* --- Stock_level ------------------------------------------------------ *)
 
-(* REWRITTEN (#491): the spec's query is
-   [SELECT COUNT(DISTINCT s_i_id) FROM order_line, stock WHERE ...].  granary
-   accepts DISTINCT only in the SELECT-list position, not as an aggregate
-   argument — [COUNT(DISTINCT ...)] is a parse error — and has no derived
-   tables to wrap the DISTINCT in.  So the join, the 20-order window, the
-   threshold filter and the duplicate elimination all still run in the engine;
-   only the final COUNT of the deduplicated ids is taken as the row count on
-   the client.  The comma-join is spelled INNER JOIN because granary's
-   FROM clause takes a single table plus explicit joins. *)
+(* The spec's statement, with one rewrite left: [FROM order_line, stock WHERE
+   ...] is spelled as an INNER JOIN because granary's FROM clause takes a single
+   table plus explicit joins (#486).  Until #491 the distinct count was rewritten
+   too — [COUNT(DISTINCT s_i_id)] was a parse error, and with no derived tables
+   there was nowhere to put the DISTINCT — so the harness shipped [SELECT
+   DISTINCT s_i_id] and counted the rows on the client.  The engine now answers
+   the count itself. *)
 let stock_level_sql =
-  "SELECT DISTINCT s_i_id FROM order_line INNER JOIN stock ON s_i_id = ol_i_id WHERE \
-   ol_w_id = ? AND ol_d_id = ? AND ol_o_id < ? AND ol_o_id >= ? AND s_w_id = ? AND \
-   s_quantity < ?"
+  "SELECT COUNT(DISTINCT s_i_id) FROM order_line INNER JOIN stock ON s_i_id = ol_i_id \
+   WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id < ? AND ol_o_id >= ? AND s_w_id = ? \
+   AND s_quantity < ?"
 ;;
 
 let stock_level_window = 20
@@ -1040,13 +1038,20 @@ let stock_level_body ops ~w_id ~d_id ~threshold =
          ; Tpc_value.VInt threshold
          ])
   in
-  (* StockLevel's answer is this count of distinct low-stock items.  [run]
+  (* StockLevel's answer is this count of distinct low-stock items, which since
+     #491 is the engine's own COUNT rather than a client-side row count.  [run]
      returns unit — the harness times the transaction rather than checking its
-     result — so the count is computed and then deliberately discarded.  It is
-     computed rather than skipped because forcing the row list is part of the
-     work the profile exists to measure, and because a shape that cannot be
-     counted is now a raise rather than a plausible number. *)
-  let low_stock_count = List.length low_stock in
+     result — so the count is read and then deliberately discarded.  It is read
+     rather than skipped because forcing the result is part of the work the
+     profile exists to measure, and because a shape that cannot be read is now a
+     raise rather than a plausible number. *)
+  let low_stock_count =
+    required_int
+      (first low_stock)
+      0
+      ~source:"StockLevel low-stock count"
+      ~column:"count(distinct s_i_id)"
+  in
   ignore (low_stock_count : int);
   ops.exec commit_txn
 ;;

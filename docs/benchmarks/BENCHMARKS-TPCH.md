@@ -145,8 +145,8 @@ Measured at SF 0.01, seed 42, one repeat, in the dev container.
 | 12 | `Rewritten` ✔ | row-level `CASE` measures projected by a setup view (#488). 2 rows. |
 | 13 | `Skipped` | `ORDER BY custdist DESC` — no expressible form (#490, #495, #489) |
 | 14 | `Skipped` | projection divides one aggregate by another (#494) |
-| 15 | `Skipped` | the spec's `(SELECT MAX(total_revenue) FROM revenue0)` names a view inside a subquery's FROM — silently 0 rows (#496); also #497, #488, #491 |
-| 16 | `Skipped` | `COUNT(DISTINCT ps_suppkey)` does not parse (#491); `ORDER BY supplier_cnt` would block it again |
+| 15 | `Skipped` | the spec's `(SELECT MAX(total_revenue) FROM revenue0)` names a view inside a subquery's FROM — silently 0 rows (#496); also #497, #488. #491 is fixed, so the setup carries the spec's own `CREATE VIEW revenue0 (supplier_no, total_revenue)` again |
+| 16 | `Skipped` | `ORDER BY supplier_cnt` (#490, #495, #489). `COUNT(DISTINCT ps_suppkey)` was the other blocker and is fixed (#491) |
 | 17 | `Skipped` | `SUM(...) / 7.0` (#494) **and** correlated subquery under a joined FROM (#492) |
 | 18 | `Rewritten` ⚠ | joins made explicit (#486). Runs and agrees — but **0 rows on both engines** at SF 0.001 and 0.01, so the agreement is not evidence. Needs SF 0.1, blocked by #493. |
 | 19 | `Rewritten` ✔ | row-level revenue measure projected by a setup view (#488). 1 row. |
@@ -165,7 +165,7 @@ Legend: ✔ verified non-empty · ⚠ agrees only on an empty result · ✖ wron
 | #492 | correlated subquery under a joined FROM — **silent wrong answer** | 2, 17, 20, 21 |
 | #488 | aggregate argument must be a column reference | worked around by setup views in 1, 6, 12, 19 |
 | #486 | no comma FROM lists, no derived tables | worked around by explicit joins and setup views throughout |
-| #491 | `COUNT(DISTINCT x)`; `CREATE VIEW v (cols) AS` | 15, 16 |
+| #491 | `COUNT(DISTINCT x)`; `CREATE VIEW v (cols) AS` — **fixed**; both forms parse and Q15's setup carries the spec's column list again. Q15 and Q16 remain skipped on their other blockers | 15, 16 |
 | #496 / #497 | a view is invisible inside a subquery's FROM (silently 0 rows) and unresolvable in JOIN position | 15 |
 | #493 / #498 | correlated `EXISTS` at 800,000× SQLite; six-way join OOM | caps scale; leaves 18 unverifiable and 9 unrunnable |
 

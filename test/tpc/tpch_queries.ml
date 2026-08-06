@@ -33,7 +33,11 @@
      to bind the unqualified form to the outer row and returns a wrong answer
      (#485); the qualified form means the same thing to any conforming engine.
    - Q15's view column list moved into the SELECT's own aliases; granary's
-     grammar has no [CREATE VIEW v (c1, c2) AS ...] form.
+     grammar had no [CREATE VIEW v (c1, c2) AS ...] form.  THIS ONE HAS BEEN
+     WITHDRAWN: #491 added the form, and Q15's setup now carries the spec's
+     own column list again.  It is left on the list because the other three
+     are still applied, and because a reader comparing this file against the
+     spec should be able to see which differences were once deliberate.
 
    These rewrites were applied to every query they touch, including queries for
    which granary still does not produce the right answer.  Such a query carries
@@ -532,9 +536,9 @@ WHERE l_shipdate >= '1995-09-01'
 let q15 =
   { number = 15
   ; setup =
-      [ {|CREATE VIEW revenue0 AS
-      SELECT l_suppkey AS supplier_no,
-             SUM(l_extendedprice * (1 - l_discount)) AS total_revenue
+      [ {|CREATE VIEW revenue0 (supplier_no, total_revenue) AS
+      SELECT l_suppkey,
+             SUM(l_extendedprice * (1 - l_discount))
       FROM lineitem
       WHERE l_shipdate >= '1996-01-01'
         AND l_shipdate < '1996-04-01'
@@ -544,12 +548,13 @@ let q15 =
       Skipped
         "the spec's own WHERE total_revenue = (SELECT MAX(total_revenue) FROM revenue0) \
          names the view inside a subquery's FROM, which granary silently answers with 0 \
-         rows — #496. Three other gaps were cleared and are recorded in the SQL below: \
-         the implicit join is now explicit (#486), the view's column list moved into the \
-         SELECT's own aliases since granary has no CREATE VIEW v (c1, c2) AS form \
-         (#491), and the view's SUM over an expression would need the Q1 treatment \
-         (#488). granary would also need the FROM operands swapped, because a view is \
-         only resolved in leading FROM position (#497)"
+         rows — #496. Two other gaps were cleared and are recorded in the SQL below: \
+         the implicit join is now explicit (#486), and the view's SUM over an expression \
+         would need the Q1 treatment (#488). A third was cleared in the engine instead: \
+         #491 added CREATE VIEW v (c1, c2) AS, so the setup below carries the spec's own \
+         column list again rather than the aliases it was rewritten into. granary would \
+         also need the FROM operands swapped, because a view is only resolved in leading \
+         FROM position (#497)"
   ; sql =
       {|SELECT s_suppkey, s_name, s_address, s_phone, total_revenue
 FROM supplier
@@ -566,9 +571,10 @@ let q16 =
   ; setup = []
   ; verdict =
       Skipped
-        "COUNT(DISTINCT ps_suppkey) does not parse — #491 — and there is no faithful way \
-         to write a distinct count without it. ORDER BY supplier_cnt DESC would block it \
-         a second time (#490/#495/#489). The SQL below carries the #486 join rewrite"
+        "ORDER BY supplier_cnt DESC has no expressible form — #490/#495/#489. \
+         COUNT(DISTINCT ps_suppkey) was the other blocker and is gone: #491 added \
+         DISTINCT as an aggregate argument, so the SQL below is now blocked only by the \
+         ordering. It also carries the #486 join rewrite"
   ; sql =
       {|SELECT p_brand, p_type, p_size, COUNT(DISTINCT ps_suppkey) AS supplier_cnt
 FROM partsupp
