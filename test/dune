@@ -1145,6 +1145,23 @@
   lwt.unix
   unix))
 
+; #629: NOT NULL on a GENERATED column is enforced on the COMPUTED value, not
+; on the placeholder the binder fills an omitted column with — before the fix
+; such a table was uninsertable.
+
+(test
+ (name test_not_null_629)
+ (modules test_not_null_629)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #600: PRAGMA not_null_check counts without retaining the rows it counts, and
 ; repair's victim buffer is bounded to one table.
 

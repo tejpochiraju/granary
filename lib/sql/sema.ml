@@ -1882,7 +1882,21 @@ let bind_insert_row
          time, which is where the parameter spelling is already skipped.  Only
          ONE place decides what `OR IGNORE` means, and it is the runtime one;
          this binder just stops pre-empting it.  Every other resolution keeps
-         the static error, which stays the earlier and better-located one. *)
+         the static error, which stays the earlier and better-located one.
+
+         #629: a GENERATED column is exempt here for the same reason, and it is
+         the same mistake in a third guise — the check running at a point where
+         it cannot see the truth.  The caller is FORBIDDEN from supplying a
+         generated column ([bind_explicit_insert_cols] rejects it outright), so
+         one is always omitted and always filled in above with the [BE_lit
+         L_null] placeholder.  Checking that placeholder made a NOT NULL
+         generated column reject EVERY insert, with no spelling that could
+         succeed: the table was uninsertable.  Both storage classes are exempt,
+         because neither has its value yet at bind time.  Enforcement is not
+         dropped, only moved to where the computed value exists —
+         [Exec.not_null_skip_or_fail] for STORED (materialised by
+         [compute_stored_generated_cols] before the check) and for VIRTUAL
+         (recomputed inside [Exec.not_null_violation]). *)
       let alias_col = Cat.rowid_alias_col meta in
       let ignore_nulls = on_conflict = Some Ast.CA_ignore in
       let nn_result =
@@ -1894,7 +1908,10 @@ let bind_insert_row
                let col = List.nth meta.columns i in
                (match bexpr with
                 | BE_lit Ast.L_null
-                  when (not ignore_nulls) && col.Row.not_null && Some i <> alias_col ->
+                  when (not ignore_nulls)
+                       && col.Row.not_null
+                       && Some i <> alias_col
+                       && col.Row.generated_as = None ->
                   Error (Not_null_violation col.Row.name)
                 | _ -> Ok ()))
           (Ok ())

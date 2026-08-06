@@ -355,6 +355,38 @@ EOF
   in `test/test_not_null_599.ml` pins all four spellings together for that
   reason.
 
+- **A GENERATED column's NOT NULL is enforced on its COMPUTED value, at both
+  levels (#629).** This was the third instance of the same shape as #567 and
+  #599 — a check running where it cannot see the truth — and the fix narrows
+  *when* each check runs, never *whether*.
+
+  The caller is forbidden from supplying a generated column, so it is always
+  omitted, and `Sema.bind_insert_row` fills an omitted column with a literal-NULL
+  placeholder. Judging that placeholder made a `NOT NULL GENERATED` column reject
+  **every** INSERT: no spelling could succeed, so the table was uninsertable.
+  `bind_insert_row` therefore exempts generated columns of **both** storage
+  classes — at bind time neither has a value. It keeps its literal-NULL error for
+  every other column.
+
+  The runtime half had the mirror-image gap. `Exec.not_null_exempt_col` exempted
+  VIRTUAL generated columns outright (#567's reasoning: their stored cell is
+  `V_null` by design), which meant a NOT NULL VIRTUAL column was *unenforceable*.
+  `Exec.not_null_violation` now recomputes the virtuals into a copy of the row
+  before judging it, and consults the exemption only when it cannot — a row that
+  does not cover every column, where evaluating the generated expression would
+  raise. **The exemption is the degraded mode; do not re-broaden it.** STORED
+  columns were always fine: `compute_stored_generated_cols` materialises them
+  before every enforcement site.
+
+  Consequences worth knowing: a generated expression that genuinely evaluates to
+  NULL is still rejected — on INSERT (skipped under `OR IGNORE`, per #599, since
+  the row now reaches the runtime site that decides that), and on an UPDATE of
+  the base column it reads (always raises; `write_row_rekeyed` has no `OR IGNORE`
+  form). `not_null_scan_cols` (`PRAGMA not_null_check`/`repair`) deliberately did
+  **not** follow — it reports on cells already on disk whose only repair is to
+  rewrite them, which is meaningless for a column never read from disk. Pinned by
+  `test/test_not_null_629.ml`.
+
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
 ### One `Db.t`, one explicit transaction (#555)

@@ -303,10 +303,12 @@ let rowid_alias_auto_assignment_still_works () =
 
 (* A VIRTUAL generated column is stored as NULL and recomputed on read
    ([decode_with_virtual]), so its stored cell says nothing about the declared
-   value.  [enforce_not_null] therefore exempts VIRTUAL columns — without that
-   exemption every write to such a table would fail on a cell that is NULL by
-   design.  A STORED one is materialised before the check runs, so it is not
-   exempt and its computed value is what gets checked. *)
+   value — without something to account for that, every write to such a table
+   would fail on a cell that is NULL by design.  #567 accounted for it by
+   exempting VIRTUAL columns outright; since #629 [not_null_violation]
+   recomputes them instead, which keeps this case writable AND makes a
+   genuinely NULL-valued one enforceable.  A STORED one is materialised before
+   the check runs, so its computed value was always what got checked. *)
 let generated_columns_still_writable () =
   with_db (fun db ->
     exec
@@ -321,27 +323,23 @@ let generated_columns_still_writable () =
       (texts db "SELECT a, v, s FROM g"))
 ;;
 
-(* Pre-existing and unrelated to #567, pinned because the tests above are the
-   natural place to look for it: a NOT NULL generated column is unreachable
-   through INSERT at all.  [Sema.bind_insert_row] fills an omitted column with
-   a literal NULL and applies its own NOT NULL check to that placeholder, so it
-   rejects the row before the generated value is ever computed — and the column
-   cannot be supplied explicitly either, since writing a generated column is
-   refused.  #567 does not change this; the encode-time check never sees the
-   statement. *)
-let not_null_generated_column_is_unreachable () =
+(* This case used to pin the OPPOSITE, as a defect: a NOT NULL generated column
+   was unreachable through INSERT at all, because [Sema.bind_insert_row] filled
+   the omitted column with a literal NULL and applied its NOT NULL check to that
+   placeholder.  Fixed by #629 — the binder now exempts generated columns of
+   both storage classes and enforcement happens where the computed value exists.
+   Kept here (rather than only in [test_not_null_629.ml]) so that a change which
+   re-broadens the binder's check fails in #567's own file too. *)
+let not_null_generated_column_is_reachable () =
   with_db (fun db ->
     exec
       db
       "CREATE TABLE gn (a INTEGER, b INTEGER NOT NULL GENERATED ALWAYS AS (a + 1) STORED)";
-    match run (Db.execute db "INSERT INTO gn (a) VALUES (3)") with
-    | Ok () -> Alcotest.fail "a NOT NULL generated column became reachable"
-    | Error e ->
-      let msg = Format.asprintf "%a" Db.pp_error e in
-      Alcotest.(check bool)
-        (Printf.sprintf "refused by the binder's placeholder check (%S)" msg)
-        true
-        (contains ~needle:"NOT NULL violation: b" msg))
+    exec db "INSERT INTO gn (a) VALUES (3)";
+    Alcotest.(check (list string))
+      "the computed value is stored, not the placeholder"
+      [ "3|4" ]
+      (texts db "SELECT a, b FROM gn"))
 ;;
 
 (* The literal spellings must still fail in the BINDER — earlier, and with the
@@ -825,9 +823,9 @@ let () =
         ; Alcotest.test_case "rowid alias" `Quick rowid_alias_auto_assignment_still_works
         ; Alcotest.test_case "generated columns" `Quick generated_columns_still_writable
         ; Alcotest.test_case
-            "NOT NULL generated is unreachable"
+            "NOT NULL generated is reachable (#629)"
             `Quick
-            not_null_generated_column_is_unreachable
+            not_null_generated_column_is_reachable
         ; Alcotest.test_case
             "literal stays a bind error"
             `Quick
