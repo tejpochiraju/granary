@@ -1092,6 +1092,15 @@
  (modules test_agg_subquery_558)
  (libraries granary granary.unix alcotest lwt.unix unix))
 
+; #635: an alias-qualified outer reference in a correlated subquery; #626: an
+; unresolvable one in a projection was answered NULL; #615: an outer join's
+; correlated ON subquery is now resolved rather than refused.
+
+(test
+ (name test_alias_outer_ref_635)
+ (modules test_alias_outer_ref_635)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 
 (test

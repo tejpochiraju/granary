@@ -33,9 +33,12 @@
     plausible full-cardinality wrong result instead of the empty one [main]
     gave.
 
-    What is still unresolvable — a self-join, a projection between the filter
-    and its scans, a reference to a query two levels out — is now a {b raise},
-    not an empty result.
+    What is still unresolvable — an {i unaliased} self-join, a projection
+    between the filter and its scans — is now a {b raise}, not an empty result.
+    (#635 later made the aliased self-join resolvable, and made a reference from
+    two levels out resolve rather than raise; #626 gave the projection the same
+    refusal instead of a column of NULLs; #615 reopened #566's outer-join
+    refusal. Each has its own test file.)
 
     {1 Oracle}
 
@@ -313,18 +316,19 @@ let an_alias_does_not_shadow_the_table_name () =
 (* What still cannot be resolved is refused, loudly                     *)
 (* ------------------------------------------------------------------ *)
 
-(* A self-join gives two inputs with the same table name, so resolving a
-   reference by name would pick one of them arbitrarily. [get_outer_scan_metas]
+(* A self-join gives two inputs with the same SCOPE IDENTIFIER, so resolving a
+   reference by it would pick one of them arbitrarily. [get_outer_scan_metas]
    answers [None] and the query is refused — the one thing #592 insists on is
-   that an unresolvable correlation must not look like "no rows matched". *)
+   that an unresolvable correlation must not look like "no rows matched".
+
+   #635 moved the boundary from "the same table name" to "the same scope
+   identifier", so this case is now spelled without aliases. The aliased
+   spelling it used to carry resolves; [test_alias_outer_ref_635.ml] pins it. *)
 let self_join_is_refused_not_emptied () =
   with_db (fun db ->
     seed db;
     let msg =
-      err_of
-        db
-        "SELECT x.a, y.a FROM l AS x JOIN l AS y ON EXISTS (SELECT 1 FROM k WHERE v < \
-         x.a)"
+      err_of db "SELECT l.a FROM l JOIN l ON EXISTS (SELECT 1 FROM k WHERE v < l.a)"
     in
     Alcotest.(check bool)
       (Printf.sprintf "refused rather than answered empty (got %S)" msg)

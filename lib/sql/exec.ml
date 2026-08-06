@@ -6432,8 +6432,8 @@ let execute_drop_index
 (* ------------------------------------------------------------------ *)
 
 let op_name = function
-  | Plan.Op_seq_scan { table_meta } -> "SeqScan(" ^ table_meta.Cat.name ^ ")"
-  | Plan.Op_col_seq_scan { table_meta } -> "ColSeqScan(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_seq_scan { table_meta; _ } -> "SeqScan(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_col_seq_scan { table_meta; _ } -> "ColSeqScan(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_filter _ -> "Filter"
   | Plan.Op_project _ -> "Project"
   | Plan.Op_expr_project _ -> "ExprProject"
@@ -8315,8 +8315,8 @@ let rec plan_expr_has_subquery : Plan.expr -> bool = function
     join's right-hand columns and a projection between the two would move
     them. *)
 let rec outer_row_width : Plan.op -> int option = function
-  | Plan.Op_seq_scan { table_meta }
-  | Plan.Op_col_seq_scan { table_meta }
+  | Plan.Op_seq_scan { table_meta; _ }
+  | Plan.Op_col_seq_scan { table_meta; _ }
   | Plan.Op_index_lookup { table_meta; _ }
   | Plan.Op_rowid_lookup { table_meta; _ } -> Some (List.length table_meta.Cat.columns)
   | Plan.Op_filter { child; _ } | Plan.Op_sort { child; _ } | Plan.Op_limit { child; _ }
@@ -8328,8 +8328,27 @@ let rec outer_row_width : Plan.op -> int option = function
   | _ -> None
 ;;
 
-(** #592: every base table feeding a plan subtree, paired with the ordinal of
-    its first column in that subtree's output row.
+(** #592/#635: one base-table input of a plan subtree.
+
+    [oi_ident] is the input's {b scope identifier} — the FROM item's alias where
+    one was given, otherwise the table name. That is the single rule an outer
+    reference resolves by, and it is the same rule [inner_scope_of] applies to a
+    subquery's own FROM: an alias {i replaces} the table name rather than adding
+    to it. *)
+type outer_input =
+  { oi_meta : Cat.table_meta
+  ; oi_ident : string
+  ; oi_offset : int (** ordinal of this input's first column in the emitted row *)
+  }
+
+(** #635: the scope identifier of a plan leaf — its alias where it has one. *)
+let scan_ident (m : Cat.table_meta) (alias : string option) =
+  Option.value alias ~default:m.Cat.name
+;;
+
+(** #592/#635: every base table feeding a plan subtree, paired with the ordinal
+    of its first column in that subtree's output row and with the identifier an
+    outer reference may name it by.
 
     This replaces the single-table [get_outer_scan_meta] that answered [None]
     over a join — the reason a correlated subquery in an INNER join's ON clause
@@ -8337,32 +8356,47 @@ let rec outer_row_width : Plan.op -> int option = function
     [right] ([Array.append lrow rrow]), so the offsets are exactly the widths
     to the left of each input.
 
-    Two inputs sharing a table name (a self-join) answers [None]: resolution is
-    by name, so keeping both would silently pick one. The caller refuses
-    instead. *)
-let get_outer_scan_metas (op : Plan.op) : (Cat.table_meta * int) list option =
-  let rec go base : Plan.op -> (Cat.table_meta * int) list option = function
-    | Plan.Op_seq_scan { table_meta }
-    | Plan.Op_col_seq_scan { table_meta }
-    | Plan.Op_index_lookup { table_meta; _ }
-    | Plan.Op_rowid_lookup { table_meta; _ } -> Some [ table_meta, base ]
+    Two inputs sharing an {b identifier} answers [None]: resolution is by
+    identifier, so keeping both would silently pick one. The caller refuses
+    instead. #635 narrowed that from "sharing a table name" —
+    [FROM l AS x JOIN l AS y] carries two distinct identifiers and now resolves,
+    while the unaliased [FROM l JOIN l] still cannot and is still refused. *)
+let get_outer_scan_metas (op : Plan.op) : outer_input list option =
+  let leaf table_meta alias base =
+    Some
+      [ { oi_meta = table_meta; oi_ident = scan_ident table_meta alias; oi_offset = base }
+      ]
+  in
+  let rec go base : Plan.op -> outer_input list option = function
+    | Plan.Op_seq_scan { table_meta; alias } | Plan.Op_col_seq_scan { table_meta; alias }
+      -> leaf table_meta alias base
+    | Plan.Op_index_lookup { table_meta; alias; _ }
+    | Plan.Op_rowid_lookup { table_meta; alias; _ } -> leaf table_meta alias base
     | Plan.Op_filter { child; _ } | Plan.Op_sort { child; _ } | Plan.Op_limit { child; _ }
       -> go base child
     | Plan.Op_hash_join { left; right; _ } ->
       (match go base left, outer_row_width left with
        | Some ls, Some w -> Option.map (fun rs -> ls @ rs) (go (base + w) right)
        | _ -> None)
-    | Plan.Op_nested_loop_join { left; right_meta; right_col_offset; _ } ->
-      Option.map (fun ls -> ls @ [ right_meta, base + right_col_offset ]) (go base left)
+    | Plan.Op_nested_loop_join { left; right_meta; right_alias; right_col_offset; _ } ->
+      Option.map
+        (fun ls ->
+           ls
+           @ [ { oi_meta = right_meta
+               ; oi_ident = scan_ident right_meta right_alias
+               ; oi_offset = base + right_col_offset
+               }
+             ])
+        (go base left)
     | _ -> None
   in
   match go 0 op with
   | None -> None
-  | Some metas ->
-    let names = List.map (fun ((m : Cat.table_meta), _) -> m.Cat.name) metas in
-    if List.length (List.sort_uniq String.compare names) <> List.length names
+  | Some inputs ->
+    let idents = List.map (fun i -> i.oi_ident) inputs in
+    if List.length (List.sort_uniq String.compare idents) <> List.length idents
     then None
-    else Some metas
+    else Some inputs
 ;;
 
 (** #592: how a correlated subquery's outer column references are resolved
@@ -8376,27 +8410,28 @@ type outer_binding =
   }
 
 (** Build an [outer_binding] over a row whose layout is described by
-    [get_outer_scan_metas]. An unqualified name that more than one input
-    carries is ambiguous and is left unresolved. *)
-let binding_of_metas (metas : (Cat.table_meta * int) list) (row : Row.t) : outer_binding =
-  let at (m : Cat.table_meta) off col =
-    match find_col_idx_by_name m.Cat.columns col with
-    | i when off + i < Array.length row -> Some row.(off + i)
+    [get_outer_scan_metas].
+
+    #635: a qualified reference matches an input's {b scope identifier} — the
+    alias where the FROM item has one, the table name otherwise — so
+    [FROM l AS x] resolves [x.a] and leaves [l.a] unresolved, which the caller
+    then refuses. An unqualified name that more than one input carries is
+    ambiguous and is likewise left unresolved rather than guessed at. *)
+let binding_of_metas (inputs : outer_input list) (row : Row.t) : outer_binding =
+  let at (i : outer_input) col =
+    match find_col_idx_by_name i.oi_meta.Cat.columns col with
+    | k when i.oi_offset + k < Array.length row -> Some row.(i.oi_offset + k)
     | _ -> None
     | exception Failure _ -> None
   in
   { bind_qual =
       (fun tbl col ->
-        match
-          List.find_opt
-            (fun ((m : Cat.table_meta), _) -> String.equal m.Cat.name tbl)
-            metas
-        with
+        match List.find_opt (fun i -> String.equal i.oi_ident tbl) inputs with
         | None -> None
-        | Some (m, off) -> at m off col)
+        | Some i -> at i col)
   ; bind_unqual =
       (fun col ->
-        match List.filter_map (fun (m, off) -> at m off col) metas with
+        match List.filter_map (fun i -> at i col) inputs with
         | [ v ] -> Some v
         | _ -> None)
   }
@@ -8418,7 +8453,7 @@ let agg_subquery_refusal () =
     describes the {b child} row layout, so each group ordinal is mapped back to
     the table and column it came from. *)
 let binding_of_group_cols
-      (metas : (Cat.table_meta * int) list)
+      (inputs : outer_input list)
       (group_cols : int list)
       (agg_row : Row.t)
   : outer_binding
@@ -8429,14 +8464,17 @@ let binding_of_group_cols
     else (
       match
         List.find_opt
-          (fun ((m : Cat.table_meta), off) ->
-             child_ord >= off && child_ord < off + List.length m.Cat.columns)
-          metas
+          (fun (oi : outer_input) ->
+             child_ord >= oi.oi_offset
+             && child_ord < oi.oi_offset + List.length oi.oi_meta.Cat.columns)
+          inputs
       with
       | None -> None
-      | Some (m, off) ->
-        let c : Row.column = List.nth m.Cat.columns (child_ord - off) in
-        Some (m.Cat.name, c.Row.name, agg_row.(i)))
+      | Some oi ->
+        let c : Row.column = List.nth oi.oi_meta.Cat.columns (child_ord - oi.oi_offset) in
+        (* #635: the qualifier recorded here is the input's scope identifier, so
+           an alias-qualified reference to a grouped column resolves too. *)
+        Some (oi.oi_ident, c.Row.name, agg_row.(i)))
   in
   let entries = List.filter_map Fun.id (List.mapi entry group_cols) in
   { bind_qual =
@@ -8462,7 +8500,8 @@ let binding_of_group_cols
 let correlated_filter_refusal () =
   "Exec: a correlated subquery in this predicate cannot be resolved — its outer column \
    reference has no source in the rows being filtered (#592). Rewrite it as an \
-   uncorrelated subquery, or qualify the outer column with its table name."
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
 ;;
 
 (** #592: what the {i inner} SELECT already has in scope, so a reference the
@@ -8482,41 +8521,26 @@ type inner_scope =
   ; has_table : string -> bool
   }
 
-(** Substitute outer column refs with literal values drawn from [bnd], leaving
-    anything [scope] says the subquery owns alone. *)
-let rec substitute_outer_in_expr
-          ~(scope : inner_scope)
-          (bnd : outer_binding)
-          (e : Ast.expr)
-  : Ast.expr
-  =
-  let go = substitute_outer_in_expr ~scope bnd in
-  match e with
-  | Ast.E_tbl_col (tbl, col) when not (scope.has_table tbl) ->
-    (match bnd.bind_qual tbl col with
-     | Some v -> Ast.E_lit (value_to_literal v)
-     | None -> e)
-  | Ast.E_col name when not (scope.has_col name) ->
-    (match bnd.bind_unqual name with
-     | Some v -> Ast.E_lit (value_to_literal v)
-     | None -> e)
-  | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
-  | Ast.E_not a -> Ast.E_not (go a)
-  | Ast.E_is_null a -> Ast.E_is_null (go a)
-  | Ast.E_is_not_null a -> Ast.E_is_not_null (go a)
-  | Ast.E_neg a -> Ast.E_neg (go a)
-  | Ast.E_bitnot a -> Ast.E_bitnot (go a)
-  | Ast.E_between (x, lo, hi) -> Ast.E_between (go x, go lo, go hi)
-  | Ast.E_in (x, vals) -> Ast.E_in (go x, List.map go vals)
-  | Ast.E_func (f, args) -> Ast.E_func (f, List.map go args)
-  | Ast.E_cast (x, ty) -> Ast.E_cast (go x, ty)
-  | Ast.E_case { scrutinee; branches; else_ } ->
-    Ast.E_case
-      { scrutinee = Option.map go scrutinee
-      ; branches = List.map (fun (c, r) -> go c, go r) branches
-      ; else_ = Option.map go else_
-      }
-  | _ -> e
+(** #635: the scope an outer reference is judged against when the substitution
+    descends through {i more than one} level of subquery nesting.
+
+    SQL resolves innermost-first, and "innermost" is cumulative: a name owned by
+    an {i intermediate} subquery belongs to that subquery, not to the outer row,
+    even when the innermost SELECT knows nothing about it.  Descending with only
+    the innermost scope would rewrite such a name from the outer row — a
+    plausible wrong answer, the failure class this whole area is about — so the
+    scopes are unioned on the way down. *)
+let scope_union (a : inner_scope) (b : inner_scope) : inner_scope =
+  { has_col = (fun n -> a.has_col n || b.has_col n)
+  ; has_table = (fun n -> a.has_table n || b.has_table n)
+  }
+;;
+
+(** The scope enclosing the {i outermost} correlated subquery: the operator
+    holding the outer row owns no identifier the subquery could be shadowed by,
+    so nothing is hidden at that level. *)
+let no_inner_scope : inner_scope =
+  { has_col = (fun _ -> false); has_table = (fun _ -> false) }
 ;;
 
 (** #592: build the [inner_scope] of a SELECT.
@@ -8568,16 +8592,91 @@ let inner_scope_of (cat_opt : Cat.t option) (s : Ast.stmt) : inner_scope =
   | _ -> { has_col = (fun _ -> true); has_table = (fun _ -> true) }
 ;;
 
+(** Substitute outer column refs with literal values drawn from [bnd], leaving
+    anything [scope] says the subquery owns alone.
+
+    #635: the [E_subquery] / [E_exists] / [E_in_select] arms are what make this
+    work at {i any} nesting depth.  They used to fall to the catch-all, so a
+    reference from a doubly-nested subquery to the outermost query was never
+    substituted — it survived, and the caller refused the query.  Descending
+    carries the union of every enclosing subquery's scope (see {!scope_union}),
+    so an intermediate level still shadows what it owns. *)
+let rec substitute_outer_in_expr
+          ~(cat : Cat.t option)
+          ~(scope : inner_scope)
+          (bnd : outer_binding)
+          (e : Ast.expr)
+  : Ast.expr
+  =
+  let go = substitute_outer_in_expr ~cat ~scope bnd in
+  let go_s = substitute_outer_in_stmt ~cat ~enclosing:scope bnd in
+  match e with
+  | Ast.E_tbl_col (tbl, col) when not (scope.has_table tbl) ->
+    (match bnd.bind_qual tbl col with
+     | Some v -> Ast.E_lit (value_to_literal v)
+     | None -> e)
+  | Ast.E_col name when not (scope.has_col name) ->
+    (match bnd.bind_unqual name with
+     | Some v -> Ast.E_lit (value_to_literal v)
+     | None -> e)
+  | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
+  | Ast.E_not a -> Ast.E_not (go a)
+  | Ast.E_is_null a -> Ast.E_is_null (go a)
+  | Ast.E_is_not_null a -> Ast.E_is_not_null (go a)
+  | Ast.E_neg a -> Ast.E_neg (go a)
+  | Ast.E_bitnot a -> Ast.E_bitnot (go a)
+  | Ast.E_between (x, lo, hi) -> Ast.E_between (go x, go lo, go hi)
+  | Ast.E_in (x, vals) -> Ast.E_in (go x, List.map go vals)
+  | Ast.E_func (f, args) -> Ast.E_func (f, List.map go args)
+  | Ast.E_cast (x, ty) -> Ast.E_cast (go x, ty)
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Ast.E_case
+      { scrutinee = Option.map go scrutinee
+      ; branches = List.map (fun (c, r) -> go c, go r) branches
+      ; else_ = Option.map go else_
+      }
+  | Ast.E_subquery inner -> Ast.E_subquery (go_s inner)
+  | Ast.E_exists inner -> Ast.E_exists (go_s inner)
+  | Ast.E_in_select (x, inner) -> Ast.E_in_select (go x, go_s inner)
+  | _ -> e
+
+(** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST
+    stmt.  [enclosing] is the union of the scopes of every subquery between this
+    one and the row [bnd] describes; it is {!no_inner_scope} at the top. *)
+and substitute_outer_in_stmt
+      ~(cat : Cat.t option)
+      ~(enclosing : inner_scope)
+      (bnd : outer_binding)
+      (s : Ast.stmt)
+  : Ast.stmt
+  =
+  let scope = scope_union (inner_scope_of cat s) enclosing in
+  let go_e = substitute_outer_in_expr ~cat ~scope bnd in
+  let go_s = substitute_outer_in_stmt ~cat ~enclosing bnd in
+  match s with
+  | Ast.S_select r ->
+    Ast.S_select
+      { r with
+        where = Option.map go_e r.where
+      ; having = Option.map go_e r.having
+      ; joins = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins
+      }
+  | Ast.S_compound { op; left; right; order; limit; offset } ->
+    Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
+  | Ast.S_with_cte { name; def; query; recursive } ->
+    Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
+  | _ -> s
+
 (** Substitute outer column refs in any embedded Ast.stmt nodes inside a
     Plan.expr (correlated subqueries / EXISTS / IN). *)
-let rec substitute_outer_in_plan_expr
-          ~(cat : Cat.t option)
-          (bnd : outer_binding)
-          (e : Plan.expr)
+and substitute_outer_in_plan_expr
+      ~(cat : Cat.t option)
+      (bnd : outer_binding)
+      (e : Plan.expr)
   : Plan.expr
   =
   let go = substitute_outer_in_plan_expr ~cat bnd in
-  let go_s = substitute_outer_in_stmt ~cat bnd in
+  let go_s = substitute_outer_in_stmt ~cat ~enclosing:no_inner_scope bnd in
   match e with
   | Plan.P_exists inner -> Plan.P_exists (go_s inner)
   | Plan.P_in_select (x, inner) -> Plan.P_in_select (go x, go_s inner)
@@ -8599,26 +8698,6 @@ let rec substitute_outer_in_plan_expr
       }
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
   | _ -> e
-
-(** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST stmt. *)
-and substitute_outer_in_stmt ~(cat : Cat.t option) (bnd : outer_binding) (s : Ast.stmt)
-  : Ast.stmt
-  =
-  let go_e = substitute_outer_in_expr ~scope:(inner_scope_of cat s) bnd in
-  let go_s = substitute_outer_in_stmt ~cat bnd in
-  match s with
-  | Ast.S_select r ->
-    Ast.S_select
-      { r with
-        where = Option.map go_e r.where
-      ; having = Option.map go_e r.having
-      ; joins = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins
-      }
-  | Ast.S_compound { op; left; right; order; limit; offset } ->
-    Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
-  | Ast.S_with_cte { name; def; query; recursive } ->
-    Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
-  | _ -> s
 ;;
 
 let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) : Plan.op =
@@ -10190,9 +10269,9 @@ and aggregate_fast_path
   then Lwt.return None
   else (
     match child with
-    | Plan.Op_seq_scan { table_meta } ->
+    | Plan.Op_seq_scan { table_meta; _ } ->
       run_aggregate_fast_path clock params store mode cat table_meta None aggs proj
-    | Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta } }
+    | Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta; _ } }
       when not (plan_expr_has_subquery pred) ->
       run_aggregate_fast_path clock params store mode cat table_meta (Some pred) aggs proj
     | _ -> Lwt.return None)
@@ -11404,8 +11483,9 @@ and to_stream
   : Row.t Lwt_stream.t Lwt.t
   =
   match op with
-  | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store mode table_meta
-  | Plan.Op_col_seq_scan { table_meta } ->
+  | Plan.Op_seq_scan { table_meta; _ } ->
+    stream_seq_scan clock params store mode table_meta
+  | Plan.Op_col_seq_scan { table_meta; _ } ->
     stream_col_seq_scan clock params store mode table_meta
   | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
   | Plan.Op_project { ordinals; child } ->
@@ -11432,13 +11512,14 @@ and to_stream
               Hashtbl.replace seen k ();
               true))
          inner)
-  | Plan.Op_index_lookup { table_tree; idx_tree; keys; range; table_meta } ->
+  | Plan.Op_index_lookup { table_tree; idx_tree; keys; range; table_meta; _ } ->
     stream_index_lookup clock params store mode table_tree idx_tree keys range table_meta
-  | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
+  | Plan.Op_rowid_lookup { table_meta; lookup_val; _ } ->
     stream_rowid_lookup clock params store mode lookup_val table_meta
   | Plan.Op_nested_loop_join
       { left
       ; right_meta
+      ; right_alias = _
       ; idx_tree
       ; probe
       ; probe_range

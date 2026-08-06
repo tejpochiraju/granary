@@ -363,7 +363,7 @@ let keyed_join_rejects_an_on_pred () =
     | Some m -> m
     | None -> Alcotest.fail "table t was not created"
   in
-  let scan = Plan.Op_seq_scan { table_meta = meta } in
+  let scan = Plan.Op_seq_scan { table_meta = meta; alias = None } in
   let op =
     Plan.Op_hash_join
       { left = scan

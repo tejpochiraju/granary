@@ -444,7 +444,9 @@ let query_seqscan_empty () =
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
      let m = Option.get meta_opt in
-     let* stream = Exec.query store cat (Plan.Op_seq_scan { table_meta = m }) in
+     let* stream =
+       Exec.query store cat (Plan.Op_seq_scan { table_meta = m; alias = None })
+     in
      let rows = collect stream in
      Alcotest.(check int) "empty table → 0 rows" 0 (List.length rows);
      Lwt.return_unit)
@@ -470,7 +472,9 @@ let query_seqscan_one_row () =
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
      let* meta_opt = Cat.find_table cat ~name:"t" in
      let m = Option.get meta_opt in
-     let* stream = Exec.query store cat (Plan.Op_seq_scan { table_meta = m }) in
+     let* stream =
+       Exec.query store cat (Plan.Op_seq_scan { table_meta = m; alias = None })
+     in
      let rows = collect stream in
      Alcotest.(check int) "one row" 1 (List.length rows);
      Lwt.return_unit)
@@ -498,7 +502,9 @@ let query_seqscan_three_rows () =
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 3L; Ast.L_text "c" ]);
      let* meta_opt = Cat.find_table cat ~name:"t" in
      let m = Option.get meta_opt in
-     let* stream = Exec.query store cat (Plan.Op_seq_scan { table_meta = m }) in
+     let* stream =
+       Exec.query store cat (Plan.Op_seq_scan { table_meta = m; alias = None })
+     in
      let rows = collect stream in
      Alcotest.(check int) "three rows" 3 (List.length rows);
      (* Rowid keys are ordered, so rows come back in insertion order *)
@@ -542,7 +548,9 @@ let query_filter_eq_int () =
      let m = Option.get meta_opt in
      (* Filter: id = 2 *)
      let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 2L)) in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "one match" 1 (List.length rows);
@@ -576,7 +584,9 @@ let query_filter_eq_string () =
      let m = Option.get meta_opt in
      (* Filter: name = 'b' *)
      let pred = Plan.P_binop (Plan.Eq, Plan.P_col 1, Plan.P_lit (Ast.L_text "b")) in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "one match" 1 (List.length rows);
@@ -609,7 +619,9 @@ let query_filter_no_match () =
      let m = Option.get meta_opt in
      (* Filter: id = 99 → no match *)
      let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)) in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "no match → 0 rows" 0 (List.length rows);
@@ -642,7 +654,9 @@ let query_filter_all_match () =
      let pred =
        Plan.P_binop (Plan.Eq, Plan.P_lit (Ast.L_int 1L), Plan.P_lit (Ast.L_int 1L))
      in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "all three rows match" 3 (List.length rows);
@@ -672,7 +686,9 @@ let query_filter_null_col () =
      let m = Option.get meta_opt in
      (* Filter: id = NULL → NULL != NULL → no match *)
      let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit Ast.L_null) in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "NULL != NULL → 0 rows" 0 (List.length rows);
@@ -705,7 +721,9 @@ let query_project_all () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_project
-         { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+         { ordinals = [ 0; 1 ]
+         ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+         }
      in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
@@ -736,7 +754,8 @@ let query_project_single_col () =
      let m = Option.get meta_opt in
      (* Project only column 0 (id) *)
      let op =
-       Plan.Op_project { ordinals = [ 0 ]; child = Plan.Op_seq_scan { table_meta = m } }
+       Plan.Op_project
+         { ordinals = [ 0 ]; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
      in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
@@ -772,7 +791,9 @@ let query_project_reversed () =
      (* Reverse the columns: ordinals=[1,0] → row[0]=name, row[1]=id *)
      let op =
        Plan.Op_project
-         { ordinals = [ 1; 0 ]; child = Plan.Op_seq_scan { table_meta = m } }
+         { ordinals = [ 1; 0 ]
+         ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+         }
      in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
@@ -815,7 +836,9 @@ let query_project_star_where () =
      let op =
        Plan.Op_project
          { ordinals = [ 0; 1 ]
-         ; child = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } }
+         ; child =
+             Plan.Op_filter
+               { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
          }
      in
      let* stream = Exec.query store cat op in
@@ -857,7 +880,8 @@ let execute_read_op_raises () =
      let m = Option.get meta_opt in
      (* Calling execute with a read op should raise Failure *)
      (try
-        ignore (Exec.execute store cat (Plan.Op_seq_scan { table_meta = m }));
+        ignore
+          (Exec.execute store cat (Plan.Op_seq_scan { table_meta = m; alias = None }));
         Alcotest.fail "expected Failure"
       with
       | Failure _ -> ());
@@ -890,7 +914,7 @@ let execute_filter_raises () =
              cat
              (Plan.Op_filter
                 { pred = Plan.P_lit (Ast.L_int 1L)
-                ; child = Plan.Op_seq_scan { table_meta = m }
+                ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
                 }));
         Alcotest.fail "expected Failure for Op_filter in execute"
       with
@@ -923,7 +947,9 @@ let execute_project_raises () =
              store
              cat
              (Plan.Op_project
-                { ordinals = [ 0 ]; child = Plan.Op_seq_scan { table_meta = m } }));
+                { ordinals = [ 0 ]
+                ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+                }));
         Alcotest.fail "expected Failure for Op_project in execute"
       with
       | Failure _ -> ());
@@ -1015,7 +1041,9 @@ let query_filter_nonnull_eq_null () =
      let m = Option.get meta_opt in
      (* Filter: name = NULL → va=V_text "ghost", vb=V_null → hits _, V_null arm *)
      let pred = Plan.P_binop (Plan.Eq, Plan.P_col 1, Plan.P_lit Ast.L_null) in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "non-null = NULL → 0 rows" 0 (List.length rows);
@@ -1046,7 +1074,9 @@ let query_filter_type_mismatch () =
      let m = Option.get meta_opt in
      (* Filter: id (V_int 5L) = "text" (V_text) → type mismatch → catch-all _ -> false *)
      let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_text "text")) in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "int = text → type mismatch → 0 rows" 0 (List.length rows);
@@ -1084,7 +1114,9 @@ let query_sort_asc () =
          { keys = [ Plan.P_col 0, `Asc, `Nulls_first ]
          ; child =
              Plan.Op_project
-               { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0; 1 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1129,7 +1161,9 @@ let query_sort_desc () =
          { keys = [ Plan.P_col 0, `Desc, `Nulls_last ]
          ; child =
              Plan.Op_project
-               { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0; 1 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1176,7 +1210,9 @@ let query_sort_nulls_first () =
          { keys = [ Plan.P_col 0, `Asc, `Nulls_first ]
          ; child =
              Plan.Op_project
-               { ordinals = [ 0 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1219,7 +1255,9 @@ let query_sort_empty () =
          { keys = [ Plan.P_col 0, `Asc, `Nulls_first ]
          ; child =
              Plan.Op_project
-               { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0; 1 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1262,7 +1300,9 @@ let query_limit_basic () =
          ; offset = 0
          ; child =
              Plan.Op_project
-               { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0; 1 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1310,7 +1350,9 @@ let query_limit_with_offset () =
          ; offset = 2
          ; child =
              Plan.Op_project
-               { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0; 1 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1355,7 +1397,9 @@ let query_limit_exceeds_rows () =
          ; offset = 0
          ; child =
              Plan.Op_project
-               { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0; 1 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1391,7 +1435,9 @@ let query_limit_offset_exceeds () =
          ; offset = 10
          ; child =
              Plan.Op_project
-               { ordinals = [ 0; 1 ]; child = Plan.Op_seq_scan { table_meta = m } }
+               { ordinals = [ 0; 1 ]
+               ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+               }
          }
      in
      let* stream = Exec.query store cat op in
@@ -1426,7 +1472,7 @@ let execute_sort_raises () =
              cat
              (Plan.Op_sort
                 { keys = [ Plan.P_col 0, `Asc, `Nulls_first ]
-                ; child = Plan.Op_seq_scan { table_meta = m }
+                ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
                 }));
         Alcotest.fail "expected Failure for Op_sort in execute"
       with
@@ -1459,7 +1505,10 @@ let execute_limit_raises () =
              store
              cat
              (Plan.Op_limit
-                { limit = 1; offset = 0; child = Plan.Op_seq_scan { table_meta = m } }));
+                { limit = 1
+                ; offset = 0
+                ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
+                }));
         Alcotest.fail "expected Failure for Op_limit in execute"
       with
       | Failure _ -> ());
@@ -1486,7 +1535,7 @@ let execute_union_raises () =
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
      let m = Option.get meta_opt in
-     let child = Plan.Op_seq_scan { table_meta = m } in
+     let child = Plan.Op_seq_scan { table_meta = m; alias = None } in
      (try
         ignore
           (Exec.execute
@@ -1524,7 +1573,8 @@ let execute_distinct_raises () =
           (Exec.execute
              store
              cat
-             (Plan.Op_distinct { child = Plan.Op_seq_scan { table_meta = m } }));
+             (Plan.Op_distinct
+                { child = Plan.Op_seq_scan { table_meta = m; alias = None } }));
         Alcotest.fail "expected Failure for Op_distinct in execute"
       with
       | Failure _ -> ());
@@ -1707,6 +1757,7 @@ let query_index_lookup_basic () =
          ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_int 2L) ]
          ; range = None
          ; table_meta = m
+         ; alias = None
          }
      in
      let* stream = Exec.query store cat op in
@@ -1771,6 +1822,7 @@ let query_index_lookup_type_mismatch () =
          ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_text "not-an-int") ]
          ; range = None
          ; table_meta = m
+         ; alias = None
          }
      in
      let* stream = Exec.query store cat op in
@@ -1835,6 +1887,7 @@ let query_index_lookup_multiple_matches () =
          ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_int 7L) ]
          ; range = None
          ; table_meta = m
+         ; alias = None
          }
      in
      let* stream = Exec.query store cat op in
@@ -1895,6 +1948,7 @@ let query_index_lookup_text () =
          ; keys = [ 1, Row.Text, Plan.P_lit (Ast.L_text "alice") ]
          ; range = None
          ; table_meta = m
+         ; alias = None
          }
      in
      let* stream = Exec.query store cat op in
@@ -1965,6 +2019,7 @@ let query_index_lookup_real () =
          ; keys = [ 0, Row.Real, Plan.P_lit (Ast.L_real 2.5) ]
          ; range = None
          ; table_meta = m
+         ; alias = None
          }
      in
      let* stream = Exec.query store cat op in
@@ -2035,6 +2090,7 @@ let query_index_lookup_blob () =
          ; keys = [ 0, Row.Blob, Plan.P_lit (Ast.L_blob (Bytes.of_string "BBBB")) ]
          ; range = None
          ; table_meta = m
+         ; alias = None
          }
      in
      let* stream = Exec.query store cat op in
@@ -2094,6 +2150,7 @@ let query_index_lookup_null () =
          ; keys = [ 0, Row.Integer, Plan.P_lit Ast.L_null ]
          ; range = None
          ; table_meta = m
+         ; alias = None
          }
      in
      let* stream = Exec.query store cat op in
@@ -2135,7 +2192,9 @@ let query_filter_eq_real () =
      let* meta_opt = Cat.find_table cat ~name:"t" in
      let m = Option.get meta_opt in
      let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_real 2.5)) in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "1 row matches real eq" 1 (List.length rows);
@@ -2176,7 +2235,9 @@ let query_filter_eq_blob () =
      let pred =
        Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_blob (Bytes.of_string "BB")))
      in
-     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      Alcotest.(check int) "1 row matches blob eq" 1 (List.length rows);
@@ -2219,7 +2280,7 @@ let query_sort_real () =
      let op =
        Plan.Op_sort
          { keys = [ Plan.P_col 0, `Asc, `Nulls_first ]
-         ; child = Plan.Op_seq_scan { table_meta = m }
+         ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
          }
      in
      let* stream = Exec.query store cat op in
@@ -2263,7 +2324,7 @@ let query_sort_blob () =
      let op =
        Plan.Op_sort
          { keys = [ Plan.P_col 0, `Asc, `Nulls_first ]
-         ; child = Plan.Op_seq_scan { table_meta = m }
+         ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
          }
      in
      let* stream = Exec.query store cat op in
@@ -2345,7 +2406,7 @@ let query_sort_multiple_nulls () =
      let op =
        Plan.Op_sort
          { keys = [ Plan.P_col 0, `Asc, `Nulls_first ]
-         ; child = Plan.Op_seq_scan { table_meta = m }
+         ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
          }
      in
      let* stream = Exec.query store cat op in
@@ -2925,8 +2986,8 @@ let query_hash_join_inner () =
          { ordinals = [ 0; 1; 2; 3 ]
          ; child =
              Plan.Op_hash_join
-               { left = Plan.Op_seq_scan { table_meta = um }
-               ; right = Plan.Op_seq_scan { table_meta = om }
+               { left = Plan.Op_seq_scan { table_meta = um; alias = None }
+               ; right = Plan.Op_seq_scan { table_meta = om; alias = None }
                ; left_key = 0
                ; right_key = 0
                ; on_pred = None
@@ -2987,8 +3048,8 @@ let query_hash_join_left () =
      let n_right = List.length orders_cols in
      let op =
        Plan.Op_hash_join
-         { left = Plan.Op_seq_scan { table_meta = um }
-         ; right = Plan.Op_seq_scan { table_meta = om }
+         { left = Plan.Op_seq_scan { table_meta = um; alias = None }
+         ; right = Plan.Op_seq_scan { table_meta = om; alias = None }
          ; left_key = 0
          ; right_key = 0
          ; on_pred = None
@@ -3060,8 +3121,8 @@ let query_hash_join_cartesian () =
      let n_left = 1 in
      let op =
        Plan.Op_hash_join
-         { left = Plan.Op_seq_scan { table_meta = um }
-         ; right = Plan.Op_seq_scan { table_meta = om }
+         { left = Plan.Op_seq_scan { table_meta = um; alias = None }
+         ; right = Plan.Op_seq_scan { table_meta = om; alias = None }
          ; left_key = -1
          ; right_key = -1
          ; on_pred = None
@@ -3123,8 +3184,8 @@ let query_hash_join_null_key_excluded () =
      let n_left = 1 in
      let op =
        Plan.Op_hash_join
-         { left = Plan.Op_seq_scan { table_meta = lm }
-         ; right = Plan.Op_seq_scan { table_meta = rm }
+         { left = Plan.Op_seq_scan { table_meta = lm; alias = None }
+         ; right = Plan.Op_seq_scan { table_meta = rm; alias = None }
          ; left_key = 0
          ; right_key = 0
          ; on_pred = None
@@ -3167,7 +3228,7 @@ let query_aggregate_count_star () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
          ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = None } ]
          ; having = None
@@ -3208,7 +3269,7 @@ let query_aggregate_sum_int () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
          ; aggs = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0 } ]
          ; having = None
@@ -3260,7 +3321,7 @@ let query_aggregate_sum_real () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
          ; aggs = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0 } ]
          ; having = None
@@ -3300,7 +3361,7 @@ let query_aggregate_avg () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
          ; aggs = [ { Plan.func = Ast.Agg_avg; col_ord = Some 0 } ]
          ; having = None
@@ -3341,7 +3402,7 @@ let query_aggregate_min_max () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
          ; aggs =
              [ { Plan.func = Ast.Agg_min; col_ord = Some 0 }
@@ -3391,7 +3452,7 @@ let query_aggregate_count_col_skips_null () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
          ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = Some 0 } ]
          ; having = None
@@ -3431,7 +3492,7 @@ let query_aggregate_with_group_by () =
      let m = Option.get meta_opt in
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = [ 0 ]
          ; (* GROUP BY id *)
            aggs = [ { Plan.func = Ast.Agg_count; col_ord = None } ]
@@ -3471,7 +3532,7 @@ let query_aggregate_with_having () =
      (* HAVING count-star > 1 → only group id=1 (count=2) passes *)
      let op =
        Plan.Op_aggregate
-         { child = Plan.Op_seq_scan { table_meta = m }
+         { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = [ 0 ]
          ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = None } ]
          ; having = Some (Plan.P_binop (Plan.Gt, Plan.P_col 1, Plan.P_lit (Ast.L_int 1L)))
@@ -3513,7 +3574,7 @@ let query_aggregate_raises_in_execute () =
              store
              cat
              (Plan.Op_aggregate
-                { child = Plan.Op_seq_scan { table_meta = m }
+                { child = Plan.Op_seq_scan { table_meta = m; alias = None }
                 ; group_cols = []
                 ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = None } ]
                 ; having = None
@@ -3551,8 +3612,9 @@ let query_nlj_raises_in_execute () =
              store
              cat
              (Plan.Op_nested_loop_join
-                { left = Plan.Op_seq_scan { table_meta = m }
+                { left = Plan.Op_seq_scan { table_meta = m; alias = None }
                 ; right_meta = m
+                ; right_alias = None
                 ; idx_tree = 99
                 ; probe = [ Plan.Probe_from_left 0 ]
                 ; probe_range = None
@@ -3591,8 +3653,8 @@ let query_hash_join_raises_in_execute () =
              store
              cat
              (Plan.Op_hash_join
-                { left = Plan.Op_seq_scan { table_meta = m }
-                ; right = Plan.Op_seq_scan { table_meta = m }
+                { left = Plan.Op_seq_scan { table_meta = m; alias = None }
+                ; right = Plan.Op_seq_scan { table_meta = m; alias = None }
                 ; left_key = 0
                 ; right_key = 0
                 ; on_pred = None
@@ -3644,7 +3706,9 @@ let query_distinct_blob () =
      insert store cat "t" ([ 0 ], [ Ast.L_blob (Bytes.of_string "BB") ]);
      let* meta_opt = Cat.find_table cat ~name:"t" in
      let m = Option.get meta_opt in
-     let op = Plan.Op_distinct { child = Plan.Op_seq_scan { table_meta = m } } in
+     let op =
+       Plan.Op_distinct { child = Plan.Op_seq_scan { table_meta = m; alias = None } }
+     in
      let* stream = Exec.query store cat op in
      let rows = collect stream in
      (* DISTINCT should collapse two "AA" blobs into one. *)
@@ -3680,7 +3744,7 @@ let query_multikey_sort () =
      let op =
        Plan.Op_sort
          { keys = [ Plan.P_col 0, `Asc, `Nulls_first; Plan.P_col 1, `Asc, `Nulls_first ]
-         ; child = Plan.Op_seq_scan { table_meta = m }
+         ; child = Plan.Op_seq_scan { table_meta = m; alias = None }
          }
      in
      let* stream = Exec.query store cat op in

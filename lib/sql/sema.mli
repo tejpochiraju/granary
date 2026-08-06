@@ -98,6 +98,9 @@ type agg_proj_item =
 type bound_join =
   { kind : Ast.join_kind
   ; right_meta : Granary_catalog.Catalog.table_meta
+  ; right_alias : string option
+    (** #635: the JOIN item's alias, carried through to the plan so a
+        correlated subquery's outer reference can resolve against it. *)
   ; on : bound_expr
   ; right_col_offset : int
     (** ordinal of the first right-table column in the combined row *)
@@ -160,6 +163,10 @@ type bound_stmt =
   | BS_select of
       { distinct : bool
       ; table_meta : Granary_catalog.Catalog.table_meta
+      ; table_alias : string option
+        (** #635: the FROM item's alias for [table_meta], carried through to the
+            plan's leaf scan so a correlated subquery's outer reference can
+            resolve against it. *)
       ; proj : int list
         (** column ordinals to project
                                             (refer to the combined row when [join] is set)
