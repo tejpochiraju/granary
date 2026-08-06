@@ -37,6 +37,20 @@ type 'a txn
     System trees use IDs 0–15; user tables use 16+. *)
 type tree_id = int
 
+(** #589/#633: the rowid allocator's live state for this store's data trees,
+    keyed by TREE ID.  It lives here rather than on a catalog because a tree id
+    is only meaningful within one {!t}, and because every catalog opened over
+    one store must share exactly one allocator: two counters over one data tree
+    hand the same rowid out twice, and the second write silently overwrites the
+    first.  Two stores (an ATTACHed schema, say) are two sets of trees and so
+    two tables, which is correct by construction. *)
+type rowid_counters = (tree_id, int64) Hashtbl.t
+
+(** This store's rowid allocator state.  Every catalog opened over the same
+    store gets this same table — there is nothing to pass by hand and nothing
+    to forget (#633). *)
+val rowid_counters : t -> rowid_counters
+
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
 type error =

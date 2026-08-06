@@ -171,21 +171,14 @@ type fts_table_meta =
 module Schema_cache : sig
   type t
 
-  (** #589: the rowid allocator's live state, keyed by TREE ID and shareable
-      between caches.  See the implementation note below for why it exists and
-      why the key is a tree id rather than a table name. *)
-  type rowid_counters
-
   (** [stamp] re-stamps the #174 tree-tag for a [table_meta]; wired to
       [register_tag store].  Every [table_meta] entering the cache is stamped so the
       page-stamp stays consistent automatically, and an undo re-stamps the prior.
-      [rowid_counters], when given, makes this cache share another cache's rowid
-      allocator state (#589) instead of starting its own. *)
-  val create : ?rowid_counters:rowid_counters -> stamp:(table_meta -> unit) -> unit -> t
-
-  (** This cache's rowid allocator state, to hand to [create] for a second cache
-      over the SAME data trees. *)
-  val rowid_counters : t -> rowid_counters
+      [rowid_counters] is the STORE's rowid allocator state (#589/#633) — it is
+      mandatory, and there is exactly one right value for it: [S.rowid_counters]
+      of the store this cache describes.  See the implementation note below for
+      why it exists and why the key is a tree id rather than a table name. *)
+  val create : rowid_counters:S.rowid_counters -> stamp:(table_meta -> unit) -> unit -> t
 
   (* reads — never touch the undo log *)
   val find_table : t -> string -> table_meta option
@@ -213,7 +206,9 @@ module Schema_cache : sig
   (** #589: open-time seeding ONLY.  Identical to [put_table_durable] except that
       it does not overwrite a shared rowid counter that is already live — a
       worker handle re-reads the catalog off disk, and disk is by definition no
-      fresher than the counter the sharing handles are already using. *)
+      fresher than the counter the sharing handles are already using.  A counter
+      still sitting at [empty_next_rowid] is NOT live (nothing has ever been
+      allocated from it) and is seeded over; see [publish_if_absent]. *)
   val seed_table : t -> name:string -> table_meta -> unit
 
   val remove_table_durable : t -> name:string -> unit
@@ -329,9 +324,19 @@ end = struct
      counter too LOW, which collides — cannot happen when the allocation is
      published immediately.  A ROLLBACK lowers it again through
      [set_rowid_durable] (#293's recompute) and [restore_rowids] (#303's
-     savepoint restore), by which point no other handle can hold the lock. *)
-  type rowid_counters = (S.tree_id, int64) Hashtbl.t
+     savepoint restore), by which point no other handle can hold the lock.
 
+     #633: the table itself is owned by [S.t] ([S.rowid_counters]), not by this
+     cache and not by a caller.  It used to be threaded through
+     [Cat.open_ ?rowid_counters] / [Db.of_store ?rowid_counters], which meant
+     every future caller reaching [of_store] over an ALREADY-OPEN store owed it
+     the argument by hand — and the penalty for forgetting was #589 verbatim
+     (silent row loss plus index corruption, durable and surviving reopen).  A
+     tree id is only an identity within one store, so the store is where the
+     table belongs; sharing is now a consequence of naming the same store rather
+     than of remembering an argument.  It also makes ATTACH right by type: an
+     attached schema is a different [S.t] and therefore, necessarily, a
+     different set of counters. *)
   type t =
     { tables : (string, table_meta) Hashtbl.t
     ; indexes : (string, index_info) Hashtbl.t
@@ -342,10 +347,10 @@ end = struct
     ; mutable savepoints : savepoint list
     ; mutable poisoned : bool
     ; rowid_bumped : (string, unit) Hashtbl.t
-    ; counters : rowid_counters
+    ; counters : S.rowid_counters
     }
 
-  let create ?rowid_counters ~stamp () =
+  let create ~rowid_counters ~stamp () =
     { tables = Hashtbl.create 16
     ; indexes = Hashtbl.create 16
     ; indexes_by_table = Hashtbl.create 16
@@ -355,14 +360,9 @@ end = struct
     ; savepoints = []
     ; poisoned = false
     ; rowid_bumped = Hashtbl.create 8
-    ; counters =
-        (match rowid_counters with
-         | Some c -> c
-         | None -> Hashtbl.create 16)
+    ; counters = rowid_counters
     }
   ;;
-
-  let rowid_counters t = t.counters
 
   (* Patch a cached [table_meta] with the shared counter on the way out. *)
   let patch t (m : table_meta) =
@@ -384,12 +384,24 @@ end = struct
   ;;
 
   (* Open-time seeding: never overwrite a counter another cache is already
-     using — disk is no fresher than the live allocator. *)
+     using — disk is no fresher than the live allocator.
+
+     #633: "already using" means an entry that has actually allocated.  An entry
+     still at [empty_next_rowid] is the never-seeded sentinel: it carries no
+     information at all (it means "the next allocation is 1"), so seeding over it
+     from disk can only move the counter UP, never into a collision.  This
+     matters now that the counters live on [S.t]: a second [open_] over a live
+     store shares the table, so without this a table whose rows reached the tree
+     without going through the allocator would keep answering 1 forever. *)
   let publish_if_absent t (m : table_meta) =
     match m.storage with
     | Row { tree_id; next_rowid; _ } when tree_id >= 0 ->
-      if not (Hashtbl.mem t.counters tree_id)
-      then Hashtbl.replace t.counters tree_id next_rowid
+      let unseeded =
+        match Hashtbl.find_opt t.counters tree_id with
+        | None -> true
+        | Some n -> Int64.equal n empty_next_rowid
+      in
+      if unseeded then Hashtbl.replace t.counters tree_id next_rowid
     | Row _ | Columnar _ -> ()
   ;;
 
@@ -675,10 +687,6 @@ end = struct
   let mark_poisoned t = t.poisoned <- true
   let is_poisoned t = t.poisoned
 end
-
-(* #589: re-export so a second catalog over the same store can be opened with
-   the first's rowid allocator. *)
-type rowid_counters = Schema_cache.rowid_counters
 
 type t =
   { store : S.t
@@ -1862,7 +1870,7 @@ let set_fk_constraints t ~table_name ~fks =
 (* Public API                                                           *)
 (* ------------------------------------------------------------------ *)
 
-let open_ ?rowid_counters store =
+let open_ store =
   let%lwt cache = load_all_tables store in
   let%lwt indexes = load_all_indexes store in
   let%lwt fts = load_all_fts store in
@@ -1981,14 +1989,20 @@ let open_ ?rowid_counters store =
   (* #283: seed the sealed cache durably (no undo, this is open-time state).
      [put_table_durable] re-stamps each table's #174 page-header tag, replacing
      the old explicit [register_tag] iteration. *)
+  (* #633: the allocator belongs to the STORE.  Every catalog over this store —
+     [Db.create_worker_handle]'s included — therefore shares it by construction,
+     with no argument to pass and none to forget. *)
   let sc =
-    Schema_cache.create ?rowid_counters ~stamp:(fun m -> register_tag store m) ()
+    Schema_cache.create
+      ~rowid_counters:(S.rowid_counters store)
+      ~stamp:(fun m -> register_tag store m)
+      ()
   in
-  (* #589: [seed_table], not [put_table_durable] — when [rowid_counters] came
-     from a sibling handle over the same store, the counters it already holds are
-     at least as fresh as what we just read off disk, and clobbering them with
-     the disk values would reintroduce the very collision this fixes (in the
-     opposite direction: the PARENT would go stale). *)
+  (* #589: [seed_table], not [put_table_durable] — when a sibling handle over the
+     same store is already using these counters, what it holds is at least as
+     fresh as what we just read off disk, and clobbering it with the disk values
+     would reintroduce the very collision this fixes (in the opposite direction:
+     the PARENT would go stale). *)
   Hashtbl.iter (fun name m -> Schema_cache.seed_table sc ~name m) cache;
   Hashtbl.iter (fun name i -> Schema_cache.put_index_durable sc ~name i) indexes;
   Hashtbl.iter (fun name m -> Schema_cache.put_fts_durable sc ~name m) fts;
@@ -2002,11 +2016,6 @@ let open_ ?rowid_counters store =
     ; last_inserted_rowid = 0L
     }
 ;;
-
-(* #589: hand this catalog's rowid allocator state to a second catalog opened
-   over the SAME store, so the two cannot allocate the same rowid twice.  See the
-   [rowid_counters] note in [Schema_cache]. *)
-let rowid_counters t = Schema_cache.rowid_counters t.sc
 
 (* #243 (T1): last-inserted rowid accessors for [last_insert_rowid()]. *)
 let set_last_inserted_rowid t rowid = t.last_inserted_rowid <- rowid
