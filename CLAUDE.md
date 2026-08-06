@@ -531,8 +531,40 @@ sequences.
   a read-only transaction does not overlap a writer either. Genuine write
   concurrency still needs #555 option 1.
 - Anything else that reaches `Db.of_store` over an **already-open** store owes
-  it `~rowid_counters` by hand; `create_worker_handle` is the only caller that
-  does so today.
+  it `~rowid_counters` **and `~cohort`** by hand; `create_worker_handle` is the
+  only caller that does so today.
+
+**A `VACUUM` on any handle kills every other handle over the same store (#634).**
+VACUUM closes the `Store.t`, rebuilds the file and swaps a freshly opened store
+into the handle that ran it. Siblings cannot follow: they keep the closed store
+*and* the pre-VACUUM `rowid_counters` table. Since #634 that is **loud** — the
+issue's option 2, not option 3. Handles over one store share a
+`Db.store_cohort`; VACUUM bumps it and re-stamps only the vacuuming handle, so
+every sibling is stale and every statement on it is refused with an error naming
+VACUUM. `Db.stale_after_vacuum` exposes it.
+
+**`ROLLBACK` is *not* an exit, and that is the deliberate difference from #555's
+poison.** A poisoned handle is recoverable because its store is still there; a
+stale handle's store is closed, so there is nothing to roll back into. The
+`Op_rollback` arm of `execute_control_op` is exempt from the poison gate and
+**below** the staleness gate for exactly that reason. The only supported
+operation on a stale handle is `Db.close`, which deliberately skips `S.close`
+(VACUUM already closed that store; a second teardown touches closed fds).
+
+Two consequences worth knowing before editing this:
+
+- **VACUUM does not move tree ids.** `copy_all_trees` writes each tid to the
+  same tid in the rebuilt file, so #589's "counters are keyed by tree id" rule is
+  untouched: the vacuuming handle gets a *fresh* counter table (`Cat.open_
+  new_store`, no `?rowid_counters`), re-seeded from the copied data — rescanned
+  for a plain rowid table, read from the copied `_sys_tables` row for
+  AUTOINCREMENT. The table is **replaced wholesale, not remapped**. Anything
+  that makes VACUUM renumber trees must remap or clear that table with it.
+- **A worker handle cannot itself run VACUUM**, because `create_worker_handle`
+  passes no `~file_path` — the statement is refused as "not file-backed" long
+  before the cohort is consulted. So the symmetric "worker vacuums, parent goes
+  stale" case is unreachable today; forwarding `file_path` to workers would make
+  it reachable, and the cohort already handles it.
 
 `Tpcc_driver`'s one-deep worker pool predates this and serializes whole
 transactions on a single handle; that is why its terminal-count sweep flatlines
