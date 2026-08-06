@@ -61,6 +61,12 @@ let rec plan_expr = function
   | Sema.BE_cast (e, ty) -> Plan.P_cast (plan_expr e, ty)
   | Sema.BE_excluded_col i -> Plan.P_excluded_col i
   | Sema.BE_window_slot i -> Plan.P_window_slot i
+  (* #489/#490: an output-row column reference.  It only ever appears as a
+     whole ORDER BY key on a sort that runs after projection, where the row in
+     hand IS the output row — so reading column [i] of it is exactly right.
+     [plan_post_agg_sort] additionally has to keep it OUT of its pre-aggregation
+     index remapping; see the comment there. *)
+  | Sema.BE_out_col i -> Plan.P_col i
   | Sema.BE_collate (be, c) -> Plan.P_collate (plan_expr be, c)
 ;;
 
@@ -1935,8 +1941,18 @@ let plan_post_agg_sort ~group_by ~agg_proj ~order ~projected =
               | `Asc -> `Nulls_first
               | `Desc -> `Nulls_last)
          in
-         let e = plan_expr bkey.key in
-         let e' = remap_e e in
+         (* #489/#490: [BE_out_col] already addresses the aggregated OUTPUT
+            row, so it must bypass [remap_e], which exists to translate
+            *pre-aggregation* input column indices.  Feeding it through would
+            silently re-point the key at whichever GROUP BY column happens to
+            share its index — an ORDER BY on an aggregate alias would then sort
+            by the grouping column instead, which is the same class of silent
+            wrong answer #489 was filed about. *)
+         let e' =
+           match bkey.key with
+           | Sema.BE_out_col i -> Plan.P_col i
+           | k -> remap_e (plan_expr k)
+         in
          e', dir, nulls)
       order
   in
