@@ -305,8 +305,11 @@ let plain_aggregate_expressions_are_untouched () =
       (rows_of db "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1"))
 ;;
 
-(* An aggregate argument still has to be a column reference — the relaxation is
-   about the expression around the aggregate, not its argument. *)
+(* #558's relaxation is about the expression AROUND the aggregate, not its
+   argument.  Since #488 an aggregate argument IS a general expression, so the
+   reason this is still refused is no longer "it is not a column reference" —
+   it is [Sema.expr_has_subquery_ast], the one shape #488 kept refusing. The
+   assertion is unchanged; only its justification moved. *)
 let a_subquery_as_an_aggregate_argument_is_still_refused () =
   with_db (fun db ->
     seed db;
