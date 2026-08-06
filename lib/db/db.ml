@@ -2191,11 +2191,25 @@ let query_impl ?stats ?mode top sql =
          | None -> Sql.Exec.Auto
          | Some tx -> Sql.Exec.In_txn tx)
     in
-    (match Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op with
-     | exception Failure msg -> Lwt.return (Error (Runtime msg))
-     | lwt_stream ->
-       let* stream = lwt_stream in
-       Lwt.return (Ok stream))
+    (* #627: a post-plan refusal (#558's [agg_subquery_refusal], #592's
+       [correlated_filter_refusal], #566's outer-join ON raise) is spelled
+       [Lwt.fail_with] / [failwith] *inside* an Lwt callback, so it arrives as a
+       REJECTED PROMISE, not a synchronous exception.  The old
+       [| exception Failure msg ->] arm only saw the synchronous spelling, so
+       every one of those refusals sailed past it and escaped [Db.query] as a
+       raw [Failure] — a caller matching [Ok _ | Error _] got an unhandled
+       exception instead of the [Error] branch.  [Lwt.catch] covers both
+       spellings ([Sql.Exec.query] is applied inside the thunk, so a synchronous
+       raise during plan-to-stream construction is caught too), which is exactly
+       the shape [iter_impl] and [run_core] already use.  Non-[Failure]
+       exceptions still propagate unchanged. *)
+    Lwt.catch
+      (fun () ->
+         let* stream = Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op in
+         Lwt.return (Ok stream))
+      (function
+        | Failure msg -> Lwt.return (Error (Runtime msg))
+        | exn -> Lwt.fail exn)
 ;;
 
 let query top sql = query_impl top sql
@@ -2308,7 +2322,17 @@ let query_as_of top (target : Granary_store.History.target) sql =
                 Lwt.return (Ok wrapped))
            (fun exn ->
               let* () = end_ro () in
-              Lwt.fail exn))
+              match exn with
+              (* #627: same hole as [query_impl] — the [| exception Failure msg ->]
+                 arm above only catches the synchronous spelling, so a post-plan
+                 refusal (a rejected promise) reached this handler and was
+                 re-raised out of [query_as_of].  Map it to the same
+                 [Error (Runtime msg)] the synchronous arm produces; the snapshot
+                 has already been ended by the idempotent [end_ro] above.
+                 [S.History_error] is not a [Failure], so the outer handler's
+                 [History_unavailable] / [History_pruned] mapping is untouched. *)
+              | Failure msg -> Lwt.return (Error (Runtime msg))
+              | exn -> Lwt.fail exn))
     (function
       | S.History_error S.History_unavailable -> Lwt.return (Error History_unavailable)
       | S.History_error S.History_pruned -> Lwt.return (Error History_pruned)

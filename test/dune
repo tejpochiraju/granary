@@ -1092,6 +1092,15 @@
  (modules test_agg_subquery_558)
  (libraries granary granary.unix alcotest lwt.unix unix))
 
+; #627: a post-plan refusal (#558/#566/#592) is spelled Lwt.fail_with, so it
+; arrives as a rejected promise and escaped Db.query as a raw Failure instead
+; of Db.error.
+
+(test
+ (name test_refusal_error_627)
+ (modules test_refusal_error_627)
+ (libraries alcotest granary granary.unix granary.store lwt lwt.unix unix))
+
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 
 (test
