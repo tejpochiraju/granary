@@ -219,6 +219,12 @@ type expr =
   | E_in of expr * expr list (** subject IN (val1, val2, ...) *)
   | E_agg of agg_func * expr option
   (** Aggregate call; [None] argument means [COUNT( * )]. *)
+  | E_agg_distinct of agg_func * expr
+  (** #491: aggregate call whose argument list carries [DISTINCT] —
+      [COUNT(DISTINCT x)], [SUM(DISTINCT x)], … The argument is mandatory:
+      there is no [COUNT(DISTINCT * )].  This is a separate constructor rather
+      than a flag on [E_agg] so that every existing exhaustive match over the
+      plain form keeps compiling only once it has been considered here. *)
   | E_func of scalar_func * expr list (** Scalar function call. *)
   | E_param of param (** parameter: ?, ?1, :name, @name, $name *)
   | E_match of string * string
@@ -704,8 +710,79 @@ let rec expr_to_sql = function
       (quote_text_literal end_tag)
       (quote_text_literal ellipsis)
       n_tokens
-  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ ->
-    failwith "expr_to_sql: unsupported expression form"
+  | E_agg _
+  | E_agg_distinct _
+  | E_match _
+  | E_subquery _
+  | E_exists _
+  | E_in_select _
+  | E_window _ -> failwith "expr_to_sql: unsupported expression form"
+;;
+
+(* #491: [CREATE VIEW v (c1, c2) AS SELECT ...].  The explicit column list is
+   desugared into the body's own output aliases, which is exactly what it
+   means — and is the workaround the TPC-H harness had been applying by hand.
+
+   Desugaring happens at PARSE time, deliberately.  A view is persisted as its
+   original SQL text and re-parsed on open (see [Db.load_views_into_hashtbl]),
+   so a rewrite applied anywhere above the parser would be silently lost the
+   next time the database was opened.
+
+   [`All] is refused rather than guessed at: the arity of [SELECT *] is not
+   known without the catalog, which the parser does not have. *)
+let rec rename_view_columns (names : string list) (q : stmt) : (stmt, string) result =
+  let n = List.length names in
+  let plural k = if k = 1 then "" else "s" in
+  let arity_error got =
+    Error
+      (Printf.sprintf
+         "CREATE VIEW column list names %d column%s but the SELECT returns %d column%s"
+         n
+         (plural n)
+         got
+         (plural got))
+  in
+  let relabel items =
+    let got = List.length items in
+    if got <> n
+    then arity_error got
+    else Ok (List.map2 (fun (e, _) name -> e, Some name) items names)
+  in
+  match q with
+  | S_select r ->
+    (match r.proj with
+     | `Exprs items ->
+       Result.map (fun items' -> S_select { r with proj = `Exprs items' }) (relabel items)
+     | `Cols cols ->
+       let got = List.length cols in
+       if got <> n
+       then arity_error got
+       else (
+         let items = List.map2 (fun c name -> E_col c, Some name) cols names in
+         Ok (S_select { r with proj = `Exprs items }))
+     | `All ->
+       Error
+         "CREATE VIEW column list requires an explicit select list; SELECT * cannot be \
+          renamed here")
+  | S_const_select { exprs } ->
+    Result.map (fun items' -> S_const_select { exprs = items' }) (relabel exprs)
+  (* A compound select takes its column names from its left arm. *)
+  | S_compound r ->
+    Result.map
+      (fun left' -> S_compound { r with left = left' })
+      (rename_view_columns names r.left)
+  (* There is deliberately NO [S_with_cte] arm.  The [create_view] production
+     takes a [compound_select], and [with_cte] is a sibling alternative of
+     [compound_select] under [stmt] rather than a case of it, so
+     [CREATE VIEW v (a, b) AS WITH c AS (...) SELECT ...] is a syntax error
+     before it ever reaches here — with or without a column list.  An arm here
+     would have been a silent no-op advertising support the grammar cannot
+     express: it would rewrite the inner SELECT, and the names would then be
+     thrown away again downstream unless [Sema.col_names_of_ast_stmt] grew a
+     matching [S_with_cte] arm.  That arm now exists (#491), so if the grammar
+     is ever widened to admit a WITH body, reinstating this one is the whole
+     change — but it must not be reinstated before the grammar is. *)
+  | _ -> Error "CREATE VIEW column list: unsupported view body"
 ;;
 
 [@@@ai_disclosure "ai-generated"]

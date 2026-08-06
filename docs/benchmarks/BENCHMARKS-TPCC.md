@@ -29,11 +29,14 @@ headline figure is **NewOrder transactions per second** and is **never tpmC**.
 - **Money is `REAL`, not `DECIMAL`** — neither engine has DECIMAL. Consistency
   condition 1 compares REAL accumulators and therefore uses a documented
   half-cent tolerance (see `tpcc_check.mli`).
-- **StockLevel is rewritten**: `COUNT(DISTINCT s_i_id)` is a granary parse error
-  (#491), so the engine returns the deduplicated ids and the count is taken
-  client-side. Every other profile runs the spec's statements untouched. The
-  verdicts are recorded in `Tpcc_txn.all` and *measured* by the smoke test, not
-  asserted.
+- **StockLevel is rewritten**, but only in its FROM clause now: the spec's
+  comma-join is spelled `INNER JOIN`, since granary's FROM takes one table plus
+  explicit joins (#486). It used to be rewritten twice over —
+  `COUNT(DISTINCT s_i_id)` was a granary parse error (#491), so the engine
+  returned the deduplicated ids and the count was taken client-side. #491 is
+  fixed and that half is withdrawn: the distinct count now runs in the engine.
+  Every other profile runs the spec's statements untouched. The verdicts are
+  recorded in `Tpcc_txn.all` and *measured* by the smoke test, not asserted.
 - **Engine order is fixed.** granary loads and runs first, SQLite second, over
   the same directory, so the second engine meets a page cache the first one
   warmed.

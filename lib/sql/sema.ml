@@ -168,6 +168,9 @@ type agg_spec =
     (** #488: the aggregate's argument as a general expression over the INPUT
         row.  [None] for the bare-column and COUNT-star forms; when it is
         [Some _], [col_ord] is [None]. *)
+  ; distinct : bool
+    (** #491: the argument list carried [DISTINCT].  Independent of which of
+        the two fields above carries the argument — see [Exec.aggregate_one]. *)
   }
 
 type agg_proj_item =
@@ -733,7 +736,7 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
        in
        Ok (BE_in (bx', ok_vals)))
   | Ast.E_param p -> Ok (BE_param (resolve_param ~param_counter ~named_params p))
-  | Ast.E_agg _ -> Error (Unsupported "aggregate in WHERE")
+  | Ast.E_agg _ | Ast.E_agg_distinct _ -> Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
     bind_func ~bind:(bind_expr ~param_counter ~named_params meta) func args
   | Ast.E_match _ ->
@@ -871,7 +874,7 @@ let rec bind_expr_join
        in
        Ok (BE_in (bx', ok_vals)))
   | Ast.E_param p -> Ok (BE_param (resolve_param ~param_counter ~named_params p))
-  | Ast.E_agg _ -> Error (Unsupported "aggregate in WHERE")
+  | Ast.E_agg _ | Ast.E_agg_distinct _ -> Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
     bind_func ~bind:(bind_expr_join ~param_counter ~named_params ~tables) func args
   | Ast.E_match _ -> Error (Unsupported "MATCH in JOIN context")
@@ -944,7 +947,7 @@ let agg_arg_col_ty_of_tables
     than beside its other users because #488's aggregate-argument binder needs
     it to refuse a nested aggregate. *)
 let rec expr_has_agg = function
-  | Ast.E_agg _ -> true
+  | Ast.E_agg _ | Ast.E_agg_distinct _ -> true
   | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
   | Ast.E_subquery _ | Ast.E_exists _ -> false
   | Ast.E_in_select (x, _) -> expr_has_agg x
@@ -978,6 +981,11 @@ let rec expr_has_subquery_ast = function
   | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ -> true
   | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
   | Ast.E_agg (_, arg) -> Option.fold ~none:false ~some:expr_has_subquery_ast arg
+  (* #491: a DISTINCT aggregate's argument is an argument like any other, so
+     #488's subquery refusal must see through it too — otherwise
+     [SUM(DISTINCT qty * (SELECT 2))] would bind a [P_subquery] that nothing
+     resolves and read NULL, which is the quiet wrong answer #488 refused. *)
+  | Ast.E_agg_distinct (_, arg) -> expr_has_subquery_ast arg
   | Ast.E_binop (_, a, b) -> expr_has_subquery_ast a || expr_has_subquery_ast b
   | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
     expr_has_subquery_ast e
@@ -1158,7 +1166,17 @@ let rec bind_expr_agg
     | Ast.E_agg (func, arg_opt) ->
       (match bind_agg_arg ~param_counter ~named_params ~resolver func arg_opt with
        | Error e -> Error e
-       | Ok (col_ord, arg_expr) -> Ok (BE_col (add_agg { func; col_ord; arg_expr })))
+       | Ok (col_ord, arg_expr) ->
+         Ok (BE_col (add_agg { func; col_ord; arg_expr; distinct = false })))
+    (* #491 x #488: a DISTINCT argument goes through the SAME [bind_agg_arg] as
+       a plain one, so it gets the expression form, the nested-aggregate
+       refusal and the subquery refusal for free — [COUNT(DISTINCT a * b)] is
+       bound exactly like [COUNT(a * b)], with one bit set. *)
+    | Ast.E_agg_distinct (func, arg) ->
+      (match bind_agg_arg ~param_counter ~named_params ~resolver func (Some arg) with
+       | Error e -> Error e
+       | Ok (col_ord, arg_expr) ->
+         Ok (BE_col (add_agg { func; col_ord; arg_expr; distinct = true })))
     | Ast.E_func (func, args) -> bind_func ~bind:go func args
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
@@ -1331,6 +1349,7 @@ let rec expr_has_window = function
    forms (aggregates, subqueries, params, windows, FTS) that cannot be. *)
 let rec check_expr_unsupported = function
   | Ast.E_agg _
+  | Ast.E_agg_distinct _
   | Ast.E_match _
   | Ast.E_subquery _
   | Ast.E_exists _
@@ -2721,7 +2740,7 @@ let bind_post_agg
       (match col_ord_result with
        | Error e -> Error e
        | Ok co ->
-         let spec = { func; col_ord = co; arg_expr = None } in
+         let spec = { func; col_ord = co; arg_expr = None; distinct = false } in
          let rec find_slot i = function
            | [] ->
              acc_aggs := !acc_aggs @ [ spec ];
@@ -2729,7 +2748,8 @@ let bind_post_agg
            | s :: _
              when s.func = spec.func
                   && s.col_ord = spec.col_ord
-                  && s.arg_expr = spec.arg_expr -> i
+                  && s.arg_expr = spec.arg_expr
+                  && s.distinct = spec.distinct -> i
            | _ :: rest -> find_slot (i + 1) rest
          in
          let slot = find_slot 0 !acc_aggs in
@@ -2747,6 +2767,10 @@ let bind_post_agg
        | Ok ba, Ok bb -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
        | Error e, _ | _, Error e -> Error e)
     | Ast.E_window _ -> Error (Unsupported "nested window functions not supported")
+    (* #491: a DISTINCT aggregate deduplicates per GROUP, which has no meaning
+       inside a window function's per-frame argument. *)
+    | Ast.E_agg_distinct _ ->
+      Error (Unsupported "DISTINCT aggregate in a window function argument")
     | _ ->
       Error
         (Unsupported
@@ -2852,6 +2876,7 @@ let project_agg
       ~(tables : (Cat.table_meta * int * string option) list)
       ~meta
       ~add_agg
+      ~(distinct : bool)
       func
       arg_opt
   : (agg_proj_item, error) result
@@ -2866,7 +2891,7 @@ let project_agg
   with
   | Error e -> Error e
   | Ok (co, arg_expr) ->
-    let slot = add_agg { func; col_ord = co; arg_expr } in
+    let slot = add_agg { func; col_ord = co; arg_expr; distinct } in
     Ok (AP_agg_slot slot)
 ;;
 
@@ -2989,7 +3014,25 @@ let project_agg_item
             (Unsupported
                (Printf.sprintf "column '%s.%s' must appear in GROUP BY clause" t c))))
   | Ast.E_agg (func, arg_opt) ->
-    project_agg ~param_counter ~named_params ~tables ~meta ~add_agg func arg_opt
+    project_agg
+      ~param_counter
+      ~named_params
+      ~tables
+      ~meta
+      ~add_agg
+      ~distinct:false
+      func
+      arg_opt
+  | Ast.E_agg_distinct (func, arg) ->
+    project_agg
+      ~param_counter
+      ~named_params
+      ~tables
+      ~meta
+      ~add_agg
+      ~distinct:true
+      func
+      (Some arg)
   | Ast.E_window { func; args; window } ->
     project_window
       ~tables
@@ -4401,6 +4444,20 @@ let rec col_names_of_ast_stmt = function
                | _ -> Printf.sprintf "col_%d" (i + 1)))
          items)
   | Ast.S_compound { left; _ } -> col_names_of_ast_stmt left
+  (* #491: mirror [col_names_of_bound_stmt]'s [BS_with_cte] arm, which this
+     function is the AST-side twin of. Without it a WITH-bodied statement
+     produced NO ast names at all, so [output_column_names] fell back entirely
+     to the bound names — and for an AGGREGATED select those are the positional
+     [col_1], [col_2]. Every alias, hand-written or put there by a CREATE VIEW
+     column list, was dropped on the floor.
+
+     No path reaches this arm today: the two callers pass a CTE's [def] or a
+     view's stored body, and both are [compound_select] in the grammar, which
+     does not include [with_cte]. It is here because it is what the twin
+     already does, and because it is the prerequisite for ever letting a view
+     body be a WITH — see the note at the bottom of [Ast.rename_view_columns],
+     which explains why that function deliberately has no matching arm. *)
+  | Ast.S_with_cte { query; _ } -> col_names_of_ast_stmt query
   | Ast.S_const_select { exprs } ->
     List.mapi
       (fun i (expr, alias_opt) ->

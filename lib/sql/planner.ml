@@ -1663,6 +1663,7 @@ let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
   ; (* #488: the argument expression addresses the INPUT row, exactly like any
        other bound expression over a scanned row, so it needs no remapping. *)
     arg_expr = Option.map plan_expr a.arg_expr
+  ; distinct = a.distinct
   }
 ;;
 

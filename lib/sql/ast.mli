@@ -226,6 +226,12 @@ type expr =
   | E_in of expr * expr list (** subject IN (val1, val2, ...) *)
   | E_agg of agg_func * expr option
   (** Aggregate call; [None] argument means [COUNT( * )]. *)
+  | E_agg_distinct of agg_func * expr
+  (** #491: aggregate call whose argument list carries [DISTINCT] —
+      [COUNT(DISTINCT x)], [SUM(DISTINCT x)], … The argument is mandatory:
+      there is no [COUNT(DISTINCT * )].  This is a separate constructor rather
+      than a flag on [E_agg] so that every existing exhaustive match over the
+      plain form keeps compiling only once it has been considered here. *)
   | E_func of scalar_func * expr list (** Scalar function call. *)
   | E_param of param (** parameter: ?, ?1, :name, @name, $name *)
   | E_match of string * string
@@ -572,3 +578,11 @@ val quote_ident : string -> string
     surface (aggregates, MATCH, subqueries, EXISTS, window calls, and BLOB
     literals). *)
 val expr_to_sql : expr -> string
+
+(** #491: [rename_view_columns names body] desugars a [CREATE VIEW v (names)
+    AS body] column list into [body]'s own output aliases — the transformation
+    the column list denotes. Returns [Error msg] when [body] has no explicit
+    select list ([SELECT *]) or when its arity does not match [names]. Applied
+    by the parser, because a view is stored as SQL text and re-parsed on open,
+    so a later rewrite would not survive a reopen. *)
+val rename_view_columns : string list -> stmt -> (stmt, string) result

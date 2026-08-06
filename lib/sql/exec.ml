@@ -8889,6 +8889,10 @@ let rec ast_expr_uses_param : Ast.expr -> bool = function
     ast_expr_uses_param x || ast_expr_uses_param lo || ast_expr_uses_param hi
   | Ast.E_in (x, vs) -> ast_expr_uses_param x || List.exists ast_expr_uses_param vs
   | Ast.E_agg (_, a) -> Option.fold ~none:false ~some:ast_expr_uses_param a
+  (* #491: a DISTINCT aggregate's argument is walked like a plain one — #493's
+     gate is about whether a placeholder could land on an injected row slot,
+     and DISTINCT changes nothing about that. *)
+  | Ast.E_agg_distinct (_, a) -> ast_expr_uses_param a
   | Ast.E_func (_, args) -> List.exists ast_expr_uses_param args
   | Ast.E_subquery s | Ast.E_exists s -> ast_stmt_uses_param s
   | Ast.E_in_select (x, s) -> ast_expr_uses_param x || ast_stmt_uses_param s
@@ -10985,6 +10989,34 @@ and agg_sum (vals : Row.value list) : Row.value =
     in
     Row.V_int s)
 
+(* #491 x #488: the DISTINCT dedup key, defined ONCE and used by both the batch
+   ([aggregate_one]) and incremental ([make_agg_acc]) paths, so the two cannot
+   drift apart the way #488's comment warns about.
+
+   The key is [row_key]'s rendering of the ARGUMENT VALUE — not of a column.
+   That is the whole composition: #491 landed dedup on a column ordinal, which
+   #488's expression arguments do not have ([col_ord] is [None] for
+   [COUNT(DISTINCT a * b)]), so a column-keyed dedup had no correct answer for
+   the shape only both features together can express.  Keying on the value the
+   aggregate is about to consume works for both spellings and is the same key
+   SELECT DISTINCT and the hash joins already use — so #536's decisions are
+   inherited verbatim: all NaNs collapse to one, and none collapses into NULL.
+   No fifth value comparator is introduced.
+
+   Returns a stateful predicate: [true] the first time a value is seen, [false]
+   afterwards.  A NULL is "seen" like any other value, so it survives the dedup
+   as ONE entry and is then dropped by each aggregate's own NULL handling —
+   which is why [COUNT(DISTINCT x)] skips NULLs exactly as [COUNT(x)] does. *)
+and distinct_filter () : Row.value -> bool =
+  let seen = Hashtbl.create 64 in
+  fun v ->
+    let k = row_key [| v |] in
+    if Hashtbl.mem seen k
+    then false
+    else (
+      Hashtbl.replace seen k ();
+      true)
+
 (* Evaluate one aggregate [spec] over the argument values of a group. *)
 and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.value =
   match func with
@@ -11052,10 +11084,22 @@ and aggregate_one clock params (spec : Plan.agg_spec) (group_rows : Row.t list)
   match agg_arg_getter clock params spec with
   | None ->
     (match spec.Plan.func with
-     | Ast.Agg_count -> Row.V_int (Int64.of_int (List.length group_rows))
+     (* #491: a COUNT-star cannot carry DISTINCT — the grammar has no
+        [COUNT(DISTINCT * )] and [E_agg_distinct] holds a mandatory argument, so
+        this is unreachable.  It raises rather than counting rows, because the
+        one thing worse than refusing the shape is silently ignoring a modifier
+        the caller wrote. *)
+     | Ast.Agg_count when not spec.Plan.distinct ->
+       Row.V_int (Int64.of_int (List.length group_rows))
+     | Ast.Agg_count -> failwith "COUNT(DISTINCT ...) requires an argument"
      | Ast.Agg_group_concat _ -> failwith "GROUP_CONCAT requires a column argument"
      | _ -> failwith "non-COUNT aggregate must have a column argument")
-  | Some get -> aggregate_over_values spec.Plan.func (List.map get group_rows)
+  | Some get ->
+    let vals = List.map get group_rows in
+    let vals =
+      if spec.Plan.distinct then List.filter (distinct_filter ()) vals else vals
+    in
+    aggregate_over_values spec.Plan.func vals
 
 (* Partition [rows] into (group_key, group_rows) by [group_cols] (stable). *)
 and aggregate_build_groups group_cols rows : (Row.value list * Row.t list) list =
@@ -11129,95 +11173,124 @@ and aggregate_apply_windows clock params agg_windows after_having =
 and make_agg_acc clock params (spec : Plan.agg_spec)
   : ((Row.t -> unit) * (unit -> Row.value)) option
   =
-  match spec.Plan.func, agg_arg_getter clock params spec with
-  | Ast.Agg_count, None ->
+  match agg_arg_getter clock params spec with
+  | None ->
+    (* No argument at all: COUNT-star, which counts rows and cannot be
+       DISTINCT (see [aggregate_one]).  Every other aggregate without an
+       argument is refused here, which drops the query onto the general
+       [stream_aggregate] path exactly as before. *)
+    (match spec.Plan.func with
+     | Ast.Agg_count when not spec.Plan.distinct ->
+       let c = ref 0 in
+       Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
+     | _ -> None)
+  | Some get ->
+    let update_v, finalize = make_agg_acc_over_values spec.Plan.func in
+    (* #491: DISTINCT keeps the #247 fast path rather than falling back to the
+       general path — a no-GROUP-BY distinct count is exactly TPC-C
+       StockLevel's shape.  The filter wraps the GETTER's result, not the row,
+       so the argument is evaluated ONCE per row: wrapping [update] instead
+       would re-evaluate an [arg_expr] per row, and a clock-dependent argument
+       could then differ between the dedup key and the accumulated value. *)
+    let update =
+      if spec.Plan.distinct
+      then (
+        let keep = distinct_filter () in
+        fun (row : Row.t) ->
+          let v = get row in
+          if keep v then update_v v)
+      else fun (row : Row.t) -> update_v (get row)
+    in
+    Some (update, finalize)
+
+(* The per-type accumulator, over ARGUMENT VALUES rather than rows.  #488 made
+   every consumer read its argument through [agg_arg_getter]; hoisting the
+   getter out to the caller leaves this function a pure function of [func] and
+   a value — structurally the same shape as [aggregate_over_values], which is
+   what makes "these two MUST stay byte-identical" checkable by reading them
+   side by side instead of by trusting a comment.  It is also what lets #491's
+   DISTINCT filter sit between the getter and the accumulator. *)
+and make_agg_acc_over_values (func : Ast.agg_func)
+  : (Row.value -> unit) * (unit -> Row.value)
+  =
+  match func with
+  | Ast.Agg_count ->
     let c = ref 0 in
-    Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
-  | Ast.Agg_count, Some get ->
-    let c = ref 0 in
-    Some
-      ( (fun row ->
-          match get row with
-          | Row.V_null -> ()
-          | _ -> incr c)
-      , fun () -> Row.V_int (Int64.of_int !c) )
-  | Ast.Agg_sum, Some get ->
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | _ -> incr c)
+    , fun () -> Row.V_int (Int64.of_int !c) )
+  | Ast.Agg_sum ->
     (* INT vs REAL preserved exactly like [agg_sum]: REAL iff any real seen;
        NULL iff no non-null seen. *)
     let si = ref 0L
     and sf = ref 0.0
     and any_real = ref false
     and any_nn = ref false in
-    Some
-      ( (fun row ->
-          match get row with
-          | Row.V_null -> ()
-          | Row.V_int n ->
-            any_nn := true;
-            si := Int64.add !si n;
-            sf := !sf +. Int64.to_float n
-          | Row.V_real f ->
-            any_nn := true;
-            any_real := true;
-            sf := !sf +. f
-          | _ -> failwith "SUM on non-numeric value")
-      , fun () ->
-          if not !any_nn
-          then Row.V_null
-          else if !any_real
-          then Row.V_real !sf
-          else Row.V_int !si )
-  | Ast.Agg_avg, Some get ->
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | Row.V_int n ->
+          any_nn := true;
+          si := Int64.add !si n;
+          sf := !sf +. Int64.to_float n
+        | Row.V_real f ->
+          any_nn := true;
+          any_real := true;
+          sf := !sf +. f
+        | _ -> failwith "SUM on non-numeric value")
+    , fun () ->
+        if not !any_nn
+        then Row.V_null
+        else if !any_real
+        then Row.V_real !sf
+        else Row.V_int !si )
+  | Ast.Agg_avg ->
     let sf = ref 0.0
     and n = ref 0 in
-    Some
-      ( (fun row ->
-          match get row with
-          | Row.V_null -> ()
-          | Row.V_int x ->
-            sf := !sf +. Int64.to_float x;
-            incr n
-          | Row.V_real f ->
-            sf := !sf +. f;
-            incr n
-          | _ -> failwith "AVG on non-numeric value")
-      , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
-  | Ast.Agg_min, Some get ->
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | Row.V_int x ->
+          sf := !sf +. Int64.to_float x;
+          incr n
+        | Row.V_real f ->
+          sf := !sf +. f;
+          incr n
+        | _ -> failwith "AVG on non-numeric value")
+    , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
+  | Ast.Agg_min ->
     let best = ref Row.V_null in
-    Some
-      ( (fun row ->
-          match get row, !best with
-          | Row.V_null, _ -> ()
-          | v, Row.V_null -> best := v
-          | v, cur -> if compare_values v cur < 0 then best := v)
-      , fun () -> !best )
-  | Ast.Agg_max, Some get ->
+    ( (fun v ->
+        match v, !best with
+        | Row.V_null, _ -> ()
+        | v, Row.V_null -> best := v
+        | v, cur -> if compare_values v cur < 0 then best := v)
+    , fun () -> !best )
+  | Ast.Agg_max ->
     let best = ref Row.V_null in
-    Some
-      ( (fun row ->
-          match get row, !best with
-          | Row.V_null, _ -> ()
-          | v, Row.V_null -> best := v
-          | v, cur -> if compare_values v cur > 0 then best := v)
-      , fun () -> !best )
-  | Ast.Agg_group_concat sep, Some get ->
+    ( (fun v ->
+        match v, !best with
+        | Row.V_null, _ -> ()
+        | v, Row.V_null -> best := v
+        | v, cur -> if compare_values v cur > 0 then best := v)
+    , fun () -> !best )
+  | Ast.Agg_group_concat sep ->
     let separator = Option.value sep ~default:"," in
     let parts = ref [] in
     (* newest-first; reversed at finalize to preserve scan order *)
-    Some
-      ( (fun row ->
-          match get row with
-          | Row.V_null -> ()
-          | Row.V_int n -> parts := Int64.to_string n :: !parts
-          | Row.V_real f -> parts := Printf.sprintf "%.17g" f :: !parts
-          | Row.V_text s -> parts := s :: !parts
-          | Row.V_blob _ -> parts := "" :: !parts)
-      , fun () ->
-          match !parts with
-          | [] -> Row.V_null
-          | l -> Row.V_text (String.concat separator (List.rev l)) )
-  | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max | Ast.Agg_group_concat _), None
-    -> None
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | Row.V_int n -> parts := Int64.to_string n :: !parts
+        | Row.V_real f -> parts := Printf.sprintf "%.17g" f :: !parts
+        | Row.V_text s -> parts := s :: !parts
+        | Row.V_blob _ -> parts := "" :: !parts)
+    , fun () ->
+        (match !parts with
+         | [] -> Row.V_null
+         | l -> Row.V_text (String.concat separator (List.rev l))) )
 
 (* #247: cursor-level fast path for a no-GROUP-BY aggregate directly over a
    (optionally filtered) sequential scan.  Folds the accumulators over the scan
@@ -11312,6 +11385,18 @@ and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs
     let any_arg_expr =
       List.exists (fun (s : Plan.agg_spec) -> s.Plan.arg_expr <> None) aggs
     in
+    (* #491 x #488: DISTINCT deliberately adds NO term to either shortcut below,
+       and that is a proof rather than an omission.  DISTINCT is a modifier on
+       an argument that must EXIST — the grammar has no [COUNT(DISTINCT * )] and
+       [Ast.E_agg_distinct] carries a mandatory expression — so every DISTINCT
+       spec has either [col_ord = Some i] (which already lifts [max_col] to
+       [>= i], forcing the decode AND keeping [i] inside the pruned prefix) or
+       [arg_expr = Some _] (which [any_arg_expr] already catches).  The dedup
+       reads exactly the argument value and nothing else, so it can never widen
+       the set of columns that must be decoded beyond what the argument itself
+       already forces.  If DISTINCT ever becomes legal without an argument,
+       this reasoning dies with it — which is why [make_agg_acc] refuses that
+       shape rather than letting it reach here. *)
     let need_decode = pred_opt <> None || max_col >= 0 || any_arg_expr in
     (* #247: when no filter reads other columns and there are no virtual columns
        to recompute, decode only the [0, max_col] prefix — skipping trailing

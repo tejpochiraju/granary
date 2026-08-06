@@ -3230,7 +3230,13 @@ let query_aggregate_count_star () =
        Plan.Op_aggregate
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
-         ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = None; arg_expr = None } ]
+         ; aggs =
+             [ { Plan.func = Ast.Agg_count
+               ; col_ord = None
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ]
          ; having = None
          ; proj = [ Plan.PI_agg_slot 0 ]
          ; windows = []
@@ -3271,7 +3277,13 @@ let query_aggregate_sum_int () =
        Plan.Op_aggregate
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
-         ; aggs = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0; arg_expr = None } ]
+         ; aggs =
+             [ { Plan.func = Ast.Agg_sum
+               ; col_ord = Some 0
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ]
          ; having = None
          ; proj = [ Plan.PI_agg_slot 0 ]
          ; windows = []
@@ -3323,7 +3335,13 @@ let query_aggregate_sum_real () =
        Plan.Op_aggregate
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
-         ; aggs = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0; arg_expr = None } ]
+         ; aggs =
+             [ { Plan.func = Ast.Agg_sum
+               ; col_ord = Some 0
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ]
          ; having = None
          ; proj = [ Plan.PI_agg_slot 0 ]
          ; windows = []
@@ -3363,7 +3381,13 @@ let query_aggregate_avg () =
        Plan.Op_aggregate
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
-         ; aggs = [ { Plan.func = Ast.Agg_avg; col_ord = Some 0; arg_expr = None } ]
+         ; aggs =
+             [ { Plan.func = Ast.Agg_avg
+               ; col_ord = Some 0
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ]
          ; having = None
          ; proj = [ Plan.PI_agg_slot 0 ]
          ; windows = []
@@ -3405,8 +3429,16 @@ let query_aggregate_min_max () =
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
          ; aggs =
-             [ { Plan.func = Ast.Agg_min; col_ord = Some 0; arg_expr = None }
-             ; { Plan.func = Ast.Agg_max; col_ord = Some 0; arg_expr = None }
+             [ { Plan.func = Ast.Agg_min
+               ; col_ord = Some 0
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ; { Plan.func = Ast.Agg_max
+               ; col_ord = Some 0
+               ; arg_expr = None
+               ; distinct = false
+               }
              ]
          ; having = None
          ; proj = [ Plan.PI_agg_slot 0; Plan.PI_agg_slot 1 ]
@@ -3454,7 +3486,13 @@ let query_aggregate_count_col_skips_null () =
        Plan.Op_aggregate
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = []
-         ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = Some 0; arg_expr = None } ]
+         ; aggs =
+             [ { Plan.func = Ast.Agg_count
+               ; col_ord = Some 0
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ]
          ; having = None
          ; proj = [ Plan.PI_agg_slot 0 ]
          ; windows = []
@@ -3495,7 +3533,13 @@ let query_aggregate_with_group_by () =
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = [ 0 ]
          ; (* GROUP BY id *)
-           aggs = [ { Plan.func = Ast.Agg_count; col_ord = None; arg_expr = None } ]
+           aggs =
+             [ { Plan.func = Ast.Agg_count
+               ; col_ord = None
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ]
          ; having = None
          ; proj = [ Plan.PI_group_col 0; Plan.PI_agg_slot 0 ]
          ; windows = []
@@ -3534,7 +3578,13 @@ let query_aggregate_with_having () =
        Plan.Op_aggregate
          { child = Plan.Op_seq_scan { table_meta = m; alias = None }
          ; group_cols = [ 0 ]
-         ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = None; arg_expr = None } ]
+         ; aggs =
+             [ { Plan.func = Ast.Agg_count
+               ; col_ord = None
+               ; arg_expr = None
+               ; distinct = false
+               }
+             ]
          ; having = Some (Plan.P_binop (Plan.Gt, Plan.P_col 1, Plan.P_lit (Ast.L_int 1L)))
          ; proj = [ Plan.PI_group_col 0; Plan.PI_agg_slot 0 ]
          ; windows = []
@@ -3577,7 +3627,12 @@ let query_aggregate_raises_in_execute () =
                 { child = Plan.Op_seq_scan { table_meta = m; alias = None }
                 ; group_cols = []
                 ; aggs =
-                    [ { Plan.func = Ast.Agg_count; col_ord = None; arg_expr = None } ]
+                    [ { Plan.func = Ast.Agg_count
+                      ; col_ord = None
+                      ; arg_expr = None
+                      ; distinct = false
+                      }
+                    ]
                 ; having = None
                 ; proj = [ Plan.PI_agg_slot 0 ]
                 ; windows = []

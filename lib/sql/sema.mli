@@ -86,6 +86,10 @@ type agg_spec =
         row, evaluated per row before accumulating ([SUM(a * (1 - b))]).
         [None] for the bare-column and COUNT-star forms; when it is [Some _],
         [col_ord] is [None]. *)
+  ; distinct : bool
+    (** #491: the argument list carried [DISTINCT], so the aggregate consumes
+        each distinct argument value once.  Independent of which of the two
+        fields above carries the argument. Always [false] for a COUNT-star. *)
   }
 
 (** Projection item in an aggregated SELECT.  The output row of

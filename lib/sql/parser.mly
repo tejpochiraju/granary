@@ -26,6 +26,26 @@
       (right', s.order, s.limit, s.offset)
     | _ -> (right, [], None, None)
 
+  (* #491: DISTINCT inside an aggregate's argument list.  For the aggregates
+     that take exactly one value — COUNT, SUM, AVG, MIN, MAX — the arguments
+     are parsed as a LIST so that [COUNT(DISTINCT a, b)] gets a real message
+     instead of a bare "syntax error".  GROUP_CONCAT and STRING_AGG do NOT come
+     through here: their optional separator is not a second aggregated value,
+     so they mirror their own non-distinct arities instead.  A DISTINCT
+     aggregate is also refused as a window function, where the argument would
+     have to be deduplicated per frame rather than per group. *)
+  let agg_distinct_arg fname args ow =
+    match ow with
+    | Some _ ->
+      failwith
+        (Printf.sprintf "%s(DISTINCT ...) is not supported as a window function" fname)
+    | None ->
+      (match args with
+       | [ e ] -> e
+       | _ ->
+         failwith
+           (Printf.sprintf "%s(DISTINCT ...) takes exactly one argument" fname))
+
   (* Fold a leading unary minus onto an integer magnitude that overflowed a
      positive int64 (carried verbatim as INT_LIT_OVERFLOW).  Only 2^63, the
      magnitude of [Int64.min_int], is representable once negated; any larger
@@ -441,6 +461,16 @@ drop_index:
 create_view:
   | CREATE VIEW name = any_ident AS query = compound_select
     { Ast.S_create_view { name; query } }
+  (* #491: CREATE VIEW v (c1, c2) AS SELECT ... — the explicit column list is
+     desugared here into the body's own output aliases.  It must happen at
+     parse time: a view is persisted as its SQL text and re-parsed on open, so
+     a rewrite applied above the parser would not survive a reopen. *)
+  | CREATE VIEW name = any_ident
+    LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
+    AS query = compound_select
+    { match Ast.rename_view_columns cols query with
+      | Ok q -> Ast.S_create_view { name; query = q }
+      | Error msg -> failwith msg }
 
 create_reactive_view:
   | CREATE REACTIVE VIEW name = any_ident AS query = compound_select refresh = refresh_clause
@@ -1057,6 +1087,12 @@ limit_clause:
   | LIMIT n = INT_LIT                       { (Some (Int64.to_int n), None) }
   | LIMIT n = INT_LIT OFFSET m = INT_LIT   { (Some (Int64.to_int n), Some (Int64.to_int m)) }
 
+(* #491: the argument list of a DISTINCT aggregate.  Parsed as a list purely so
+   that a multi-argument spelling reaches [agg_distinct_arg]'s message rather
+   than dying as a bare syntax error. *)
+%inline agg_distinct_args:
+  | args = separated_nonempty_list(COMMA, expr) { args }
+
 agg_or_window_expr:
   | COUNT LPAREN STAR RPAREN ow = option(preceded(OVER, window_spec))
     { match ow with
@@ -1066,28 +1102,51 @@ agg_or_window_expr:
     { match ow with
       | None   -> E_agg (Agg_count, Some e)
       | Some w -> E_window { func = WF_agg Agg_count; args = [e]; window = w } }
+  | COUNT LPAREN DISTINCT args = agg_distinct_args RPAREN ow = option(preceded(OVER, window_spec))
+    { E_agg_distinct (Agg_count, agg_distinct_arg "COUNT" args ow) }
   | SUM LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
     { match ow with
       | None   -> E_agg (Agg_sum, Some e)
       | Some w -> E_window { func = WF_agg Agg_sum; args = [e]; window = w } }
+  | SUM LPAREN DISTINCT args = agg_distinct_args RPAREN ow = option(preceded(OVER, window_spec))
+    { E_agg_distinct (Agg_sum, agg_distinct_arg "SUM" args ow) }
   | AVG LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
     { match ow with
       | None   -> E_agg (Agg_avg, Some e)
       | Some w -> E_window { func = WF_agg Agg_avg; args = [e]; window = w } }
+  | AVG LPAREN DISTINCT args = agg_distinct_args RPAREN ow = option(preceded(OVER, window_spec))
+    { E_agg_distinct (Agg_avg, agg_distinct_arg "AVG" args ow) }
   | MIN LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
     { match ow with
       | None   -> E_agg (Agg_min, Some e)
       | Some w -> E_window { func = WF_agg Agg_min; args = [e]; window = w } }
+  | MIN LPAREN DISTINCT args = agg_distinct_args RPAREN ow = option(preceded(OVER, window_spec))
+    { E_agg_distinct (Agg_min, agg_distinct_arg "MIN" args ow) }
   | MAX LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
     { match ow with
       | None   -> E_agg (Agg_max, Some e)
       | Some w -> E_window { func = WF_agg Agg_max; args = [e]; window = w } }
+  | MAX LPAREN DISTINCT args = agg_distinct_args RPAREN ow = option(preceded(OVER, window_spec))
+    { E_agg_distinct (Agg_max, agg_distinct_arg "MAX" args ow) }
   | GROUP_CONCAT LPAREN e = expr RPAREN
     { E_agg (Agg_group_concat None, Some e) }
   | GROUP_CONCAT LPAREN e = expr COMMA sep = STRING_LIT RPAREN
     { E_agg (Agg_group_concat (Some sep), Some e) }
+  (* The two concatenating aggregates take their DISTINCT productions by
+     MIRRORING their own non-distinct arities rather than through
+     [agg_distinct_args], for two reasons.  A separator argument is not a
+     second aggregated value, so the "exactly one argument" rule does not
+     apply to it — SQLite 3.44+ accepts GROUP_CONCAT(DISTINCT x, sep) and so
+     does this.  And mirroring keeps the arities symmetric: STRING_AGG has no
+     one-argument form, so it must not acquire one under DISTINCT. *)
+  | GROUP_CONCAT LPAREN DISTINCT e = expr RPAREN
+    { E_agg_distinct (Agg_group_concat None, e) }
+  | GROUP_CONCAT LPAREN DISTINCT e = expr COMMA sep = STRING_LIT RPAREN
+    { E_agg_distinct (Agg_group_concat (Some sep), e) }
   | STRING_AGG LPAREN e = expr COMMA sep = STRING_LIT RPAREN
     { E_agg (Agg_group_concat (Some sep), Some e) }
+  | STRING_AGG LPAREN DISTINCT e = expr COMMA sep = STRING_LIT RPAREN
+    { E_agg_distinct (Agg_group_concat (Some sep), e) }
 
 window_spec:
   | LPAREN pb = partition_clause ob = order_by_clause fs = option(frame_spec) RPAREN

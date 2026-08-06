@@ -449,6 +449,12 @@ and agg_spec =
           fast path can keep pruning the decode to the columns it needs.
           When this is [Some _], [col_ord] is [None] and every consumer must
           read the argument through it — see [Exec.agg_arg_getter]. *)
+  ; distinct : bool
+    (** #491: the argument list carried [DISTINCT]; the aggregate consumes each
+            distinct argument value once.  Orthogonal to how the argument is
+            READ: it applies equally to the [col_ord] and [arg_expr] forms,
+            because the dedup key is the argument VALUE, not a column.  Always
+            [false] for a COUNT-star, which has no argument to deduplicate. *)
   }
 
 [@@@ai_disclosure "ai-generated"]
