@@ -3560,9 +3560,104 @@ let unique_constraint_failed_msg ~(table : string) ~(columns : string list) : st
     (String.concat ", " (List.map (fun c -> table ^ "." ^ c) columns))
 ;;
 
-(* UNIQUE pre-check for INSERT: fold over [idxs] returning (skip, rowids to
-   delete for REPLACE, optional rowid to update for UPSERT). Raises on a plain
-   UNIQUE violation. *)
+(* Probe ONE unique index for a conflict with [row_for_idx], returning the
+   conflicting row's rowid.  [None] means "no conflict", which includes the two
+   cases that exempt the row from the probe entirely: a partial index whose
+   WHERE the row does not match, and #290's NULL exemption (SQLite treats every
+   NULL as distinct in a UNIQUE index — such a row is still written to the index
+   tree, it just never conflicts).  Callers must have checked [idx_unique]. *)
+let probe_unique_conflict
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row_for_idx : Row.t)
+      (idx : Cat.index_info)
+  : int64 option Lwt.t
+  =
+  if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
+  then Lwt.return_none
+  else (
+    let key_vals = get_index_key_values clock params idx table_meta.columns row_for_idx in
+    if any_null_val key_vals
+    then Lwt.return_none
+    else (
+      let iks = List.map row_value_to_index_value key_vals in
+      let prefix, plen = encode_index_key_prefix iks in
+      let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+      (* O(log n) native probe: only the first entry >= seek_key is needed to
+         detect a duplicate prefix — never drain the whole index (#229). *)
+      let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
+      let* first = S.seek_next cur in
+      let conflict_rowid_opt =
+        match first with
+        | None -> None
+        | Some (ikey, _) ->
+          if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+          then (
+            let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
+            Some (Rowid.decode rid_bytes))
+          else None
+      in
+      S.seek_close cur;
+      Lwt.return conflict_rowid_opt))
+;;
+
+(* #639: does this index carry the constraint an ON CONFLICT clause names?
+   [idx_unique] is part of the test on purpose — a conflict target must name a
+   uniqueness constraint, so a non-unique index with the same column list is not
+   one, and falls through to the modifier like any other index. *)
+let index_is_conflict_target
+      (idx : Cat.index_info)
+      ~(upsert_update : (string list * (int * Plan.expr) list) option)
+  : bool
+  =
+  match upsert_update with
+  | None -> false
+  | Some (conflict_cols, _) ->
+    idx.Cat.idx_unique
+    && List.sort String.compare idx.Cat.idx_columns
+       = List.sort String.compare conflict_cols
+;;
+
+(* UNIQUE pre-check for INSERT: returns (skip, rowids to delete for REPLACE,
+   optional rowid to update for UPSERT). Raises on a plain UNIQUE violation.
+
+   #639: the conflict TARGET is probed first, in its own pass, and supersedes
+   everything else when it hits. That is not a micro-optimisation — it is what
+   makes the answer well-defined. The single fold this replaced let a conflict
+   on ANY index decide, so with two unique indexes and a row conflicting on
+   both, the outcome depended on the order [Cat.indexes_for_table] happened to
+   return them in (newest-first, i.e. on `CREATE UNIQUE INDEX` order): the
+   target seen first gave an upsert, the other seen first gave a skip under
+   [CA_ignore]. Same schema, same statement, two answers.
+
+   When the target hits, the accumulator is reset to [(false, [], Some rid)]:
+
+   - [skip] must be false. The upsert supersedes the insert, and a skip decided
+     against a row that is no longer being inserted is meaningless.
+   - [dels] must be EMPTY. Those rowids were queued for deletion because they
+     conflicted with the row being INSERTED — and that row is discarded in
+     favour of updating [rid], so nothing should be displaced. Dropping them
+     silently would be worse than either answer: [execute_insert]'s upsert
+     branch never calls [delete_replace_conflicts], so a non-empty [dels] there
+     is a queued delete that never happens.
+
+   What is NOT true, and was claimed here in the first revision of #639: that
+   the DO UPDATE's result is re-checked against the other unique indexes.
+   [write_row_rekeyed] does no uniqueness probe at all — its index loop is an
+   unconditional [S.del] of the old key and [S.put] of the new one, and
+   [check_index_unique_on_update] is defined AFTER it in this file and is
+   reached only from [validate_update_unique], the plain-UPDATE pre-pass.
+
+   So discarding the other indexes' verdicts here loses a check that nothing
+   downstream replaces. That is sound for the verdicts this pass drops — they
+   were computed against the row being INSERTED, which is discarded, and the
+   DO UPDATE may not touch those columns at all — but a DO UPDATE that WRITES a
+   duplicate into another unique index is accepted silently. That gap is
+   pre-existing (it is the upsert path's share of "DO UPDATE is not
+   uniqueness-checked", true on main for the secondary-index shape) and is
+   tracked as #667. Do not read this pass as covering it. *)
 let check_insert_unique
       tx
       (table_meta : Cat.table_meta)
@@ -3574,59 +3669,46 @@ let check_insert_unique
       (idxs : Cat.index_info list)
   : (bool * int64 list * int64 option) Lwt.t
   =
-  Lwt_list.fold_left_s
-    (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
-       if skip || not idx.idx_unique
-       then Lwt.return (skip, dels, upsert_rid)
-       else if
-         not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
-       then Lwt.return (skip, dels, upsert_rid)
-       else (
-         let key_vals =
-           get_index_key_values clock params idx table_meta.columns row_for_idx
-         in
-         (* #290: SQLite treats every NULL as distinct in a UNIQUE index — a row
-            whose key has ANY NULL column is exempt from the uniqueness probe (it
-            is still inserted into the index tree, it just never conflicts). *)
-         if any_null_val key_vals
-         then Lwt.return (false, dels, upsert_rid)
-         else (
-           let iks = List.map row_value_to_index_value key_vals in
-           let prefix, plen = encode_index_key_prefix iks in
-           let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-           (* O(log n) native probe: only the first entry >= seek_key is needed
-            to detect a duplicate prefix — never drain the whole index (#229). *)
-           let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
-           let* first = S.seek_next cur in
-           let conflict_rowid_opt =
-             match first with
-             | None -> None
-             | Some (ikey, _) ->
-               if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-               then (
-                 let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
-                 Some (Rowid.decode rid_bytes))
-               else None
+  let targets, others =
+    List.partition (fun idx -> index_is_conflict_target idx ~upsert_update) idxs
+  in
+  let* target_hit =
+    Lwt_list.fold_left_s
+      (fun acc idx ->
+         match acc with
+         | Some _ -> Lwt.return acc
+         | None -> probe_unique_conflict tx table_meta ~clock ~params ~row_for_idx idx)
+      None
+      targets
+  in
+  match target_hit with
+  | Some old_rowid -> Lwt.return (false, [], Some old_rowid)
+  | None ->
+    (* No target conflict (or no target at all): the modifier governs, exactly
+       as it did before #639. [upsert_rid] can only stay [None] here — every
+       index that could have set it is in [targets]. *)
+    Lwt_list.fold_left_s
+      (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
+         if skip || not idx.idx_unique
+         then Lwt.return (skip, dels, upsert_rid)
+         else
+           let* conflict =
+             probe_unique_conflict tx table_meta ~clock ~params ~row_for_idx idx
            in
-           S.seek_close cur;
-           match conflict_rowid_opt with
-           | None -> Lwt.return (false, dels, upsert_rid)
+           match conflict with
+           | None -> Lwt.return (skip, dels, upsert_rid)
            | Some old_rowid ->
-             (match on_conflict, upsert_update with
-              | Some Ast.CA_ignore, _ ->
+             (match on_conflict with
+              | Some Ast.CA_ignore ->
                 Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
-              | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
-              | _, Some (conflict_cols, _)
-                when List.sort String.compare idx.idx_columns
-                     = List.sort String.compare conflict_cols ->
-                Lwt.return (false, dels, Some old_rowid)
+              | Some Ast.CA_replace -> Lwt.return (false, old_rowid :: dels, upsert_rid)
               | _ ->
                 Lwt.fail_with
                   (unique_constraint_failed_msg
                      ~table:table_meta.Cat.name
-                     ~columns:idx.idx_columns)))))
-    (false, [], None)
-    idxs
+                     ~columns:idx.idx_columns)))
+      (false, [], None)
+      others
 ;;
 
 (* Write [row]'s index entries (honoring each index's WHERE predicate). *)
@@ -4021,7 +4103,42 @@ let execute_insert_write
          put_x returns a sentinel [Some Bytes.empty] — callers that need the
          old row bytes (CA_replace) fetch them via S.get below. *)
       let col_name = Option.value alias_col_name ~default:"rowid" in
+      (* #639: same reorder as [check_insert_unique] — an explicit ON CONFLICT
+         clause naming this alias PK beats the statement's modifier, so
+         `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` runs the DO UPDATE
+         instead of silently skipping.  A modifier still governs a conflict the
+         ON CONFLICT clause does not name (it falls through to the arms below).
+
+         BACKSTOP, not the primary path: since the review of PR #652 the
+         alias-PK target is probed in [execute_insert] BEFORE
+         [check_insert_unique], because a secondary-index conflict resolved here
+         would otherwise have already set [skip] or run
+         [delete_replace_conflicts] by the time [put_x] discovers this one.  The
+         arm is kept because it costs nothing and its absence would turn any
+         hole in that probe into a bare "UNIQUE constraint failed" rather than
+         the DO UPDATE the caller asked for. *)
       (match on_conflict, upsert_update with
+       | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
+         (* Alias PK is always a single column, so single-element equality
+            suffices — no sort needed.  Fire AFTER DELETE for any secondary
+            REPLACE displaced rows before handing off to the upsert path. *)
+         let* () =
+           match on_replace_delete with
+           | None -> Lwt.return_unit
+           | Some f -> Lwt_list.iter_s (fun r -> f ~tx ~old_row:r) displaced_rows
+         in
+         execute_upsert_update
+           tx
+           cat
+           table_meta
+           ~clock
+           ~params
+           ~owned
+           ~row
+           ~assigns
+           ~old_rowid:rowid
+           ~on_upsert_update_before
+           ~on_upsert_update
        | Some Ast.CA_ignore, _ ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.return false
@@ -4088,27 +4205,6 @@ let execute_insert_write
          in
          let* () = release_txn ~cat tx owned in
          Lwt.return true
-       | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
-         (* Alias PK is always a single column, so single-element equality
-            suffices — no sort needed.  Fire AFTER DELETE for any secondary
-            REPLACE displaced rows before handing off to the upsert path. *)
-         let* () =
-           match on_replace_delete with
-           | None -> Lwt.return_unit
-           | Some f -> Lwt_list.iter_s (fun r -> f ~tx ~old_row:r) displaced_rows
-         in
-         execute_upsert_update
-           tx
-           cat
-           table_meta
-           ~clock
-           ~params
-           ~owned
-           ~row
-           ~assigns
-           ~old_rowid:rowid
-           ~on_upsert_update_before
-           ~on_upsert_update
        | _ ->
          Lwt.fail_with
            (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name))
@@ -4135,6 +4231,74 @@ let build_insert_row
       ordinals
       values;
     r
+;;
+
+(* #631: a statement-level undo point for a row an [OR IGNORE] INSERT may skip.
+
+   A skipped row must leave nothing behind.  The row-store path is otherwise
+   scrupulous about that — the skip returns before [S.put], the index writes,
+   the FTS/AFTER-trigger hook, the IVM change feed and the #240 dirty mark —
+   but a BEFORE INSERT trigger has ALREADY run, inside the parent txn, and its
+   nested DML is real.  In autocommit that vanished with [S.rollback tx]
+   ([owned = true]); inside an explicit [BEGIN] it survived, because the undo
+   was keyed on WHO OWNS the transaction rather than on WHAT THE STATEMENT
+   DECIDED.  The same statement therefore left a trace or not depending on
+   whether the caller happened to open a transaction.
+
+   The fix is a savepoint taken around the row and rolled back when the row is
+   skipped.  Three properties matter:
+
+   - It is taken ONLY when [not owned] (autocommit already undoes everything),
+     a BEFORE INSERT trigger actually exists ([Option.is_some before_hook] —
+     [Db] returns [None] when no trigger matches table/timing/event), and the
+     statement can skip at all ([CA_ignore]).  Outside that intersection not a
+     single savepoint is pushed, so the TPC-C write path is untouched; a B-tree
+     savepoint clones the pager's dirty set and is not free.
+   - It never aborts the caller's transaction and never touches
+     [Db.explicit_txn] or the #555 poison flag — it is opened and resolved
+     within one statement, so it adds no second way out of a poisoned handle
+     and nothing in #555/#584/#598 changes shape.
+   - The name is unique per row, so nesting (a trigger body whose own INSERT
+     takes one) stays LIFO over [Store]'s savepoint stack.
+
+   On an exception the savepoint is RELEASED, not rolled back: a statement that
+   raises mid-way still leaves its partial effects in an explicit transaction
+   (see [with_ddl_txn]'s #286 note), and changing that is a different issue.
+   Releasing keeps the stack from growing without changing what is kept. *)
+let stmt_savepoint_seq = ref 0
+
+let stmt_savepoint_begin ~(cat : Cat.t) tx ~(take : bool) : string option Lwt.t =
+  if not take
+  then Lwt.return_none
+  else (
+    incr stmt_savepoint_seq;
+    let name = Printf.sprintf "__granary_stmt_%d" !stmt_savepoint_seq in
+    let* () = S.savepoint_begin tx name in
+    Cat.savepoint_begin_schema cat name;
+    Lwt.return_some name)
+;;
+
+let stmt_savepoint_release ~(cat : Cat.t) tx (sp : string option) : unit Lwt.t =
+  match sp with
+  | None -> Lwt.return_unit
+  | Some name ->
+    let* () = S.savepoint_release tx name in
+    Cat.savepoint_release_schema cat name;
+    Lwt.return_unit
+;;
+
+let stmt_savepoint_finish ~(cat : Cat.t) tx ~(wrote : bool) (sp : string option)
+  : unit Lwt.t
+  =
+  let* () =
+    match sp with
+    | Some name when not wrote ->
+      let* () = S.savepoint_rollback tx name in
+      Cat.savepoint_rollback_schema cat name;
+      Lwt.return_unit
+    | _ -> Lwt.return_unit
+  in
+  stmt_savepoint_release ~cat tx sp
 ;;
 
 (** Run [Op_insert] against the store: write the new row to the table
@@ -4177,6 +4341,18 @@ let execute_insert
      INSERT fires inside the parent txn so its nested DML shares the tx and
      its writes roll back atomically with the parent on failure. *)
   let* tx, owned = acquire_txn store mode in
+  (* #631: undo point for a row this statement may skip.  Only when the
+     transaction is the caller's ([not owned] — autocommit already undoes
+     everything through [S.rollback]), a BEFORE INSERT trigger exists whose
+     nested DML could outlive the skip, and the statement has a resolution that
+     can skip at all.  [Option.is_some], not [<> None]: the payload is a
+     closure and structural comparison would raise. *)
+  let* sp =
+    stmt_savepoint_begin
+      ~cat
+      tx
+      ~take:((not owned) && Option.is_some before_hook && on_conflict = Some Ast.CA_ignore)
+  in
   Lwt.catch
     (fun () ->
        let* () =
@@ -4202,24 +4378,99 @@ let execute_insert
        (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
          before extracting index keys so VIRTUAL cells contribute their value. *)
        let row_for_idx = with_computed_virtuals clock params table_meta row in
-       let* skip, to_delete, upsert_rowid =
-         check_insert_unique
-           tx
-           table_meta
-           ~clock
-           ~params
-           ~row_for_idx
-           ~on_conflict
-           ~upsert_update
-           idxs
+       (* #639/#599: an ON CONFLICT clause only ever intercepts a UNIQUENESS
+          conflict, never a NOT NULL one — the modifier governs the INSERT half.
+          So the row being inserted is checked for NULLs BEFORE any conflict
+          resolution is consulted, and the modifier decides what that means:
+          [OR IGNORE] skips the row, every other resolution raises.
+
+          Two entry conditions, and the second one is the review fix.
+          [CA_ignore] is there so `INSERT OR IGNORE` skips identically whichever
+          index the row collides with — the check used to live only in
+          [execute_insert_write], which an alias-PK conflict reaches and a
+          secondary-index conflict does not.  [Option.is_some upsert_update]
+          extends the same reasoning to the raising resolutions, which have the
+          same asymmetry for the same reason and which the alias pre-probe below
+          would otherwise route past [execute_insert_write] entirely: on `main`,
+          `INSERT INTO t VALUES (1, NULL_param) ON CONFLICT(k) DO UPDATE ...`
+          with row 1 present raised NOT NULL, and the pre-probe silently turned
+          that into a successful DO UPDATE.  It now raises again, and the
+          secondary-index shape — which never raised — agrees with it.
+
+          Deliberately NOT extended to plain INSERTs: with no upsert clause,
+          [execute_insert_write] still owns the check, so a statement without an
+          ON CONFLICT clause keeps `main`'s exact behaviour, including the
+          precedence between a UNIQUE error and a NOT NULL one.
+          [execute_insert_write] never double-evaluates — its [null_skip] is
+          guarded by [not skip], and for a raising resolution this call has
+          already raised. *)
+       let null_skip =
+         (on_conflict = Some Ast.CA_ignore || Option.is_some upsert_update)
+         && not_null_skip_or_fail table_meta row ~on_conflict
        in
-       (* #243 (T1): alias PK conflict detection is now folded into put_x
+       (* #243 (T1): alias PK conflict detection is normally folded into put_x
           inside execute_insert_write (#350) — no pre-read needed. *)
        let alias_col_name =
          match alias_idx with
          | Some i when alias_explicit -> Some (List.nth table_meta.columns i).Row.name
          | _ -> None
        in
+       (* #639: the rowid-alias PK is the OTHER thing an ON CONFLICT clause can
+          name, and when it names that one the target has to be resolved before
+          [check_insert_unique] gets a say — for exactly the reason spelled out
+          there. The alias PK has no index, so it is invisible to that fold: a
+          secondary conflict would set [skip] (under [OR IGNORE], losing the DO
+          UPDATE the caller asked for) or queue deletes (under [OR REPLACE],
+          displacing rows for an insert that then never happens, since
+          [delete_replace_conflicts] runs before [put_x] discovers the alias
+          conflict). Both are the same defect as the multi-index case, mirrored.
+
+          The probe costs one [S.get] and is only paid when an ON CONFLICT
+          clause actually names the alias column — never on the plain INSERT
+          path #350 optimised, which has no upsert clause at all. When it hits,
+          the result is the same shape the secondary-index target produces:
+          [(false, [], Some rowid)], with [old_rowid = rowid] by the alias-PK
+          invariant (the conflict is on this very key). *)
+       let alias_is_conflict_target =
+         match upsert_update, alias_col_name with
+         | Some (conflict_cols, _), Some name -> conflict_cols = [ name ]
+         | _ -> false
+       in
+       let* alias_target_hit =
+         if null_skip || not alias_is_conflict_target
+         then Lwt.return false
+         else
+           let* existing =
+             S.get
+               tx
+               (let x, _, _, _ = Cat.row_storage table_meta in
+                x)
+               (Rowid.encode rowid)
+           in
+           Lwt.return (Option.is_some existing)
+       in
+       let* skip, to_delete, upsert_rowid =
+         if null_skip
+         then Lwt.return (true, [], None)
+         else if alias_target_hit
+         then Lwt.return (false, [], Some rowid)
+         else
+           check_insert_unique
+             tx
+             table_meta
+             ~clock
+             ~params
+             ~row_for_idx
+             ~on_conflict
+             ~upsert_update
+             idxs
+       in
+       (* #639 (review): [skip] and [to_delete] are BOTH meaningless when
+          [upsert_rowid] is [Some _], and the branch below discards them. That is
+          sound only because every producer of a [Some] returns [(false, [], _)]
+          — [check_insert_unique]'s target pass and the alias probe above. Do not
+          reintroduce a path that sets [upsert_rowid] alongside a live [skip] or
+          a non-empty [to_delete]: the delete would be queued and never run. *)
        match upsert_update, upsert_rowid with
        | Some (_, assigns), Some old_rowid ->
          (* Secondary-index upsert conflict: update the conflicting row.
@@ -4241,6 +4492,7 @@ let execute_insert
              ~on_upsert_update
          in
          if updated then mark_dirty table_meta.Cat.name;
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:updated sp in
          Lwt.return updated
        | _ ->
          let* inserted =
@@ -4275,9 +4527,15 @@ let execute_insert
          then (
            mark_dirty table_meta.Cat.name;
            record_change table_meta.Cat.name (Inserted { rowid; row }));
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:inserted sp in
          Lwt.return inserted)
     (fun exn ->
-       (* On any exception: rollback if we own the txn, then re-raise. *)
+       (* On any exception: rollback if we own the txn, then re-raise.  #631:
+          the statement savepoint is released, not rolled back — a raising
+          statement's partial effects already survive in a borrowed
+          transaction, and this fix is about a SKIP, not about statement
+          atomicity on error.  Releasing only keeps the stack bounded. *)
+       let* () = stmt_savepoint_release ~cat tx sp in
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
 ;;

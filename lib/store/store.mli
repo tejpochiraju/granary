@@ -242,18 +242,30 @@ val commit : rw txn -> unit Lwt.t
     writer lock. Phase 3 introduces true rollback. *)
 val rollback : rw txn -> unit Lwt.t
 
-(** Push a named savepoint by snapshotting current Mem tree state.
-    No-op on the B-tree backend (deferred). *)
+(** Push a named savepoint, snapshotting the current shadow state (#178).
+    Implemented on {b both} backends: the Mem arm snapshots the shadow tree map,
+    the B-tree arm snapshots the meta root, every tree root, the freelist,
+    [n_pages], the pager's dirty set and its txn-owned pool. Names form a stack
+    and are matched newest-first, so identical names nest LIFO.
+
+    The B-tree snapshot is proportional to the dirty set, so this is not free —
+    see #631's use of it as a statement-level undo point, which is gated to a
+    narrow case for that reason. *)
 val savepoint_begin : rw txn -> string -> unit Lwt.t
 
 (** Release the named savepoint and all newer ones.
     Writes accumulated since the savepoint remain in the outer transaction.
-    No-op on the B-tree backend. *)
+    Unknown name: no-op. *)
 val savepoint_release : rw txn -> string -> unit Lwt.t
 
 (** Restore to the named savepoint, dropping all newer savepoints.
     The named savepoint is kept so ROLLBACK TO can be repeated.
-    No-op on the B-tree backend. *)
+    Unknown name: no-op.
+
+    This restores {b store} state only. Callers that also hold catalog state
+    derived from those trees — cached rowid counters, columnar stores, the
+    schema-undo log — must pair it with {!Granary_catalog.Catalog.savepoint_rollback_schema}
+    (#280/#303), as the db layer's [ROLLBACK TO] handler does. *)
 val savepoint_rollback : rw txn -> string -> unit Lwt.t
 
 (** End a read-only transaction. *)

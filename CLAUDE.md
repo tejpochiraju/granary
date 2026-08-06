@@ -385,8 +385,12 @@ EOF
 
   **The skip is decided in exactly one place, and it is the runtime one.**
   `Exec.not_null_skip_or_fail` is called from the INSERT sites only —
-  `execute_insert_write` and the two columnstore `Op_insert` /
-  `Op_insert_select` arms. `Exec.enforce_not_null` is unchanged and still
+  `execute_insert`, `execute_insert_write` and the two columnstore `Op_insert`
+  / `Op_insert_select` arms. (`execute_insert`'s call is #639's: it is guarded
+  by `CA_ignore` and runs *before* conflict resolution, so the skip no longer
+  depends on which index the row collides with;
+  `execute_insert_write`'s is guarded by `not skip` and so never
+  double-evaluates it.) `Exec.enforce_not_null` is unchanged and still
   raises unconditionally. Since #620 it has exactly ONE call site left —
   `write_row_rekeyed` — but three write paths funnel through it: plain
   `UPDATE`, `UPSERT ... DO UPDATE`, and `ON UPDATE CASCADE`. None of the three
@@ -513,6 +517,155 @@ EOF
   **not** follow — it reports on cells already on disk whose only repair is to
   rewrite them, which is meaningless for a column never read from disk. Pinned by
   `test/test_not_null_629.ml`.
+- **An explicit `ON CONFLICT` target beats the statement's conflict-resolution
+  modifier, for the index it names (#639, decided 2026-08-06).** The modifier
+  still governs every *other* index. Before this, `CA_ignore` matched above the
+  upsert arm in both places that resolve a conflict — `check_insert_unique` for
+  a secondary UNIQUE index and `execute_insert_write`'s `put_x` arm for the
+  rowid-alias PK — so `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` silently
+  skipped for *any* conflict: a caller who wrote both got "insert, or do
+  nothing".
+
+  **The target is resolved in its own pass, before the modifier sees anything,
+  and that is what makes the answer well-defined rather than a micro-
+  optimisation.** `check_insert_unique` used to fold over every unique index in
+  one pass and let whichever conflicted first decide. With two unique indexes
+  and a row conflicting on both, the outcome then depended on the order
+  `Cat.indexes_for_table` returned them in — newest-first, i.e. on `CREATE
+  UNIQUE INDEX` order: target first gave an upsert, the other first gave a skip
+  under `OR IGNORE`. Same schema, same statement, two answers. When the target
+  hits, the accumulator is reset to `(false, [], Some rid)`: `skip` is
+  meaningless because the insert it was decided against is discarded, and
+  `dels` **must** be empty because `execute_insert`'s upsert branch never calls
+  `delete_replace_conflicts` — a non-empty `dels` there is a queued delete that
+  never happens.
+
+  **What this pass does NOT do — and an earlier revision of this bullet claimed
+  it did — is hand the check downstream.** `write_row_rekeyed` performs *no*
+  uniqueness probe: its index loop is an unconditional `S.del` of the old key
+  and `S.put` of the new one. `check_index_unique_on_update` is defined after it
+  in `exec.ml` and is reached only from `validate_update_unique`, the
+  plain-`UPDATE` pre-pass. Discarding the other indexes' verdicts is still
+  sound — they were computed against the row being INSERTED, which is discarded,
+  and a `SET v = 42` does not touch the column they were about — but **a DO
+  UPDATE that writes a duplicate into another unique index is accepted
+  silently**. That is pre-existing (true on `main` for the secondary-index
+  shape) and is tracked as **#667**. Do not read the target pass as covering it.
+
+  One consequence of the target pass is a change for the *raising* modifiers:
+  bare / `OR ABORT` / `OR FAIL` / `OR ROLLBACK` used to report
+  `UNIQUE constraint failed` for a second index the discarded insert row
+  collided with, and now run the DO UPDATE. That was a false positive — the
+  conflicting row is never written — and it is pinned by
+  `raising_modifiers_no_longer_report_the_discarded_rows_conflict`.
+
+  The **rowid-alias PK** is the other thing an ON CONFLICT clause can name, and
+  it has no index, so it is invisible to that fold. When the clause names it,
+  `execute_insert` probes the row key with one `S.get` *before*
+  `check_insert_unique` — otherwise a secondary conflict would set `skip`
+  (losing the DO UPDATE) or run `delete_replace_conflicts` (displacing rows for
+  an insert that then never happens, because `put_x` discovers the alias
+  conflict afterwards). The probe is only paid when an upsert clause names the
+  alias column, so #350's plain-INSERT path is untouched. The arm in
+  `execute_insert_write` is kept as a backstop, not the primary path.
+
+  **Two things ride on that pre-probe, both decided rather than incidental**,
+  because routing a conflicting row to the upsert branch skips
+  `execute_insert_write` entirely and that function did more than one job:
+
+  - **The insert row's NOT NULL check moved up, for upserts only.** It is now in
+    `execute_insert`, entered when the statement is `OR IGNORE` *or* carries an
+    upsert clause. Without that, `INSERT INTO t VALUES (1, ?) ON CONFLICT(k) DO
+    UPDATE …` bound to NULL raised on `main` and silently became a successful DO
+    UPDATE. The rule stands: an `ON CONFLICT` clause never intercepts a NOT NULL
+    violation. The *secondary-index* shape is the one that changed to agree — it
+    never raised here — and a statement with **no** upsert clause is untouched,
+    including the precedence between a UNIQUE error and a NOT NULL one.
+  - **`last_insert_rowid()` is no longer set by a DO UPDATE.** No row was
+    inserted, so it should not move. Before #639 the alias-PK shape set it (it
+    returned through the INSERT branch) and the secondary-index shape never did —
+    the same "answer depends on which constraint you hit" split #639 is about.
+    `test_upsert_on_pk_last_rowid` in `test/test_rowid_alias.ml` asserted the old
+    answer **vacuously** (it seeded rowid 5 and upserted rowid 5, so the seed's
+    own value satisfied it); it now seeds 7, upserts 5, and pins the new one. The
+    comment it carried claimed SQLite parity for the opposite answer and was
+    never oracle-checked; the reasoning runs the other way (SQLite sets the value
+    at `OP_Insert` under `OPFLAG_LASTROWID`, and a DO UPDATE is generated as an
+    UPDATE). If the oracle disagrees, set it in **both** shapes — do not restore
+    the split.
+
+  **An unremarked improvement, recorded so nobody finds it by bisect:** the
+  pre-probe also removes a bogus #417 delta. The old alias-PK upsert path emitted
+  *both* an `Updated` and a phantom `Inserted { rowid; row }` — with `row` being
+  the *attempted insert* row, not the stored one — so any reactive view over the
+  table saw a row that was never written. The upsert branch emits only `Updated`.
+
+  **A conflict target that names no PRIMARY KEY or UNIQUE constraint is silently
+  ignored, where SQLite rejects the statement** ("ON CONFLICT clause does not
+  match any PRIMARY KEY or UNIQUE constraint"). Granary treats it as a plain
+  INSERT and drops the `DO UPDATE`. Pre-existing, pinned by
+  `a_non_unique_index_is_not_a_conflict_target`, and tracked as **#668** — it is
+  #639's failure mode reached through a schema mistake instead of a modifier.
+  `Exec.index_is_conflict_target` does require `idx_unique`, so a non-unique
+  index can never be *promoted* into a target; what is missing is the rejection.
+
+  **`OR REPLACE` defers to the target too, and that is a decision, not a side
+  effect of the arm order (#639, decided 2026-08-06).** `INSERT OR REPLACE ...
+  ON CONFLICT(k) DO UPDATE` now updates the conflicting row in place instead of
+  deleting it and inserting the new one. The alternative — `CA_replace` keeping
+  precedence over the named target — reproduces #639 exactly, for `REPLACE`
+  instead of `IGNORE`: the caller writes an explicit `DO UPDATE` and the engine
+  silently does something else with it. One rule for all six modifiers is the
+  only reading under which writing both clauses means anything. This is
+  **believed** to match SQLite but was **not oracle-checked**; if the oracle
+  disagrees, the divergence is deliberate under "inspired by, not a port" and
+  whoever changes it is re-deciding, not fixing an oversight.
+
+  **NOT NULL is not a uniqueness conflict, so an `ON CONFLICT` clause never
+  intercepts it** — the modifier does, per #599 above. The two directions
+  differ and both are pinned in `test/test_or_ignore_upsert_639.ml`: a NULL in
+  the row being *inserted* skips under `OR IGNORE`, while a NULL *assigned by
+  the DO UPDATE* raises, because that write funnels through
+  `write_row_rekeyed` → `enforce_not_null`. `Sema.bind_upsert_assignments`'s
+  static literal-NULL check is therefore **not** suspended under `CA_ignore`
+  (unlike `bind_insert_row`'s): the runtime answer below it is "raise", so the
+  two levels agree rather than disagreeing. #639 noted that binder check was
+  load-bearing while the runtime path was unreachable; the path is reachable
+  now, and the check stays as the earlier, better-located error.
+
+  `INSERT ... SELECT ... ON CONFLICT DO UPDATE` has no grammar at all
+  (`S_insert_select` carries no `upsert_update`) and must stay a **parse
+  error** rather than a silently-dropped clause — that would be #639 again in
+  a new place.
+
+- **A skipped `INSERT` leaves nothing behind in the STORE and the CATALOG,
+  including its BEFORE INSERT trigger's nested DML, in an explicit transaction
+  as well as in autocommit (#631, fixed 2026-08-06).** Read the scope literally:
+  the two things it does *not* revert are the #240 dirty-table set and the #417
+  row-level change feed. A spurious dirty mark is over-invalidation of an
+  external cache and is safe; a stale `record_change` delta is a phantom row for
+  a reactive view whose base table the trigger wrote to. **Neither is a
+  regression** — autocommit's `S.rollback` never cleared them either — but the
+  invariant above is about `Store` and `Schema_cache` state only. Tracked as
+  #666. The undo used to be `if owned then S.rollback`,
+  keyed on *who owns the transaction* rather than on *what the statement
+  decided*, so the same statement left a trace or not depending on whether the
+  caller had opened a `BEGIN`. It is now a statement-level savepoint
+  (`Store.savepoint_begin` plus #280's schema-undo marker, which also restores
+  #303's rowid counters), rolled back when the statement wrote nothing — so it
+  covers the long-standing UNIQUE skip and #599's NOT NULL skip alike.
+
+  It is taken **only** when the transaction is borrowed, a BEFORE INSERT
+  trigger exists on the table, and the resolution is `CA_ignore`; outside that
+  intersection no savepoint is pushed, which is what keeps it off the TPC-C
+  write path (a B-tree savepoint clones the pager dirty set, and
+  `Schema_cache.savepoint_begin` also encodes every columnar store). It is
+  opened and resolved within one statement and never touches `explicit_txn` or
+  the #555 poison flag, so it is **not** a second exit from a poisoned handle
+  and "ROLLBACK is the sole exit" stays true. On an *exception* the savepoint
+  is released, not rolled back: a raising statement's partial effects already
+  survive in a borrowed transaction, and statement atomicity on error is a
+  different problem.
 
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
