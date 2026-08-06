@@ -332,8 +332,12 @@ EOF
 
   **The skip is decided in exactly one place, and it is the runtime one.**
   `Exec.not_null_skip_or_fail` is called from the INSERT sites only —
-  `execute_insert_write` and the two columnstore `Op_insert` /
-  `Op_insert_select` arms. `Exec.enforce_not_null` is unchanged and still
+  `execute_insert`, `execute_insert_write` and the two columnstore `Op_insert`
+  / `Op_insert_select` arms. (`execute_insert`'s call is #639's: it is guarded
+  by `CA_ignore` and runs *before* conflict resolution, so the skip no longer
+  depends on which index the row collides with;
+  `execute_insert_write`'s is guarded by `not skip` and so never
+  double-evaluates it.) `Exec.enforce_not_null` is unchanged and still
   raises unconditionally. Since #620 it has exactly ONE call site left —
   `write_row_rekeyed` — but three write paths funnel through it: plain
   `UPDATE`, `UPSERT ... DO UPDATE`, and `ON UPDATE CASCADE`. None of the three
@@ -354,6 +358,57 @@ EOF
   because `Sema` does not inspect a projection. `or_ignore_skips_every_spelling_of_null`
   in `test/test_not_null_599.ml` pins all four spellings together for that
   reason.
+
+- **An explicit `ON CONFLICT` target beats the statement's conflict-resolution
+  modifier, for the index it names (#639, decided 2026-08-06).** The modifier
+  still governs every *other* index. Before this, `CA_ignore` matched above the
+  upsert arm in both places that resolve a conflict — `check_insert_unique` for
+  a secondary UNIQUE index and `execute_insert_write`'s `put_x` arm for the
+  rowid-alias PK — so `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` silently
+  skipped for *any* conflict: a caller who wrote both got "insert, or do
+  nothing". The reorder applies to `OR REPLACE` too, which is a **behaviour
+  change wider than the issue**: `INSERT OR REPLACE ... ON CONFLICT(k) DO
+  UPDATE` now updates the conflicting row in place instead of deleting and
+  re-inserting it.
+
+  **NOT NULL is not a uniqueness conflict, so an `ON CONFLICT` clause never
+  intercepts it** — the modifier does, per #599 above. The two directions
+  differ and both are pinned in `test/test_or_ignore_upsert_639.ml`: a NULL in
+  the row being *inserted* skips under `OR IGNORE`, while a NULL *assigned by
+  the DO UPDATE* raises, because that write funnels through
+  `write_row_rekeyed` → `enforce_not_null`. `Sema.bind_upsert_assignments`'s
+  static literal-NULL check is therefore **not** suspended under `CA_ignore`
+  (unlike `bind_insert_row`'s): the runtime answer below it is "raise", so the
+  two levels agree rather than disagreeing. #639 noted that binder check was
+  load-bearing while the runtime path was unreachable; the path is reachable
+  now, and the check stays as the earlier, better-located error.
+
+  `INSERT ... SELECT ... ON CONFLICT DO UPDATE` has no grammar at all
+  (`S_insert_select` carries no `upsert_update`) and must stay a **parse
+  error** rather than a silently-dropped clause — that would be #639 again in
+  a new place.
+
+- **A skipped `INSERT` leaves nothing behind, including its BEFORE INSERT
+  trigger's nested DML, in an explicit transaction as well as in autocommit
+  (#631, fixed 2026-08-06).** The undo used to be `if owned then S.rollback`,
+  keyed on *who owns the transaction* rather than on *what the statement
+  decided*, so the same statement left a trace or not depending on whether the
+  caller had opened a `BEGIN`. It is now a statement-level savepoint
+  (`Store.savepoint_begin` plus #280's schema-undo marker, which also restores
+  #303's rowid counters), rolled back when the statement wrote nothing — so it
+  covers the long-standing UNIQUE skip and #599's NOT NULL skip alike.
+
+  It is taken **only** when the transaction is borrowed, a BEFORE INSERT
+  trigger exists on the table, and the resolution is `CA_ignore`; outside that
+  intersection no savepoint is pushed, which is what keeps it off the TPC-C
+  write path (a B-tree savepoint clones the pager dirty set, and
+  `Schema_cache.savepoint_begin` also encodes every columnar store). It is
+  opened and resolved within one statement and never touches `explicit_txn` or
+  the #555 poison flag, so it is **not** a second exit from a poisoned handle
+  and "ROLLBACK is the sole exit" stays true. On an *exception* the savepoint
+  is released, not rolled back: a raising statement's partial effects already
+  survive in a borrowed transaction, and statement atomicity on error is a
+  different problem.
 
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
