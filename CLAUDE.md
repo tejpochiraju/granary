@@ -83,15 +83,24 @@ O(n²) bulk insert, a lost reader/writer overlap:
 | `bench_wal_reader_scaling` | #149 parallel-read regression | parallel ≤ 2.0x serial | `GRANARY_BENCH_PARALLEL_MAX` |
 | `bench_slow_read_yield` | reader starving the writer | writer ≤ 3.0 s | `GRANARY_BENCH_MAX_WRITER_S` |
 
-One gate is **not** wall-clock and therefore **not** neutralized anywhere:
+Two gates are **not** wall-clock and therefore **not** neutralized anywhere:
 
 | test | guards | gate | knob |
 |---|---|---|---|
 | `test_not_null_600` | #600 `PRAGMA not_null_check` retaining every violating row | marginal peak live heap < 4 words/row when the table doubles | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
+| `test_not_null_repair_630` | #630 `PRAGMA not_null_repair`'s **scan** draining the tree via `cursor_open` | same gate, but with the violation count held FIXED at 5 while the table doubles, so only the scan can move it | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
 
-It measures *allocation* (peak live major-heap words, sampled through a `Gc`
-alarm), so a loaded runner does not move it — ±0.02% across runs, which no
-wall-clock gate manages. That is why it runs armed in `ci.yml`, `coverage.yml`
+The two are complements, not duplicates: #600's doubles the violations along
+with the table and so cannot tell a retaining scan from a retaining victim
+buffer; #630's holds the violations fixed and therefore measures the scan
+alone. The repair's victim buffer is *supposed* to be O(violations) — #541's
+finding is that the rows must be collected and sorted before they are fetched,
+because fetching in index-key order costs up to a page read per row once the
+table outgrows the pager cache. Do not "bound" that by streaming it.
+
+They measure *allocation* (peak live major-heap words, sampled through a `Gc`
+alarm), so a loaded runner does not move them — ±0.02% across runs, which no
+wall-clock gate manages. That is why they run armed in `ci.yml`, `coverage.yml`
 and `cross-arch.yml` alongside the ones those jobs disarm. What load cannot
 change, a different allocator or word size can, and `cross-arch.yml`'s arm64
 arm has never run it, so `GRANARY_MEM_MAX_WORDS_PER_ROW` exists as the escape

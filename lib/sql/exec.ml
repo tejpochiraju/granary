@@ -10674,7 +10674,8 @@ and not_null_count_columnar (meta : Cat.table_meta) (cols : (int * string) list)
    ever needs — it emits (table, column, count) and nothing else.
 
    [not_null_scan_table] below retains every violating row so the repair can
-   delete it, and the shape this command exists for is a legacy file whose
+   delete it (and, before #630, drained the whole tree to find them), and the
+   shape this command exists for is a legacy file whose
    declared-NOT NULL column is wholly NULL: retaining there costs O(table)
    resident memory in the one command an operator runs FIRST, on a database
    whose scope of damage is still unknown.  Being OOM-killed while surveying
@@ -10719,54 +10720,82 @@ and not_null_count_table : type m. m S.txn -> Cat.table_meta -> (string * int) l
            counters))
 
 (* #563: scan one table for stored NULLs in a declared-NOT NULL column.
-   Returns one entry per VIOLATING column: its name, how many rows violate it,
-   and — for a row-store table — those rows with their rowids, which is what
-   the repair deletes.  Columns with no violation are dropped, so an empty
-   result means the table honours its own schema.
+   Returns the per-column violation counts — one entry per VIOLATING column,
+   clean columns dropped, so empty counts mean the table honours its own
+   schema — paired with the violating rows themselves, which is what the
+   repair deletes.  A row violating two NOT NULL columns is counted under both
+   but appears ONCE in the victim list.
 
    #600: this is the REPAIR path only; the report uses [not_null_count_table],
-   which retains nothing.  The retention here is deliberate and must stay —
-   #541 found that fetching in index-key order costs up to a page read per row
-   once the table outgrows the pager cache, so the candidate rowids have to be
-   collected and sorted before they are fetched.  The bound on this buffer is
-   one TABLE's violations (see [stream_pragma_not_null_repair]), not the whole
-   database's. *)
+   which retains nothing.
+
+   #630: the SCAN streams and the VICTIM BUFFER retains — the two halves are
+   separate and only the first was ever the defect.
+
+   - The scan runs on [S.seek_ge]/[S.seek_next], not [S.cursor_open].
+     [cursor_open] drains the entire tree into a list before the first
+     violation is examined (the #228/#229 finding), so [PRAGMA
+     not_null_repair] on a large but mostly CLEAN table paid O(table) resident
+     memory to find a handful of violators.  [seek_ge] from the empty key
+     positions before the first entry in O(log n) and yields one [(key, value)]
+     at a time, so what the scan holds is now one decoded row, not the table.
+     This is the same move #600 made for the report path.
+   - The victim buffer stays collected-and-sorted before the rows are fetched,
+     and that is deliberate: #541 found that fetching in index-key order costs
+     up to a page read per row once the table outgrows the pager cache.  Its
+     bound is one TABLE's violations (see [stream_pragma_not_null_repair]), not
+     the whole database's, and it is O(violations) rather than O(table) — a
+     clean table now costs nothing at all.
+
+   Splitting the counts from the victims (they used to share one per-column
+   bucket of retained rows) is what makes the second bound exact: a row
+   violating [k] columns previously occupied [k] list cells and was deduped
+   only later, in [repair_not_null_table]. *)
 and not_null_scan_table
-  : type m. m S.txn -> Cat.table_meta -> (string * int * (int64 * Row.t) list) list Lwt.t
+  : type m.
+    m S.txn -> Cat.table_meta -> ((string * int) list * (int64 * Row.t) list) Lwt.t
   =
   fun tx meta ->
   let cols = not_null_scan_cols meta in
   if cols = []
-  then Lwt.return []
+  then Lwt.return ([], [])
   else (
     match meta.Cat.storage with
-    | Cat.Columnar _ ->
-      Lwt.return (List.map (fun (n, c) -> n, c, []) (not_null_count_columnar meta cols))
+    | Cat.Columnar _ -> Lwt.return (not_null_count_columnar meta cols, [])
     | Cat.Row { tree_id; _ } ->
-      let buckets = List.map (fun (i, name) -> i, name, ref []) cols in
-      let* cur = S.cursor_open tx tree_id in
-      let _sr = S.cursor_first cur in
-      let note row rowid (i, _, bucket) =
+      let counters = List.map (fun (i, name) -> i, name, ref 0) cols in
+      let victims = ref [] in
+      (* One pass over the row: bump EVERY column it violates (the counts are
+         per column) but retain the row at most ONCE.  Both helpers are lifted
+         out of [go] so the scan loop stays flat. *)
+      let bump row hit (i, _, n) =
         if i < Array.length row && row.(i) = Row.V_null
-        then bucket := (rowid, row) :: !bucket
+        then (
+          incr n;
+          hit := true)
       in
+      let note k row =
+        let hit = ref false in
+        List.iter (bump row hit) counters;
+        if !hit then victims := (Rowid.decode k, row) :: !victims
+      in
+      let* cur = S.seek_ge tx tree_id Bytes.empty in
       let rec go () =
-        match S.cursor_next cur with
-        | None -> ()
+        let* nxt = S.seek_next cur in
+        match nxt with
+        | None -> Lwt.return_unit
         | Some (k, v) ->
-          let row = Row.decode meta.Cat.columns v in
-          List.iter (note row (Rowid.decode k)) buckets;
+          note k (Row.decode meta.Cat.columns v);
           go ()
       in
-      go ();
-      S.cursor_close cur;
-      Lwt.return
-        (List.filter_map
-           (fun (_i, name, bucket) ->
-              match List.rev !bucket with
-              | [] -> None
-              | l -> Some (name, List.length l, l))
-           buckets))
+      let* () = go () in
+      S.seek_close cur;
+      let counts =
+        List.filter_map
+          (fun (_i, name, n) -> if !n = 0 then None else Some (name, !n))
+          counters
+      in
+      Lwt.return (counts, List.rev !victims))
 
 (* #563: the report row shape shared by check and repair — (table, column, n).
    [n] is the number of offending rows for [not_null_check] and the number of
@@ -10843,8 +10872,8 @@ and stream_pragma_not_null_repair store mode cat =
        let* per_table =
          Lwt_list.map_s
            (fun (meta : Cat.table_meta) ->
-              let* found = not_null_scan_table tx meta in
-              repair_not_null_table tx cat_val meta found)
+              let* counts, victims = not_null_scan_table tx meta in
+              repair_not_null_table tx cat_val meta ~counts ~victims)
            tables
        in
        let* () = release_txn ~cat:cat_val tx owned in
@@ -10862,7 +10891,7 @@ and stream_pragma_not_null_repair store mode cat =
    unrepairable table crash the caller instead of informing it.
 
    {b The count-0 row is a standalone signal, not a cross-reference.}  A table
-   with nothing to fix produces NO row at all (the [found = []] branch below),
+   with nothing to fix produces NO row at all (the [counts = []] branch below),
    so a row whose count is 0 is emitted in exactly one situation: findings that
    could not be deleted.  "Nothing to fix" and "cannot fix" are therefore
    distinguishable from the repair output alone — empty versus a 0-count row —
@@ -10876,9 +10905,8 @@ and stream_pragma_not_null_repair store mode cat =
    expressible from this path at all, for the reason above; #588 tracks fixing
    the [Db.query_impl] guard, and closing it should turn this branch back into
    a raise. *)
-and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) found =
-  let counts = List.map (fun (name, n, _) -> name, n) found in
-  if found = []
+and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~victims =
+  if counts = []
   then Lwt.return []
   else if Cat.is_columnar meta
   then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) counts)
@@ -10889,10 +10917,12 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) found =
       then build_child_refs cat_val ~parent_table_name:meta.Cat.name
       else Lwt.return []
     in
-    let victims =
-      List.concat_map (fun (_name, _n, rows) -> rows) found
-      |> List.sort_uniq (fun (a, _) (b, _) -> Int64.compare a b)
-    in
+    (* #541: the rows are fetched in ascending rowid order, never index-key
+       order.  [not_null_scan_table] already yields them that way (its seek
+       walks the data tree ascending) and already deduplicates; the sort is
+       kept because THIS is where the ordering the delete depends on is
+       required, and it must not become an accident of the scan. *)
+    let victims = List.sort_uniq (fun (a, _) (b, _) -> Int64.compare a b) victims in
     let* () =
       Lwt_list.iter_s
         (fun ((rowid, row) as m) ->

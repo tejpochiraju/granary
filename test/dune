@@ -1161,6 +1161,22 @@
   lwt.unix
   unix))
 
+; #630: PRAGMA not_null_repair's scan streams (seek_ge), so a mostly-clean
+; table costs no resident memory; its victim buffer stays O(violations).
+
+(test
+ (name test_not_null_repair_630)
+ (modules test_not_null_repair_630)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
 ; #568: the SUM/AVG non-numeric argument check must not depend on spelling.
 
 (test
