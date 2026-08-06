@@ -40,7 +40,27 @@ let getenv_float k d =
   | _ -> d
 ;;
 
-let path = "/tmp/granary_phase38_bench.db"
+(* Drawn per process (#628), for the reason spelled out at the same binding in
+   [bench_wal_fsync_overlap]: this is the second of the wall-clock gates in
+   CLAUDE.md's table, it had the same fixed shared name, and two suite runs at
+   once — the documented normal working mode here — overwrite each other's
+   database mid-measurement and report a timing nothing produced.  The issue
+   asked for the survey; this is the other instance it found among the timing
+   gates.  ([bench_slow_read_yield] already drew a fresh path.) *)
+let path =
+  let f = Filename.temp_file "granary_bench_wal_reader_scaling" ".db" in
+  (try Unix.unlink f with
+   | _ -> ());
+  f
+;;
+
+let () =
+  at_exit (fun () ->
+    (try Unix.unlink path with
+     | _ -> ());
+    try Unix.unlink (path ^ "-wal") with
+    | _ -> ())
+;;
 
 let setup () =
   (try Unix.unlink path with
