@@ -23,6 +23,18 @@
    installed, so this runs — and must run — even where those benchmarks are
    not built. *)
 
+(* sqlite3-policy: names-only — this test NAMES the bindings' module as a bare
+   word, in string literals, because [test_binding_module_is_unsplit_in_the_
+   source] pins the lint's binding line as SOURCE TEXT and cannot do that
+   without spelling the name.  It links nothing: the module never appears as a
+   qualifier here, only as data.
+
+   The entry in SQLITE3_NAMES_ONLY_ALLOWLIST is new in #621, and the file did
+   not change to earn it — the guard did.  Its pattern was the fixed string
+   `Sqlite3.` WITH THE DOT, which missed every mention below along with `open
+   Sqlite3` and `module S = Sqlite3` in real code; widening it to the whole word
+   is what brought this honest naming into view. *)
+
 module L = Granary_tpc.Tpc_keepalive_lint
 
 let show findings =
