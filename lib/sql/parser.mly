@@ -404,6 +404,8 @@ pragma_stmt:
       | "not_null_check"  -> Ast.S_pragma Ast.Pragma_not_null_check
       | "not_null_repair" -> Ast.S_pragma Ast.Pragma_not_null_repair
       | "wal_checkpoint"  -> Ast.S_pragma Ast.Pragma_wal_checkpoint
+      (* #638: read-only report on autocheckpoint failures. *)
+      | "checkpoint_status" -> Ast.S_pragma Ast.Pragma_checkpoint_status
       | "wal_autocheckpoint" -> Ast.S_pragma Ast.Pragma_wal_autocheckpoint
       | "synchronous"           -> Ast.S_pragma Ast.Pragma_synchronous
       | "wal_batch_commits"     -> Ast.S_pragma Ast.Pragma_wal_batch_commits

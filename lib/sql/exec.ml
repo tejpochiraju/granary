@@ -6503,6 +6503,7 @@ let op_name = function
   | Plan.Op_pragma_set_defer_fk { on } ->
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_pragma_wal_checkpoint -> "Pragma(wal_checkpoint)"
+  | Plan.Op_pragma_checkpoint_status -> "Pragma(checkpoint_status)"
   | Plan.Op_pragma_get_wal_autocheckpoint -> "Pragma(get_wal_autocheckpoint)"
   | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
     Printf.sprintf "Pragma(set_wal_autocheckpoint=%Ld)" n
@@ -7824,6 +7825,7 @@ let execute_with_count
   | Plan.Op_sqlite_master
   | Plan.Op_sqlite_sequence
   | Plan.Op_pragma_get_synchronous
+  | Plan.Op_pragma_checkpoint_status
   | Plan.Op_pragma_get_wal_batch_commits
   | Plan.Op_pragma_get_wal_batch_interval_ms ->
     failwith "Exec.execute: use Exec.query for read operations"
@@ -11564,6 +11566,22 @@ and to_stream
   | Plan.Op_pragma_get_synchronous ->
     let s = S.string_of_durability (S.durability store) in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_text s |] ])
+  (* #638: (total_failures, consecutive_failures, last_error).  [last_error] is
+     NULL when no checkpoint has failed since the last one that completed. *)
+  | Plan.Op_pragma_checkpoint_status ->
+    let h = S.checkpoint_health store in
+    let last =
+      match h.S.last_error with
+      | None -> Row.V_null
+      | Some m -> Row.V_text m
+    in
+    Lwt.return
+      (Lwt_stream.of_list
+         [ [| Row.V_int (Int64.of_int h.S.total_failures)
+            ; Row.V_int (Int64.of_int h.S.consecutive_failures)
+            ; last
+           |]
+         ])
   | Plan.Op_pragma_get_wal_batch_commits ->
     let n = S.sync_batch_commits store in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])

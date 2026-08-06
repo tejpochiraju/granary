@@ -7,6 +7,9 @@ let attr_for ev =
   match (ev : Ev.t) with
   | Ev.Txn_commit _ -> fg green
   | Ev.Txn_rollback _ -> fg red
+  (* #638: a failed autocheckpoint is the loudest thing the monitor can show —
+     the store keeps running but the WAL was not truncated. *)
+  | Ev.Checkpoint_failed _ -> fg red
   | Ev.Checkpoint_begin _ | Ev.Checkpoint_end _ | Ev.Wal_reset _ -> fg yellow
   | Ev.Txn_begin _
   | Ev.Savepoint_begin _

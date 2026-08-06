@@ -487,6 +487,12 @@ and pragma_kind =
        separate statement from the report: it is destructive, and for a legacy
        PRIMARY KEY column the NULL row may be the one worth inspecting. *)
   | Pragma_wal_checkpoint (* PRAGMA wal_checkpoint — migrate WAL → main *)
+  | Pragma_checkpoint_status
+    (* #638: PRAGMA checkpoint_status — read the checkpoint-failure signal
+       (total failures, consecutive failures, last error).  An autocheckpoint
+       failure is never raised to a caller, so without this (and the
+       Checkpoint_failed event) a repeatedly-failing checkpoint is invisible
+       while the WAL grows without bound. *)
   | Pragma_wal_autocheckpoint (* PRAGMA wal_autocheckpoint — read threshold *)
   | Pragma_wal_autocheckpoint_set of int64
     (* PRAGMA wal_autocheckpoint = N — set per-connection threshold (0 disables) *)
