@@ -92,7 +92,37 @@ type t =
   ; mutable rv_resync : bool
     (** #427: set when a savepoint rollback made the accumulated deltas
         untrustworthy; the next flush full-resyncs every affected view. *)
+  ; mutable txn_scope : int option
+    (** #585: the owner token of the {!with_transaction} extent that opened the
+        transaction currently sitting in [explicit_txn], or [None] when the
+        transaction (if any) was opened by a bare [BEGIN].
+
+        This is the first instance of the thing #555/#584 said the engine did not
+        have: a transaction {e extent} an owner token can be attached to.  The
+        token is minted when [with_transaction] BEGINs, stored here, and
+        simultaneously published into the calling fiber's Lwt storage under
+        {!txn_scope_key}.  A fiber is the owner iff the two agree, which is
+        exactly what {!in_transaction_scope} tests.
+
+        Today it decides exactly one question — whether a [with_transaction] call
+        is a re-entrant call by the owner (refuse cleanly, outer transaction
+        intact) or a collision with another fiber (fall through to [BEGIN], which
+        poisons as it always has).  Binding {e statements} to their owner needs
+        the same token plumbed to [resolve_txn]; that is #555 option 1's work,
+        not this field's. *)
   }
+
+(* #585: monotone source of transaction-scope owner tokens.  Process-wide rather
+   than per-handle so a token is meaningful even when it travels with a fiber
+   across handles — comparing tokens can then never produce a false match. *)
+let txn_scope_counter = ref 0
+
+(* #585: the calling fiber's transaction-scope owner token.  Same idiom as
+   [Sql.Exec]'s [txn_mode_key] and the #240 dirty-table accumulator: set with
+   [Lwt.with_value] for the dynamic extent of the [with_transaction] body, so
+   every fiber spawned inside that body inherits it and every fiber outside it
+   reads [None]. *)
+let txn_scope_key : int Lwt.key = Lwt.new_key ()
 
 let pp fmt t =
   Format.fprintf
@@ -268,6 +298,7 @@ let open_in_memory ?clock () =
     ; rv_pending = Hashtbl.create 4
     ; rv_refreshing = false
     ; rv_resync = false
+    ; txn_scope = None
     }
 ;;
 
@@ -349,6 +380,7 @@ let of_store ?clock ?durability ?file_path ?rowid_counters store =
     ; rv_pending = Hashtbl.create 4
     ; rv_refreshing = false
     ; rv_resync = false
+    ; txn_scope = None
     }
   in
   (* #427: reconstruct reactive-view registry (parse defs, rebuild delta engine
@@ -2099,6 +2131,110 @@ let drive_reactive top ~core =
 ;;
 
 let execute top sql = drive_reactive top ~core:(fun () -> execute_core top sql)
+
+(* ------------------------------------------------------------------ *)
+(* #585: scoped transactions                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* #585: a re-entrant [with_transaction] from inside its own extent.  Refused,
+   NOT turned into a savepoint and NOT joined onto the outer transaction — see
+   the .mli for why either of those would have to lie to the inner caller.
+
+   This is the one case the owner token lets the engine answer precisely, and it
+   is answered WITHOUT poisoning: the token proves the caller is the fiber that
+   opened the outer transaction, so there is no cross-fiber contamination to
+   contain and no reason to doom work that is provably the caller's own. *)
+let nested_txn_msg =
+  "Db.with_transaction refused: this fiber is already inside a with_transaction scope on \
+   this handle (#585).  Nesting is deliberately not supported - it cannot be a savepoint \
+   (the inner scope would RELEASE rather than commit, so returning from it would not \
+   mean durable) and it cannot join the outer transaction (the inner scope's rollback \
+   would abort the OUTER transaction while returning to code that believes only its own \
+   work was undone).  Use SAVEPOINT / RELEASE / ROLLBACK TO explicitly if a partial undo \
+   point is what you want.  Nothing was rolled back, the outer transaction is intact and \
+   this handle is NOT poisoned."
+;;
+
+(* #585: the scope's transaction is no longer the one in the handle's slot.
+   Only reachable through #584: another fiber's ROLLBACK aborted this scope's
+   transaction and then opened its own in the freed slot.  Neither COMMIT nor
+   ROLLBACK is issued here — both would act on the OTHER fiber's transaction,
+   which is precisely the contamination #584 describes. *)
+let stolen_txn_msg =
+  "Db.with_transaction: the transaction this scope opened is gone - another fiber's \
+   ROLLBACK aborted it and the handle's transaction slot now holds a different \
+   transaction (#584).  This scope's writes are lost.  Neither COMMIT nor ROLLBACK was \
+   issued, because either would have acted on the other fiber's transaction.  Give each \
+   fiber its own handle with Db.create_worker_handle."
+;;
+
+(* Drop the token only if it is still ours: a scope that was displaced (#584)
+   must not clear the token of the transaction that displaced it. *)
+let clear_txn_scope t token = if t.txn_scope = Some token then t.txn_scope <- None
+
+let in_transaction_scope t =
+  match t.txn_scope, Lwt.get txn_scope_key with
+  | Some owner, Some tok -> Int.equal owner tok
+  | _, _ -> false
+;;
+
+let owns_txn_scope t token = t.txn_scope = Some token
+
+(* Success arm: COMMIT, then release the scope.  A COMMIT error is reported as
+   [Error] and no compensating ROLLBACK is issued — [commit_txn] already rolls
+   back the arms that leave the transaction uncommittable (#286 in-txn DDL,
+   deferred-FK violation), and on a poisoned handle (#555) ROLLBACK is the
+   caller's prescribed single exit, not this combinator's to take on their
+   behalf. *)
+let scoped_commit t token v =
+  if not (owns_txn_scope t token)
+  then Lwt.return (Error (Runtime stolen_txn_msg))
+  else
+    let* cr = execute t "COMMIT" in
+    clear_txn_scope t token;
+    match cr with
+    | Ok () -> Lwt.return (Ok v)
+    | Error e -> Lwt.return (Error e)
+;;
+
+(* Failure arm: ROLLBACK, release the scope, re-raise the original exception.
+   The ROLLBACK's own result is discarded on purpose — the exception the body
+   raised is the interesting one, and swallowing it to report a rollback error
+   would hide the cause. *)
+let scoped_rollback t token exn =
+  if not (owns_txn_scope t token)
+  then Lwt.fail exn
+  else
+    let* _ = execute t "ROLLBACK" in
+    clear_txn_scope t token;
+    Lwt.fail exn
+;;
+
+let run_txn_scope t token body =
+  Lwt.catch
+    (fun () ->
+       let* v = Lwt.with_value txn_scope_key (Some token) (fun () -> body t) in
+       scoped_commit t token v)
+    (fun exn -> scoped_rollback t token exn)
+;;
+
+let with_transaction t body =
+  if in_transaction_scope t
+  then Lwt.return (Error (Runtime nested_txn_msg))
+  else
+    let* r = execute t "BEGIN" in
+    match r with
+    (* The BEGIN failed.  Nothing was opened, so nothing is rolled back — and
+       critically, if it failed because the handle already held a transaction
+       then #555 has just poisoned it, and ROLLBACK is the caller's sole exit.
+       Issuing one here would make this combinator a second exit. *)
+    | Error e -> Lwt.return (Error e)
+    | Ok () ->
+      incr txn_scope_counter;
+      let token = !txn_scope_counter in
+      t.txn_scope <- Some token;
+      run_txn_scope t token body
+;;
 
 let execute_change_count top sql =
   drive_reactive top ~core:(fun () -> execute_change_count_core top sql)

@@ -444,6 +444,60 @@ execution time.
   when the detach target itself has none. Narrowing it to the target's own slot
   would be defensible; it is not what is implemented.
 
+### `Db.with_transaction` — the scoped extent (#585)
+
+`Db.with_transaction db (fun db -> …)` BEGINs, runs the body, COMMITs on
+success, ROLLBACKs and **re-raises** on exception. An exception is never
+converted into `Error`; `Error` is reserved for a failed BEGIN or COMMIT.
+
+Its point is not convenience. It is the first place a transaction has a dynamic
+*extent*, so an owner token can live in an Lwt key for its duration — the thing
+#555 and #584 both name as the missing prerequisite. The token is minted at
+BEGIN, stored on the handle (`txn_scope`) and published into the calling fiber's
+Lwt storage (`txn_scope_key`); a fiber owns the transaction iff the two agree,
+which is what `Db.in_transaction_scope` reports.
+
+**Nesting is refused, and that is a decision, not an omission.** A nested
+`with_transaction` on the same handle — directly, or from a fiber spawned inside
+the body, which inherits the token — returns `Error` without opening anything,
+without rolling anything back and **without poisoning**. A savepoint would make
+the inner scope's "commit" a `RELEASE`, so returning from it would not mean
+durable and the outer scope could still discard it. A no-op join would make the
+inner scope's rollback-on-exception abort the *outer* transaction while
+returning to code that believes only its own work was undone. Refusal is the
+only answer that does not lie; `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` inside the
+body is the supported partial-undo point.
+
+The clean refusal is also the token's only live decision today, and it is worth
+seeing why it is sound: the token *proves* the caller is the fiber that opened
+the outer transaction, so there is nothing to contain. The #555 poison exists
+precisely for the case where the engine cannot tell the fibers apart, and that
+case is untouched — a second *fiber* on a shared handle holds no token, so its
+BEGIN collides and poisons exactly as a bare `BEGIN` does.
+
+**The poison contract is preserved, deliberately.** `with_transaction` issues no
+`ROLLBACK` when its BEGIN fails, and none when its COMMIT fails — otherwise it
+would be a second exit from the poisoned state and "ROLLBACK is the sole exit"
+would become false. It rolls back only its *own* transaction, on the
+body-raised-an-exception path.
+
+**#584 is narrowed at the scope boundary, not closed.** If another fiber's
+`ROLLBACK` aborts this scope's transaction and then opens its own in the freed
+slot, the token no longer matches the slot; the combinator detects that at scope
+exit and issues **neither** COMMIT nor ROLLBACK, returning `Error` — either
+would act on the other fiber's transaction, which is #584 itself. It does *not*
+cover statements *inside* the body: those still resolve the transaction from the
+handle's mutable slot, so a displaced scope's writes land in the other fiber's
+transaction before the boundary check reports the loss. Binding statements to
+their owner is #555 option 1's work. **This is not permission to share a handle
+across fibers** — `create_worker_handle` still is.
+
+The body owns the statements, not the transaction: a `BEGIN` inside it poisons,
+and a `COMMIT`/`ROLLBACK` inside it empties the slot so the combinator's own
+COMMIT reports `no active transaction` even though the work committed. Neither
+is guarded against, because the slot is shared mutable state with nothing to
+guard it with yet. Pinned by `test/test_with_transaction_585.ml`.
+
 ### Running explicit transactions from more than one fiber
 
 `Db.create_worker_handle` is the mechanism, and it is sound: it is `of_store`

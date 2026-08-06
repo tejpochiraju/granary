@@ -270,6 +270,130 @@ val vacuum : t -> unit Lwt.t
     across fibers without [BEGIN] never poisons it. *)
 val transaction_poisoned : t -> bool
 
+(** #585: run [body] inside an explicit transaction with a scoped extent.
+
+    [with_transaction t body] issues [BEGIN], runs [body t], and then [COMMIT]s
+    on success or [ROLLBACK]s and re-raises on exception. It is the
+    exception-safe replacement for hand-written
+    [BEGIN] / … / [COMMIT] sequences, and — more importantly — it is the first
+    place the engine has a transaction {e extent} rather than a sequence of
+    unrelated statements.
+
+    {2 Why the extent matters}
+
+    #555/#584 are not "the slot is not locked"; they are "the engine cannot tell
+    which fiber owns the slot". A statement-at-a-time API gives it nothing to
+    attach an owner to: [Lwt.with_value] can only tag a fiber for the dynamic
+    extent of a callback, and a bare [Db.execute db "BEGIN"] has no enclosing
+    scope to be that extent. This combinator supplies one, and mints an owner
+    token into it (readable via {!in_transaction_scope}). Binding every
+    {e statement} to its owner is still #555 option 1's work; what the token
+    decides today is listed below.
+
+    {2 Return value}
+
+    [Ok v] where [v] is [body]'s result, once the [COMMIT] has succeeded. [Error]
+    if the [BEGIN] or the [COMMIT] failed. An exception raised by [body] is
+    {e re-raised} after the rollback, never converted into [Error] — a caller
+    that wants it as a value should catch it inside [body].
+
+    {2 Nesting: refused, deliberately}
+
+    Calling [with_transaction] again on the same handle from inside the extent —
+    directly, or from a fiber spawned inside [body], which inherits the token —
+    returns [Error (Runtime …)] without opening anything, without rolling
+    anything back, and {b without poisoning the handle}. The outer transaction is
+    untouched and the outer scope carries on normally.
+
+    The two alternatives were rejected because each has to lie to the inner
+    caller:
+
+    - {b Savepoint.} The inner scope's "commit" would be a [RELEASE], so
+      returning from it would not mean durable, and the outer scope could still
+      discard all of it. Code that reads [with_transaction] as "committed when it
+      returns" would be wrong in a way no type catches.
+    - {b No-op join.} The inner scope's rollback-on-exception would abort the
+      {e outer} transaction while returning control to code that believes only
+      its own work was undone — silent, unbounded loss of the outer scope's
+      writes.
+
+    Refusal is the only answer that is true. If a partial undo point is what you
+    want, [SAVEPOINT] / [RELEASE] / [ROLLBACK TO] say so explicitly.
+
+    Note this is the one question the owner token answers precisely today: the
+    token proves the caller is the fiber that opened the outer transaction, so
+    the engine can refuse {e without} the #555 poison, which exists only for the
+    case where it cannot tell the fibers apart.
+
+    {2 Interaction with the #555 poison}
+
+    Unchanged, and deliberately not routed around.
+
+    - A second fiber calling [with_transaction] on a handle that already holds an
+      explicit transaction is {e not} the nesting case (it has no token): its
+      [BEGIN] fails and poisons the handle exactly as a bare [BEGIN] would. The
+      combinator reports the [Error] and returns.
+    - When the [BEGIN] fails, no [ROLLBACK] is issued. [ROLLBACK] is the sole
+      exit from the poisoned state and it stays the {e caller's} to issue —
+      this combinator must not become a second exit.
+    - When the [COMMIT] fails, no compensating [ROLLBACK] is issued either. The
+      arms that leave a transaction uncommittable ([#286] in-txn DDL, a violated
+      deferred FK) already roll it back themselves, and on a poisoned handle the
+      recovery is the caller's.
+    - The rollback-on-exception path {e does} issue [ROLLBACK] — but that is the
+      prescribed exit itself, applied to this scope's own transaction, not an
+      additional one.
+
+    {2 #584 is narrowed here, not closed}
+
+    If another fiber's [ROLLBACK] aborts this scope's transaction and then opens
+    its own in the freed slot, the token no longer matches the slot. This
+    combinator detects that at scope exit and issues {b neither} [COMMIT] nor
+    [ROLLBACK], returning [Error] instead — either would have acted on the other
+    fiber's transaction, which is exactly #584's failure. That covers the
+    scope's own boundaries. It does {b not} cover statements {e inside} [body]:
+    those still resolve the transaction from the handle's mutable slot, so a
+    displaced scope's writes land in the other fiber's transaction before the
+    boundary check reports the loss.
+
+    So this is not permission to share a handle across fibers. Use
+    {!create_worker_handle}, which gives each fiber its own slot and blocks on
+    the shared writer lock instead of contaminating.
+
+    {2 The body must not manage the transaction itself}
+
+    [body] owns the statements, not the transaction. A [BEGIN] inside it fails
+    and poisons; a [COMMIT] or [ROLLBACK] inside it empties the slot, after which
+    this combinator's own [COMMIT] reports [Error (Runtime "no active
+    transaction")] even though the body's work was committed. Neither is guarded
+    against — the slot is shared mutable state and there is nothing to guard it
+    with until #555 option 1. [SAVEPOINT] and friends are fine.
+
+    {2 ATTACH}
+
+    The [BEGIN] routes to the active schema, as it always does, so the
+    transaction belongs to that schema's sub-handle. The owner token is held on
+    the top-level handle [t] the call was made on, so nesting is refused per
+    connection rather than per schema. Since #598 refuses a
+    [PRAGMA active_database] switch while any schema holds a transaction, the
+    routing cannot move under an open scope. *)
+val with_transaction : t -> (t -> 'a Lwt.t) -> ('a, error) result Lwt.t
+
+(** #585: whether the {e calling fiber} is inside a {!with_transaction} extent
+    that currently owns [t]'s explicit-transaction slot.
+
+    True only when the fiber's inherited owner token equals the token stored on
+    the handle, so it answers [false] for a fiber that never entered a scope, for
+    a fiber whose scope has exited, and for a fiber whose scope was displaced by
+    another's transaction (#584). It also answers [false] inside a transaction
+    opened by a bare [BEGIN] — an unscoped transaction has no owner to report.
+
+    This is the observable half of the owner token, exposed for tests and for
+    library code that needs to know whether it may open a transaction or is
+    already inside one. It is {e not} a general "is a transaction open" predicate;
+    it says nothing about a transaction this fiber does not own. *)
+val in_transaction_scope : t -> bool
+
 (** Execute a DDL or DML statement (CREATE TABLE, INSERT, UPDATE, ...).
     Returns [Ok ()] on success, [Error e] on failure. *)
 val execute : t -> string -> (unit, error) result Lwt.t
