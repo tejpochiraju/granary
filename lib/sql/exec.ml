@@ -4096,6 +4096,74 @@ let build_insert_row
     r
 ;;
 
+(* #631: a statement-level undo point for a row an [OR IGNORE] INSERT may skip.
+
+   A skipped row must leave nothing behind.  The row-store path is otherwise
+   scrupulous about that — the skip returns before [S.put], the index writes,
+   the FTS/AFTER-trigger hook, the IVM change feed and the #240 dirty mark —
+   but a BEFORE INSERT trigger has ALREADY run, inside the parent txn, and its
+   nested DML is real.  In autocommit that vanished with [S.rollback tx]
+   ([owned = true]); inside an explicit [BEGIN] it survived, because the undo
+   was keyed on WHO OWNS the transaction rather than on WHAT THE STATEMENT
+   DECIDED.  The same statement therefore left a trace or not depending on
+   whether the caller happened to open a transaction.
+
+   The fix is a savepoint taken around the row and rolled back when the row is
+   skipped.  Three properties matter:
+
+   - It is taken ONLY when [not owned] (autocommit already undoes everything),
+     a BEFORE INSERT trigger actually exists ([Option.is_some before_hook] —
+     [Db] returns [None] when no trigger matches table/timing/event), and the
+     statement can skip at all ([CA_ignore]).  Outside that intersection not a
+     single savepoint is pushed, so the TPC-C write path is untouched; a B-tree
+     savepoint clones the pager's dirty set and is not free.
+   - It never aborts the caller's transaction and never touches
+     [Db.explicit_txn] or the #555 poison flag — it is opened and resolved
+     within one statement, so it adds no second way out of a poisoned handle
+     and nothing in #555/#584/#598 changes shape.
+   - The name is unique per row, so nesting (a trigger body whose own INSERT
+     takes one) stays LIFO over [Store]'s savepoint stack.
+
+   On an exception the savepoint is RELEASED, not rolled back: a statement that
+   raises mid-way still leaves its partial effects in an explicit transaction
+   (see [with_ddl_txn]'s #286 note), and changing that is a different issue.
+   Releasing keeps the stack from growing without changing what is kept. *)
+let stmt_savepoint_seq = ref 0
+
+let stmt_savepoint_begin ~(cat : Cat.t) tx ~(take : bool) : string option Lwt.t =
+  if not take
+  then Lwt.return_none
+  else (
+    incr stmt_savepoint_seq;
+    let name = Printf.sprintf "__granary_stmt_%d" !stmt_savepoint_seq in
+    let* () = S.savepoint_begin tx name in
+    Cat.savepoint_begin_schema cat name;
+    Lwt.return_some name)
+;;
+
+let stmt_savepoint_release ~(cat : Cat.t) tx (sp : string option) : unit Lwt.t =
+  match sp with
+  | None -> Lwt.return_unit
+  | Some name ->
+    let* () = S.savepoint_release tx name in
+    Cat.savepoint_release_schema cat name;
+    Lwt.return_unit
+;;
+
+let stmt_savepoint_finish ~(cat : Cat.t) tx ~(wrote : bool) (sp : string option)
+  : unit Lwt.t
+  =
+  let* () =
+    match sp with
+    | Some name when not wrote ->
+      let* () = S.savepoint_rollback tx name in
+      Cat.savepoint_rollback_schema cat name;
+      Lwt.return_unit
+    | _ -> Lwt.return_unit
+  in
+  stmt_savepoint_release ~cat tx sp
+;;
+
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
@@ -4136,6 +4204,18 @@ let execute_insert
      INSERT fires inside the parent txn so its nested DML shares the tx and
      its writes roll back atomically with the parent on failure. *)
   let* tx, owned = acquire_txn store mode in
+  (* #631: undo point for a row this statement may skip.  Only when the
+     transaction is the caller's ([not owned] — autocommit already undoes
+     everything through [S.rollback]), a BEFORE INSERT trigger exists whose
+     nested DML could outlive the skip, and the statement has a resolution that
+     can skip at all.  [Option.is_some], not [<> None]: the payload is a
+     closure and structural comparison would raise. *)
+  let* sp =
+    stmt_savepoint_begin
+      ~cat
+      tx
+      ~take:((not owned) && Option.is_some before_hook && on_conflict = Some Ast.CA_ignore)
+  in
   Lwt.catch
     (fun () ->
        let* () =
@@ -4221,6 +4301,7 @@ let execute_insert
              ~on_upsert_update
          in
          if updated then mark_dirty table_meta.Cat.name;
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:updated sp in
          Lwt.return updated
        | _ ->
          let* inserted =
@@ -4255,9 +4336,15 @@ let execute_insert
          then (
            mark_dirty table_meta.Cat.name;
            record_change table_meta.Cat.name (Inserted { rowid; row }));
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:inserted sp in
          Lwt.return inserted)
     (fun exn ->
-       (* On any exception: rollback if we own the txn, then re-raise. *)
+       (* On any exception: rollback if we own the txn, then re-raise.  #631:
+          the statement savepoint is released, not rolled back — a raising
+          statement's partial effects already survive in a borrowed
+          transaction, and this fix is about a SKIP, not about statement
+          atomicity on error.  Releasing only keeps the stack bounded. *)
+       let* () = stmt_savepoint_release ~cat tx sp in
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
 ;;
