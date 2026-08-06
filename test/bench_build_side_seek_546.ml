@@ -36,9 +36,16 @@
     [Wal_read] (WAL overlay) — i.e. pager-cache misses, cold from a freshly
     opened handle. They are near-deterministic and are the load-bearing number;
     wall time is reported cold and warm but this engine's dev host is shared, so
-    read a 3x as real and a 1.1x as noise. Every read observed here is in fact a
-    [Wal_read], with or without the post-seeding checkpoint, so
-    [GRANARY_PAGE_CACHE] barely participates — worth knowing before tuning it.
+    read a 3x as real and a 1.1x as noise.
+
+    {b The sentence that used to follow is now false.} It said every read
+    observed here is a [Wal_read] with or without the post-seeding checkpoint,
+    so [GRANARY_PAGE_CACHE] barely participates. That was true only because the
+    pager did not cache WAL-resolved pages at all; since #611 it does, keyed by
+    [(page_id, frame_idx)], so the un-checkpointed configuration exercises the
+    cache too and both the read counts and the [B546_CHECKPOINT] contrast below
+    are expected to have moved. Re-measure before drawing anything from the
+    numbers quoted above — they are pre-#611.
 
     Tunables:
       B546_STOCK       stock rows                  (default 100000)
@@ -169,13 +176,17 @@ let n_stock = env_int "B546_STOCK" 100_000
 let n_line = env_int "B546_LINE" 30_000
 let reps = env_int "B546_REPS" 3
 
-(* Checkpoint the WAL after seeding, by default.  It matters more than it
-   looks: {!Granary_storage.Pager} deliberately does NOT cache WAL-resolved
-   pages (frame indices are recycled on reset, so a cached entry could go
-   stale), so on an unchecked WAL every page ACCESS emits a [Wal_read] and the
-   pager cache is inert.  Checkpointed is the steady state a long-lived database
-   is in and the only configuration in which the cache is exercised at all; set
-   [B546_CHECKPOINT=0] for the other one. *)
+(* Checkpoint the WAL after seeding, by default.  Checkpointed is the steady
+   state a long-lived database is in; set [B546_CHECKPOINT=0] for the other one.
+
+   #611 changed what this knob selects.  It used to be the difference between a
+   participating pager cache and an inert one: {!Granary_storage.Pager}
+   deliberately did NOT cache WAL-resolved pages (frame indices are recycled on
+   reset, so a cached entry could go stale), so on an unchecked WAL every page
+   ACCESS emitted a [Wal_read].  Since #611 the cache participates in BOTH
+   configurations — WAL-resolved pages are keyed by [(page_id, frame_idx)] and
+   invalidated on the WAL's generation counter — so this knob now selects only
+   where the bytes come from, not whether they are cached. *)
 let checkpoint_after_seed = env_int "B546_CHECKPOINT" 1 <> 0
 let exec db sql = ignore (unwrap (run (Db.execute db sql)))
 let open_at path = unwrap (run (Granary_unix.open_file_wal ~path ()))

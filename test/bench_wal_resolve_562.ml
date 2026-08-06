@@ -41,10 +41,20 @@
     now holds them. That is the whole of the pager-cache inertness #562
     observed, and it comes free with the correctness fix.
 
-    The un-checkpointed row is deliberately unchanged: inside a live
-    generation the pager cache still does not participate. Measured cost is
-    CPU only (the WAL frame cache absorbs the I/O), which is why it is a
-    follow-up rather than part of this change.
+    The un-checkpointed row was deliberately unchanged by #562: inside a live
+    generation the pager cache still did not participate. Measured cost was
+    CPU only (the WAL frame cache absorbs the I/O), which is why it was a
+    follow-up rather than part of that change.
+
+    {b #611 closed that follow-up}, so the un-checkpointed row is no longer a
+    control: WAL-resolved pages are now cached under [(page_id, frame_idx)]
+    and the un-checkpointed warm scan and repeated point lookups should
+    resolve nothing. The numbers above are pre-#611 and are kept as the
+    historical baseline this harness was written to produce — re-run it to see
+    the current ones. Correctness of the caching (the three invalidation
+    triggers) is pinned by [test_pager_wal_cache_611.ml] and
+    [test_wal_cache_e2e_611.ml]; this file remains a measurement tool, not a
+    gate.
 
     Tunables: B562_ROWS (default 20000), B562_REPS (default 3). *)
 
