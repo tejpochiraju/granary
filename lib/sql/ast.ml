@@ -713,6 +713,62 @@ let rec expr_to_sql = function
   | E_window _ -> failwith "expr_to_sql: unsupported expression form"
 ;;
 
+(* #491: [CREATE VIEW v (c1, c2) AS SELECT ...].  The explicit column list is
+   desugared into the body's own output aliases, which is exactly what it
+   means — and is the workaround the TPC-H harness had been applying by hand.
+
+   Desugaring happens at PARSE time, deliberately.  A view is persisted as its
+   original SQL text and re-parsed on open (see [Db.load_views_into_hashtbl]),
+   so a rewrite applied anywhere above the parser would be silently lost the
+   next time the database was opened.
+
+   [`All] is refused rather than guessed at: the arity of [SELECT *] is not
+   known without the catalog, which the parser does not have. *)
+let rec rename_view_columns (names : string list) (q : stmt) : (stmt, string) result =
+  let n = List.length names in
+  let plural k = if k = 1 then "" else "s" in
+  let arity_error got =
+    Error
+      (Printf.sprintf
+         "CREATE VIEW column list names %d column%s but the SELECT returns %d column%s"
+         n
+         (plural n)
+         got
+         (plural got))
+  in
+  let relabel items =
+    let got = List.length items in
+    if got <> n
+    then arity_error got
+    else Ok (List.map2 (fun (e, _) name -> e, Some name) items names)
+  in
+  match q with
+  | S_select r ->
+    (match r.proj with
+     | `Exprs items ->
+       Result.map (fun items' -> S_select { r with proj = `Exprs items' }) (relabel items)
+     | `Cols cols ->
+       let got = List.length cols in
+       if got <> n
+       then arity_error got
+       else (
+         let items = List.map2 (fun c name -> E_col c, Some name) cols names in
+         Ok (S_select { r with proj = `Exprs items }))
+     | `All ->
+       Error
+         "CREATE VIEW column list requires an explicit select list; SELECT * cannot be \
+          renamed here")
+  | S_const_select { exprs } ->
+    Result.map (fun items' -> S_const_select { exprs = items' }) (relabel exprs)
+  (* A compound select takes its column names from its left arm. *)
+  | S_compound r ->
+    Result.map (fun left' -> S_compound { r with left = left' }) (rename_view_columns names r.left)
+  | S_with_cte r ->
+    Result.map
+      (fun query' -> S_with_cte { r with query = query' })
+      (rename_view_columns names r.query)
+  | _ -> Error "CREATE VIEW column list: unsupported view body"
+;;
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]

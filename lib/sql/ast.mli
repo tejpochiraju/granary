@@ -573,3 +573,10 @@ val quote_ident : string -> string
     literals). *)
 val expr_to_sql : expr -> string
 
+(** #491: [rename_view_columns names body] desugars a [CREATE VIEW v (names)
+    AS body] column list into [body]'s own output aliases — the transformation
+    the column list denotes. Returns [Error msg] when [body] has no explicit
+    select list ([SELECT *]) or when its arity does not match [names]. Applied
+    by the parser, because a view is stored as SQL text and re-parsed on open,
+    so a later rewrite would not survive a reopen. *)
+val rename_view_columns : string list -> stmt -> (stmt, string) result

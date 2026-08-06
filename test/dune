@@ -1274,3 +1274,9 @@
   lwt.unix
   unix))
 
+; #491: CREATE VIEW v (c1, c2) AS ... — the explicit column-name list.
+
+(test
+ (name test_view_columns_491)
+ (modules test_view_columns_491)
+ (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))

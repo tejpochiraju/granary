@@ -457,6 +457,16 @@ drop_index:
 create_view:
   | CREATE VIEW name = any_ident AS query = compound_select
     { Ast.S_create_view { name; query } }
+  (* #491: CREATE VIEW v (c1, c2) AS SELECT ... — the explicit column list is
+     desugared here into the body's own output aliases.  It must happen at
+     parse time: a view is persisted as its SQL text and re-parsed on open, so
+     a rewrite applied above the parser would not survive a reopen. *)
+  | CREATE VIEW name = any_ident
+    LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
+    AS query = compound_select
+    { match Ast.rename_view_columns cols query with
+      | Ok q -> Ast.S_create_view { name; query = q }
+      | Error msg -> failwith msg }
 
 create_reactive_view:
   | CREATE REACTIVE VIEW name = any_ident AS query = compound_select refresh = refresh_clause
