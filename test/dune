@@ -1296,3 +1296,21 @@
  (name test_checkpoint_failure_638)
  (modules test_checkpoint_failure_638)
  (libraries granary granary.store granary.encoding alcotest lwt.unix unix))
+; #612: a checkpoint must physically reclaim the WAL file, not just empty it
+; logically — its size was a permanent high-water mark. Covers the reclaim, the
+; rotate-then-truncate crash window, degradation when the device refuses, and
+; the reader gate that keeps an older snapshot from being truncated out from
+; under.
+
+(test
+ (name test_wal_truncate_612)
+ (modules test_wal_truncate_612)
+ (libraries
+  granary
+  granary.store
+  granary.storage
+  granary.unix
+  granary.encoding
+  alcotest
+  lwt.unix
+  unix))

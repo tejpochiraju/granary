@@ -80,6 +80,14 @@ val open_
   -> ?frame_cache_capacity:int
        (** Max decrypted frames cached for re-read (#246); 0 disables.
            Defaults from [GRANARY_WAL_FRAME_CACHE] (else 1024). *)
+  -> ?resize:(int64 -> (unit, string) result Lwt.t)
+       (** #612: shrink the WAL device to the given byte length.  Supplied, a
+           checkpoint reclaims the file instead of leaving its size as a
+           permanent high-water mark; omitted, the pre-#612 behaviour stands and
+           the space is reused rather than returned.  Optional so the in-memory
+           and fixed-extent device stubs need not implement it.  Called only
+           from {!reset}, only after the generation-marker rotation is durable,
+           and never with a target below [header_size_bytes]. *)
   -> read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
@@ -89,6 +97,19 @@ val open_
 
 (** Total committed frames currently in the WAL. *)
 val committed_frames : t -> int
+
+(** Byte length of the WAL device as this handle understands it: reads past it
+    are refused.  Grows as frames are appended and — since #612, and only when
+    {!open_} was given a [resize] callback — drops back to [header_size_bytes]
+    at {!reset}.
+
+    It may lag the device's real length (a WAL that was never truncated is
+    longer than this says, and harmlessly so) but must never {e lead} it within
+    a generation: frame reads are bounds-checked against it, so understating it
+    while the current generation still owns frames above the bound loses them.
+    That is why {!reset} lowers it only when the truncation it pairs with
+    actually succeeded. *)
+val size_bytes : t -> int64
 
 (** Number of successful device syncs since this WAL was opened.
     Exposed for #77 group-commit testing: tracks how many fsyncs the
@@ -149,13 +170,33 @@ val flush_sync : t -> (unit, error) result Lwt.t
 
     {b #562: this also rotates the header's generation marker on disk and
     fsyncs it, which is why it is now an Lwt operation that can fail.}  The
-    file is still not physically truncated — later appends overwrite from the
-    beginning — but the previous generation's frames no longer verify, so
-    recovery stops at the new generation's tail instead of replaying them.
-    Before #562 they did replay, which (a) made a checkpoint invisible across a
-    reopen, so every page kept resolving through the WAL overlay forever, and
-    (b) silently resurrected pre-checkpoint page contents whenever the new
-    generation was shorter than the old one.
+    previous generation's frames no longer verify, so recovery stops at the new
+    generation's tail instead of replaying them.  Before #562 they did replay,
+    which (a) made a checkpoint invisible across a reopen, so every page kept
+    resolving through the WAL overlay forever, and (b) silently resurrected
+    pre-checkpoint page contents whenever the new generation was shorter than
+    the old one.
+
+    {b #612: when {!open_} was given a [resize] callback, the file is then
+    physically truncated back to [header_size_bytes] and {!size_bytes} drops to
+    match} — the two move together or not at all, because {!size_bytes} is what
+    bounds-checks a frame read.  Without the callback the pre-#612 behaviour
+    stands: the bytes stay and the next generation overwrites them, so the file
+    size is a permanent high-water mark.
+
+    The truncation runs {b after} the marker rotation is durable, and that order
+    is the whole crash-safety argument: whatever fraction of it reaches the
+    device, the surviving trailing bytes are old-generation frames that fail the
+    new marker, so recovery reads the WAL as empty either way.  The reverse
+    order is unsafe — a crash between a truncation and its rotation leaves a
+    short file under the OLD marker, where the next generation's frames are
+    indistinguishable from the old one's survivors.  The floor is
+    [header_size_bytes], never 0, so the header — and with it the generation
+    chain — always survives.
+
+    A truncation failure is {b not} reported: it costs disk space, not
+    correctness, and a failed [reset] fails the whole checkpoint.  {!size_bytes}
+    is lowered only on success.
 
     The caller MUST hold the writer lock across this call: it yields on the
     header fsync, and an append landing in that window would be written under
