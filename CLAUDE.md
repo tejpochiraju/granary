@@ -83,14 +83,15 @@ O(n²) bulk insert, a lost reader/writer overlap:
 | `bench_wal_reader_scaling` | #149 parallel-read regression | parallel ≤ 2.0x serial | `GRANARY_BENCH_PARALLEL_MAX` |
 | `bench_slow_read_yield` | reader starving the writer | writer ≤ 3.0 s | `GRANARY_BENCH_MAX_WRITER_S` |
 
-Two gates are **not** wall-clock and therefore **not** neutralized anywhere:
+Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
 
 | test | guards | gate | knob |
 |---|---|---|---|
 | `test_not_null_600` | #600 `PRAGMA not_null_check` retaining every violating row | marginal peak live heap < 4 words/row when the table doubles | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
 | `test_not_null_repair_630` | #630 `PRAGMA not_null_repair`'s **scan** draining the tree via `cursor_open` | same gate, but with the violation count held FIXED at 5 while the table doubles, so only the scan can move it | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
+| `test_correlated_exists_493` | #493 a correlated `EXISTS` leaking one RO snapshot per outer row | peak live RO snapshots does not grow when the outer rows go 100 → 400 | `GRANARY_MAX_LIVE_READERS` |
 
-The two are complements, not duplicates: #600's doubles the violations along
+The first two are complements, not duplicates: #600's doubles the violations along
 with the table and so cannot tell a retaining scan from a retaining victim
 buffer; #630's holds the violations fixed and therefore measures the scan
 alone. The repair's victim buffer is *supposed* to be O(violations) — #541's
@@ -109,6 +110,24 @@ same test makes. Reach for it only after ruling out the thing it guards: the
 measured slopes are ≈20-23 words/row retaining (19.61-23.52 across three runs;
 the 40 000-row point is the noisy one) and 1.6-1.9 counting, so a failure
 anywhere between those two bands is a regression, not a platform difference.
+
+`test_correlated_exists_493` measures a *count* — `Store.active_reader_count`,
+an integer folded from a refcount table — sampled between outer rows, so load
+cannot move it either. It has **two** assertions and they are not equally
+trustworthy:
+
+- the **ratio** (`peak(400) ≤ peak(100) + 2`) needs no prediction about what the
+  healthy number is, and is the real gate;
+- the **ceiling** (`peak(400) ≤ GRANARY_MAX_LIVE_READERS`, default 32) does, and
+  **that default is a prediction, not a measurement** — this test shipped in a
+  batch whose build and benchmark pass was deferred, and no armed run has ever
+  been observed. A leaked run reports ≈400, so the ceiling has ~12x headroom
+  over the expected healthy value; if it nonetheless fails while the ratio
+  passes, the default was simply wrong and raising it is correct. If the
+  **ratio** fails, that is the leak and no knob should be touched.
+
+It must run **on disk**: the `Mem` backend answers 0 for the reader counters
+unconditionally, so an in-memory version passes vacuously.
 
 **Being non-wall-clock is necessary but not sufficient to run armed
 everywhere — being *measured* is the other half.** A second allocation gate

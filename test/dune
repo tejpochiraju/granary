@@ -1131,6 +1131,7 @@
  (name test_refusal_error_627)
  (modules test_refusal_error_627)
  (libraries alcotest granary granary.unix granary.store lwt lwt.unix unix))
+
 ; #635: an alias-qualified outer reference in a correlated subquery; #626: an
 ; unresolvable one in a projection was answered NULL; #615: an outer join's
 ; correlated ON subquery is now resolved rather than refused.
@@ -1149,6 +1150,23 @@
  (name test_outer_join_subquery_615)
  (modules test_outer_join_subquery_615)
  (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #493: a correlated EXISTS abandoned its inner stream after the first row,
+; leaking one RO snapshot (and its page pins) per outer row; it was also
+; re-planned per outer row and evaluated ahead of the cheap conjuncts beside it.
+; The leak assertions read Store counters, so they need an on-disk database.
+
+(test
+ (name test_correlated_exists_493)
+ (modules test_correlated_exists_493)
+ (libraries
+  granary
+  granary.sql
+  granary.store
+  granary.unix
+  alcotest
+  lwt.unix
+  unix))
 
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 
@@ -1309,6 +1327,7 @@
   alcotest
   lwt.unix
   unix))
+
 ; #634: VACUUM invalidates every other handle over the store, loudly.
 
 (test
@@ -1361,6 +1380,7 @@
  (name test_checkpoint_failure_638)
  (modules test_checkpoint_failure_638)
  (libraries granary granary.store granary.encoding alcotest lwt.unix unix))
+
 ; #612: a checkpoint must physically reclaim the WAL file, not just empty it
 ; logically — its size was a permanent high-water mark. Covers the reclaim, the
 ; rotate-then-truncate crash window, degradation when the device refuses, and
@@ -1379,6 +1399,7 @@
   alcotest
   lwt.unix
   unix))
+
 ; #611: end-to-end — the pager cache participates inside a LIVE WAL
 ; generation, and a checkpoint does not let it answer from a dead one.
 
@@ -1386,6 +1407,7 @@
  (name test_wal_cache_e2e_611)
  (modules test_wal_cache_e2e_611)
  (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+
 ; #585: Db.with_transaction — a scoped transaction extent carrying an owner
 ; token.  Commit/rollback/re-raise, nesting refused, and the #555 poison and
 ; its single ROLLBACK exit left intact.
