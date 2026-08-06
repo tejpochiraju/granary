@@ -605,6 +605,61 @@ let read_borrow ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id f =
   | Some max_frame -> load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
 ;;
 
+(* #481: [read] without the defensive [cstruct_dup], for callers that RETAIN
+   the buffer past a single scope but only ever read it.  [read_borrow] already
+   hands out the pager's own buffer, but only for the extent of a callback; a
+   B+-tree cursor holds its leaf page across the K [cursor_next] calls that
+   consume it, which is not a scope [read_borrow] can express.  Before this,
+   that cursor used [read], paying a full ~4 KB page copy per leaf advance —
+   even on a cache hit — which lands in the major heap and dominated the
+   allocation of a "SELECT COUNT(*)" scan (#481, cause 3).
+
+   CONTRACT — the caller MUST treat the result as read-only and MUST NOT
+   mutate it.  Soundness rests on the same invariant as [read_borrow]: cache
+   and WAL-frame buffers are immutable once stored (replaced wholesale, never
+   written in place — see [write]/[write_owned]/[cache_add]/[Wal.read_frame]),
+   and eviction only drops the hashtbl entry, so a retained buffer stays live
+   and stays correct for as long as the caller holds it.  Retention is
+   therefore safe for an unbounded time, at the cost of keeping one page alive.
+
+   DIRTY PAGES ARE STILL COPIED, deliberately.  A dirty page is the one buffer
+   in the pager that IS mutated in place — [dirty_buffer] grants the writer
+   exactly that right (#356), and the B+-tree insert path uses it.  Handing a
+   retaining reader the live dirty buffer would let a writer shift entries
+   under a positioned cursor.  Copying keeps this function's observable
+   behaviour identical to [read] on the writer path.
+
+   WHAT THIS ADDS TO THE INVARIANT ANY FUTURE WAL CHANGE MUST KEEP.  Retention
+   is unbounded in time, so "immutable once stored" now has to hold for the
+   whole life of a scan, not just the extent of a [read_borrow] callback.  Two
+   changes in flight touch exactly that: #611 (PR #649) caches WAL-resolved
+   frames in the pager, and #612 (PR #644) truncates the WAL at checkpoint.
+   Both are fine as long as they keep dropping-and-rebuilding rather than
+   recycling: a retained borrower keeps its buffer alive through the GC, so
+   evicting a cache entry, resetting a hashtable or truncating the WAL file
+   costs it nothing.  What would break it is REUSING a frame or page buffer for
+   different content — reading a new frame into a buffer some cache still
+   hands out, or writing a checkpointed page back into the buffer a cursor is
+   mid-leaf on.  That was already forbidden by [read_borrow]'s contract; this
+   function widens the window in which violating it is observable from
+   microseconds to the length of a table scan. *)
+let read_shared ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
+  let open Lwt.Syntax in
+  let load_after_wal finder =
+    let* wal_r = resolve_wal_page_borrow t ~page_id finder in
+    match wal_r with
+    | Error e -> Lwt.return_error e
+    | Ok (Some page) -> Lwt.return_ok page
+    | Ok None -> load_main_page_borrow ~bypass_cache t pin_set page_id
+  in
+  match snapshot_frames with
+  | None ->
+    (match Hashtbl.find_opt t.dirty page_id with
+     | Some buf -> Lwt.return_ok (cstruct_dup buf)
+     | None -> load_after_wal (fun cb -> cb.wal_find_page page_id))
+  | Some max_frame -> load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
+;;
+
 let write t page_id buf =
   let copy = cstruct_dup buf in
   Hashtbl.replace t.dirty page_id copy

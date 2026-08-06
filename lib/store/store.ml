@@ -3035,6 +3035,28 @@ type seek_cursor =
 let seek_pause_interval = 256
 let mk_seek_cursor sc_impl = { sc_calls = 0; sc_impl }
 
+(* The cursor is advanced eagerly by the caller; [result] already holds this
+   call's entry (or [None]), so splicing a pause here only defers the *return*,
+   never reordering or dropping a match (#235).  We count calls, not matches:
+   every recursive consumer call nests a frame whether or not it yields a row,
+   so the terminal [None] call is counted too.
+
+   Yielding mid-stream is safe under the current concurrency model: a paused RO
+   seek streams from an immutable snapshot, and a paused RW seek holds the
+   single-writer lock — so no other fiber can mutate the tree under the cursor
+   between pause and resume.  If that invariant is ever relaxed (concurrent
+   writers), revisit this yield point.
+
+   #481: shared by [seek_next] and [seek_next_value] so the two cannot drift in
+   their stack-bounding behaviour; the counter lives on the cursor, so mixing
+   the two on one cursor still yields every [seek_pause_interval] reads. *)
+let seek_pause_tail sc result =
+  sc.sc_calls <- sc.sc_calls + 1;
+  if sc.sc_calls mod seek_pause_interval = 0
+  then Lwt.bind (Lwt.pause ()) (fun () -> result)
+  else result
+;;
+
 let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
   fun tx tid key ->
   match tx with
@@ -3107,21 +3129,34 @@ let seek_next : seek_cursor -> (bytes * bytes) option Lwt.t =
        | Error e ->
          Lwt.fail_with (Format.asprintf "Store.seek_next: %a" pp_error (map_btree_err e)))
   in
-  (* The cursor is advanced eagerly above; [result] already holds this call's
-     entry (or [None]), so splicing a pause here only defers the *return*, never
-     reordering or dropping a match (#235).  We count calls, not matches: every
-     recursive consumer call nests a frame whether or not it yields a row, so the
-     terminal [None] call is counted too.
+  seek_pause_tail sc result
+;;
 
-     Yielding mid-stream is safe under the current concurrency model: a paused RO
-     seek streams from an immutable snapshot, and a paused RW seek holds the
-     single-writer lock — so no other fiber can mutate the tree under the cursor
-     between pause and resume.  If that invariant is ever relaxed (concurrent
-     writers), revisit this yield point. *)
-  sc.sc_calls <- sc.sc_calls + 1;
-  if sc.sc_calls mod seek_pause_interval = 0
-  then Lwt.bind (Lwt.pause ()) (fun () -> result)
-  else result
+(* #481: [seek_next] that never materialises the key.  Identical traversal,
+   identical pause accounting — the B+-tree backend simply skips the per-entry
+   key copy (and, one layer down, the tag-strip copy of the value).  For a
+   sequential table scan, which binds the key as [_key] and drops it, that copy
+   was pure waste on every row.  The [Mem] backend has nothing to save: its
+   entries are already materialised pairs, so it just projects. *)
+let seek_next_value : seek_cursor -> bytes option Lwt.t =
+  fun sc ->
+  let result =
+    match sc.sc_impl with
+    | SC_mem r ->
+      (match !r () with
+       | Seq.Nil -> Lwt.return_none
+       | Seq.Cons ((_key, v), rest) ->
+         r := rest;
+         Lwt.return_some v)
+    | SC_bt c ->
+      let* r = Btree.cursor_next_value c in
+      (match r with
+       | Ok v -> Lwt.return v
+       | Error e ->
+         Lwt.fail_with
+           (Format.asprintf "Store.seek_next_value: %a" pp_error (map_btree_err e)))
+  in
+  seek_pause_tail sc result
 ;;
 
 let seek_close : seek_cursor -> unit =

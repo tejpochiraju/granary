@@ -134,6 +134,45 @@ type leaf_entry =
     Returns `` `Entry leaf_entry`` or `` `End``. *)
 val leaf_entry_at : Cstruct.t -> offset:int -> [ `Entry of leaf_entry | `End ]
 
+(** #481: where one leaf entry's key and value LIE inside a page buffer.
+
+    Filled by {!leaf_span_at}, which allocates nothing — unlike
+    {!leaf_entry_at}, which copies both the key and the value out of the page
+    for every entry, including the ones the caller discards.
+
+    {b Ownership.}  A span records no reference to the buffer it was filled
+    from; its offsets are meaningful only for that buffer and only while that
+    buffer still holds the same leaf page.  Never carry a span across a change
+    of leaf, and always pass {!copy_span} the buffer the span was filled
+    from. *)
+type leaf_span =
+  { mutable sp_key_off : int (** byte offset of the key within the page *)
+  ; mutable sp_key_len : int (** key length in bytes *)
+  ; mutable sp_val_off : int (** byte offset of the stored value *)
+  ; mutable sp_val_len : int (** stored-value length in bytes (tag included) *)
+  ; mutable sp_next_offset : int (** offset of the following entry *)
+  }
+
+(** A fresh, zeroed span.  Callers keep ONE per cursor and refill it per entry
+    so that walking a leaf allocates nothing. *)
+val leaf_span_create : unit -> leaf_span
+
+(** Fill [span] with the entry at [offset] in [buf].  Returns [false] — exactly
+    where {!leaf_entry_at} returns `` `End `` — when the entry does not fit in
+    the page; [span] is then untouched.  Allocates nothing. *)
+val leaf_span_at : Cstruct.t -> offset:int -> leaf_span -> bool
+
+(** Copy [len] bytes out of [buf] starting at [off] into a fresh [bytes].  The
+    single copy a span-based reader makes, for the bytes it actually wants. *)
+val copy_span : Cstruct.t -> off:int -> len:int -> bytes
+
+(** Compare a target [key] against the entry key stored in [buf] at
+    [kstart .. kstart+klen), without copying the stored key out.  Same sign
+    convention as [Bytes.compare key stored_key]: bytes compared unsigned, then
+    the shorter key sorts first.  Both leaf and branch entries start with
+    [key_len: uint16][key: key_len], so this serves both.  Allocates nothing. *)
+val compare_key_at : Cstruct.t -> kstart:int -> klen:int -> key:bytes -> int
+
 (** Append a leaf entry at [offset].  Returns the next offset.  The usable
     ceiling is [Cstruct.length buf - reserved] ([reserved] defaults to 0, #95);
     the page size is taken from the buffer.  Raises [Invalid_argument] if the

@@ -110,6 +110,31 @@ measured slopes are ≈20-23 words/row retaining (19.61-23.52 across three runs;
 the 40 000-row point is the noisy one) and 1.6-1.9 counting, so a failure
 anywhere between those two bands is a regression, not a platform difference.
 
+**Being non-wall-clock is necessary but not sufficient to run armed
+everywhere — being *measured* is the other half.** A second allocation gate
+exists and is deliberately **not** armed by default:
+
+| test | guards | gate | knob |
+|---|---|---|---|
+| `test_scan_borrow_481` | #481 the scan path copying the key, the value twice, and a 4 KB page per leaf | scan allocates < 2.0 bytes per byte of payload it never reads | `GRANARY_MEM_MAX_PAYLOAD_SLOPE` |
+
+The unit is *copies of the payload*: 1.0 is the one copy the caller asked for,
+3.0 is the three #481 removed, and word-size rounding moves it by ~0.02, so the
+2.0 boundary is an integer boundary rather than a tuned number. That derivation
+is why the ceiling is defensible; the fact that **nobody has run it yet** is why
+it is unarmed. Unset (the default in `ci.yml`, `coverage.yml`, `cross-arch.yml`
+and on your box), the test measures and prints the slope and still asserts every
+correctness property around it — it just does not block. It is armed in exactly
+one place, `bench-nightly.yml`, which sets `GRANARY_MEM_MAX_PAYLOAD_SLOPE=2.0`
+and reports through an auto-filed issue rather than failing a PR.
+
+This is the shape to copy for any future allocation gate: **derive the ceiling,
+arm it nightly, and promote it to armed-by-default only once a real measurement
+backs it.** Arming a guessed ceiling on every PR is how a gate gets silently
+neutralized later, which is the honour system #549 removed. When #481's
+benchmark pass produces the number, flip the default in the test and move its
+row into the table above.
+
 **Where they run armed.** `ci.yml`, `coverage.yml` and `cross-arch.yml` — all
 six files, Forgejo and GitHub — neutralize every one of them, because those
 jobs share a loaded runner with every other PR. The single *scheduled* job that

@@ -300,6 +300,69 @@ let leaf_entry_at buf ~offset =
         `Entry { key; value; next_offset })))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #481: zero-allocation leaf-entry iteration (spans, not copies)      *)
+(* ------------------------------------------------------------------ *)
+
+(* [leaf_entry_at] copies BOTH the key and the value out of the page for every
+   entry it is asked about.  On a full scan that is two [Bytes.create] + blit
+   per row, and a consumer that discards the key (every aggregate, and
+   [Exec.stream_seq_scan] itself, which binds it as [_key]) pays for the copy
+   anyway.  The value was then copied a SECOND time one layer up, by
+   [Btree.decode_leaf_value], purely to drop its leading one-byte inline tag.
+
+   A [leaf_span] instead records WHERE the key and value lie inside the page
+   buffer and allocates nothing at all, letting the caller copy exactly the
+   bytes it wants, exactly once, straight out of the page.
+
+   OWNERSHIP / LIFETIME.  A span holds no reference to the buffer it was filled
+   from: its offsets are meaningful ONLY for that buffer, and only while that
+   buffer still holds the same leaf page.  Callers must therefore (a) pass the
+   same [buf] they filled the span from, and (b) never carry a span across a
+   change of leaf.  [Btree]'s cursor owns exactly one span, refills it on every
+   step, and drops its leaf buffer and span together.  A span is deliberately
+   mutable and reused so that iterating a leaf allocates nothing per entry. *)
+type leaf_span =
+  { mutable sp_key_off : int
+  ; mutable sp_key_len : int
+  ; mutable sp_val_off : int
+  ; mutable sp_val_len : int
+  ; mutable sp_next_offset : int
+  }
+
+let leaf_span_create () =
+  { sp_key_off = 0; sp_key_len = 0; sp_val_off = 0; sp_val_len = 0; sp_next_offset = 0 }
+;;
+
+(* Bounds handling mirrors [leaf_entry_at] exactly: [false] here is precisely
+   the `` `End `` that function returns, and the field arithmetic is the same. *)
+let leaf_span_at buf ~offset span =
+  let page_size = Cstruct.length buf in
+  if offset + 4 > page_size
+  then false
+  else (
+    let key_len = Cstruct.BE.get_uint16 buf offset in
+    if offset + 2 + key_len + 2 > page_size
+    then false
+    else (
+      let val_len = Cstruct.BE.get_uint16 buf (offset + 2 + key_len) in
+      if offset + 2 + key_len + 2 + val_len > page_size
+      then false
+      else (
+        span.sp_key_off <- offset + 2;
+        span.sp_key_len <- key_len;
+        span.sp_val_off <- offset + 2 + key_len + 2;
+        span.sp_val_len <- val_len;
+        span.sp_next_offset <- offset + 2 + key_len + 2 + val_len;
+        true)))
+;;
+
+let copy_span buf ~off ~len =
+  let out = Bytes.create len in
+  Cstruct.blit_to_bytes buf off out 0 len;
+  out
+;;
+
 let leaf_append_entry ?(reserved = 0) buf ~offset ~key ~value =
   let page_size = Cstruct.length buf in
   let key_len = Bytes.length key in
