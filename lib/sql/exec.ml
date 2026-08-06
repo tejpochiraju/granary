@@ -2184,7 +2184,15 @@ let eval_check_constraints
 (* #567: a column whose stored cell is allowed to be [V_null] even though the
    schema says NOT NULL.  VIRTUAL generated columns are stored as NULL and
    recomputed on read ([decode_with_virtual]), so their stored cell says
-   nothing about the value the schema declares. *)
+   nothing about the value the schema declares.
+
+   #629: this is a fallback, not the answer.  "The stored cell says nothing"
+   is a reason to look at the COMPUTED value, not a reason to stop checking —
+   exempting outright made a NOT NULL VIRTUAL generated column unenforceable.
+   [not_null_violation] now recomputes the virtual cells first whenever it can
+   and consults this only when it cannot (a short row, i.e. one that does not
+   cover every column, where evaluating the generated expression would raise).
+   Do not re-broaden it: the exemption is the degraded mode. *)
 let not_null_exempt_col (col : Row.column) : bool =
   match col.Row.generated_as with
   | Some (_, false) -> true (* VIRTUAL: not materialised in the stored row *)
@@ -2229,15 +2237,56 @@ let not_null_exempt_col (col : Row.column) : bool =
    [enforce_not_null] because UPDATE has no [OR IGNORE] form to consult.
 
    Returns the message for the FIRST violating column, matching the column
-   order the raising version reported. *)
-let not_null_violation (table_meta : Cat.table_meta) (row : Row.t) : string option =
+   order the raising version reported.
+
+   #629: [clock]/[params] are how a VIRTUAL generated column gets checked
+   against the value it actually holds.  The write paths set a VIRTUAL cell to
+   [V_null] on purpose ([compute_stored_generated_cols]) and recompute it on
+   read, so the row handed in here says NULL for a column that is not NULL —
+   which is why #567 exempted them wholesale.  Recomputing the virtuals into a
+   copy first narrows WHEN the check runs (after the generated value exists)
+   rather than WHETHER, so a genuinely NULL-valued generated expression is
+   still caught.  Both are optional and default to the same values
+   [compute_stored_generated_cols] is already called with elsewhere in this
+   module ([None], [[||]]); a generated expression is DDL and cannot reference
+   a parameter, so the default is only ever wrong for a clock-dependent one.
+
+   The STORED half of #629 rests on an ordering claim, and the claim is about
+   the ROW-STORE sites only — stating it as "every enforcement site" was wrong
+   when this shipped, so here it is enumerated.  [compute_stored_generated_cols]
+   runs before the check at [execute_insert] (feeding [execute_insert_write]),
+   [execute_upsert_update], [update_col_in_tx] and [apply_update_row] (feeding
+   [write_row_rekeyed]).  It is NOT called on either columnar arm: both build
+   the row with [Array.make n_cols Row.V_null] and pass it straight to
+   [not_null_skip_or_fail].  That is sound only because
+   [Sema.bind_create] now refuses a GENERATED column on a COLUMNSTORE table
+   outright (#660) — no generated column can reach those two sites, so the
+   ordering question does not arise there.  If that refusal is ever lifted, the
+   two arms need the call before the check, and the VIRTUAL read path needs a
+   recompute, or a columnar generated column reads NULL forever. *)
+let not_null_violation
+      ?(clock : (unit -> float) option = None)
+      ?(params : Row.value array = [||])
+      (table_meta : Cat.table_meta)
+      (row : Row.t)
+  : string option
+  =
   let n = Array.length row in
+  (* Only safe when the row covers every column: [compute_virtual_generated_cols]
+     writes into [row.(i)] for each virtual column and would raise on a short
+     row.  When it is not safe the #567 exemption stands. *)
+  let virtuals_computed =
+    has_virtual_cols table_meta.Cat.columns && n = List.length table_meta.Cat.columns
+  in
+  let row =
+    if virtuals_computed then with_computed_virtuals clock params table_meta row else row
+  in
   let rec go i = function
     | [] -> None
     | (col : Row.column) :: rest ->
       let violated =
         col.Row.not_null
-        && (not (not_null_exempt_col col))
+        && ((not (not_null_exempt_col col)) || virtuals_computed)
         && i < n
         && row.(i) = Row.V_null
       in
@@ -2253,8 +2302,8 @@ let not_null_violation (table_meta : Cat.table_meta) (row : Row.t) : string opti
   go 0 table_meta.Cat.columns
 ;;
 
-let enforce_not_null (table_meta : Cat.table_meta) (row : Row.t) : unit =
-  match not_null_violation table_meta row with
+let enforce_not_null ?clock ?params (table_meta : Cat.table_meta) (row : Row.t) : unit =
+  match not_null_violation ?clock ?params table_meta row with
   | None -> ()
   | Some msg -> failwith msg
 ;;
@@ -2274,12 +2323,14 @@ let enforce_not_null (table_meta : Cat.table_meta) (row : Row.t) : unit =
      caller's value is a bigger surprise than the error.  Pinned in
      [test_not_null_599.ml]. *)
 let not_null_skip_or_fail
+      ?clock
+      ?params
       (table_meta : Cat.table_meta)
       (row : Row.t)
       ~(on_conflict : Ast.conflict_action option)
   : bool
   =
-  match not_null_violation table_meta row with
+  match not_null_violation ?clock ?params table_meta row with
   | None -> false
   | Some msg -> if on_conflict = Some Ast.CA_ignore then true else failwith msg
 ;;
@@ -3750,8 +3801,9 @@ let write_row_rekeyed
   (* #567: every single-row UPDATE path (UPDATE, UPSERT DO UPDATE, ON UPDATE
      CASCADE / SET NULL / SET DEFAULT) funnels through here, so this is the one
      place the new row's NULLs have to be checked.  Raises before any index or
-     row write. *)
-  enforce_not_null table_meta new_row;
+     row write.  #629: [clock]/[params] let it see a VIRTUAL generated column's
+     computed value — an UPDATE to a base column can make one NULL. *)
+  enforce_not_null ~clock ~params table_meta new_row;
   let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
   let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
   let* () =
@@ -3894,7 +3946,9 @@ let execute_insert_write
      modifier already did for a UNIQUE conflict; every other resolution
      raises.  Not evaluated when [skip] is already set: that only happens under
      [CA_ignore], which would answer the same way. *)
-  let null_skip = (not skip) && not_null_skip_or_fail table_meta row ~on_conflict in
+  let null_skip =
+    (not skip) && not_null_skip_or_fail ~clock ~params table_meta row ~on_conflict
+  in
   if skip || null_skip
   then
     (* IGNORE from secondary-index pre-check: rollback if owned.
@@ -7556,7 +7610,7 @@ let execute_with_count
                    into a NOT NULL column here.  #599: [OR IGNORE] drops the
                    offending row here too, so the modifier means the same thing
                    on both storage engines. *)
-                if not_null_skip_or_fail table_meta row ~on_conflict
+                if not_null_skip_or_fail ~clock ~params table_meta row ~on_conflict
                 then None
                 else Some row)
              values
@@ -7603,7 +7657,7 @@ let execute_with_count
                  the check has to be here.  Raised before the txn is acquired,
                  so nothing has been written when it fires.  #599: under
                  [OR IGNORE] the row is dropped instead. *)
-              if not_null_skip_or_fail table_meta dest ~on_conflict
+              if not_null_skip_or_fail ~clock ~params table_meta dest ~on_conflict
               then None
               else Some dest)
            src_rows)
@@ -11425,8 +11479,15 @@ and stream_pragma_integrity_check store cat =
 
 (* #563: the (ordinal, name) of every column whose loaded schema declares NOT
    NULL and whose stored cell therefore has to hold a value.  VIRTUAL
-   generated columns are excluded for exactly the reason [enforce_not_null]
-   exempts them: they are stored as NULL and recomputed on read. *)
+   generated columns are excluded because they are stored as NULL and
+   recomputed on read.
+
+   #629 deliberately does NOT follow the write path here.  [not_null_violation]
+   stopped exempting VIRTUAL columns and recomputes them instead, because a
+   write can be refused; this scan reports on cells that are already on disk and
+   whose only repair action is to rewrite the cell — which is meaningless for a
+   column that is never read from disk in the first place.  The exclusion is
+   about what [repair] can act on, not about where the truth lives. *)
 and not_null_scan_cols (meta : Cat.table_meta) : (int * string) list =
   meta.Cat.columns
   |> List.mapi (fun i (c : Row.column) -> i, c)

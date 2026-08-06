@@ -1656,17 +1656,47 @@ let bind_create
   | Error e -> Lwt.return (Error e)
   | Ok () ->
     if using_columnstore
-    then
-      let* existing = Cat.find_table cat ~name in
-      match existing with
-      | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-      | Some _ ->
-        Lwt.return (Ok (BS_col_create_table { name; columns = []; if_not_exists = true }))
-      | None ->
+    then (
+      (* #629: a columnstore table may not declare a GENERATED column.  Nothing
+         on the columnar path ever computes one: the two write arms build the
+         row with [Array.make n_cols Row.V_null] and hand it straight to
+         [Col_store.insert_rows] without calling
+         [Exec.compute_stored_generated_cols], and [stream_col_seq_scan] returns
+         [Col_store.to_row_seq] rows verbatim without recomputing VIRTUAL ones.
+         So the column was silently NULL forever, in both storage classes — a
+         wrong-answer bug that no error ever surfaced.  Refusing at DDL turns
+         that into a loud, early, accurate one, and it is what makes the
+         enumerated NOT NULL invariant hold at the two columnar enforcement
+         sites: with no generated column reachable there, "STORED is
+         materialised before the check" is vacuously true rather than false.
+
+         Deliberately a refusal rather than wiring the computation in: fixing
+         only the write side would leave VIRTUAL reading NULL, which deepens the
+         asymmetry instead of removing it.  Supporting generated columns on the
+         columnstore properly is #660. *)
+      match
+        List.find_opt (fun (c : Ast.column_def) -> c.generated_as <> None) columns
+      with
+      | Some c ->
         Lwt.return
-          (Ok
-             (BS_col_create_table
-                { name; columns = List.map column_of_def columns; if_not_exists }))
+          (Error
+             (Unsupported
+                (Printf.sprintf
+                   "GENERATED column '%s' in a COLUMNSTORE table (the columnar path \
+                    never computes one; it would read NULL forever)"
+                   c.name)))
+      | None ->
+        let* existing = Cat.find_table cat ~name in
+        (match existing with
+         | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+         | Some _ ->
+           Lwt.return
+             (Ok (BS_col_create_table { name; columns = []; if_not_exists = true }))
+         | None ->
+           Lwt.return
+             (Ok
+                (BS_col_create_table
+                   { name; columns = List.map column_of_def columns; if_not_exists }))))
     else
       let* existing = Cat.find_table cat ~name in
       (match existing with
@@ -1889,7 +1919,21 @@ let bind_upsert_assignments
           | None -> Error (Unknown_column { table = meta.name; column = col_name })
           | Some i ->
             let col = List.nth meta.columns i in
-            if col.Row.not_null && rhs_expr = Ast.E_lit Ast.L_null
+            (* #629: DO UPDATE SET is an UPDATE, so it refuses a generated column
+               exactly as [bind_update_assignments] does — and for a sharper
+               reason than symmetry.  Without this guard the assignment BOUND
+               fine and then [compute_stored_generated_cols] overwrote the column
+               immediately after the assigns were applied
+               ([Exec.execute_upsert_update]), so the statement silently did
+               nothing.  This is the third assignment spelling; the other two
+               were already guarded. It must sit ABOVE the NOT NULL check, or a
+               NOT NULL generated column reports the wrong error. *)
+            if col.Row.generated_as <> None
+            then
+              Error
+                (Unsupported
+                   (Printf.sprintf "cannot UPDATE generated column '%s'" col.Row.name))
+            else if col.Row.not_null && rhs_expr = Ast.E_lit Ast.L_null
             then Error (Not_null_violation col.Row.name)
             else (
               match bind_upsert_rhs_expr ~param_counter ~named_params meta rhs_expr with
@@ -2014,7 +2058,21 @@ let bind_insert_row
          time, which is where the parameter spelling is already skipped.  Only
          ONE place decides what `OR IGNORE` means, and it is the runtime one;
          this binder just stops pre-empting it.  Every other resolution keeps
-         the static error, which stays the earlier and better-located one. *)
+         the static error, which stays the earlier and better-located one.
+
+         #629: a GENERATED column is exempt here for the same reason, and it is
+         the same mistake in a third guise — the check running at a point where
+         it cannot see the truth.  The caller is FORBIDDEN from supplying a
+         generated column ([bind_explicit_insert_cols] rejects it outright), so
+         one is always omitted and always filled in above with the [BE_lit
+         L_null] placeholder.  Checking that placeholder made a NOT NULL
+         generated column reject EVERY insert, with no spelling that could
+         succeed: the table was uninsertable.  Both storage classes are exempt,
+         because neither has its value yet at bind time.  Enforcement is not
+         dropped, only moved to where the computed value exists —
+         [Exec.not_null_skip_or_fail] for STORED (materialised by
+         [compute_stored_generated_cols] before the check) and for VIRTUAL
+         (recomputed inside [Exec.not_null_violation]). *)
       let alias_col = Cat.rowid_alias_col meta in
       let ignore_nulls = on_conflict = Some Ast.CA_ignore in
       let nn_result =
@@ -2026,7 +2084,10 @@ let bind_insert_row
                let col = List.nth meta.columns i in
                (match bexpr with
                 | BE_lit Ast.L_null
-                  when (not ignore_nulls) && col.Row.not_null && Some i <> alias_col ->
+                  when (not ignore_nulls)
+                       && col.Row.not_null
+                       && Some i <> alias_col
+                       && col.Row.generated_as = None ->
                   Error (Not_null_violation col.Row.name)
                 | _ -> Ok ()))
           (Ok ())
@@ -2101,8 +2162,27 @@ let bind_insert
       ~columns
       ~values:(List.concat values)
   | Some meta ->
+    (* #629: the implicit column list omits generated columns.  Supplying one is
+       refused ([bind_explicit_insert_cols]), so including them here made the
+       bare spelling `INSERT INTO g VALUES (1, 1)` unreachable in its own right —
+       [Arity_mismatch] when the caller passes one value per *base* column, and
+       "cannot INSERT into generated column" when they pad it out.  That is the
+       issue's headline symptom ("the table is uninsertable") surviving the
+       binder fix, in the commonest spelling of all.
+
+       This is not a new divergence decision: the [INSERT ... SELECT] binder
+       below already builds its implicit ordinal list with exactly this filter
+       ([bind_insert_select], the [columns = []] arm), and [Db.dump] already
+       emits an explicit column list that omits generated columns. The VALUES
+       binder was the odd one out. SQLite agrees. *)
     let columns =
-      if columns = [] then List.map (fun c -> c.Row.name) meta.columns else columns
+      if columns = []
+      then
+        List.filter_map
+          (fun (c : Row.column) ->
+             if c.Row.generated_as = None then Some c.Row.name else None)
+          meta.columns
+      else columns
     in
     let rows_result =
       List.fold_left

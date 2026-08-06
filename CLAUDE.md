@@ -456,6 +456,63 @@ EOF
   - `Op_nested_loop_join` cannot carry a subquery in its probe through the
     planner, but it is a public constructor, so `stream_nested_loop_join`
     refuses one explicitly rather than encoding it as NULL.
+- **A GENERATED column's NOT NULL is enforced on its COMPUTED value, at both
+  levels (#629).** This was the third instance of the same shape as #567 and
+  #599 — a check running where it cannot see the truth — and the fix narrows
+  *when* each check runs, never *whether*.
+
+  The caller is forbidden from supplying a generated column, so it is always
+  omitted, and `Sema.bind_insert_row` fills an omitted column with a literal-NULL
+  placeholder. Judging that placeholder made a `NOT NULL GENERATED` column reject
+  **every** INSERT: no spelling could succeed, so the table was uninsertable.
+  `bind_insert_row` therefore exempts generated columns of **both** storage
+  classes — at bind time neither has a value. It keeps its literal-NULL error for
+  every other column.
+
+  Two neighbouring binders were out of step with that and had to move too, or
+  the headline symptom survived the fix. `bind_insert`'s **implicit column list**
+  now omits generated columns, so bare `INSERT INTO g VALUES (…)` works — before,
+  it was `Arity_mismatch` with one value per base column and "cannot INSERT into
+  generated column" when padded out. That was not a new divergence decision: the
+  `INSERT … SELECT` binder's `columns = []` arm already applied exactly that
+  filter, and `Db.dump` already emits an explicit list that omits them; the
+  VALUES binder was the odd one out. And `bind_upsert_assignments` now refuses
+  `DO UPDATE SET <generated> = …` the way `bind_update_assignments` always did —
+  it was the third assignment spelling and the only unguarded one, so the
+  assignment bound fine and `compute_stored_generated_cols` overwrote the column
+  immediately after, making the statement silently do nothing.
+
+  The runtime half had the mirror-image gap. `Exec.not_null_exempt_col` exempted
+  VIRTUAL generated columns outright (#567's reasoning: their stored cell is
+  `V_null` by design), which meant a NOT NULL VIRTUAL column was *unenforceable*.
+  `Exec.not_null_violation` now recomputes the virtuals into a copy of the row
+  before judging it, and consults the exemption only when it cannot — a row that
+  does not cover every column, where evaluating the generated expression would
+  raise. **The exemption is the degraded mode; do not re-broaden it.**
+
+  **STORED columns rest on an ordering claim, and the claim covers the
+  ROW-STORE sites only** — do not restate it as "every enforcement site", which
+  is how it shipped and is false. `compute_stored_generated_cols` runs before
+  the check at `execute_insert`, `execute_upsert_update`, `update_col_in_tx` and
+  `apply_update_row`. It is **not** called on either columnar arm: both build the
+  row with `Array.make n_cols Row.V_null` and pass it straight to
+  `not_null_skip_or_fail`. Nor does `stream_col_seq_scan` recompute VIRTUAL ones
+  on the way out. So a generated column on a columnstore table read NULL forever
+  in **both** classes, silently. `Sema.bind_create` now **refuses** a GENERATED
+  column on a `USING COLUMNSTORE` table (#660) — which is what makes the ordering
+  question not arise at those two sites, rather than a claim that it was already
+  answered there. Wiring the computation into the write arms alone was rejected:
+  it fixes STORED and leaves VIRTUAL reading NULL, deepening the asymmetry. If
+  #660 lifts the refusal, both halves are owed at once.
+
+  Consequences worth knowing: a generated expression that genuinely evaluates to
+  NULL is still rejected — on INSERT (skipped under `OR IGNORE`, per #599, since
+  the row now reaches the runtime site that decides that), and on an UPDATE of
+  the base column it reads (always raises; `write_row_rekeyed` has no `OR IGNORE`
+  form). `not_null_scan_cols` (`PRAGMA not_null_check`/`repair`) deliberately did
+  **not** follow — it reports on cells already on disk whose only repair is to
+  rewrite them, which is meaningless for a column never read from disk. Pinned by
+  `test/test_not_null_629.ml`.
 
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
