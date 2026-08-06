@@ -2987,6 +2987,17 @@ let bind_select_having
    shadowing case.  A QUALIFIED name ([t.a]) is not a bare identifier, so it
    always means the input column.
 
+   {b Where this DIVERGES from SQLite, deliberately:} an alias is substituted
+   only when the whole ORDER BY term IS the identifier.  SQLite substitutes a
+   select-list alias anywhere INSIDE an ORDER BY expression, so [ORDER BY n + 1]
+   and [ORDER BY -revenue] work there and still answer "unknown column" here.
+   The two bare forms are what the standard requires and what the five TPC-H
+   queries in #490 need; substituting inside arbitrary expressions is a larger
+   change (the alias's bound expression would have to be spliced into a tree
+   that may also mention input columns, and in the aggregated case the two live
+   in different row spaces) and is not attempted.  Rule 3 above is SQLite parity
+   for [ORDER BY 1+1]; this paragraph is where the parity stops.
+
    [out_ref] turns a 1-based output position into the bound key for it and owns
    the range check; [out_aliases] lists the SELECT list's explicit aliases in
    output order ([None] where an item has none, [[]] when the projection cannot
@@ -2999,7 +3010,12 @@ let bind_select_order
       ~(out_ref : int64 -> (bound_expr, error) result)
       order
   =
-  (* 1-based position of the output column carrying alias [name], if any. *)
+  (* 1-based position of the output column carrying alias [name], if any.
+     Duplicate aliases resolve FIRST-WINS and silently — [SELECT a AS x, b AS x
+     ... ORDER BY x] sorts by [a].  SQLite calls that ambiguous and errors;
+     matching it would mean a scan for a second hit here.  Left as is because
+     it is a pre-existing shape (the old alias fallback used [List.assoc_opt],
+     which is also first-wins) and the answer is at least deterministic. *)
   let alias_pos name =
     let rec go i = function
       | [] -> None
@@ -3016,7 +3032,17 @@ let bind_select_order
        | Some pos -> out_ref pos
        | None ->
          (* Alias-aware binder for both single-table and joined
-            queries; see comment in [bind_one] above. *)
+            queries; see comment in [bind_one] above.
+
+            KNOWN HOLE, pre-existing and not introduced by #489/#490: in an
+            AGGREGATED select this fall-through applies no GROUP BY membership
+            check, unlike [bind_select_having]'s resolver.  A known but
+            non-grouped column binds to its INPUT index, [Planner.remap_e]
+            leaves any index it does not find in [group_cols] alone, and the
+            key then reads whatever output column sits at that index — or
+            indexes past the end of the output row and raises from [Exec].
+            Tracked as #663; the fix belongs with the aggregated ORDER BY
+            resolver (#658's [bind_select_order_agg]), not here. *)
          bind_expr_join ~param_counter ~named_params ~tables e)
     | _ -> bind_expr_join ~param_counter ~named_params ~tables e
   in
@@ -3393,6 +3419,10 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
 (* UPDATE                                                               *)
 (* ------------------------------------------------------------------ *)
 
+(* ORDER BY for UPDATE and DELETE.  #489 deliberately does NOT apply here: a
+   bare integer literal stays a constant, because these statements have no
+   select list for an ordinal to be a position in.  Do not "fix" that by
+   routing this through the ordinal path. *)
 let bind_order_keys
       ~param_counter
       ~named_params
@@ -3415,10 +3445,26 @@ let bind_order_keys
    ORDER BY, where a bare integer literal is the SQL:92 ordinal — the 1-based
    position of a column in the compound's OUTPUT row.  That output row is
    exactly what the post-set-op sort sees, so the ordinal becomes a
-   [BE_out_col] and needs no table at all.  Everything else still binds against
-   the leftmost arm's [meta], since a compound takes its column names from the
-   leftmost SELECT.  Output ALIASES are not resolved here (#490 covers the
-   plain-SELECT path only); a compound arm's aliases are not carried this far. *)
+   [BE_out_col] and needs no table at all.  [n_out] must therefore be the
+   OUTPUT width, which is why {!compound_col_count} had to learn to read
+   [agg_proj]: a wrong width turns a valid ordinal into a hard rejection, which
+   is a worse bug than the silent-ignore #489 was filed about.
+
+   Output ALIASES are not resolved here (#490 covers the plain-SELECT path
+   only); a compound arm's aliases are not carried this far.
+
+   {b Everything that is NOT an ordinal is still bound against the leftmost
+   arm's [meta], and that rule is UNSOUND for anything but a leading-prefix
+   projection.}  It yields [BE_col <table ordinal>], which [plan_order_keys]
+   turns into [P_col i] — evaluated against the set-op OUTPUT row, not against
+   a table row.  So for [SELECT b, a FROM t UNION ALL SELECT b, a FROM u ORDER
+   BY a] the name [a] resolves to table index 0 and the sort silently uses the
+   output's column 0, which holds [b]; and a projection narrower than the table
+   indexes past the end of the output row and raises [Invalid_argument] from
+   [Exec]'s unchecked [row.(i)] mid-query.  This predates #489 — [bind_order_keys]
+   did exactly the same — and is tracked as #662; it is recorded here
+   because this function is now the home of the rule.  Do not extend the
+   non-ordinal path without fixing it. *)
 let bind_compound_order_keys
       ~param_counter
       ~named_params
@@ -3903,10 +3949,25 @@ let pp_error fmt = function
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
-(* Count output columns of a bound statement for compound-select validation. *)
+(* Count output columns of a bound statement for compound-select validation.
+
+   #489: an AGGREGATED arm's output width lives in [agg_proj], and nowhere
+   else.  [aggs] counts aggregate *specs*, which is neither the number of
+   output columns (a grouped column is not an aggregate, and a HAVING
+   aggregate is not projected) nor even non-zero — a bare [GROUP BY nm] with
+   no aggregate call at all registers no spec, so this used to answer 0 for a
+   one-column arm.  [col_names_of_bound_stmt], immediately below, already
+   reads [agg_proj] for exactly this; the two now agree.
+
+   Two callers depend on the answer: the compound [Arity_mismatch] gate, and
+   the compound ORDER BY ordinal range check ([bind_compound_order_keys]).
+   The latter is why this had to be fixed here rather than worked around —
+   a wrong width turns a valid ordinal into a hard rejection. *)
 let rec compound_col_count = function
-  | BS_select { proj; expr_proj; aggs; _ } ->
-    if aggs <> []
+  | BS_select { proj; expr_proj; aggs; agg_proj; _ } ->
+    if agg_proj <> []
+    then List.length agg_proj
+    else if aggs <> []
     then List.length aggs
     else if expr_proj <> []
     then List.length expr_proj

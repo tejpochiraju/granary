@@ -387,6 +387,66 @@ let test_compound_ordinal () =
     check_ordinal_error db "SELECT x FROM u1 UNION ALL SELECT x FROM u2 ORDER BY 0")
 ;;
 
+(* A compound ordinal is range-checked against [compound_col_count], which read
+   the arm's [aggs] — the count of aggregate SPECS — and so had the width of an
+   AGGREGATED arm wrong in two ways, both of which turned a valid ordinal into
+   a hard rejection:
+
+   - a bare [GROUP BY nm] registers NO agg_spec, so a one-column arm measured 0
+     and EVERY ordinal was refused with "expected 1..0";
+   - [nm, COUNT(x)] registers one spec for two output columns, so [ORDER BY 2]
+     was refused.
+
+   Both queries ran (unordered) before #489 and must run, ordered, now. The
+   width now comes from [agg_proj], which is what the arm actually projects.
+   The non-aggregated arms above cannot reach any of this. *)
+let test_compound_aggregated_arm_ordinal () =
+  with_db (fun db ->
+    exec db "CREATE TABLE ca (nm TEXT)";
+    exec db "CREATE TABLE cb (nm TEXT)";
+    List.iter
+      (fun v -> exec db (Printf.sprintf "INSERT INTO ca VALUES ('%s')" v))
+      [ "x"; "x"; "y" ];
+    List.iter
+      (fun v -> exec db (Printf.sprintf "INSERT INTO cb VALUES ('%s')" v))
+      [ "z"; "z"; "z"; "w" ];
+    (* One output column, zero agg specs — the "expected 1..0" case. *)
+    check_rows
+      "GROUP BY arm with no aggregate, ORDER BY 1"
+      [ "w"; "x"; "y"; "z" ]
+      (rows
+         db
+         "SELECT nm FROM ca GROUP BY nm UNION ALL SELECT nm FROM cb GROUP BY nm ORDER BY \
+          1");
+    check_rows
+      "GROUP BY arm with no aggregate, ORDER BY 1 DESC"
+      [ "z"; "y"; "x"; "w" ]
+      (rows
+         db
+         "SELECT nm FROM ca GROUP BY nm UNION ALL SELECT nm FROM cb GROUP BY nm ORDER BY \
+          1 DESC");
+    (* Two output columns, one agg spec — the "ORDER BY 2 out of range" case.
+       Counts are ca: x=2, y=1; cb: z=3, w=1. *)
+    let agg_union order =
+      Printf.sprintf
+        "SELECT nm, COUNT(*) FROM ca GROUP BY nm UNION ALL SELECT nm, COUNT(*) FROM cb \
+         GROUP BY nm ORDER BY %s"
+        order
+    in
+    check_rows
+      "two-column aggregated arms, ORDER BY 2 then 1"
+      [ "w|1"; "y|1"; "x|2"; "z|3" ]
+      (rows db (agg_union "2, 1"));
+    check_rows
+      "two-column aggregated arms, ORDER BY 1"
+      [ "w|1"; "x|2"; "y|1"; "z|3" ]
+      (rows db (agg_union "1"));
+    (* Genuinely out of range is still refused — the width is now right, so
+       this is 3 of 2, not 2 of 1. *)
+    check_ordinal_error db (agg_union "3");
+    check_ordinal_error db (agg_union "0"))
+;;
+
 let () =
   Alcotest.run
     "order_by_ref_489_490"
@@ -400,6 +460,10 @@ let () =
             test_expression_is_not_an_ordinal
         ; Alcotest.test_case "over an aggregate" `Quick test_aggregate_ordinal
         ; Alcotest.test_case "compound" `Quick test_compound_ordinal
+        ; Alcotest.test_case
+            "compound with an aggregated arm"
+            `Quick
+            test_compound_aggregated_arm_ordinal
         ] )
     ; ( "#490 output aliases"
       , [ Alcotest.test_case "issue repro" `Quick test_490_repro
