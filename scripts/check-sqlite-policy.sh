@@ -11,7 +11,7 @@
 #      integration test drives it, so `bin/repl/granary_repl.ml` and
 #      `test/test_sqlite_import_91.ml` are allowed here.
 #
-#   2. The `Sqlite3.` module guard catches use of the OCaml `sqlite3` library.
+#   2. The `Sqlite3` module guard catches use of the OCaml `sqlite3` library.
 #      It is STRICTER on purpose: the two REPL/import files above are NOT
 #      allowlisted for it, because shelling out to a CLI takes on no build
 #      dependency while linking the module does.  Its allowlist is itself in two
@@ -26,6 +26,28 @@
 # What is scanned: `*.ml` and `*.mli` under lib/ bin/ containers/ test/ bench/,
 # excluding `_build`, with symlinks REFUSED rather than skipped.  All three of
 # those were blind spots until #604 — see [SCAN_ROOTS] and [check_no_symlinks].
+# Since #621, `dune` files under those roots and the root `dune-project` are
+# scanned too, by guard 4.
+#
+# #621, and why this section had become a LIE.  Guard 2's pattern was the fixed
+# string `Sqlite3.` — the qualifier WITH ITS DOT — so every ordinary way of
+# using an OCaml module walked straight past it:
+#
+#     open Sqlite3            let _ = db_open "x"
+#     let f () = let open Sqlite3 in db_open "x"
+#     module S = Sqlite3      let _ = S.db_open "x"
+#     let _ = Sqlite3 . db_open "x"          (* a space before the dot *)
+#
+# Each of those was verified to print "Policy OK", rc 0.  These are not
+# evasions; `open Sqlite3` at the top of an engine file is the idiomatic
+# spelling, and it got a green gate.  Worse, #574 and #607 had by then made this
+# header read as a COMPLETENESS CLAIM — which is #549's disease, a marker that
+# trains people to trust something untrue.  The pattern is now the whole WORD.
+#
+# The second half of the same hole: no `dune` file was ever scanned, and
+# `(libraries sqlite3)` is what actually creates the build dependency the whole
+# policy exists to prevent.  Guard 4 closes that, with the limit stated at its
+# allowlist.
 #
 # Adding a new comparison file means adding it to the relevant list(s) below —
 # one place now, not four.  A designated comparison file is one that is
@@ -90,9 +112,17 @@ test/bench_tpcc.ml
 #     entry here must ALSO carry the marker below at the site, so the exemption
 #     is visible in the file and not only in this script.  See
 #     [check_names_only_entries].
+#
+#     test_sqlite_keepalive_571.ml joined this list in #621, not because it
+#     changed but because the guard did: it pins the lint's own binding line as
+#     SOURCE TEXT (see [test_binding_module_is_unsplit_in_the_source]), which
+#     means quoting the bare module name, which the widened whole-word pattern
+#     now sees.  Widening a guard is supposed to surface exactly this kind of
+#     honest naming; the entry plus its marker is the record of it.
 SQLITE3_NAMES_ONLY_ALLOWLIST='
 test/tpc/tpc_keepalive_lint.ml
 test/tpc/tpc_keepalive_lint.mli
+test/test_sqlite_keepalive_571.ml
 '
 
 NAMES_ONLY_MARKER='sqlite3-policy: names-only'
@@ -150,12 +180,66 @@ SPLIT_LITERAL_PATTERN='^[[:space:]]*(let|and)([[:space:]]+rec)?[[:space:]]+[A-Za
 # What guard 2 matches.  Held once so that [check_names_only_entries] can ask
 # the converse question — does an exempted file still NEED its exemption? — with
 # the same pattern the guard uses, rather than a second copy of it.
-SQLITE3_MODULE_PATTERN='Sqlite3.'
+#
+# The WHOLE WORD since #621, where the fixed string `Sqlite3.` missed `open
+# Sqlite3`, `module S = Sqlite3` and a space before the dot — see the header.
+# It is an ERE, so both consumers pass `-E`; a leftover `-F` would search for
+# these parentheses literally and match nothing, which is a fail-open, so the
+# self-test's planted-violation cases are what keep the two flags honest.
+#
+# The boundaries are spelled as character classes rather than `\b` on purpose:
+# `\b` is a GNU extension that POSIX does not define and the BusyBox grep applet
+# does not accept, and fail-open #3 in this file was exactly a non-portable grep
+# flag whose error went unnoticed.
+#
+# What the boundaries deliberately do NOT match: a LONGER identifier that merely
+# contains the name, `Sqlite3_ext.open_` or `MySqlite3`.  Those name a different
+# module, and anything that really wraps the bindings has to write `Sqlite3`
+# somewhere to do it.  The self-test pins that too, so a future "just make it a
+# substring match" mutation shows up as a red case rather than as noise in
+# everyone's PR.
+SQLITE3_MODULE_PATTERN='(^|[^A-Za-z0-9_])Sqlite3([^A-Za-z0-9_]|$)'
 
 # What guard 2 actually consumes.  Keep this an assembly of the two lists above,
 # never a third hand-written copy.
 SQLITE3_MODULE_ALLOWLIST="$SQLITE3_COMPARISON_ALLOWLIST
 $SQLITE3_NAMES_ONLY_ALLOWLIST"
+
+# Guard 4: no BUILD file may declare a dependency on the `sqlite3` library
+# outside the one directory whose dune file declares the comparison benchmarks
+# (#621).
+#
+# This is the half the policy never had.  Guards 1-3 read source text; the thing
+# that actually creates the dependency is `(libraries ... sqlite3 ...)`, and no
+# dune file was scanned at all.  A new `lib/foo/dune` could take the dependency
+# on the whole engine and print "Policy OK".
+#
+# STATED LIMIT, because an overclaim here is what #621 was about: `test/dune` is
+# allowlisted WHOLE, and it is where the comparison benchmarks' `(optional)`
+# stanzas live, so this guard says nothing about a fourth stanza added there.
+# `test/tpc/dune` is allowlisted because its comments discuss the dependency it
+# deliberately does NOT take, and a grep cannot tell prose from a stanza.  What
+# the guard does close is a build dependency appearing anywhere ELSE — lib/,
+# bin/, containers/, bench/, and the root `dune-project`, i.e. every place the
+# engine itself is built.  Narrowing `test/dune` to the stanza level needs an
+# s-expression reader, not a grep; #591's shellcheck gate is a separate matter
+# and is not being built here either.
+SQLITE3_DUNE_ALLOWLIST='
+test/dune
+test/tpc/dune
+'
+
+# Same whole-word shape and the same portability argument as
+# SQLITE3_MODULE_PATTERN, lowercased: a dune library name is `sqlite3`, and
+# `bench_perf_compare_sqlite3` (an executable NAME containing it) must not
+# match, which the leading boundary handles.
+SQLITE3_DUNE_PATTERN='(^|[^A-Za-z0-9_])sqlite3([^A-Za-z0-9_]|$)'
+
+# The root `dune-project` is not under any scan root, so `find` never reaches
+# it, and it is scanned by name with NO allowlist: a `(depends sqlite3)` there
+# would put the dependency on the granary package itself, which no comparison
+# benchmark needs and nothing in the tree has ever wanted.
+DUNE_PROJECT_FILE='dune-project'
 
 # The #571 keep-alive lint, whose own list of comparison sources must agree with
 # SQLITE3_COMPARISON_ALLOWLIST (#601).
@@ -225,14 +309,20 @@ SCAN_ROOTS='lib bin containers test bench'
 # the false confidence that produced 3, so: `-r`/`-R` and `--include` are both
 # gone.)
 
-# Print `path:lineno:content` for every hit of a pattern in a *.ml file under
+# Print `path:lineno:content` for every hit of a pattern in a scanned file under
 # SCAN_ROOTS that is NOT in the given allowlist.
 #
-# $1 = allowlist (newline-separated), $2 = grep flag (-E or -F), $3 = pattern.
+# $1 = allowlist (newline-separated), $2 = grep flag (-E or -F), $3 = pattern,
+# $4 = file kind: `ml` (the default, `*.ml` and `*.mli`) or `dune` (`dune` and
+# `dune-project`, added by #621).  The kind is a parameter rather than a second
+# copy of this function because everything else here — the allowlist applied to
+# the FILE LIST, the `_build` prune, the symlink refusal, the captured stderr —
+# is exactly the set of fail-opens a second copy would reacquire one at a time.
 scan_outside_allowlist() {
   sc_allow=$1
   sc_flag=$2
   sc_pattern=$3
+  sc_kind=${4:-ml}
   # Build the `! -path X` exclusions positionally so that find's argv is exact
   # (an entry containing a space reaches find as ONE argument).  Note this does
   # not make such an entry work end-to-end: the source loop still splits on
@@ -256,7 +346,10 @@ scan_outside_allowlist() {
   for sc_r in $SCAN_ROOTS; do
     set -- "$@" -path "$sc_r/_build" -type d -prune -o
   done
-  set -- "$@" -type f '(' -name '*.ml' -o -name '*.mli' ')'
+  case $sc_kind in
+    dune) set -- "$@" -type f '(' -name 'dune' -o -name 'dune-project' ')' ;;
+    *) set -- "$@" -type f '(' -name '*.ml' -o -name '*.mli' ')' ;;
+  esac
   for sc_p in $sc_allow; do
     set -- "$@" '!' -path "$sc_p"
   done
@@ -361,6 +454,11 @@ reject_glob_entries() {
 run_guards() {
   cli_allow=$1
   mod_allow=$2
+  # Guard 4's allowlist (#621).  Optional so that the self-test cases which
+  # predate it keep their two-argument form; unset means the EMPTY list, which
+  # excludes nothing and therefore fails CLOSED — the same shape as fail-open 1
+  # above, resolved the same way.
+  dune_allow=${3:-}
   rc=0
 
   # `rg_` prefix: the loop variable must not collide with [self_test]'s $root,
@@ -381,6 +479,7 @@ run_guards() {
   # the self-test, which is what makes the rejection testable at all.
   reject_glob_entries 'sqlite3-CLI' "$cli_allow" || rc=1
   reject_glob_entries 'Sqlite3-module' "$mod_allow" || rc=1
+  reject_glob_entries 'sqlite3-dune' "$dune_allow" || rc=1
 
   [ "$rc" -eq 0 ] || return 1
 
@@ -402,15 +501,44 @@ run_guards() {
     rc=1
   fi
 
-  mod_violations=$(scan_outside_allowlist "$mod_allow" -F "$SQLITE3_MODULE_PATTERN")
+  mod_violations=$(scan_outside_allowlist "$mod_allow" -E "$SQLITE3_MODULE_PATTERN")
   if [ -n "$mod_violations" ]; then
     echo "FAIL: Sqlite3 module used outside the gated comparison benchmarks:"
     echo "$mod_violations"
     echo
-    echo "If this is a designated comparison benchmark, add it to"
-    echo "SQLITE3_MODULE_ALLOWLIST in scripts/check-sqlite-policy.sh.  Shelling"
-    echo "out to the CLI does NOT qualify — that belongs in"
-    echo "SQLITE_CLI_ALLOWLIST only."
+    echo "This matches the whole word since #621, so 'open Sqlite3',"
+    echo "'let open Sqlite3 in' and 'module S = Sqlite3' are caught as well as"
+    echo "the qualified 'Sqlite3.' form.  If this is a designated comparison"
+    echo "benchmark, add it to SQLITE3_MODULE_ALLOWLIST in"
+    echo "scripts/check-sqlite-policy.sh; if the file only NAMES the module"
+    echo "without linking it, that is SQLITE3_NAMES_ONLY_ALLOWLIST plus the"
+    echo "marker at the site.  Shelling out to the CLI does NOT qualify — that"
+    echo "belongs in SQLITE_CLI_ALLOWLIST only."
+    rc=1
+  fi
+
+  # Guard 4: the build dependency itself (#621).
+  dune_violations=$(
+    scan_outside_allowlist "$dune_allow" -E "$SQLITE3_DUNE_PATTERN" dune
+    # The root dune-project is outside every scan root; see DUNE_PROJECT_FILE.
+    # `|| true` for grep's normal 1 (no match) only — its stderr is captured
+    # into SCAN_ERR_FILE like the scanner's, so a read error still fails the run
+    # rather than passing as "no match".
+    if [ -f "$DUNE_PROJECT_FILE" ]; then
+      grep -n -E -e "$SQLITE3_DUNE_PATTERN" /dev/null "$DUNE_PROJECT_FILE" \
+        2>>"$SCAN_ERR_FILE" || true
+    fi
+  )
+  if [ -n "$dune_violations" ]; then
+    echo "FAIL: a build file declares a dependency on the sqlite3 library:"
+    echo "$dune_violations"
+    echo
+    echo "'(libraries ... sqlite3 ...)' is what actually makes granary depend on"
+    echo "real SQLite, which is the thing #370 exists to prevent.  The"
+    echo "comparison benchmarks declare theirs in test/dune, which is"
+    echo "allowlisted; nothing under lib/, bin/, containers/ or bench/, and not"
+    echo "the root dune-project, may take that dependency.  See"
+    echo "SQLITE3_DUNE_ALLOWLIST in scripts/check-sqlite-policy.sh."
     rc=1
   fi
 
@@ -494,7 +622,10 @@ check_names_only_entries() {
       echo "      from SQLITE3_NAMES_ONLY_ALLOWLIST."
       cnm_bad=1
     fi
-    if ! grep -F -e "$cnm_pattern" "$cnm_p" >/dev/null; then
+    # `-E`, not `-F`: since #621 the pattern is an ERE.  Matching it literally
+    # would find nothing, every exemption would read as DEAD, and this check
+    # would fail on the honest files — loud rather than fail-open, but wrong.
+    if ! grep -E -e "$cnm_pattern" "$cnm_p" >/dev/null; then
       echo "FAIL: '$cnm_p' is allowlisted for naming the Sqlite3 module but does"
       echo "      not contain '$cnm_pattern' at all, so the exemption is dead."
       echo "      Remove it from SQLITE3_NAMES_ONLY_ALLOWLIST — and if the name"
@@ -641,7 +772,13 @@ test/bench_tpcc.ml
   st_mod="$st_cmp
 test/tpc/tpc_keepalive_lint.ml
 test/tpc/tpc_keepalive_lint.mli
+test/test_sqlite_keepalive_571.ml
 "
+  # Guard 4's allowlist (#621).
+  st_dune='
+test/dune
+test/tpc/dune
+'
 
   report() {
     if [ "$2" = "$1" ]; then
@@ -652,10 +789,13 @@ test/tpc/tpc_keepalive_lint.mli
     fi
   }
 
+  # $5 is guard 4's allowlist and is optional, so every case written before
+  # #621 keeps its four-argument form and gets the empty (excludes-nothing)
+  # list.
   expect() {
     if (
       cd "$root"
-      run_guards "$3" "$4"
+      run_guards "$3" "$4" "${5:-}"
     ) >/dev/null 2>&1; then
       report "$1" pass "$2"
     else
@@ -689,10 +829,17 @@ test/tpc/tpc_keepalive_lint.mli
   write_lint '"bench_tpcc.ml"; "bench_tpch.ml"; "bench_compare.ml"'
   printf '(* %s *)\nval x : Sqlite3.db\n' "$NAMES_ONLY_MARKER" \
     >"$root/test/tpc/tpc_keepalive_lint.mli"
+  # The lint's TEST names the module as a bare word — it pins the lint's own
+  # binding line as source text — which only the widened #621 pattern sees.  A
+  # stand-in for it, so the clean-tree case exercises a names-only file that has
+  # NO dot after the name.
+  printf '(* %s *)\nlet expected = "Sqlite3"\n' "$NAMES_ONLY_MARKER" \
+    >"$root/test/test_sqlite_keepalive_571.ml"
 
   st_names_only='
 test/tpc/tpc_keepalive_lint.ml
 test/tpc/tpc_keepalive_lint.mli
+test/test_sqlite_keepalive_571.ml
 '
 
   expect_marker() {
@@ -857,6 +1004,103 @@ test/*"
   fi
   chmod 644 "$root/lib/zz_unreadable.ml"
   rm -f "$root/lib/zz_unreadable.ml"
+
+  # --- #621: the module guard matches the WHOLE WORD --------------------
+  #
+  # Every one of these printed "Policy OK" against the fixed-string `Sqlite3.`
+  # pattern, and none of them is an evasion — they are the normal ways to use an
+  # OCaml module.  Reverting the pattern to the old fixed string turns all four
+  # green, which is the mutation these cases exist to catch.
+
+  printf 'open Sqlite3\nlet _ = db_open "x"\n' >"$root/lib/zz_probe.ml"
+  expect fail "module guard catches 'open Sqlite3' (#621)" "$st_cli" "$st_mod"
+  rm -f "$root/lib/zz_probe.ml"
+
+  printf 'let f () = let open Sqlite3 in db_open "x"\n' >"$root/lib/zz_probe.ml"
+  expect fail "module guard catches a local 'let open Sqlite3 in' (#621)" \
+    "$st_cli" "$st_mod"
+  rm -f "$root/lib/zz_probe.ml"
+
+  printf 'module S = Sqlite3\nlet _ = S.db_open "x"\n' >"$root/lib/zz_probe.ml"
+  expect fail "module guard catches a 'module S = Sqlite3' alias (#621)" \
+    "$st_cli" "$st_mod"
+  rm -f "$root/lib/zz_probe.ml"
+
+  printf 'let _ = Sqlite3 . db_open "x"\n' >"$root/lib/zz_probe.ml"
+  expect fail "module guard catches a space before the dot (#621)" "$st_cli" "$st_mod"
+  rm -f "$root/lib/zz_probe.ml"
+
+  # An .mli aliasing the module is the same build dependency as an .ml doing it.
+  printf 'module S = Sqlite3\n' >"$root/lib/zz_iface.mli"
+  expect fail "module guard catches an alias in an .mli (#621)" "$st_cli" "$st_mod"
+  rm -f "$root/lib/zz_iface.mli"
+
+  # ...and the other direction, which is what stops the widened pattern being
+  # "just make it a substring".  A LONGER identifier merely containing the name
+  # is a different module and is not a violation.
+  printf 'let _ = Sqlite3_ext.open_ "x"\nlet _ = MySqlite3.db_open "x"\n' \
+    >"$root/lib/zz_probe.ml"
+  expect pass "a longer identifier containing the name is not a violation (#621)" \
+    "$st_cli" "$st_mod"
+  rm -f "$root/lib/zz_probe.ml"
+
+  # A names-only file whose only mention has NO dot after it — the shape that
+  # brought test_sqlite_keepalive_571.ml into the allowlist.  Drop JUST that
+  # entry and the widened guard fires on it, which is both why the entry exists
+  # and proof that the widening reaches a bare mention at all.
+  expect fail "a names-only file with no dot needs its entry under the wider pattern" \
+    "$st_cli" "$st_cmp
+test/tpc/tpc_keepalive_lint.ml
+test/tpc/tpc_keepalive_lint.mli
+"
+
+  # --- #621: guard 4, the build dependency itself -----------------------
+  #
+  # No dune file was scanned at all before this, so each of these passed clean
+  # while declaring exactly the dependency the policy exists to prevent.
+
+  printf '(library\n (name zz)\n (libraries granary sqlite3))\n' >"$root/lib/dune"
+  expect fail "dune guard catches '(libraries ... sqlite3)' in lib/ (#621)" \
+    "$st_cli" "$st_mod" "$st_dune"
+  rm -f "$root/lib/dune"
+
+  printf '(executable\n (name zz)\n (libraries granary sqlite3))\n' >"$root/bench/dune"
+  expect fail "dune guard reaches bench/ (#621)" "$st_cli" "$st_mod" "$st_dune"
+  rm -f "$root/bench/dune"
+
+  # test/dune is where the comparison benchmarks declare theirs; allowlisted.
+  printf '(tests\n (names bench_compare)\n (libraries granary sqlite3))\n' \
+    >"$root/test/dune"
+  expect pass "the allowlisted test/dune may declare the dependency" \
+    "$st_cli" "$st_mod" "$st_dune"
+  # ...and an EMPTY guard-4 allowlist must allow nothing rather than everything,
+  # the same fail-open 1 shape as the other two lists.
+  expect fail "dune guard still fires when ITS allowlist is EMPTY" \
+    "$st_cli" "$st_mod" ""
+  rm -f "$root/test/dune"
+
+  # The boundary again, on the lowercase pattern: an executable NAME containing
+  # the library name is not a dependency on it.  test/dune really does have one
+  # (bench_perf_compare_sqlite3), so a substring match would need that file
+  # allowlisted for the wrong reason.
+  printf '(executable\n (name zz_probe_sqlite3)\n (libraries granary))\n' \
+    >"$root/lib/dune"
+  expect pass "an executable name containing the library name is not a dependency" \
+    "$st_cli" "$st_mod" "$st_dune"
+  rm -f "$root/lib/dune"
+
+  # The root dune-project sits outside every scan root, so `find` never reaches
+  # it; it is scanned by name and has NO allowlist.  A dependency there is on
+  # the granary package itself.
+  printf '(lang dune 3.0)\n(package (name granary) (depends lwt sqlite3))\n' \
+    >"$root/dune-project"
+  expect fail "dune guard reaches the root dune-project (#621)" \
+    "$st_cli" "$st_mod" "$st_dune"
+  printf '(lang dune 3.0)\n(package (name granary) (depends lwt))\n' \
+    >"$root/dune-project"
+  expect pass "a clean root dune-project is not a violation" \
+    "$st_cli" "$st_mod" "$st_dune"
+  rm -f "$root/dune-project"
 
   # --- #605: the split literal itself, tree-wide ------------------------
   #
@@ -1032,12 +1276,14 @@ cd "$(dirname "$0")/.."
 fresh=0
 check_allowlist_fresh 'sqlite3-CLI' "$SQLITE_CLI_ALLOWLIST" || fresh=1
 check_allowlist_fresh 'Sqlite3-module' "$SQLITE3_MODULE_ALLOWLIST" || fresh=1
+check_allowlist_fresh 'sqlite3-dune' "$SQLITE3_DUNE_ALLOWLIST" || fresh=1
 [ "$fresh" -eq 0 ] || exit 1
 
 check_names_only_entries \
   "$SQLITE3_NAMES_ONLY_ALLOWLIST" "$NAMES_ONLY_MARKER" "$SQLITE3_MODULE_PATTERN" || exit 1
 check_lint_coverage "$SQLITE3_COMPARISON_ALLOWLIST" "$KEEPALIVE_LINT_SOURCE" || exit 1
 
-run_guards "$SQLITE_CLI_ALLOWLIST" "$SQLITE3_MODULE_ALLOWLIST" || exit 1
+run_guards "$SQLITE_CLI_ALLOWLIST" "$SQLITE3_MODULE_ALLOWLIST" \
+  "$SQLITE3_DUNE_ALLOWLIST" || exit 1
 
 echo "Policy OK: all sqlite3 references confined to gated comparison files"

@@ -2,10 +2,16 @@
 ; ADDING A REAL-SQLITE COMPARISON EXECUTABLE?  READ THIS FIRST.  (#370, #574)
 ;
 ; Granary must not acquire a dependency on real SQLite, and CI enforces that
-; with two greps over lib/ bin/ containers/ test/: one for the `"sqlite3 ..."`
-; CLI error-string form, one for the OCaml `Sqlite3.` module.  Designated
-; comparison files — the `(optional)` stanzas below that name `sqlite3`, or
-; that shell out to the sqlite3 CLI — are allowlisted by path.
+; with four greps over lib/ bin/ containers/ test/ bench/: one for the
+; `"sqlite3 ..."` CLI error-string form, one for the OCaml `Sqlite3` module as
+; a WHOLE WORD (so `open Sqlite3` and `module S = Sqlite3` are caught, not only
+; the qualified form — #621), one against assembling that name from pieces
+; (#605), and one over `dune` files and the root `dune-project` for the
+; `(libraries ... sqlite3)` stanza that creates the dependency in the first
+; place (#621).  Designated comparison files — the `(optional)` stanzas below
+; that name `sqlite3`, or that shell out to the sqlite3 CLI — are allowlisted
+; by path.  THIS FILE is allowlisted for the dune guard, so the guard says
+; nothing about a stanza added here; the script explains why.
 ;
 ; The allowlists live in scripts/check-sqlite-policy.sh.  A new comparison
 ; file that is not listed there turns CI red on main even though it violates
