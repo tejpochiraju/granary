@@ -6661,6 +6661,22 @@ type subplan_cache = (Ast.stmt, Plan.op option) Hashtbl.t
 
 let subplan_cache_key : subplan_cache Lwt.key = Lwt.new_key ()
 
+(* #493 review: the count-shaped observable for "plan once, execute N times".
+
+   That was the one claim in #493 with nothing in the tree able to see it: the
+   leak has [Store.active_reader_count], the seek has [index_entries], the
+   short-circuit has [rows_examined], but a subquery re-planned per outer row
+   and one planned once are indistinguishable in every counter that existed.
+   This is the missing one — a monotone count of the times a subquery statement
+   was actually bound and planned, as opposed to served from the cache.
+
+   Diagnostic/testing only, exactly like [Store.active_reader_count] and
+   [Store.pinned_page_count] (#164): a process-global counter, not per-query, so
+   a test reads it either side of one query and takes the difference. It is an
+   integer count with no clock in it, so a gate built on it needs no
+   [GRANARY_BENCH_*] neutralizer. *)
+let subquery_plans_built = ref 0
+
 (* #262: re-establish the per-query Lwt-storage contexts (the stats record, the
    txn mode, and #493's subquery plan cache) for work that runs at pull time —
    outside [query]'s construction-time [with_value] scope — currently the
@@ -8831,15 +8847,22 @@ let rec substitute_outer_in_plan_expr
       ; else_ = Option.map go else_
       }
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
-  (* #493 review: [P_collate] was missing here while {!plan_expr_has_subquery},
-     {!plan_expr_subqueries_use_param} and {!plan_expr_embedded_stmts} all
-     recurse into it — a three-way divergence over one node set, which is one
-     more than the two that existed before this PR. The consequence was small
-     but real: a correlated subquery under a COLLATE ([x = (SELECT …) COLLATE
-     NOCASE]) fell to the catch-all with its outer reference unsubstituted, so
-     it was refused rather than answered. Aligning the four walkers is the fix;
-     if this arm is ever removed, remove it from the other three too. *)
-  | Plan.P_collate (e, c) -> Plan.P_collate (go e, c)
+  (* #493 review: there is NO [P_collate] arm here, while
+     {!plan_expr_has_subquery}, {!plan_expr_subqueries_use_param} and
+     {!plan_expr_embedded_stmts} all recurse into it — a four-way walker set
+     over one node set, of which this one is the odd member. The consequence:
+     a correlated subquery under a COLLATE ([x = (SELECT …) COLLATE NOCASE])
+     falls to the catch-all with its outer reference unsubstituted, and is
+     therefore REFUSED rather than answered.
+
+     The arm was added in the first round of this PR and is deliberately
+     reverted. Adding it is an error-to-answer change — it turns a refusal into
+     rows — and this PR cannot be built, so it could not be given the test that
+     such a change needs; nothing in [test/] exercises COLLATE over a subquery
+     today. A PR whose other half is about not letting refusals move silently
+     should not move one silently on the way past. Tracked as #670; the one-line
+     fix is [| Plan.P_collate (e, c) -> Plan.P_collate (go e, c)] plus a test
+     that pins the answer it produces. *)
   | _ -> e
 
 (** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST stmt. *)
@@ -8975,6 +8998,9 @@ let plan_subquery_cached (cat : Cat.t) (inner_ast : Ast.stmt) : Plan.op option L
   match Option.bind cache (fun tbl -> Hashtbl.find_opt tbl inner_ast) with
   | Some cached -> Lwt.return cached
   | None ->
+    (* Counted here and nowhere else: this is the branch a cache hit skips, so
+       the counter measures exactly "how many times did we pay bind+plan". *)
+    incr subquery_plans_built;
     let* bound_r = Sema.bind cat inner_ast in
     let result =
       match bound_r with
@@ -9799,17 +9825,35 @@ and stream_filter clock params store mode cat pred child =
       (* Decided once, over every correlated conjunct — see
          {!refuse_unresolved_correlation}. The first row pulled settles it,
          because resolvability depends on the substituted NAMES and the row
-         WIDTH, neither of which varies across one scan. *)
+         WIDTH, neither of which varies across one scan.
+
+         The flag is set AFTER the probe resolves, not before. [filter_s] pulls
+         strictly sequentially, so [keep] is never re-entered while a probe is
+         in flight and either order works today — but setting it first would
+         make the invariant depend on that sequencing, and a row sailing past a
+         refusal that has not finished being decided is the failure this whole
+         pre-pass exists to prevent.
+
+         Cost note: on the parameterized path the probe runs against the SAME
+         cache the rows then use, so it warms rather than duplicates. With
+         [cache = None] (an inner statement carrying its own parameters) its
+         bind+plan is discarded, and it is paid even for a conjunct the
+         short-circuit would have skipped for every row. That is bounded by the
+         number of subquery SITES, not by rows, so it does not reintroduce the
+         per-row cost #493 removed. *)
       let refusal_decided = ref false in
       let decide_refusal bnd =
         if !refusal_decided
         then Lwt.return_unit
-        else (
+        else
+          let* () =
+            with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+              refuse_unresolved_correlation
+                cat
+                (List.map (substitute_outer_in_plan_expr ~cat bnd) correlated_cs))
+          in
           refusal_decided := true;
-          with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
-            refuse_unresolved_correlation
-              cat
-              (List.map (substitute_outer_in_plan_expr ~cat bnd) correlated_cs)))
+          Lwt.return_unit
       in
       let keep row =
         let bnd =

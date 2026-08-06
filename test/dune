@@ -1100,7 +1100,14 @@
 (test
  (name test_correlated_exists_493)
  (modules test_correlated_exists_493)
- (libraries granary granary.store granary.unix alcotest lwt.unix unix))
+ (libraries
+  granary
+  granary.sql
+  granary.store
+  granary.unix
+  alcotest
+  lwt.unix
+  unix))
 
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 

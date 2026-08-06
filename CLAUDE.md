@@ -83,23 +83,43 @@ O(n²) bulk insert, a lost reader/writer overlap:
 | `bench_wal_reader_scaling` | #149 parallel-read regression | parallel ≤ 2.0x serial | `GRANARY_BENCH_PARALLEL_MAX` |
 | `bench_slow_read_yield` | reader starving the writer | writer ≤ 3.0 s | `GRANARY_BENCH_MAX_WRITER_S` |
 
-One gate is **not** wall-clock and therefore **not** neutralized anywhere:
+Two gates are **not** wall-clock and therefore **not** neutralized anywhere:
 
 | test | guards | gate | knob |
 |---|---|---|---|
 | `test_not_null_600` | #600 `PRAGMA not_null_check` retaining every violating row | marginal peak live heap < 4 words/row when the table doubles | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
+| `test_correlated_exists_493` | #493 a correlated `EXISTS` leaking one RO snapshot per outer row | peak live RO snapshots does not grow when the outer rows go 100 → 400 | `GRANARY_MAX_LIVE_READERS` |
 
-It measures *allocation* (peak live major-heap words, sampled through a `Gc`
-alarm), so a loaded runner does not move it — ±0.02% across runs, which no
-wall-clock gate manages. That is why it runs armed in `ci.yml`, `coverage.yml`
-and `cross-arch.yml` alongside the ones those jobs disarm. What load cannot
-change, a different allocator or word size can, and `cross-arch.yml`'s arm64
-arm has never run it, so `GRANARY_MEM_MAX_WORDS_PER_ROW` exists as the escape
-hatch — it raises the ceiling without disabling the correctness assertions the
-same test makes. Reach for it only after ruling out the thing it guards: the
-measured slopes are ≈20-23 words/row retaining (19.61-23.52 across three runs;
-the 40 000-row point is the noisy one) and 1.6-1.9 counting, so a failure
-anywhere between those two bands is a regression, not a platform difference.
+`test_not_null_600` measures *allocation* (peak live major-heap words, sampled
+through a `Gc` alarm), so a loaded runner does not move it — ±0.02% across runs,
+which no wall-clock gate manages. That is why it runs armed in `ci.yml`,
+`coverage.yml` and `cross-arch.yml` alongside the ones those jobs disarm. What
+load cannot change, a different allocator or word size can, and
+`cross-arch.yml`'s arm64 arm has never run it, so
+`GRANARY_MEM_MAX_WORDS_PER_ROW` exists as the escape hatch — it raises the
+ceiling without disabling the correctness assertions the same test makes. Reach
+for it only after ruling out the thing it guards: the measured slopes are ≈20-23
+words/row retaining (19.61-23.52 across three runs; the 40 000-row point is the
+noisy one) and 1.6-1.9 counting, so a failure anywhere between those two bands
+is a regression, not a platform difference.
+
+`test_correlated_exists_493` measures a *count* — `Store.active_reader_count`,
+an integer folded from a refcount table — sampled between outer rows, so load
+cannot move it either. It has **two** assertions and they are not equally
+trustworthy:
+
+- the **ratio** (`peak(400) ≤ peak(100) + 2`) needs no prediction about what the
+  healthy number is, and is the real gate;
+- the **ceiling** (`peak(400) ≤ GRANARY_MAX_LIVE_READERS`, default 32) does, and
+  **that default is a prediction, not a measurement** — this test shipped in a
+  batch whose build and benchmark pass was deferred, and no armed run has ever
+  been observed. A leaked run reports ≈400, so the ceiling has ~12x headroom
+  over the expected healthy value; if it nonetheless fails while the ratio
+  passes, the default was simply wrong and raising it is correct. If the
+  **ratio** fails, that is the leak and no knob should be touched.
+
+It must run **on disk**: the `Mem` backend answers 0 for the reader counters
+unconditionally, so an in-memory version passes vacuously.
 
 **Where they run armed.** `ci.yml`, `coverage.yml` and `cross-arch.yml` — all
 six files, Forgejo and GitHub — neutralize every one of them, because those

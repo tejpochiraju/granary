@@ -61,13 +61,35 @@
 
     {1 What these tests can and cannot see}
 
-    "Planned once" is still the one claim with no in-tree observable; it needs
-    the benchmark. Everything else is asserted: the leak (store counters), its
-    scaling (peak live snapshots at 1x and 4x the outer rows), the seek
+    Everything the PR claims is now asserted by something count-shaped: the leak
+    (store counters), its scaling (peak live snapshots at 1x and 4x the outer
+    rows), "plan once" ([Exec.subquery_plans_built], added for exactly this
+    reason — it was the one claim with no observable at all), the seek
     (index_entries / rows_examined), the short-circuit (rows_examined against
     the same query without its cheap restriction), and — because the
     short-circuit could have weakened it — #592's refusal invariant under three
-    conjunct arrangements.
+    conjunct arrangements plus the empty-input boundary.
+
+    None of it has been RUN. The constants in the scaling gate are predictions;
+    see the note above them for what each failure mode means. The deferred
+    build/test/benchmark pass is still a merge precondition, and a wall-clock
+    number for TPC-H Q4 is still the only thing that closes #493's own headline.
+
+    {1 Deliberate limits}
+
+    - {b [stream_expr_project] has no refusal at all — that is #626, and PR #659
+      fixes it, not this one.} An unresolvable correlated subquery in the SELECT
+      {i list} — as opposed to the WHERE clause — is handed to [eval_expr] and
+      answers [V_null]: the silent-wrong-answer outcome #592 removed from the
+      filter path, wearing a different hat. Pre-existing on [main] and untouched
+      here. It matters to this file only because the refusal cases below cover
+      three arrangements of {i conjuncts}, and the projection is a fourth
+      arrangement where the invariant does not hold; do not read those cases as
+      claiming more than they do. The aggregate path {i is} guarded
+      ([agg_subquery_refusal]).
+    - {b Nested EXISTS does not get "plan once".} The plan cache is created per
+      [to_stream], so an EXISTS inside an EXISTS re-plans the innermost
+      statement per outer row. See the note at [Exec.subplan_cache].
 
     Every correctness case is a before-and-after invariant: the answers must not
     move, whichever substitution path a query takes. *)
@@ -351,7 +373,37 @@ let scalar_and_in_subqueries_leave_nothing_behind () =
 
    ON DISK, necessarily: the [Mem] backend answers 0 for all three reader
    counters unconditionally, so an in-memory version of this passes vacuously
-   whether or not anything leaks. *)
+   whether or not anything leaks.
+
+   {b THE CONSTANTS BELOW ARE PREDICTIONS, NOT MEASUREMENTS.} This test shipped
+   in a batch whose build/test/benchmark pass was deferred; no armed run of it
+   has ever been observed, by anyone. The two assertions therefore do NOT
+   deserve equal trust, and they are written so that the trustworthy one can be
+   read separately from the guess:
+
+   - The RATIO ([peak(400) <= peak(100) + 2]) is prediction-free. It does not
+     need to know what the healthy peak IS, only that it does not grow with the
+     outer row count. This is the actual gate, and it is the one that encodes
+     #493's claim.
+   - The CEILING ([peak(400) <= GRANARY_MAX_LIVE_READERS]) is a guess about the
+     healthy constant. It is set deliberately loose — 32, against an expected
+     healthy value of about 2 and a leaked value of about 400, so ~12x headroom
+     either way.
+
+   {b What the verification pass should do with each outcome:}
+
+   - Both pass: the numbers this prints are the first real measurement. Record
+     them in the PR and tighten the ceiling to something near the observed
+     value if desired.
+   - Ratio passes, ceiling fails: the guess was wrong, not the code. Raise
+     [GRANARY_MAX_LIVE_READERS] to the observed value and record it. This is
+     what the knob is for.
+   - Ratio fails: that is the leak, or a new one. Do not touch the knob.
+   - Both fail on [main] and pass here: that is the result this PR is claiming.
+
+   The measured peaks are printed unconditionally, on success as well as
+   failure, so a green run still produces the number rather than swallowing
+   it. *)
 
 let env_int name default =
   match Sys.getenv_opt name with
@@ -360,10 +412,12 @@ let env_int name default =
 ;;
 
 (* The escape hatch, in the spirit of GRANARY_MEM_MAX_WORDS_PER_ROW: it raises
-   the ceiling without disabling the scaling assertion beside it. Reach for it
-   only after ruling out the leak it guards — a leaked run reports a peak equal
-   to the outer row count, which is nowhere near this. *)
-let max_live_readers = env_int "GRANARY_MAX_LIVE_READERS" 8
+   the ceiling without disabling the scaling assertion beside it. Unmeasured —
+   see the note above; 32 is a deliberately loose bound around an expected
+   healthy value of ~2, chosen so that a wrong prediction about the pager's
+   working set cannot turn into a red CI run, while a leaked run (~400 at
+   n_large) still fails it by an order of magnitude. *)
+let max_live_readers = env_int "GRANARY_MAX_LIVE_READERS" 32
 
 let seed_scaling db ~n =
   exec db "CREATE TABLE outer_t (k INTEGER PRIMARY KEY, tag INTEGER)";
@@ -448,19 +502,77 @@ let live_snapshots_do_not_accumulate_with_outer_rows () =
       n_large
       (n_large / n_small)
   in
-  (* The scaling assertion. Leaked: peak tracks the probe count, so this is
-     ~4x. Repaired: both are a small constant and the ratio is ~1. The slack
-     absorbs a genuinely concurrent snapshot or two, not a trend. *)
+  (* Printed on success too: a green run must still hand back the number, since
+     nobody has ever seen it. See the note above the constants. *)
+  Printf.printf "\n[#493 scaling] %s\n%!" report;
+  (* The scaling assertion — prediction-free, and the real gate. Leaked: peak
+     tracks the probe count, so this is ~4x. Repaired: both are a small constant
+     and the ratio is ~1. The slack absorbs a genuinely concurrent snapshot or
+     two, not a trend. If THIS fails, do not reach for the knob. *)
   Alcotest.(check bool)
     (Printf.sprintf "%s — must not grow with the outer row count" report)
     true
     (peak_large <= peak_small + 2);
-  (* The absolute ceiling, which is what actually fails loudly on a leak: a
-     leaked run reports ~400 here. *)
+  (* The absolute ceiling — a deliberately loose GUESS at the healthy constant
+     (see above). A leaked run reports ~400 here, so it still fails loudly; if
+     it fails while the ratio passes, raise GRANARY_MAX_LIVE_READERS and record
+     the observed number. *)
   Alcotest.(check bool)
-    (Printf.sprintf "%s — must stay bounded (<= %d)" report max_live_readers)
+    (Printf.sprintf
+       "%s — must stay bounded (<= %d, unmeasured guess; raise GRANARY_MAX_LIVE_READERS \
+        if the ratio above passed)"
+       report
+       max_live_readers)
     true
     (peak_large <= max_live_readers)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* 1c. Plan once, execute N times                                       *)
+(* ------------------------------------------------------------------ *)
+
+(* The other half of the perf claim, and until now the half with no in-tree
+   observable at all: the parameterized-substitution machinery is most of the
+   diff, and a subquery re-planned per outer row looks identical to one planned
+   once in every counter that existed.
+
+   [Exec.subquery_plans_built] is that observable — a monotone count of the
+   times a subquery statement was actually bound and planned rather than served
+   from the plan cache. Count-shaped, so no neutralizer; and unlike the leak
+   gate above it needs no guessed constant, because the expected value is
+   derived rather than predicted: ONE subquery site in the query means the
+   builds must not scale with the outer row count at all.
+
+   Before #493 this was one build per outer row, because the substituted
+   statement carried the row's literal values and so differed every time. In
+   memory is fine here — the counter is not a store counter. *)
+let plan_builds_do_not_scale_with_outer_rows () =
+  with_mem_db (fun db ->
+    seed db;
+    let before = !Granary_sql.Exec.subquery_plans_built in
+    let rows = rows_of db q4_no_date in
+    let builds = !Granary_sql.Exec.subquery_plans_built - before in
+    (* Every one of the n_orders outer rows probes, so the pre-#493 count would
+       be n_orders (plus the refusal pre-pass's one). *)
+    Alcotest.(check int)
+      "the query still answers"
+      (n_orders / (in_range_every * 2))
+      (List.length rows);
+    Printf.printf
+      "\n[#493 plan-once] %d bind+plan for %d probing outer rows\n%!"
+      builds
+      n_orders;
+    (* Derived, not guessed: one subquery site, so a handful of builds however
+       many rows there are. The bound is generous enough to absorb the refusal
+       pre-pass and any re-plan the aggregate/sort path adds, and still an order
+       of magnitude below the per-row behaviour it rules out. *)
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "%d bind+plan over %d probing rows — must not scale with the rows"
+         builds
+         n_orders)
+      true
+      (builds < n_orders / 4))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -564,6 +676,34 @@ let err_of db sql =
   | e -> Printexc.to_string e
 ;;
 
+let contains msg needle =
+  let n = String.length needle
+  and m = String.length msg in
+  let rec go i = i + n <= m && (String.sub msg i n = needle || go (i + 1)) in
+  go 0
+;;
+
+(* Non-emptiness alone is not enough, and the sibling #592 test says so
+   (test_join_subquery_592.ml:333-337): ANY error satisfies it, including an
+   outer-statement [Sema] bind failure that never reaches [stream_filter] at
+   all. If that were what these queries did, all three cases below would pass
+   while testing nothing — and the failing-conjunct case exists precisely to
+   catch a regression in [stream_filter]. So assert the message is
+   [correlated_filter_refusal]'s, by the two markers it carries. *)
+let check_refused ~label msg =
+  Alcotest.(check bool)
+    (Printf.sprintf "%s: refused rather than answered (got %S)" label msg)
+    true
+    (msg <> "");
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "%s: and it is the correlated-subquery refusal, not some other error (got %S)"
+       label
+       msg)
+    true
+    (contains msg "correlated subquery" && contains msg "#592")
+;;
+
 let seed_unresolvable db =
   exec db "CREATE TABLE a (k INTEGER PRIMARY KEY, x INTEGER)";
   exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)";
@@ -584,10 +724,7 @@ let an_unresolvable_correlation_is_refused_behind_a_failing_conjunct () =
         db
         "SELECT k FROM a WHERE a.x = -1 AND EXISTS (SELECT * FROM b WHERE b.y = z.zz)"
     in
-    Alcotest.(check bool)
-      (Printf.sprintf "refused rather than answered empty (got %S)" msg)
-      true
-      (msg <> ""))
+    check_refused ~label:"behind a conjunct no row satisfies" msg)
 ;;
 
 (* The control: the same unresolvable subquery with a conjunct every row passes
@@ -601,7 +738,7 @@ let an_unresolvable_correlation_is_refused_behind_a_passing_conjunct () =
         db
         "SELECT k FROM a WHERE a.x > 0 AND EXISTS (SELECT * FROM b WHERE b.y = z.zz)"
     in
-    Alcotest.(check bool) (Printf.sprintf "refused (got %S)" msg) true (msg <> ""))
+    check_refused ~label:"behind a conjunct every row satisfies" msg)
 ;;
 
 (* ... and with no conjunct in front of it at all. Three spellings, one
@@ -612,7 +749,7 @@ let an_unresolvable_correlation_is_refused_alone () =
     let msg =
       err_of db "SELECT k FROM a WHERE EXISTS (SELECT * FROM b WHERE b.y = z.zz)"
     in
-    Alcotest.(check bool) (Printf.sprintf "refused (got %S)" msg) true (msg <> ""))
+    check_refused ~label:"with no conjunct in front of it" msg)
 ;;
 
 (* The documented boundary: an EMPTY outer input probes nothing, so it raises
@@ -831,6 +968,10 @@ let () =
             "live RO snapshots do not grow with the outer row count"
             `Quick
             live_snapshots_do_not_accumulate_with_outer_rows
+        ; Alcotest.test_case
+            "bind+plan does not scale with the outer row count"
+            `Quick
+            plan_builds_do_not_scale_with_outer_rows
         ] )
     ; ( "seek, not drain"
       , [ Alcotest.test_case
