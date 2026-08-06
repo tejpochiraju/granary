@@ -73,6 +73,11 @@ type window_sema =
 type agg_spec =
   { func : Ast.agg_func
   ; col_ord : int option
+  ; arg_expr : bound_expr option
+    (** #488: the aggregate's argument as a general expression over the INPUT
+        row, evaluated per row before accumulating ([SUM(a * (1 - b))]).
+        [None] for the bare-column and COUNT-star forms; when it is [Some _],
+        [col_ord] is [None]. *)
   }
 
 (** Projection item in an aggregated SELECT.  The output row of

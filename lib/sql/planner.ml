@@ -1644,7 +1644,12 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
 ;;
 
 let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
-  { Plan.func = a.func; col_ord = a.col_ord }
+  { Plan.func = a.func
+  ; col_ord = a.col_ord
+  ; (* #488: the argument expression addresses the INPUT row, exactly like any
+       other bound expression over a scanned row, so it needs no remapping. *)
+    arg_expr = Option.map plan_expr a.arg_expr
+  }
 ;;
 
 let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function

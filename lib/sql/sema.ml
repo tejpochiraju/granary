@@ -156,6 +156,10 @@ type window_sema =
 type agg_spec =
   { func : Ast.agg_func
   ; col_ord : int option
+  ; arg_expr : bound_expr option
+    (** #488: the aggregate's argument as a general expression over the INPUT
+        row.  [None] for the bare-column and COUNT-star forms; when it is
+        [Some _], [col_ord] is [None]. *)
   }
 
 type agg_proj_item =
@@ -913,6 +917,35 @@ let agg_arg_col_ty_of_tables
   Option.map (fun (c : Row.column) -> c.Row.ty) (List.nth_opt cols i)
 ;;
 
+(** Check if any [E_agg] appears anywhere in an [expr].  Defined here rather
+    than beside its other users because #488's aggregate-argument binder needs
+    it to refuse a nested aggregate. *)
+let rec expr_has_agg = function
+  | Ast.E_agg _ -> true
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
+  | Ast.E_subquery _ | Ast.E_exists _ -> false
+  | Ast.E_in_select (x, _) -> expr_has_agg x
+  | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
+  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
+    expr_has_agg e
+  | Ast.E_between (x, lo, hi) -> expr_has_agg x || expr_has_agg lo || expr_has_agg hi
+  | Ast.E_in (x, vals) -> expr_has_agg x || List.exists expr_has_agg vals
+  | Ast.E_func (_, args) -> List.exists expr_has_agg args
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    (match scrutinee with
+     | Some e -> expr_has_agg e
+     | None -> false)
+    || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
+    ||
+      (match else_ with
+      | Some e -> expr_has_agg e
+      | None -> false)
+  | Ast.E_cast (e, _) -> expr_has_agg e
+  | Ast.E_collate (e, _) -> expr_has_agg e
+  | Ast.E_window _ -> false
+  | Ast.E_fts_snippet _ -> false
+;;
+
 (* #568: SUM/AVG over a TEXT or BLOB column is rejected at bind time.  This
    used to live only in [project_agg] (the binder for a *bare* aggregate
    projection item), so wrapping the same aggregate in any expression —
@@ -974,19 +1007,19 @@ let agg_col_ord
     [BE_col (offset + slot)] referring to the aggregate output row.
     [offset] is 1 when GROUP BY is present (slot 0 holds the group key)
     and 0 otherwise. *)
-let bind_expr_agg
-      ~param_counter
-      ~named_params
-      ?(register : (agg_spec -> int) option)
-      ?(on_window :
-         (Ast.window_func
-          -> Ast.expr list
-          -> Ast.window_spec
-          -> (bound_expr, error) result)
-           option)
-      ~(resolver : col_resolver)
-      ~(offset : int)
-      (e : Ast.expr)
+let rec bind_expr_agg
+          ~param_counter
+          ~named_params
+          ?(register : (agg_spec -> int) option)
+          ?(on_window :
+             (Ast.window_func
+              -> Ast.expr list
+              -> Ast.window_spec
+              -> (bound_expr, error) result)
+               option)
+          ~(resolver : col_resolver)
+          ~(offset : int)
+          (e : Ast.expr)
   : (bound_expr * agg_spec list, error) result
   =
   let aggs = ref [] in
@@ -1066,9 +1099,9 @@ let bind_expr_agg
          Ok (BE_in (bx', ok_vals)))
     | Ast.E_param p -> Ok (BE_param (resolve_param ~param_counter ~named_params p))
     | Ast.E_agg (func, arg_opt) ->
-      (match agg_col_ord ~resolver func arg_opt with
+      (match bind_agg_arg ~param_counter ~named_params ~resolver func arg_opt with
        | Error e -> Error e
-       | Ok col_ord -> Ok (BE_col (add_agg { func; col_ord })))
+       | Ok (col_ord, arg_expr) -> Ok (BE_col (add_agg { func; col_ord; arg_expr })))
     | Ast.E_func (func, args) -> bind_func ~bind:go func args
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
@@ -1105,6 +1138,51 @@ let bind_expr_agg
   match go e with
   | Error e -> Error e
   | Ok be -> Ok (be, !aggs)
+
+(* #488: resolve an aggregate's argument.  Returns [(col_ord, arg_expr)] where
+    at most one is [Some]: a bare column reference keeps the ordinal form the
+    whole engine (and the #247 fast path) already understands, and anything
+    else is bound as an expression over the INPUT row, to be evaluated per row
+    during accumulation.
+
+    The argument sees the resolver's [resolve_agg_arg]/[resolve_agg_arg_qual]
+    lookups for {i every} column reference — inside an aggregate any table
+    column is legal, which is exactly what the bare-column arm already did and
+    what distinguishes an aggregate's argument from the expression around it
+    (a GROUP BY projection and HAVING both restrict bare column refs to grouped
+    columns; the argument must not inherit that).
+
+    A nested aggregate is refused here rather than left to fall out of the
+    generic binder, which would otherwise register it as a second, separate
+    aggregate over the input rows and silently answer something that is not
+    what was asked. *)
+and bind_agg_arg
+      ~param_counter
+      ~named_params
+      ~(resolver : col_resolver)
+      (func : Ast.agg_func)
+      (arg_opt : Ast.expr option)
+  : (int option * bound_expr option, error) result
+  =
+  match arg_opt with
+  | None | Some (Ast.E_col _) | Some (Ast.E_tbl_col _) ->
+    (match agg_col_ord ~resolver func arg_opt with
+     | Error e -> Error e
+     | Ok co -> Ok (co, None))
+  | Some e when expr_has_agg e ->
+    Error (Unsupported "aggregate function calls may not be nested")
+  | Some e ->
+    let arg_resolver =
+      { resolver with
+        resolve_unqual = resolver.resolve_agg_arg
+      ; resolve_qual = resolver.resolve_agg_arg_qual
+      }
+    in
+    (match
+       bind_expr_agg ~param_counter ~named_params ~resolver:arg_resolver ~offset:0 e
+     with
+     | Error er -> Error er
+     | Ok (be, _) -> Ok (None, Some be))
 ;;
 
 (** Check if any subquery node appears anywhere in a [bound_expr]. *)
@@ -1132,33 +1210,6 @@ let rec expr_has_subquery = function
   | BE_collate (e, _) -> expr_has_subquery e
   | BE_excluded_col _ -> false
   | BE_window_slot _ -> false
-;;
-
-(** Check if any [E_agg] appears anywhere in an [expr]. *)
-let rec expr_has_agg = function
-  | Ast.E_agg _ -> true
-  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
-  | Ast.E_subquery _ | Ast.E_exists _ -> false
-  | Ast.E_in_select (x, _) -> expr_has_agg x
-  | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
-  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
-    expr_has_agg e
-  | Ast.E_between (x, lo, hi) -> expr_has_agg x || expr_has_agg lo || expr_has_agg hi
-  | Ast.E_in (x, vals) -> expr_has_agg x || List.exists expr_has_agg vals
-  | Ast.E_func (_, args) -> List.exists expr_has_agg args
-  | Ast.E_case { scrutinee; branches; else_ } ->
-    (match scrutinee with
-     | Some e -> expr_has_agg e
-     | None -> false)
-    || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
-    ||
-      (match else_ with
-      | Some e -> expr_has_agg e
-      | None -> false)
-  | Ast.E_cast (e, _) -> expr_has_agg e
-  | Ast.E_collate (e, _) -> expr_has_agg e
-  | Ast.E_window _ -> false
-  | Ast.E_fts_snippet _ -> false
 ;;
 
 let rec expr_has_window = function
@@ -2517,12 +2568,15 @@ let bind_post_agg
       (match col_ord_result with
        | Error e -> Error e
        | Ok co ->
-         let spec = { func; col_ord = co } in
+         let spec = { func; col_ord = co; arg_expr = None } in
          let rec find_slot i = function
            | [] ->
              acc_aggs := !acc_aggs @ [ spec ];
              List.length !acc_aggs - 1
-           | s :: _ when s.func = spec.func && s.col_ord = spec.col_ord -> i
+           | s :: _
+             when s.func = spec.func
+                  && s.col_ord = spec.col_ord
+                  && s.arg_expr = spec.arg_expr -> i
            | _ :: rest -> find_slot (i + 1) rest
          in
          let slot = find_slot 0 !acc_aggs in
@@ -2640,6 +2694,8 @@ let agg_arg_resolver ~(tables : (Cat.table_meta * int * string option) list) ~me
    every expression-over-aggregate path share, so both spellings of the same
    aggregate are checked identically. *)
 let project_agg
+      ~param_counter
+      ~named_params
       ~(tables : (Cat.table_meta * int * string option) list)
       ~meta
       ~add_agg
@@ -2647,10 +2703,17 @@ let project_agg
       arg_opt
   : (agg_proj_item, error) result
   =
-  match agg_col_ord ~resolver:(agg_arg_resolver ~tables ~meta) func arg_opt with
+  match
+    bind_agg_arg
+      ~param_counter
+      ~named_params
+      ~resolver:(agg_arg_resolver ~tables ~meta)
+      func
+      arg_opt
+  with
   | Error e -> Error e
-  | Ok co ->
-    let slot = add_agg { func; col_ord = co } in
+  | Ok (co, arg_expr) ->
+    let slot = add_agg { func; col_ord = co; arg_expr } in
     Ok (AP_agg_slot slot)
 ;;
 
@@ -2772,7 +2835,8 @@ let project_agg_item
           Error
             (Unsupported
                (Printf.sprintf "column '%s.%s' must appear in GROUP BY clause" t c))))
-  | Ast.E_agg (func, arg_opt) -> project_agg ~tables ~meta ~add_agg func arg_opt
+  | Ast.E_agg (func, arg_opt) ->
+    project_agg ~param_counter ~named_params ~tables ~meta ~add_agg func arg_opt
   | Ast.E_window { func; args; window } ->
     project_window
       ~tables
