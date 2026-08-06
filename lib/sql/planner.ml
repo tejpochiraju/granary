@@ -1942,10 +1942,14 @@ let plan_agg_order_hidden ~agg_order_keys ~projected =
     in
     Plan.Op_project
       { ordinals = List.init n_visible Fun.id; child = Plan.Op_sort { keys; child } }
-  | other ->
+  | _ ->
     (* Unreachable: [agg_order_keys] is non-empty only for an aggregated
-       SELECT, whose projection is always an [Op_aggregate]. *)
-    other
+       SELECT, and [plan_projection] then always returns [Op_aggregate].  This
+       fails loudly rather than returning the child unchanged, because the
+       symptom of the latter would be silently UNSORTED rows — the hidden
+       columns have nowhere to go, so the whole ORDER BY would evaporate. *)
+    failwith
+      "plan_agg_order_hidden: ORDER BY over an aggregate needs an Op_aggregate projection"
 ;;
 
 (* Post-aggregation ORDER BY: ORDER BY col indices are in pre-aggregation

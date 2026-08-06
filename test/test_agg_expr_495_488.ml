@@ -86,6 +86,14 @@ let text = function
   | Row.V_blob _ -> Alcotest.fail "expected text, got a blob"
 ;;
 
+let show_value = function
+  | Row.V_text s -> Printf.sprintf "V_text %S" s
+  | Row.V_null -> "V_null"
+  | Row.V_int n -> Printf.sprintf "V_int %Ld" n
+  | Row.V_real f -> Printf.sprintf "V_real %g" f
+  | Row.V_blob b -> Printf.sprintf "V_blob(%d)" (Bytes.length b)
+;;
+
 let close_to ~msg expected got =
   Alcotest.(check bool)
     (Printf.sprintf "%s: expected %.6f, got %.6f" msg expected got)
@@ -131,6 +139,44 @@ let seed db =
     ; "INSERT INTO li VALUES (4, 'b', 50.0, 0.50, 4)"
     ; "INSERT INTO li VALUES (5, 'c', 10.0, 0.00, 5)"
     ]
+;;
+
+(* A second table where the ARGUMENT evaluates to NULL on rows whose columns
+   are individually present — the case a bare column argument cannot produce,
+   and the one every accumulator's null-skip has to see.
+
+   id | g | a    | b    | a * b
+    1 | x |    2 |    3 |     6
+    2 | x | NULL |    4 |  NULL
+    3 | y | NULL | NULL |  NULL
+    4 | y | NULL |    5 |  NULL
+    5 | z |   10 |    1 |    10
+*)
+let seed_nulls db =
+  exec db "CREATE TABLE n (id INTEGER PRIMARY KEY, g TEXT, a INTEGER, b INTEGER)";
+  List.iter
+    (exec db)
+    [ "INSERT INTO n VALUES (1, 'x', 2, 3)"
+    ; "INSERT INTO n VALUES (2, 'x', NULL, 4)"
+    ; "INSERT INTO n VALUES (3, 'y', NULL, NULL)"
+    ; "INSERT INTO n VALUES (4, 'y', NULL, 5)"
+    ; "INSERT INTO n VALUES (5, 'z', 10, 1)"
+    ]
+;;
+
+let one_value db sql =
+  match rows db sql with
+  | [ r ] when Array.length r = 1 -> r.(0)
+  | rs -> Alcotest.failf "%S: expected one 1-column row, got %d" sql (List.length rs)
+;;
+
+let value_both_paths db sql (check : Row.value -> unit) =
+  List.iter
+    (fun on ->
+       set_fastpath on;
+       check (one_value db sql))
+    [ true; false ];
+  set_fastpath true
 ;;
 
 (* ---------------------------------------------------------------- #488 *)
@@ -193,12 +239,81 @@ let count_star_beside_an_expression_aggregate () =
     set_fastpath true)
 ;;
 
+(* NULL propagation is the property a bare column argument could not exercise:
+   the argument evaluates to NULL on rows where the columns themselves are
+   present, so every accumulator's null-skip has to run on the EVALUATED value.
+   [COUNT(a * b)] answering 5 instead of 2 would be the tell. *)
+let nulls_propagate_through_an_expression_argument () =
+  with_db (fun db ->
+    seed_nulls db;
+    scalar_both_paths db "SELECT COUNT(*) FROM n" 5.0;
+    scalar_both_paths db "SELECT COUNT(a * b) FROM n" 2.0;
+    scalar_both_paths db "SELECT SUM(a * b) FROM n" 16.0;
+    scalar_both_paths db "SELECT AVG(a * b) FROM n" 8.0;
+    scalar_both_paths db "SELECT MIN(a * b) FROM n" 6.0;
+    scalar_both_paths db "SELECT MAX(a * b) FROM n" 10.0)
+;;
+
+(* An all-NULL group is NULL, not 0 — [agg_sum]'s [any_non_null] and the
+   accumulator's [any_nn] must agree about that over evaluated values too.
+   This query also covers the one fast-path combination the rest of the file
+   misses: a filter AND an expression argument, i.e. [pred_opt <> None] with
+   [any_arg_expr] true. *)
+let an_all_null_expression_sums_to_null () =
+  with_db (fun db ->
+    seed_nulls db;
+    value_both_paths db "SELECT SUM(a * b) FROM n WHERE g = 'y'" (fun v ->
+      Alcotest.(check bool)
+        (Printf.sprintf "SUM over an all-NULL group is NULL (got %s) " (show_value v))
+        true
+        (v = Row.V_null));
+    value_both_paths db "SELECT MAX(a * b) FROM n WHERE g = 'y'" (fun v ->
+      Alcotest.(check bool) "MAX over an all-NULL group is NULL" true (v = Row.V_null));
+    (* the filter still narrows correctly when the argument is an expression *)
+    scalar_both_paths db "SELECT SUM(a * b) FROM n WHERE g <> 'y'" 16.0)
+;;
+
+let group_concat_over_an_expression () =
+  with_db (fun db ->
+    seed_nulls db;
+    value_both_paths db "SELECT GROUP_CONCAT(a * b) FROM n" (fun v ->
+      Alcotest.(check string)
+        "NULL parts are skipped, scan order preserved"
+        "6,10"
+        (text v)))
+;;
+
 (* An aggregate may not contain another aggregate, in either position. *)
 let nested_aggregates_are_rejected () =
   with_db (fun db ->
     seed db;
     rejected db "SELECT SUM(SUM(price)) FROM li" ~needle:"nested";
     rejected db "SELECT SUM(price + SUM(qty)) FROM li" ~needle:"nested")
+;;
+
+(* Review finding on PR #658, and the reason it was blocking: making the
+   argument a general expression makes SUBQUERIES bindable there, and nothing
+   ever resolves one for an agg spec — [stream_aggregate] pre-evaluates
+   subqueries in HAVING and the projection, the #247 fast path does it for the
+   filter, and [eval_expr] answers NULL for a surviving [P_subquery].  So these
+   would have returned NULL (or 0 for COUNT) with no error whatsoever, in a
+   shape that was refused outright before #488.  They must be refused at BIND
+   time — the error arrives from [Db.query] before a single row is read, so it
+   cannot depend on the data.  Resolving them properly is #664. *)
+let subqueries_in_an_aggregate_argument_are_rejected () =
+  with_db (fun db ->
+    seed db;
+    List.iter
+      (fun sql -> rejected db sql ~needle:"subquer")
+      [ "SELECT SUM(qty * (SELECT 2)) FROM li"
+      ; "SELECT COUNT(price * (SELECT 1)) FROM li"
+      ; "SELECT SUM(CASE WHEN EXISTS (SELECT 1 FROM li) THEN qty ELSE 0 END) FROM li"
+      ; "SELECT SUM(CASE WHEN qty IN (SELECT qty FROM li) THEN 1 ELSE 0 END) FROM li"
+      ; (* HAVING and ORDER BY route through the same binder, so the refusal
+           must reach them too *)
+        "SELECT k FROM li GROUP BY k HAVING SUM(qty * (SELECT 2)) > 0"
+      ; "SELECT k FROM li GROUP BY k ORDER BY SUM(qty * (SELECT 2)) DESC"
+      ])
 ;;
 
 (* ---------------------------------------------------------------- #495 *)
@@ -296,6 +411,32 @@ let order_by_mixes_an_aggregate_and_a_group_column () =
     Alcotest.(check (list string)) "order" [ "a"; "b"; "d"; "c" ] (List.map fst got))
 ;;
 
+(* An explicit NULLS clause on an aggregate key: the group whose aggregate is
+   NULL moves to whichever end was asked for.  These are the two branches of
+   the planner's [order_dir_nulls] that a direction alone never reaches. *)
+let order_by_a_null_aggregate_honours_the_nulls_clause () =
+  with_db (fun db ->
+    seed_nulls db;
+    let groups sql =
+      List.map
+        (fun r ->
+           if Array.length r <> 2
+           then
+             Alcotest.failf "%S: expected 2 output columns, got %d" sql (Array.length r);
+           text r.(0))
+        (rows db sql)
+    in
+    (* SUM(a * b) per group: x = 6, y = NULL, z = 10 *)
+    Alcotest.(check (list string))
+      "DESC NULLS FIRST"
+      [ "y"; "z"; "x" ]
+      (groups "SELECT g, SUM(a * b) AS s FROM n GROUP BY g ORDER BY s DESC NULLS FIRST");
+    Alcotest.(check (list string))
+      "ASC NULLS LAST"
+      [ "x"; "z"; "y" ]
+      (groups "SELECT g, SUM(a * b) AS s FROM n GROUP BY g ORDER BY s ASC NULLS LAST"))
+;;
+
 let having_over_an_aggregate_expression () =
   with_db (fun db ->
     seed db;
@@ -357,9 +498,25 @@ let () =
             `Quick
             count_star_beside_an_expression_aggregate
         ; Alcotest.test_case
+            "NULL propagation through the argument"
+            `Quick
+            nulls_propagate_through_an_expression_argument
+        ; Alcotest.test_case
+            "all-NULL argument sums to NULL (and WHERE + expression argument)"
+            `Quick
+            an_all_null_expression_sums_to_null
+        ; Alcotest.test_case
+            "GROUP_CONCAT over an expression"
+            `Quick
+            group_concat_over_an_expression
+        ; Alcotest.test_case
             "SUM(SUM(x)) is rejected"
             `Quick
             nested_aggregates_are_rejected
+        ; Alcotest.test_case
+            "a subquery in the argument is rejected at bind time"
+            `Quick
+            subqueries_in_an_aggregate_argument_are_rejected
         ] )
     ; ( "#495 ORDER BY over an aggregate"
       , [ Alcotest.test_case
@@ -376,6 +533,10 @@ let () =
             "aggregate key beside a group column"
             `Quick
             order_by_mixes_an_aggregate_and_a_group_column
+        ; Alcotest.test_case
+            "explicit NULLS FIRST / NULLS LAST on an aggregate key"
+            `Quick
+            order_by_a_null_aggregate_honours_the_nulls_clause
         ; Alcotest.test_case
             "HAVING SUM(expr) > k"
             `Quick
