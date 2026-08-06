@@ -1106,6 +1106,11 @@
  (modules test_projection_subquery_626)
  (libraries granary granary.unix alcotest lwt.unix unix))
 
+(test
+ (name test_outer_join_subquery_615)
+ (modules test_outer_join_subquery_615)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 
 (test

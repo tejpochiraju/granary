@@ -378,22 +378,22 @@ let plain_general_on_is_untouched () =
       (rows_of db "SELECT a, b FROM l INNER JOIN r ON b > a"))
 ;;
 
-(* The outer spelling of the same query is still refused by
-   [stream_hash_join]'s cartesian arm (#566, PR #586). For an outer join the ON
-   predicate is the match test and must be evaluated {i inside} the join, which
-   this change does not touch — the machinery it adds would suffice, but that
-   is a separate decision to reopen. Pinned so the asymmetry is deliberate and
-   visible rather than discovered. *)
-let outer_spelling_is_still_refused () =
+(* The outer spelling of the same query WAS refused by [stream_hash_join]'s
+   cartesian arm (#566, PR #586), and #592 deliberately left that asymmetry
+   pinned here rather than reopening a decision that had merged hours earlier.
+
+   #615 reopened it, using exactly the machinery this file's fix introduced:
+   the joined row is [lrow @ rrow] and [get_outer_scan_metas] describes both
+   inputs, so the correlation resolves inside the join. The two spellings now
+   agree, and this test asserts the agreement rather than the asymmetry.
+   [test_outer_join_subquery_615.ml] carries the full case set. *)
+let outer_spelling_now_agrees () =
   with_db (fun db ->
     seed db;
-    let msg =
-      err_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < a)"
-    in
-    Alcotest.(check bool)
-      (Printf.sprintf "LEFT JOIN still refuses (got %S)" msg)
-      true
-      (contains msg "#566"))
+    check_rows
+      ~label:"#615: the LEFT spelling answers and null-extends the unmatched row"
+      [ [ "1"; "NULL" ]; [ "9"; "5" ] ]
+      (rows_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < a)"))
 ;;
 
 let () =
@@ -454,9 +454,9 @@ let () =
             `Quick
             plain_general_on_is_untouched
         ; Alcotest.test_case
-            "the outer spelling is still refused (#566)"
+            "the outer spelling now agrees (#615)"
             `Quick
-            outer_spelling_is_still_refused
+            outer_spelling_now_agrees
         ] )
     ]
 ;;

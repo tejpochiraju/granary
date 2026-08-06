@@ -53,10 +53,12 @@
     [pre_eval_subquery] resolves only the uncorrelated case. A correlated
     [P_subquery] survives into [eval_expr], which answers [Row.V_null] for it, so
     an outer join's ON predicate is false for every pair and every left row
-    null-extends. #566 chose to refuse the query rather than return that, and
-    that refusal still stands for [`Left]. The INNER spelling, which #592 found
-    was silently returning no rows, is now evaluated — see
-    [test_join_subquery_592.ml]. *)
+    null-extends. #566 chose to refuse the query rather than return that.
+
+    #615 reopened that decision once #592 built the correlation source: the
+    [`Left] arm now resolves the correlation per (left, right) pair and answers,
+    and only a genuinely unresolvable reference is refused. Both spellings are
+    covered here; [test_outer_join_subquery_615.ml] carries the full case set. *)
 
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
@@ -735,11 +737,35 @@ let err_of db sql =
      | e -> Printexc.to_string e)
 ;;
 
-let correlated_on_subquery_is_refused () =
+(* #615: this used to assert the refusal.  #592 built the correlation source
+   ([get_outer_scan_metas]) and #615 wired it into this operator's cartesian
+   arm, so the query now answers — and answers the same as the INNER spelling
+   below, plus the null-extended row an outer join owes.  What remains refused
+   is an outer reference that names no input, or that two inputs answer to; see
+   [test_outer_join_subquery_615.ml].
+
+   sqlite3 3.45.1 answers [1|NULL] and [9|5]: for [a = 1] the subquery is empty
+   so [5 > NULL] is unknown and the left row null-extends; for [a = 9] it is 4
+   and [5 > 4] holds. *)
+let correlated_on_subquery_is_evaluated_615 () =
   with_db (fun db ->
     seed_correlated db;
+    check_rows
+      ~label:"#615: the correlated ON predicate is evaluated per pair"
+      [ [ "1"; "NULL" ]; [ "9"; "5" ] ]
+      (rows_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < a)"))
+;;
+
+(* The refusal did not disappear, it moved to the boundary the INNER spelling
+   has: an outer reference no input can answer to is still refused rather than
+   null-extending every left row, which is the wrong answer #566 existed to
+   avoid. *)
+let an_unresolvable_correlated_on_is_still_refused () =
+  with_db (fun db ->
+    seed_correlated db;
+    exec db "CREATE TABLE zz (q INTEGER)";
     let msg =
-      err_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < a)"
+      err_of db "SELECT a, b FROM l LEFT JOIN r ON b > (SELECT v FROM k WHERE v < zz.q)"
     in
     Alcotest.(check bool)
       (Printf.sprintf "the query is refused, not answered (got %S)" msg)
@@ -755,7 +781,7 @@ let correlated_on_subquery_is_refused () =
          let rec go i = i + n <= m && (String.sub msg i n = needle || go (i + 1)) in
          go 0
        in
-       has "correlated subquery" && has "#566"))
+       has "correlated subquery" && has "#615"))
 ;;
 
 (* The uncorrelated spelling was already correct and must stay correct — it is
@@ -895,9 +921,13 @@ let () =
         ] )
     ; ( "correlated ON subquery is refused (#566)"
       , [ Alcotest.test_case
-            "a correlated ON subquery is refused"
+            "a correlated ON subquery is evaluated (#615)"
             `Quick
-            correlated_on_subquery_is_refused
+            correlated_on_subquery_is_evaluated_615
+        ; Alcotest.test_case
+            "an unresolvable correlated ON is still refused"
+            `Quick
+            an_unresolvable_correlated_on_is_still_refused
         ; Alcotest.test_case
             "an uncorrelated ON subquery still works"
             `Quick

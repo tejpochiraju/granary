@@ -8521,6 +8521,21 @@ let correlated_projection_refusal () =
    in scope under (#635)."
 ;;
 
+(** #615: the outer join's counterpart.
+
+    #566 refused every correlated subquery in an outer join's ON predicate,
+    because the correlation source could not be located over a join node. #592
+    built that source ([get_outer_scan_metas]), so the resolvable shapes are now
+    evaluated and only the genuinely unresolvable ones reach this message —
+    which is the same boundary the INNER spelling has. *)
+let correlated_on_refusal () =
+  "Exec: a correlated subquery in an outer join's ON predicate cannot be resolved — its \
+   outer column reference has no source in the joined row (#615; #566 refused every \
+   spelling of this before the correlation source existed). Rewrite it as an \
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
+;;
+
 (** #592: what the {i inner} SELECT already has in scope, so a reference the
     subquery owns can be told apart from an outer one. SQL resolves
     innermost-first, and both halves of that matter:
@@ -9803,6 +9818,26 @@ and stream_nested_loop_join
   (* #239: captured under [query]'s [with_value] scope; counts right-side index
      probes (the left input's base scan is counted via [to_stream] below). *)
   let s_opt = Lwt.get query_stats_key in
+  (* #615: this operator expresses its ON predicate as an index probe, and
+     [plan_join] only builds it from a recognised [col = col] equality whose
+     remaining key columns are pinned by literal equalities — so a subquery
+     cannot reach [probe] or [probe_range] through the planner today.
+     [Op_nested_loop_join] is a public constructor, and an unresolved
+     [P_subquery] here would encode as NULL and silently drop every driving row,
+     which is the exact failure class #566/#592/#615 are about.  Refuse it. *)
+  let expr_corr = plan_expr_has_subquery in
+  let range_corr (r : Plan.range) =
+    Option.fold ~none:false ~some:expr_corr r.Plan.r_lo
+    || Option.fold ~none:false ~some:expr_corr r.Plan.r_hi
+  in
+  if
+    List.exists
+      (function
+        | Plan.Probe_const e -> expr_corr e
+        | Plan.Probe_from_left _ -> false)
+      probe
+    || Option.fold ~none:false ~some:range_corr probe_range
+  then failwith (correlated_on_refusal ());
   let* left_stream = to_stream clock params store ~mode ~cat left in
   let* left_rows = Lwt_stream.to_list left_stream in
   (* #262: probe the inner index through the active txn so the join sees inner
@@ -9882,71 +9917,130 @@ and stream_hash_join
        filter above the join would reject the very null-extended row it has to
        let through.  With [on_pred = None] every pair matches and the caller
        filters, which is what an INNER join still does. *)
+    (* Uncorrelated subqueries in the ON predicate are resolved once, as
+       [stream_filter] does.  What survives [pre_eval_subquery] is correlated.
+
+       #566 refused that outright, because the correlation source could not be
+       located over a join node: a surviving [P_subquery] evaluates to
+       [Row.V_null], so [matches] is false for every pair, [any] is never set,
+       and an outer join null-extends {i every} left row — a complete result set
+       of the right cardinality with the ON predicate silently unevaluated.
+
+       #615 reopens that decision, because #592 built the source: the joined row
+       is [lrow @ rrow] and [get_outer_scan_metas] describes both inputs, so the
+       correlation resolves here exactly as it does in the [Op_filter] above an
+       INNER join.  The two spellings of the same query agreed on nothing before
+       this; now they agree on both the answer and the refusal.
+
+       The cost is that the pairing loop becomes Lwt and the substitution runs
+       once per (left, right) {i pair} rather than once per surviving row — an
+       outer join has no choice, since the ON predicate {b is} the match test and
+       a filter above the join would reject the null-extended row it must emit
+       (#552).  The pure loop below is kept for the arm where no subquery
+       survives, which is every join that has no correlated ON. *)
+    let s_opt = Lwt.get query_stats_key in
     let* pred =
       match on_pred with
       | None -> Lwt.return None
       | Some p ->
-        (* Uncorrelated subqueries in the ON predicate are resolved once, as
-           [stream_filter] does.  A correlated one cannot be resolved here, and
-           could not be resolved by the filter this replaces either — that
-           filter's [get_outer_scan_meta] answers [None] over a join.
-
-           #566: refuse it rather than answer.  A [P_subquery] that survives
-           [pre_eval_subquery] is correlated, and [eval_expr] answers
-           [Row.V_null] for it — so [matches] is false for every pair, [any] is
-           never set, and an outer join null-extends {i every} left row.  That
-           is a complete result set of the right cardinality with the ON
-           predicate silently unevaluated: indistinguishable from the correct
-           answer for the uncorrelated case, which [pre_eval_subquery] has
-           already resolved by this point and which stays correct.  Supporting
-           it needs per-row re-evaluation with a correlation source
-           [get_outer_scan_meta] cannot resolve over a join node (#566 option
-           2); until then a visible error beats a quiet wrong answer.
-
-           #592: this covers the OUTER case only, because [on_pred] is [Some]
-           only for [`Left] — [general_on_join] puts an INNER join's ON predicate
-           in an [Op_filter] above the join instead.  That path used to have the
-           same defect and drop every row silently; it now resolves the
-           correlation through [get_outer_scan_metas] and answers.  The same
-           machinery would serve here — the joined row is [lrow @ rrow] and both
-           inputs' metas are in hand — but an outer join has to evaluate the
-           predicate per {i pair} inside this loop rather than per row above it,
-           and reopening #566's refusal is a separate decision.  Until then the
-           two spellings differ deliberately. *)
-        let* p = pre_eval_subquery clock store params cat p in
-        if plan_expr_has_subquery p
-        then
-          failwith
-            "Exec: a correlated subquery in an outer join's ON predicate is not \
-             supported — its correlation source cannot be resolved over a join (#566). \
-             Rewrite it as a WHERE-clause subquery or an uncorrelated one.";
-        Lwt.return (Some p)
+        let+ p = pre_eval_subquery clock store params cat p in
+        Some p
     in
-    let matches joined =
+    let correlated =
       match pred with
-      | None -> true
-      | Some p -> value_truthy (eval_expr clock params joined p)
+      | Some p -> plan_expr_has_subquery p
+      | None -> false
+    in
+    (* #615: both inputs of this join, re-based into the joined row.  The right
+       input's offsets shift by the left input's width, and the identifiers must
+       still be unique across the two — a self-join with no aliases is refused
+       here for the same reason [get_outer_scan_metas] refuses one. *)
+    let joined_inputs () =
+      match get_outer_scan_metas left, outer_row_width left with
+      | Some ls, Some w ->
+        (match get_outer_scan_metas right with
+         | None -> None
+         | Some rs ->
+           let all =
+             ls @ List.map (fun oi -> { oi with oi_offset = oi.oi_offset + w }) rs
+           in
+           let idents = List.map (fun oi -> oi.oi_ident) all in
+           if List.length (List.sort_uniq String.compare idents) <> List.length idents
+           then None
+           else Some all)
+      | _, _ -> None
     in
     let* left_rows = Lwt_stream.to_list left_stream in
     let out = ref [] in
-    List.iter
-      (fun lrow ->
-         let any = ref false in
-         List.iter
-           (fun rrow ->
-              let joined = Array.append lrow rrow in
-              if matches joined
-              then (
-                out := joined :: !out;
-                any := true))
-           right_rows;
-         match join_kind with
-         | `Left when not !any ->
-           let null_right = Array.make n_right_cols Row.V_null in
-           out := Array.append lrow null_right :: !out
-         | _ -> ())
-      left_rows;
-    Lwt.return (Lwt_stream.of_list (List.rev !out)))
+    let null_extend lrow any =
+      match join_kind with
+      | `Left when not any ->
+        out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out
+      | _ -> ()
+    in
+    if not correlated
+    then (
+      (* The pre-#615 loop, unchanged and still pure: every join whose ON
+         predicate carries no surviving subquery takes this arm. *)
+      let matches joined =
+        match pred with
+        | None -> true
+        | Some p -> value_truthy (eval_expr clock params joined p)
+      in
+      List.iter
+        (fun lrow ->
+           let any = ref false in
+           List.iter
+             (fun rrow ->
+                let joined = Array.append lrow rrow in
+                if matches joined
+                then (
+                  out := joined :: !out;
+                  any := true))
+             right_rows;
+           null_extend lrow !any)
+        left_rows;
+      Lwt.return (Lwt_stream.of_list (List.rev !out)))
+    else (
+      match joined_inputs () with
+      | None -> Lwt.fail_with (correlated_on_refusal ())
+      | Some inputs ->
+        let p = Option.get pred in
+        let matches_s joined =
+          let bnd = binding_of_metas inputs joined in
+          let* resolved =
+            with_pull_context ~stats:s_opt ~mode (fun () ->
+              pre_eval_subquery
+                clock
+                store
+                params
+                cat
+                (substitute_outer_in_plan_expr ~cat bnd p))
+          in
+          if plan_expr_has_subquery resolved
+          then Lwt.fail_with (correlated_on_refusal ())
+          else Lwt.return (value_truthy (eval_expr clock params joined resolved))
+        in
+        let* () =
+          Lwt_list.iter_s
+            (fun lrow ->
+               let any = ref false in
+               let* () =
+                 Lwt_list.iter_s
+                   (fun rrow ->
+                      let joined = Array.append lrow rrow in
+                      let+ keep = matches_s joined in
+                      if keep
+                      then (
+                        out := joined :: !out;
+                        any := true))
+                   right_rows
+               in
+               null_extend lrow !any;
+               Lwt.return_unit)
+            left_rows
+        in
+        Lwt.return (Lwt_stream.of_list (List.rev !out))))
   else (
     let tbl = hash_build right_rows right_key in
     let* left_rows = Lwt_stream.to_list left_stream in
