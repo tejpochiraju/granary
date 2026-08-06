@@ -115,7 +115,6 @@ let ints_in_order rows =
 ;;
 
 let ints rows = List.sort compare (ints_in_order rows)
-
 let pair_list = Alcotest.(list (pair int int))
 
 let seed db =
@@ -134,7 +133,11 @@ let column_list_parses_and_renames () =
     seed db;
     exec db "CREATE VIEW v (p, q) AS SELECT a, x FROM t";
     let got = pairs (query db "SELECT p, q FROM v") in
-    Alcotest.check pair_list "the view's rows, under the new names" [ 1, 10; 2, 20; 3, 30 ] got)
+    Alcotest.check
+      pair_list
+      "the view's rows, under the new names"
+      [ 1, 10; 2, 20; 3, 30 ]
+      got)
 ;;
 
 (* The rename is a rename: the body's own column names must no longer resolve
@@ -195,8 +198,7 @@ let tpch_q15_view_shape () =
   with_db (fun db ->
     exec db "CREATE TABLE lineitem (l_suppkey INTEGER, l_extendedprice INTEGER)";
     List.iter
-      (fun (s, p) ->
-         exec db (Printf.sprintf "INSERT INTO lineitem VALUES (%d, %d)" s p))
+      (fun (s, p) -> exec db (Printf.sprintf "INSERT INTO lineitem VALUES (%d, %d)" s p))
       [ 1, 100; 1, 50; 2, 70 ];
     exec
       db

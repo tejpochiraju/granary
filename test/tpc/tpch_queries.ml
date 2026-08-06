@@ -548,8 +548,8 @@ let q15 =
       Skipped
         "the spec's own WHERE total_revenue = (SELECT MAX(total_revenue) FROM revenue0) \
          names the view inside a subquery's FROM, which granary silently answers with 0 \
-         rows — #496. Two other gaps were cleared and are recorded in the SQL below: \
-         the implicit join is now explicit (#486), and the view's SUM over an expression \
+         rows — #496. Two other gaps were cleared and are recorded in the SQL below: the \
+         implicit join is now explicit (#486), and the view's SUM over an expression \
          would need the Q1 treatment (#488). A third was cleared in the engine instead: \
          #491 added CREATE VIEW v (c1, c2) AS, so the setup below carries the spec's own \
          column list again rather than the aliases it was rewritten into. granary would \

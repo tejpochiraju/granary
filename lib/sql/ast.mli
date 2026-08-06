@@ -229,7 +229,7 @@ type expr =
   | E_agg_distinct of agg_func * expr
   (** #491: aggregate call whose argument list carries [DISTINCT] —
       [COUNT(DISTINCT x)], [SUM(DISTINCT x)], … The argument is mandatory:
-      there is no [COUNT(DISTINCT *)].  This is a separate constructor rather
+      there is no [COUNT(DISTINCT * )].  This is a separate constructor rather
       than a flag on [E_agg] so that every existing exhaustive match over the
       plain form keeps compiling only once it has been considered here. *)
   | E_func of scalar_func * expr list (** Scalar function call. *)

@@ -26,12 +26,12 @@ type profile =
    StockLevel needed a documented rewrite. *)
 let stock_level_verdict =
   Rewritten
-    "one rewrite left: the spec's comma-join is spelled INNER JOIN, since granary's \
-     FROM clause takes one table plus explicit joins (#486). StockLevel is the only \
-     profile with a join at all, which is why it is the only one carrying a rewrite. \
-     The distinct count is no longer one of them — #491 taught the parser DISTINCT as \
-     an aggregate argument, so the spec's COUNT(DISTINCT s_i_id) now runs in the engine \
-     and the count is the engine's answer, not a client-side row count over a SELECT \
+    "one rewrite left: the spec's comma-join is spelled INNER JOIN, since granary's FROM \
+     clause takes one table plus explicit joins (#486). StockLevel is the only profile \
+     with a join at all, which is why it is the only one carrying a rewrite. The \
+     distinct count is no longer one of them — #491 taught the parser DISTINCT as an \
+     aggregate argument, so the spec's COUNT(DISTINCT s_i_id) now runs in the engine and \
+     the count is the engine's answer, not a client-side row count over a SELECT \
      DISTINCT projection."
 ;;
 
@@ -1005,8 +1005,8 @@ let run_delivery ops ~w_id ~carrier_id = delivery_from ops ~w_id ~carrier_id ~d_
    the count itself. *)
 let stock_level_sql =
   "SELECT COUNT(DISTINCT s_i_id) FROM order_line INNER JOIN stock ON s_i_id = ol_i_id \
-   WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id < ? AND ol_o_id >= ? AND s_w_id = ? \
-   AND s_quantity < ?"
+   WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id < ? AND ol_o_id >= ? AND s_w_id = ? AND \
+   s_quantity < ?"
 ;;
 
 let stock_level_window = 20

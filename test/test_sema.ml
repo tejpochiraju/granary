@@ -1881,7 +1881,10 @@ let bind_select_count_star () =
       }
   in
   match bind cat stmt with
-  | Ok (Sema.BS_select { aggs = [ { func = Ast.Agg_count; col_ord = None; distinct = false } ]; _ }) -> ()
+  | Ok
+      (Sema.BS_select
+         { aggs = [ { func = Ast.Agg_count; col_ord = None; distinct = false } ]; _ }) ->
+    ()
   | _ -> Alcotest.fail "expected BS_select with COUNT(*) agg"
 ;;
 
@@ -1903,7 +1906,10 @@ let bind_select_sum_col () =
       }
   in
   match bind cat stmt with
-  | Ok (Sema.BS_select { aggs = [ { func = Ast.Agg_sum; col_ord = Some 0; distinct = false } ]; _ }) -> ()
+  | Ok
+      (Sema.BS_select
+         { aggs = [ { func = Ast.Agg_sum; col_ord = Some 0; distinct = false } ]; _ }) ->
+    ()
   | _ -> Alcotest.fail "expected BS_select with SUM(id)"
 ;;
 
@@ -3117,7 +3123,10 @@ let bind_select_agg_qual_col_arg () =
       }
   in
   match bind cat stmt with
-  | Ok (Sema.BS_select { aggs = [ { func = Ast.Agg_sum; col_ord = Some 0; distinct = false } ]; _ }) -> ()
+  | Ok
+      (Sema.BS_select
+         { aggs = [ { func = Ast.Agg_sum; col_ord = Some 0; distinct = false } ]; _ }) ->
+    ()
   | _ -> Alcotest.fail "expected SUM(users.id) bound"
 ;;
 

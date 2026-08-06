@@ -222,7 +222,7 @@ type expr =
   | E_agg_distinct of agg_func * expr
   (** #491: aggregate call whose argument list carries [DISTINCT] —
       [COUNT(DISTINCT x)], [SUM(DISTINCT x)], … The argument is mandatory:
-      there is no [COUNT(DISTINCT *)].  This is a separate constructor rather
+      there is no [COUNT(DISTINCT * )].  This is a separate constructor rather
       than a flag on [E_agg] so that every existing exhaustive match over the
       plain form keeps compiling only once it has been considered here. *)
   | E_func of scalar_func * expr list (** Scalar function call. *)
@@ -762,7 +762,9 @@ let rec rename_view_columns (names : string list) (q : stmt) : (stmt, string) re
     Result.map (fun items' -> S_const_select { exprs = items' }) (relabel exprs)
   (* A compound select takes its column names from its left arm. *)
   | S_compound r ->
-    Result.map (fun left' -> S_compound { r with left = left' }) (rename_view_columns names r.left)
+    Result.map
+      (fun left' -> S_compound { r with left = left' })
+      (rename_view_columns names r.left)
   | S_with_cte r ->
     Result.map
       (fun query' -> S_with_cte { r with query = query' })

@@ -3515,7 +3515,8 @@ let query_aggregate_raises_in_execute () =
              (Plan.Op_aggregate
                 { child = Plan.Op_seq_scan { table_meta = m }
                 ; group_cols = []
-                ; aggs = [ { Plan.func = Ast.Agg_count; col_ord = None; distinct = false } ]
+                ; aggs =
+                    [ { Plan.func = Ast.Agg_count; col_ord = None; distinct = false } ]
                 ; having = None
                 ; proj = [ Plan.PI_agg_slot 0 ]
                 ; windows = []
