@@ -164,6 +164,10 @@ type window_sema =
 type agg_spec =
   { func : Ast.agg_func
   ; col_ord : int option
+  ; arg_expr : bound_expr option
+    (** #488: the aggregate's argument as a general expression over the INPUT
+        row.  [None] for the bare-column and COUNT-star forms; when it is
+        [Some _], [col_ord] is [None]. *)
   }
 
 type agg_proj_item =
@@ -252,6 +256,11 @@ type bound_stmt =
       ; windows : window_sema list
       ; agg_windows : window_sema list
         (** Window functions computed AFTER aggregation, over aggregated output rows. *)
+      ; agg_order_keys : bound_order_key list
+        (** #495: ORDER BY keys bound over the AGGREGATE OUTPUT row
+            ([group_cols @ aggs]) rather than the input row.  Non-empty only
+            when the clause mentions an aggregate, and then [order] is empty:
+            the two are alternatives, never both. *)
       }
   | BS_create_index of
       { name : string
@@ -931,6 +940,69 @@ let agg_arg_col_ty_of_tables
   Option.map (fun (c : Row.column) -> c.Row.ty) (List.nth_opt cols i)
 ;;
 
+(** Check if any [E_agg] appears anywhere in an [expr].  Defined here rather
+    than beside its other users because #488's aggregate-argument binder needs
+    it to refuse a nested aggregate. *)
+let rec expr_has_agg = function
+  | Ast.E_agg _ -> true
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
+  | Ast.E_subquery _ | Ast.E_exists _ -> false
+  | Ast.E_in_select (x, _) -> expr_has_agg x
+  | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
+  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
+    expr_has_agg e
+  | Ast.E_between (x, lo, hi) -> expr_has_agg x || expr_has_agg lo || expr_has_agg hi
+  | Ast.E_in (x, vals) -> expr_has_agg x || List.exists expr_has_agg vals
+  | Ast.E_func (_, args) -> List.exists expr_has_agg args
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    (match scrutinee with
+     | Some e -> expr_has_agg e
+     | None -> false)
+    || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
+    ||
+      (match else_ with
+      | Some e -> expr_has_agg e
+      | None -> false)
+  | Ast.E_cast (e, _) -> expr_has_agg e
+  | Ast.E_collate (e, _) -> expr_has_agg e
+  | Ast.E_window _ -> false
+  | Ast.E_fts_snippet _ -> false
+;;
+
+(** Check if any subquery node appears anywhere in an AST [expr].  The
+    [bound_expr] equivalent is [expr_has_subquery] below; this one exists
+    because #488's aggregate-argument binder has to decide {i before} binding
+    (see [bind_agg_arg]), and unlike the bound form it must also look inside
+    [E_exists]/[E_subquery] rather than treat them as opaque leaves. *)
+let rec expr_has_subquery_ast = function
+  | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ -> true
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
+  | Ast.E_agg (_, arg) -> Option.fold ~none:false ~some:expr_has_subquery_ast arg
+  | Ast.E_binop (_, a, b) -> expr_has_subquery_ast a || expr_has_subquery_ast b
+  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
+    expr_has_subquery_ast e
+  | Ast.E_between (x, lo, hi) ->
+    expr_has_subquery_ast x || expr_has_subquery_ast lo || expr_has_subquery_ast hi
+  | Ast.E_in (x, vals) ->
+    expr_has_subquery_ast x || List.exists expr_has_subquery_ast vals
+  | Ast.E_func (_, args) -> List.exists expr_has_subquery_ast args
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:false ~some:expr_has_subquery_ast scrutinee
+    || List.exists
+         (fun (c, r) -> expr_has_subquery_ast c || expr_has_subquery_ast r)
+         branches
+    || Option.fold ~none:false ~some:expr_has_subquery_ast else_
+  | Ast.E_cast (e, _) -> expr_has_subquery_ast e
+  | Ast.E_collate (e, _) -> expr_has_subquery_ast e
+  | Ast.E_window { args; _ } ->
+    (* The window SPEC's own expressions are not walked: a window function
+       inside an aggregate argument is refused outright by [bind_expr_agg]
+       ("window functions not yet supported in aggregate context"), so the only
+       caller of this function can never reach them. *)
+    List.exists expr_has_subquery_ast args
+  | Ast.E_fts_snippet _ -> false
+;;
+
 (* #568: SUM/AVG over a TEXT or BLOB column is rejected at bind time.  This
    used to live only in [project_agg] (the binder for a *bare* aggregate
    projection item), so wrapping the same aggregate in any expression —
@@ -992,19 +1064,19 @@ let agg_col_ord
     [BE_col (offset + slot)] referring to the aggregate output row.
     [offset] is 1 when GROUP BY is present (slot 0 holds the group key)
     and 0 otherwise. *)
-let bind_expr_agg
-      ~param_counter
-      ~named_params
-      ?(register : (agg_spec -> int) option)
-      ?(on_window :
-         (Ast.window_func
-          -> Ast.expr list
-          -> Ast.window_spec
-          -> (bound_expr, error) result)
-           option)
-      ~(resolver : col_resolver)
-      ~(offset : int)
-      (e : Ast.expr)
+let rec bind_expr_agg
+          ~param_counter
+          ~named_params
+          ?(register : (agg_spec -> int) option)
+          ?(on_window :
+             (Ast.window_func
+              -> Ast.expr list
+              -> Ast.window_spec
+              -> (bound_expr, error) result)
+               option)
+          ~(resolver : col_resolver)
+          ~(offset : int)
+          (e : Ast.expr)
   : (bound_expr * agg_spec list, error) result
   =
   let aggs = ref [] in
@@ -1084,9 +1156,9 @@ let bind_expr_agg
          Ok (BE_in (bx', ok_vals)))
     | Ast.E_param p -> Ok (BE_param (resolve_param ~param_counter ~named_params p))
     | Ast.E_agg (func, arg_opt) ->
-      (match agg_col_ord ~resolver func arg_opt with
+      (match bind_agg_arg ~param_counter ~named_params ~resolver func arg_opt with
        | Error e -> Error e
-       | Ok col_ord -> Ok (BE_col (add_agg { func; col_ord })))
+       | Ok (col_ord, arg_expr) -> Ok (BE_col (add_agg { func; col_ord; arg_expr })))
     | Ast.E_func (func, args) -> bind_func ~bind:go func args
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
@@ -1123,6 +1195,74 @@ let bind_expr_agg
   match go e with
   | Error e -> Error e
   | Ok be -> Ok (be, !aggs)
+
+(* #488: resolve an aggregate's argument.  Returns [(col_ord, arg_expr)] where
+    at most one is [Some]: a bare column reference keeps the ordinal form the
+    whole engine (and the #247 fast path) already understands, and anything
+    else is bound as an expression over the INPUT row, to be evaluated per row
+    during accumulation.
+
+    The argument sees the resolver's [resolve_agg_arg]/[resolve_agg_arg_qual]
+    lookups for {i every} column reference — inside an aggregate any table
+    column is legal, which is exactly what the bare-column arm already did and
+    what distinguishes an aggregate's argument from the expression around it
+    (a GROUP BY projection and HAVING both restrict bare column refs to grouped
+    columns; the argument must not inherit that).
+
+    Two shapes are refused here rather than left to fall out of the generic
+    binder, because in both cases the generic binder would ACCEPT them and the
+    engine would then answer something that is not what was asked:
+
+    - A nested aggregate ([SUM(SUM(x))]) would be registered as a second,
+      separate aggregate over the input rows.
+    - A subquery ([SUM(qty * (SELECT 2))]) binds as a leaf (the #558 arms of
+      [bind_expr_agg]) and becomes a [P_subquery] that nothing ever resolves:
+      [stream_aggregate] pre-evaluates subqueries in [having] and [proj] only,
+      the #247 fast path does it for the filter predicate only, and
+      [Exec.eval_expr] answers [Row.V_null] for a surviving [P_subquery].  So
+      [SELECT SUM(qty * (SELECT 2)) FROM li] would read NULL and
+      [COUNT(price * (SELECT 1))] would read 0, with no error at all.  Before
+      #488 the whole shape was refused as "not a column reference", so this is
+      newly reachable; a visible error beats a quiet wrong answer (the same
+      call #566 made).  Resolving it properly — pre-evaluating an aggregate
+      ARGUMENT's subqueries the way #558 does for the projection — is #664.
+
+    **#568's SUM/AVG type check does not reach an expression argument**, and
+    that is a deliberate limit rather than an oversight: [agg_numeric_check]
+    keys off a stored column's declared type, and a computed expression has
+    none.  The consequence is that [SUM(CASE WHEN … THEN 'a' ELSE 'b' END)]
+    fails at RUNTIME with [failwith "SUM on non-numeric value"] mid-scan
+    instead of at bind time, i.e. an expression argument is a third spelling
+    checked differently from the two #568 unified.  Tracked as #665. *)
+and bind_agg_arg
+      ~param_counter
+      ~named_params
+      ~(resolver : col_resolver)
+      (func : Ast.agg_func)
+      (arg_opt : Ast.expr option)
+  : (int option * bound_expr option, error) result
+  =
+  match arg_opt with
+  | None | Some (Ast.E_col _) | Some (Ast.E_tbl_col _) ->
+    (match agg_col_ord ~resolver func arg_opt with
+     | Error e -> Error e
+     | Ok co -> Ok (co, None))
+  | Some e when expr_has_agg e ->
+    Error (Unsupported "aggregate function calls may not be nested")
+  | Some e when expr_has_subquery_ast e ->
+    Error (Unsupported "subqueries are not supported inside an aggregate argument")
+  | Some e ->
+    let arg_resolver =
+      { resolver with
+        resolve_unqual = resolver.resolve_agg_arg
+      ; resolve_qual = resolver.resolve_agg_arg_qual
+      }
+    in
+    (match
+       bind_expr_agg ~param_counter ~named_params ~resolver:arg_resolver ~offset:0 e
+     with
+     | Error er -> Error er
+     | Ok (be, _) -> Ok (None, Some be))
 ;;
 
 (** Check if any subquery node appears anywhere in a [bound_expr]. *)
@@ -1151,33 +1291,6 @@ let rec expr_has_subquery = function
   | BE_excluded_col _ -> false
   | BE_window_slot _ -> false
   | BE_out_col _ -> false
-;;
-
-(** Check if any [E_agg] appears anywhere in an [expr]. *)
-let rec expr_has_agg = function
-  | Ast.E_agg _ -> true
-  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
-  | Ast.E_subquery _ | Ast.E_exists _ -> false
-  | Ast.E_in_select (x, _) -> expr_has_agg x
-  | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
-  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
-    expr_has_agg e
-  | Ast.E_between (x, lo, hi) -> expr_has_agg x || expr_has_agg lo || expr_has_agg hi
-  | Ast.E_in (x, vals) -> expr_has_agg x || List.exists expr_has_agg vals
-  | Ast.E_func (_, args) -> List.exists expr_has_agg args
-  | Ast.E_case { scrutinee; branches; else_ } ->
-    (match scrutinee with
-     | Some e -> expr_has_agg e
-     | None -> false)
-    || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
-    ||
-      (match else_ with
-      | Some e -> expr_has_agg e
-      | None -> false)
-  | Ast.E_cast (e, _) -> expr_has_agg e
-  | Ast.E_collate (e, _) -> expr_has_agg e
-  | Ast.E_window _ -> false
-  | Ast.E_fts_snippet _ -> false
 ;;
 
 let rec expr_has_window = function
@@ -2528,12 +2641,15 @@ let bind_post_agg
       (match col_ord_result with
        | Error e -> Error e
        | Ok co ->
-         let spec = { func; col_ord = co } in
+         let spec = { func; col_ord = co; arg_expr = None } in
          let rec find_slot i = function
            | [] ->
              acc_aggs := !acc_aggs @ [ spec ];
              List.length !acc_aggs - 1
-           | s :: _ when s.func = spec.func && s.col_ord = spec.col_ord -> i
+           | s :: _
+             when s.func = spec.func
+                  && s.col_ord = spec.col_ord
+                  && s.arg_expr = spec.arg_expr -> i
            | _ :: rest -> find_slot (i + 1) rest
          in
          let slot = find_slot 0 !acc_aggs in
@@ -2651,6 +2767,8 @@ let agg_arg_resolver ~(tables : (Cat.table_meta * int * string option) list) ~me
    every expression-over-aggregate path share, so both spellings of the same
    aggregate are checked identically. *)
 let project_agg
+      ~param_counter
+      ~named_params
       ~(tables : (Cat.table_meta * int * string option) list)
       ~meta
       ~add_agg
@@ -2658,10 +2776,17 @@ let project_agg
       arg_opt
   : (agg_proj_item, error) result
   =
-  match agg_col_ord ~resolver:(agg_arg_resolver ~tables ~meta) func arg_opt with
+  match
+    bind_agg_arg
+      ~param_counter
+      ~named_params
+      ~resolver:(agg_arg_resolver ~tables ~meta)
+      func
+      arg_opt
+  with
   | Error e -> Error e
-  | Ok co ->
-    let slot = add_agg { func; col_ord = co } in
+  | Ok (co, arg_expr) ->
+    let slot = add_agg { func; col_ord = co; arg_expr } in
     Ok (AP_agg_slot slot)
 ;;
 
@@ -2783,7 +2908,8 @@ let project_agg_item
           Error
             (Unsupported
                (Printf.sprintf "column '%s.%s' must appear in GROUP BY clause" t c))))
-  | Ast.E_agg (func, arg_opt) -> project_agg ~tables ~meta ~add_agg func arg_opt
+  | Ast.E_agg (func, arg_opt) ->
+    project_agg ~param_counter ~named_params ~tables ~meta ~add_agg func arg_opt
   | Ast.E_window { func; args; window } ->
     project_window
       ~tables
@@ -3065,6 +3191,118 @@ let bind_select_order
     order
 ;;
 
+(* #495: the AST expression an ORDER BY key really names.  A bare name that
+   matches a select-list alias stands for that select-list expression, which is
+   the spelling every TPC-H query uses ([ORDER BY revenue DESC]); SQL:92 also
+   allows repeating the aggregate itself, and both must reach the same place. *)
+let order_key_ast ~alias_map (e : Ast.expr) =
+  match e with
+  | Ast.E_col name -> Option.value (List.assoc_opt name alias_map) ~default:e
+  | _ -> e
+;;
+
+let order_mentions_agg ~alias_map (order : Ast.order_key list) =
+  List.exists
+    (fun (ok : Ast.order_key) -> expr_has_agg (order_key_ast ~alias_map ok.Ast.expr))
+    order
+;;
+
+(* #495: bind the ORDER BY of an aggregated SELECT whose clause mentions an
+   aggregate.  The sort runs on the POST-aggregation rows, so a key cannot be
+   bound against the input row the way [bind_select_order] does — it is bound
+   in aggregate-output space, on exactly the resolver discipline HAVING uses:
+   a bare column reference must be a GROUP BY column, while inside an
+   aggregate's arguments any table column is legal.
+
+   Aggregates met here are appended to the statement's aggregate list AFTER the
+   projection's and HAVING's (hence [offset]), which is what keeps the
+   post-aggregate window slots — which sit after every aggregate — where the
+   planner and executor expect them.  Repeating an aggregate that the select
+   list already computes registers a second slot for it rather than sharing
+   one; that costs an accumulator, not a wrong answer, and matches what HAVING
+   has always done.
+
+   The whole clause takes this path or none of it does (see
+   [order_mentions_agg]): mixing the two spaces in one clause would leave the
+   planner remapping some keys and not others against the same row. *)
+let bind_select_order_agg
+      ~param_counter
+      ~named_params
+      ~(tables : (Cat.table_meta * int * string option) list)
+      ~(meta : Cat.table_meta)
+      ~group_cols
+      ~offset
+      ~alias_map
+      order
+  : (bound_order_key list * agg_spec list, error) result
+  =
+  let grouped lookup what =
+    match lookup with
+    | Error e -> Error e
+    | Ok i ->
+      (match select_find_pos group_cols i with
+       | Some pos -> Ok pos
+       | None ->
+         Error
+           (Unsupported
+              (Printf.sprintf "ORDER BY references non-grouped column '%s'" what)))
+  in
+  let resolver =
+    { resolve_unqual = (fun n -> grouped (select_proj_lookup ~tables ~meta n) n)
+    ; resolve_qual = (fun t c -> grouped (select_qual_lookup ~tables t c) (t ^ "." ^ c))
+    ; resolve_agg_arg = select_proj_lookup ~tables ~meta
+    ; resolve_agg_arg_qual = select_qual_lookup ~tables
+    ; agg_arg_col_ty = agg_arg_col_ty_of_tables ~tables
+    }
+  in
+  let aggs = ref [] in
+  let register spec =
+    let idx = offset + List.length !aggs in
+    aggs := !aggs @ [ spec ];
+    idx
+  in
+  let bind e = bind_expr_agg ~param_counter ~named_params ~register ~resolver ~offset e in
+  (* A name that is not a column of the FROM list may still be a select-list
+     alias.  The alias is tried only after the plain binding fails, so a real
+     column keeps winning — the precedence [bind_select_order] already had. *)
+  let alias_of = function
+    | Ast.E_col name -> List.assoc_opt name alias_map
+    | _ -> None
+  in
+  let retry_alias e err =
+    match alias_of e with
+    | None -> Error err
+    | Some ast ->
+      (match bind ast with
+       | Ok (be, _) -> Ok be
+       | Error _ -> Error err)
+  in
+  let bind_key (e : Ast.expr) =
+    let saved = !aggs in
+    match bind e with
+    | Ok (be, _) -> Ok be
+    | Error err ->
+      (* discard whatever the failed attempt registered *)
+      aggs := saved;
+      retry_alias e err
+  in
+  let keys_result =
+    List.fold_left
+      (fun acc (ok : Ast.order_key) ->
+         match acc with
+         | Error _ -> acc
+         | Ok keys ->
+           (match bind_key ok.Ast.expr with
+            | Error e -> Error e
+            | Ok key -> Ok (keys @ [ { key; dir = ok.Ast.dir; nulls = ok.Ast.nulls } ])))
+      (Ok [])
+      order
+  in
+  match keys_result with
+  | Error e -> Error e
+  | Ok keys -> Ok (keys, !aggs)
+;;
+
 (* Validate LIMIT/OFFSET are non-negative. *)
 let validate_limit_offset ~limit ~offset =
   match limit with
@@ -3145,7 +3383,7 @@ let bind_select_resolved
       ~is_aggregated
       having
   in
-  let all_aggs = proj_aggs @ having_aggs in
+  let pre_order_aggs = proj_aggs @ having_aggs in
   (* #489/#490: the SELECT list as ORDER BY sees it.  [out_aliases] is the
      explicit aliases in output order; only an `Exprs projection can carry any.
      [out_ref] maps a 1-based output position to the key that reads it, and the
@@ -3183,9 +3421,45 @@ let bind_select_resolved
       then Ok (fst (List.nth proj_exprs i))
       else Ok (BE_col (List.nth proj_ords i)))
   in
-  let$ bound_order =
-    bind_select_order ~param_counter ~named_params ~tables ~out_aliases ~out_ref order
+  (* #495: an ORDER BY that mentions an aggregate is bound over the aggregate
+     OUTPUT row instead, and lands in [agg_order_keys]; [order] then stays
+     empty.  Everything else keeps the input-row binding above.
+
+     #489/#490 + #495: the two paths must not overlap.  [order_mentions_agg]
+     picks the aggregate path only for an aggregated SELECT whose key actually
+     mentions an aggregate; every other key — ordinal, output alias, plain
+     column — goes to [bind_select_order] and its [out_ref], which is the only
+     thing that knows whether the sort runs before or after projection. *)
+  let alias_map =
+    match proj with
+    | `Exprs es -> List.filter_map (fun (e, alias) -> Option.map (fun a -> a, e) alias) es
+    | `All | `Cols _ -> []
   in
+  let$ bound_order, agg_order_keys, order_aggs =
+    if is_aggregated && order_mentions_agg ~alias_map order
+    then (
+      let offset = offset_for_aggs + List.length pre_order_aggs in
+      match
+        bind_select_order_agg
+          ~param_counter
+          ~named_params
+          ~tables
+          ~meta
+          ~group_cols
+          ~offset
+          ~alias_map
+          order
+      with
+      | Error e -> Error e
+      | Ok (keys, order_aggs) -> Ok ([], keys, order_aggs))
+    else (
+      match
+        bind_select_order ~param_counter ~named_params ~tables ~out_aliases ~out_ref order
+      with
+      | Error e -> Error e
+      | Ok keys -> Ok (keys, [], []))
+  in
+  let all_aggs = pre_order_aggs @ order_aggs in
   let$ valid_limit, valid_offset = validate_limit_offset ~limit ~offset in
   Lwt.return
     (Ok
@@ -3206,6 +3480,7 @@ let bind_select_resolved
           ; agg_proj = agg_proj_items
           ; windows = proj_windows
           ; agg_windows = agg_wins
+          ; agg_order_keys
           }))
 ;;
 

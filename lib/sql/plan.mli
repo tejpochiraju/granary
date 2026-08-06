@@ -519,5 +519,12 @@ and proj_item =
 
 and agg_spec =
   { func : Ast.agg_func
-  ; col_ord : int option (** [None] means COUNT-star *)
+  ; col_ord : int option (** [None] means COUNT-star, or an expression argument *)
+  ; arg_expr : expr option
+    (** #488: the aggregate's argument as a general expression, evaluated
+          against each INPUT row before accumulating.  [None] for the bare
+          column and COUNT-star forms, which stay on [col_ord] so the #247
+          fast path can keep pruning the decode to the columns it needs.
+          When this is [Some _], [col_ord] is [None] and every consumer must
+          read the argument through it. *)
   }

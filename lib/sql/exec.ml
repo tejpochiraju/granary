@@ -10607,23 +10607,35 @@ and stream_hash_join
       left_rows;
     Lwt.return (Lwt_stream.of_list (List.rev !out)))
 
-(* SUM over a group's column [i]: preserve INT vs REAL like SQLite-lite. *)
-and agg_sum group_rows i : Row.value =
+(* #488: how an aggregate reads its argument out of one INPUT row.  [None] is
+   the COUNT-star case — no argument at all.  A bare column stays an array
+   index (what the whole engine did before #488); anything else is an
+   expression evaluated per row, which is why this needs [clock] and [params].
+   Every consumer of a [Plan.agg_spec] must go through here: reading
+   [col_ord] directly answers [None] for an expression argument and would
+   silently turn [SUM(a * b)] into COUNT-star's "no argument" arm. *)
+and agg_arg_getter clock params (spec : Plan.agg_spec) : (Row.t -> Row.value) option =
+  match spec.Plan.arg_expr, spec.Plan.col_ord with
+  | Some e, _ -> Some (fun row -> eval_expr clock params row e)
+  | None, Some i -> Some (fun row -> row.(i))
+  | None, None -> None
+
+(* SUM over one group's already-extracted argument values: preserve INT vs REAL
+   like SQLite-lite. *)
+and agg_sum (vals : Row.value list) : Row.value =
   let any_real =
     List.exists
-      (fun r ->
-         match r.(i) with
-         | Row.V_real _ -> true
-         | _ -> false)
-      group_rows
+      (function
+        | Row.V_real _ -> true
+        | _ -> false)
+      vals
   in
   let any_non_null =
     List.exists
-      (fun r ->
-         match r.(i) with
-         | Row.V_null -> false
-         | _ -> true)
-      group_rows
+      (function
+        | Row.V_null -> false
+        | _ -> true)
+      vals
   in
   if not any_non_null
   then Row.V_null
@@ -10631,93 +10643,100 @@ and agg_sum group_rows i : Row.value =
   then (
     let s =
       List.fold_left
-        (fun acc r ->
-           match r.(i) with
+        (fun acc v ->
+           match v with
            | Row.V_null -> acc
            | Row.V_int n -> acc +. Int64.to_float n
            | Row.V_real f -> acc +. f
            | _ -> failwith "SUM on non-numeric value")
         0.0
-        group_rows
+        vals
     in
     Row.V_real s)
   else (
     let s =
       List.fold_left
-        (fun acc r ->
-           match r.(i) with
+        (fun acc v ->
+           match v with
            | Row.V_null -> acc
            | Row.V_int n -> Int64.add acc n
            | _ -> failwith "SUM on non-numeric value")
         0L
-        group_rows
+        vals
     in
     Row.V_int s)
 
-(* Evaluate one aggregate [spec] over the rows of a group. *)
-and aggregate_one (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
-  match spec.func, spec.col_ord with
-  | Ast.Agg_count, None -> Row.V_int (Int64.of_int (List.length group_rows))
-  | Ast.Agg_count, Some i ->
+(* Evaluate one aggregate [spec] over the argument values of a group. *)
+and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.value =
+  match func with
+  | Ast.Agg_count ->
     let n =
       List.fold_left
-        (fun acc r ->
-           match r.(i) with
+        (fun acc v ->
+           match v with
            | Row.V_null -> acc
            | _ -> acc + 1)
         0
-        group_rows
+        vals
     in
     Row.V_int (Int64.of_int n)
-  | Ast.Agg_sum, Some i -> agg_sum group_rows i
-  | Ast.Agg_avg, Some i ->
+  | Ast.Agg_sum -> agg_sum vals
+  | Ast.Agg_avg ->
     let sum, n =
       List.fold_left
-        (fun (s, n) r ->
-           match r.(i) with
+        (fun (s, n) v ->
+           match v with
            | Row.V_null -> s, n
            | Row.V_int x -> s +. Int64.to_float x, n + 1
            | Row.V_real f -> s +. f, n + 1
            | _ -> failwith "AVG on non-numeric value")
         (0.0, 0)
-        group_rows
+        vals
     in
     if n = 0 then Row.V_null else Row.V_real (sum /. float_of_int n)
-  | Ast.Agg_min, Some i ->
+  | Ast.Agg_min ->
     List.fold_left
-      (fun acc r ->
-         match r.(i), acc with
+      (fun acc v ->
+         match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
          | v, cur -> if compare_values v cur < 0 then v else cur)
       Row.V_null
-      group_rows
-  | Ast.Agg_max, Some i ->
+      vals
+  | Ast.Agg_max ->
     List.fold_left
-      (fun acc r ->
-         match r.(i), acc with
+      (fun acc v ->
+         match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
          | v, cur -> if compare_values v cur > 0 then v else cur)
       Row.V_null
-      group_rows
-  | Ast.Agg_group_concat sep, Some i ->
+      vals
+  | Ast.Agg_group_concat sep ->
     let separator = Option.value sep ~default:"," in
     let parts =
       List.filter_map
-        (fun r ->
-           match r.(i) with
-           | Row.V_null -> None
-           | Row.V_int n -> Some (Int64.to_string n)
-           | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
-           | Row.V_text s -> Some s
-           | Row.V_blob _ -> Some "")
-        group_rows
+        (function
+          | Row.V_null -> None
+          | Row.V_int n -> Some (Int64.to_string n)
+          | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+          | Row.V_text s -> Some s
+          | Row.V_blob _ -> Some "")
+        vals
     in
     if parts = [] then Row.V_null else Row.V_text (String.concat separator parts)
-  | Ast.Agg_group_concat _, None -> failwith "GROUP_CONCAT requires a column argument"
-  | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max), None ->
-    failwith "non-COUNT aggregate must have a column argument"
+
+(* Evaluate one aggregate [spec] over the rows of a group. *)
+and aggregate_one clock params (spec : Plan.agg_spec) (group_rows : Row.t list)
+  : Row.value
+  =
+  match agg_arg_getter clock params spec with
+  | None ->
+    (match spec.Plan.func with
+     | Ast.Agg_count -> Row.V_int (Int64.of_int (List.length group_rows))
+     | Ast.Agg_group_concat _ -> failwith "GROUP_CONCAT requires a column argument"
+     | _ -> failwith "non-COUNT aggregate must have a column argument")
+  | Some get -> aggregate_over_values spec.Plan.func (List.map get group_rows)
 
 (* Partition [rows] into (group_key, group_rows) by [group_cols] (stable). *)
 and aggregate_build_groups group_cols rows : (Row.value list * Row.t list) list =
@@ -10788,20 +10807,22 @@ and aggregate_apply_windows clock params agg_windows after_having =
    spec the fast-path doesn't handle (e.g. a non-COUNT aggregate with no column),
    which makes the caller fall back to the general [stream_aggregate] path.  The
    per-type logic here MUST stay byte-identical to [aggregate_one]/[agg_sum]. *)
-and make_agg_acc (spec : Plan.agg_spec) : ((Row.t -> unit) * (unit -> Row.value)) option =
-  match spec.Plan.func, spec.Plan.col_ord with
+and make_agg_acc clock params (spec : Plan.agg_spec)
+  : ((Row.t -> unit) * (unit -> Row.value)) option
+  =
+  match spec.Plan.func, agg_arg_getter clock params spec with
   | Ast.Agg_count, None ->
     let c = ref 0 in
     Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
-  | Ast.Agg_count, Some i ->
+  | Ast.Agg_count, Some get ->
     let c = ref 0 in
     Some
       ( (fun row ->
-          match row.(i) with
+          match get row with
           | Row.V_null -> ()
           | _ -> incr c)
       , fun () -> Row.V_int (Int64.of_int !c) )
-  | Ast.Agg_sum, Some i ->
+  | Ast.Agg_sum, Some get ->
     (* INT vs REAL preserved exactly like [agg_sum]: REAL iff any real seen;
        NULL iff no non-null seen. *)
     let si = ref 0L
@@ -10810,7 +10831,7 @@ and make_agg_acc (spec : Plan.agg_spec) : ((Row.t -> unit) * (unit -> Row.value)
     and any_nn = ref false in
     Some
       ( (fun row ->
-          match row.(i) with
+          match get row with
           | Row.V_null -> ()
           | Row.V_int n ->
             any_nn := true;
@@ -10827,12 +10848,12 @@ and make_agg_acc (spec : Plan.agg_spec) : ((Row.t -> unit) * (unit -> Row.value)
           else if !any_real
           then Row.V_real !sf
           else Row.V_int !si )
-  | Ast.Agg_avg, Some i ->
+  | Ast.Agg_avg, Some get ->
     let sf = ref 0.0
     and n = ref 0 in
     Some
       ( (fun row ->
-          match row.(i) with
+          match get row with
           | Row.V_null -> ()
           | Row.V_int x ->
             sf := !sf +. Int64.to_float x;
@@ -10842,31 +10863,31 @@ and make_agg_acc (spec : Plan.agg_spec) : ((Row.t -> unit) * (unit -> Row.value)
             incr n
           | _ -> failwith "AVG on non-numeric value")
       , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
-  | Ast.Agg_min, Some i ->
+  | Ast.Agg_min, Some get ->
     let best = ref Row.V_null in
     Some
       ( (fun row ->
-          match row.(i), !best with
+          match get row, !best with
           | Row.V_null, _ -> ()
           | v, Row.V_null -> best := v
           | v, cur -> if compare_values v cur < 0 then best := v)
       , fun () -> !best )
-  | Ast.Agg_max, Some i ->
+  | Ast.Agg_max, Some get ->
     let best = ref Row.V_null in
     Some
       ( (fun row ->
-          match row.(i), !best with
+          match get row, !best with
           | Row.V_null, _ -> ()
           | v, Row.V_null -> best := v
           | v, cur -> if compare_values v cur > 0 then best := v)
       , fun () -> !best )
-  | Ast.Agg_group_concat sep, Some i ->
+  | Ast.Agg_group_concat sep, Some get ->
     let separator = Option.value sep ~default:"," in
     let parts = ref [] in
     (* newest-first; reversed at finalize to preserve scan order *)
     Some
       ( (fun row ->
-          match row.(i) with
+          match get row with
           | Row.V_null -> ()
           | Row.V_int n -> parts := Int64.to_string n :: !parts
           | Row.V_real f -> parts := Printf.sprintf "%.17g" f :: !parts
@@ -10933,7 +10954,7 @@ and aggregate_fast_path
 
 and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs proj =
   match
-    let accs = List.map make_agg_acc aggs in
+    let accs = List.map (make_agg_acc clock params) aggs in
     if List.exists Option.is_none accs
     then None
     else Some (Array.of_list (List.map Option.get accs))
@@ -10958,11 +10979,29 @@ and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs
         (-1)
         aggs
     in
-    let need_decode = pred_opt <> None || max_col >= 0 in
+    (* #488: an aggregate over an EXPRESSION reads whichever columns the
+       expression names, and [max_col] cannot see them — its [col_ord] is
+       [None].  Both of the decode shortcuts below are keyed off [max_col], so
+       both must be switched off for such a spec: skipping the decode entirely
+       would accumulate over an empty row (a silent wrong answer, not a crash),
+       and pruning to a [max_col] of -1 would decode no columns at all.  The
+       test is on the spec list, not on the projection, because an expression
+       aggregate combined with a COUNT-star in one select list must still
+       decode.
+       Widening the prefix to the columns an argument expression mentions is a
+       later optimisation; correctness first. *)
+    let any_arg_expr =
+      List.exists (fun (s : Plan.agg_spec) -> s.Plan.arg_expr <> None) aggs
+    in
+    let need_decode = pred_opt <> None || max_col >= 0 || any_arg_expr in
     (* #247: when no filter reads other columns and there are no virtual columns
        to recompute, decode only the [0, max_col] prefix — skipping trailing
        columns (e.g. a TEXT payload) the aggregate never touches. *)
-    let can_prune = pred_opt = None && not (has_virtual_cols table_meta.Cat.columns) in
+    let can_prune =
+      pred_opt = None
+      && (not any_arg_expr)
+      && not (has_virtual_cols table_meta.Cat.columns)
+    in
     let decode_row vbytes =
       if can_prune
       then Row.decode_prefix table_meta.Cat.columns vbytes ~upto:max_col
@@ -11121,7 +11160,9 @@ and stream_aggregate
     let agg_output_rows =
       List.map
         (fun (group_key, group_rows) ->
-           let agg_vals = List.map (fun spec -> aggregate_one spec group_rows) aggs in
+           let agg_vals =
+             List.map (fun spec -> aggregate_one clock params spec group_rows) aggs
+           in
            Array.of_list (group_key @ agg_vals))
         groups
     in
