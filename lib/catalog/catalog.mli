@@ -255,7 +255,17 @@ val persist_dirty_columnar_stores
 val load_columnar_stores : t -> Granary_store.Store.t -> unit Lwt.t
 
 (** Allocate and return the next rowid for a table, incrementing the counter.
-    Raises [Failure] if the table does not exist. *)
+    Raises [Failure] (synchronously) if the table does not exist.
+
+    Autocommit: this takes the store's writer lock itself, so it must NOT be
+    called with an RW transaction already held — use {!next_rowid_in_txn} there
+    or the nested [rw_begin] self-deadlocks.
+
+    #632: the whole read-modify-write happens under that lock, and the new
+    counter reaches the shared allocator only after the commit succeeds.  An
+    allocator that publishes before it commits can be lowered again by another
+    handle's ROLLBACK recompute while this one is parked on the lock, handing the
+    same rowid out twice. *)
 val next_rowid : t -> name:string -> int64 Lwt.t
 
 (** Like [next_rowid] but operates within an already-held RW transaction.

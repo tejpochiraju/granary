@@ -1220,6 +1220,22 @@
  (modules test_worker_handle_589)
  (libraries granary granary.unix alcotest lwt.unix))
 
+; #632/#633: the rowid allocator belongs to the store, and an allocation is
+; published only once it has committed.
+
+(test
+ (name test_rowid_counter_ownership_632)
+ (modules test_rowid_counter_ownership_632)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.catalog
+  granary.encoding
+  alcotest
+  lwt.unix
+  unix))
+
 ; #598: routing statements refused while any schema holds a transaction.
 
 (test

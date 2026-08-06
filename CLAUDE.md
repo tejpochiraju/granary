@@ -459,13 +459,23 @@ anyway, because the fix's invariant is what keeps it that way.
 
 Each handle still gets a *fresh catalog* — that is what makes DDL invisible
 across handles — but it no longer gets a fresh **rowid allocator**. The
-allocator's live state was lifted out of the cached `table_meta` and into
-`Schema_cache.rowid_counters`, a table `Cat.open_ ?rowid_counters` accepts so a
-second catalog over the same store shares it. Every read of a cached
-`table_meta` is patched from that table on the way out and every write publishes
-to it on the way in, which keeps `table_meta` the only type the rest of the
-engine sees. Two rules make the sharing correct and must survive any future
-edit:
+allocator's live state was lifted out of the cached `table_meta` and into a
+tree-id-keyed table that **`Store.t` owns** (`Store.rowid_counters`, #633), so
+every catalog opened over one store shares one allocator by construction. Every
+read of a cached `table_meta` is patched from that table on the way out and
+every write publishes to it on the way in, which keeps `table_meta` the only
+type the rest of the engine sees.
+
+**#633 moved the ownership; do not move it back.** It was originally threaded by
+hand as `Cat.open_ ?rowid_counters` / `Db.of_store ?rowid_counters`, with
+`create_worker_handle` as the only caller that remembered — and the penalty for
+the next caller forgetting was #589 verbatim (silent row loss plus durable index
+corruption). A tree id is only an identity within one store, so the store is the
+only correct home. This also makes ATTACH right by type rather than by accident:
+an attached schema is a different `Store.t` and therefore, necessarily, a
+different set of counters.
+
+Two rules make the sharing correct and must survive any future edit:
 
 - **Keyed by tree id, not by table name** — a tree id identifies the data tree
   the counter counts for and survives `ALTER TABLE … RENAME`; keying by name
@@ -492,7 +502,25 @@ edit:
   overwrite a counter that is already live. A worker re-reads the catalog off
   disk, and disk is never fresher than the running allocator; clobbering would
   reintroduce the same collision with the roles exchanged, making the **parent**
-  go stale.
+  go stale. **One deliberate exception (#633):** an entry still at
+  `empty_next_rowid` has never allocated and carries no information (it means
+  "the next allocation is 1"), so seeding *does* overwrite that one — it can only
+  move the counter up, never into a collision. Without it, now that a second
+  `Cat.open_` over a live store shares the table, `recover_next_rowid`'s
+  mirror-recovery result would be invisible behind a sentinel published by the
+  original `CREATE`.
+- **An allocation is published only once it has committed (#632).**
+  `Catalog.next_rowid` — the autocommit allocator — used to publish the bumped
+  counter *before* `S.rw_begin`. Since the table is store-wide, that window made
+  an allocation visible to every other handle while it had not happened: another
+  handle could take the writer lock, `ROLLBACK`, and *lower* the counter through
+  #293's recompute, handing the same rowid out twice. It now takes the lock
+  first, does the whole read-modify-write under it, and publishes after the
+  commit. That is also what makes the shared table safe in general: **every**
+  allocator runs with the writer lock held, so the interval between an
+  allocation and its publish is an interval in which nothing else can allocate.
+  The unknown-table `Failure` stays *synchronous* (raised before any `Lwt.t`
+  exists) — `test_rowid_unknown_table` in `test_catalog.ml` pins the contract.
 
 What it used to do, and what the tests now assert the opposite of — two counters
 over one data tree, neither invalidating the other, so an `INSERT` with an
@@ -530,9 +558,11 @@ sequences.
 - Write transactions *serialize* on the shared lock rather than overlapping, and
   a read-only transaction does not overlap a writer either. Genuine write
   concurrency still needs #555 option 1.
-- Anything else that reaches `Db.of_store` over an **already-open** store owes
-  it `~rowid_counters` by hand; `create_worker_handle` is the only caller that
-  does so today.
+
+`Db.of_store` over an **already-open** store is safe as of #633 — there is no
+argument to pass and none to forget. `test/test_rowid_counter_ownership_632.ml`
+exercises that path directly (bare `of_store`, no `create_worker_handle`)
+alongside the #632 rollback cases and the four invariants above.
 
 `Tpcc_driver`'s one-deep worker pool predates this and serializes whole
 transactions on a single handle; that is why its terminal-count sweep flatlines

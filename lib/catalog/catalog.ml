@@ -319,12 +319,14 @@ end = struct
      them.
 
      Sharing is safe under the store's single-writer lock, which is what makes
-     the two handles serialize: a counter can only be observed by another handle
-     between writes, and the two directions of staleness that mattered — a
-     counter too LOW, which collides — cannot happen when the allocation is
-     published immediately.  A ROLLBACK lowers it again through
-     [set_rowid_durable] (#293's recompute) and [restore_rowids] (#303's
-     savepoint restore), by which point no other handle can hold the lock.
+     the two handles serialize.  The direction of staleness that costs rows is a
+     counter too LOW, and it cannot be observed: EVERY allocator runs with the
+     writer lock held ([next_rowid_in_txn] and [bump_next_rowid_in_txn] by
+     construction, [next_rowid] since #632), so the interval between an
+     allocation and its publish is an interval in which no other fiber can
+     allocate.  A ROLLBACK lowers the counter again through [set_rowid_durable]
+     (#293's recompute) and [restore_rowids] (#303's savepoint restore), by which
+     point no other handle can hold the lock either.
 
      #633: the table itself is owned by [S.t] ([S.rowid_counters]), not by this
      cache and not by a caller.  It used to be threaded through
@@ -2360,9 +2362,42 @@ let alloc_rowid (next_rowid : int64) : int64 * int64 =
   id, next
 ;;
 
+(* #632: the autocommit allocator.  The read-modify-write of the counter used to
+   straddle [rw_begin]: find -> alloc -> [set_rowid_durable] -> rw_begin ->
+   put -> commit.  That was defensible while each catalog owned its own counter,
+   but since #589 [set_rowid_durable] publishes into the store-wide table, so the
+   window between the publish and the commit is a window in which the allocation
+   is visible to every other handle and yet has not happened:
+
+   - another handle can take the writer lock while this fiber is parked in
+     [rw_begin], ROLLBACK, and LOWER the shared counter through #293's
+     post-rollback recompute — discarding an allocation already handed out, so
+     the next allocation collides with the row this fiber is about to write
+     (#589's symptom by a different route); and
+   - if the commit itself fails, the counter stays advanced for a write that
+     never landed.
+
+   Same shape as #223 (a WAL counter lost-update found by Jepsen): a read-modify-
+   write straddling a lock acquisition.  The fix is to do the whole thing under
+   the writer lock and publish only once the commit has succeeded — the order
+   [create_index]'s autocommit branch already uses.  Taking the lock first is
+   also what preserves the property the old comment was defending: two concurrent
+   autocommit callers now serialize on [rw_begin] and the second reads the first's
+   published counter, where before both could read the same stale value.
+
+   The unknown-table check stays SYNCHRONOUS (it raises before any [Lwt.t] is
+   constructed) because that is the documented behaviour and [test_catalog]'s
+   [test_rowid_unknown_table] pins it. *)
 let next_rowid t ~name =
+  if not (Schema_cache.mem_table t.sc name)
+  then failwith (Printf.sprintf "no table '%s'" name);
+  let%lwt tx = S.rw_begin t.store in
   match Schema_cache.find_table t.sc name with
-  | None -> failwith (Printf.sprintf "no table '%s'" name)
+  | None ->
+    (* Unreachable: nothing can drop the table between the check above and here
+       (no yield point but [rw_begin], and DDL needs the very lock we hold). *)
+    let%lwt () = S.rollback tx in
+    Lwt.fail_with (Printf.sprintf "no table '%s'" name)
   | Some m ->
     let tree_id, nrid, without_rowid, autoincrement = row_storage m in
     let id, next = alloc_rowid nrid in
@@ -2371,13 +2406,11 @@ let next_rowid t ~name =
         storage = Row { tree_id; next_rowid = next; without_rowid; autoincrement }
       }
     in
-    (* Update the cache BEFORE [rw_begin] (which yields), matching the original
-       order: find -> alloc -> cache-write stays atomic under Lwt so two
-       concurrent autocommit callers cannot read the same stale counter. *)
-    Schema_cache.set_rowid_durable t.sc ~name m';
-    let%lwt tx = S.rw_begin t.store in
     let%lwt () = put_table_counter_tx tx m' in
     let%lwt () = S.commit tx in
+    (* #632: publish only now — the allocation is durable, so the shared counter
+       can never run ahead of what committed. *)
+    Schema_cache.set_rowid_durable t.sc ~name m';
     Lwt.return id
 ;;
 
