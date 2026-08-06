@@ -522,6 +522,22 @@ let test_wal_two_fiber_catalog_next_rowid () =
    regression guard that the whole allocator stays sound on disk, not just the
    autocommit entry point. Row count = max rowid is the assertion that matters:
    any reused rowid makes the count smaller than the max. *)
+(* Lifted out of the test below for merlint's depth limit: a [let rec] inside a
+   [let] inside [run] inside the [with_tmp_path] callback is one level too
+   many.  [n] is passed rather than closed over for the same reason. *)
+let insert_fiber ~n h tag =
+  let rec loop i =
+    if i > n
+    then Lwt.return_unit
+    else
+      let* r = Db.execute h (Printf.sprintf "INSERT INTO t (b) VALUES ('%s%d')" tag i) in
+      match r with
+      | Ok () -> loop (i + 1)
+      | Error e -> Alcotest.failf "%s %d: %a" tag i Db.pp_error e
+  in
+  loop 1
+;;
+
 let test_wal_two_fiber_inserts () =
   with_tmp_path "wal_insert" (fun path ->
     let db =
@@ -532,22 +548,7 @@ let test_wal_two_fiber_inserts () =
     exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
     let wdb = run (Db.create_worker_handle db) in
     let n = 25 in
-    run
-      (let fiber h tag =
-         let rec loop i =
-           if i > n
-           then Lwt.return_unit
-           else
-             let* r =
-               Db.execute h (Printf.sprintf "INSERT INTO t (b) VALUES ('%s%d')" tag i)
-             in
-             match r with
-             | Ok () -> loop (i + 1)
-             | Error e -> Alcotest.failf "%s %d: %a" tag i Db.pp_error e
-         in
-         loop 1
-       in
-       Lwt.join [ fiber db "p"; fiber wdb "w" ]);
+    run (Lwt.join [ insert_fiber ~n db "p"; insert_fiber ~n wdb "w" ]);
     check "every row landed" [ string_of_int (2 * n) ] (rows db "SELECT COUNT(*) FROM t");
     check "no rowid reused" [ string_of_int (2 * n) ] (rows db "SELECT MAX(a) FROM t");
     (* Name every surviving row, not just count them.  A reused rowid does not

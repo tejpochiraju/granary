@@ -6988,7 +6988,8 @@ let subplan_cache_key : subplan_cache Lwt.key = Lwt.new_key ()
    a test reads it either side of one query and takes the difference. It is an
    integer count with no clock in it, so a gate built on it needs no
    [GRANARY_BENCH_*] neutralizer. *)
-let subquery_plans_built = ref 0
+let subquery_plans_built_ref = ref 0
+let subquery_plans_built () = !subquery_plans_built_ref
 
 (* #262: re-establish the per-query Lwt-storage contexts (the stats record, the
    txn mode, and #493's subquery plan cache) for work that runs at pull time —
@@ -9436,7 +9437,7 @@ let plan_subquery_cached (cat : Cat.t) (inner_ast : Ast.stmt) : Plan.op option L
   | None ->
     (* Counted here and nowhere else: this is the branch a cache hit skips, so
        the counter measures exactly "how many times did we pay bind+plan". *)
-    incr subquery_plans_built;
+    incr subquery_plans_built_ref;
     let* bound_r = Sema.bind cat inner_ast in
     let result =
       match bound_r with

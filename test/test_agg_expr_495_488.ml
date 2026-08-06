@@ -414,18 +414,22 @@ let order_by_mixes_an_aggregate_and_a_group_column () =
 (* An explicit NULLS clause on an aggregate key: the group whose aggregate is
    NULL moves to whichever end was asked for.  These are the two branches of
    the planner's [order_dir_nulls] that a direction alone never reaches. *)
+(* Lifted out of the test below to keep merlint's nesting depth at 4: the
+   arity check inside a [List.map] inside a callback inside [with_db] is one
+   level too many. *)
+let group_labels db sql =
+  List.map
+    (fun r ->
+       if Array.length r <> 2
+       then Alcotest.failf "%S: expected 2 output columns, got %d" sql (Array.length r);
+       text r.(0))
+    (rows db sql)
+;;
+
 let order_by_a_null_aggregate_honours_the_nulls_clause () =
   with_db (fun db ->
     seed_nulls db;
-    let groups sql =
-      List.map
-        (fun r ->
-           if Array.length r <> 2
-           then
-             Alcotest.failf "%S: expected 2 output columns, got %d" sql (Array.length r);
-           text r.(0))
-        (rows db sql)
-    in
+    let groups sql = group_labels db sql in
     (* SUM(a * b) per group: x = 6, y = NULL, z = 10 *)
     Alcotest.(check (list string))
       "DESC NULLS FIRST"

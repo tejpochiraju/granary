@@ -147,8 +147,11 @@ val make_query_stats : unit -> query_stats
     once, execute N times" was otherwise unobservable: a correlated subquery
     re-planned on every outer row and one planned once look identical in
     {!query_stats}.  Being an integer count rather than a wall clock, a test
-    asserting on it needs no [GRANARY_BENCH_*] neutralizer. *)
-val subquery_plans_built : int ref
+    asserting on it needs no [GRANARY_BENCH_*] neutralizer.
+
+    Exposed as a function rather than the underlying [ref] so the counter
+    cannot be written from outside (merlint E351). *)
+val subquery_plans_built : unit -> int
 
 (** #417 Phase 0: one row-level mutation captured by a change-capturing
     {!dirty_tables_acc}.  [rowid] is the row's int64 rowid; rows are the full

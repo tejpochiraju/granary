@@ -549,9 +549,9 @@ let live_snapshots_do_not_accumulate_with_outer_rows () =
 let plan_builds_do_not_scale_with_outer_rows () =
   with_mem_db (fun db ->
     seed db;
-    let before = !Granary_sql.Exec.subquery_plans_built in
+    let before = Granary_sql.Exec.subquery_plans_built () in
     let rows = rows_of db q4_no_date in
-    let builds = !Granary_sql.Exec.subquery_plans_built - before in
+    let builds = Granary_sql.Exec.subquery_plans_built () - before in
     (* Every one of the n_orders outer rows probes, so the pre-#493 count would
        be n_orders (plus the refusal pre-pass's one). *)
     Alcotest.(check int)
