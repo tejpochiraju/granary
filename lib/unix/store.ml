@@ -297,6 +297,20 @@ let open_file_wal
             with
             | Unix.Unix_error (e, _, _) -> Lwt.return_error (Unix.error_message e)
           in
+          (* #612: physically reclaim the sidecar at checkpoint.  [Wal.reset]
+             calls this only after its generation-marker rotation is durable and
+             never below the 24-byte header, so a crash at any point inside
+             [ftruncate] leaves a file whose trailing bytes fail the new marker
+             — i.e. an empty WAL — rather than a partially-valid one.  Blocking
+             [Unix.ftruncate], matching [wal_sync] and the positioned I/O
+             above. *)
+          let wal_resize n =
+            try
+              Unix.ftruncate wal_fd (Int64.to_int n);
+              Lwt.return_ok ()
+            with
+            | Unix.Unix_error (e, _, _) -> Lwt.return_error (Unix.error_message e)
+          in
           let close () =
             let* _ = Unix_file.close file in
             Lwt.return_unit
@@ -329,6 +343,7 @@ let open_file_wal
               ~wal_write_at:(wal_write_at wal_fd)
               ~wal_sync
               ~wal_size_bytes
+              ~wal_resize
               ~close
               ~wal_close
               ()

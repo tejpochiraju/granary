@@ -136,6 +136,12 @@ val open_block_wal
   -> wal_write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> wal_sync:(unit -> (unit, string) result Lwt.t)
   -> wal_size_bytes:int64
+  -> ?wal_resize:(int64 -> (unit, string) result Lwt.t)
+       (** (#612) Shrink the WAL device to a byte length.  Supplied, a
+           checkpoint physically truncates the WAL back to its 24-byte header
+           instead of leaving the file at its all-time high-water mark;
+           omitted, the space is reused but never returned.  Optional because
+           not every backing device can shrink. *)
   -> close:(unit -> unit Lwt.t)
   -> wal_close:(unit -> unit Lwt.t)
   -> unit

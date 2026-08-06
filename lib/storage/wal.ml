@@ -32,6 +32,12 @@ type t =
   { read_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   ; write_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   ; sync : unit -> (unit, string) result Lwt.t
+  ; resize : (int64 -> (unit, string) result Lwt.t) option
+    (** #612: physically shrink the WAL device to a byte length.  Optional: a
+        device that cannot be resized (the in-memory stubs, a fixed-extent
+        block device) simply keeps the old high-water behaviour.  Called ONLY
+        from [reset], only after the generation-marker rotation is durable, and
+        never with a target below [header_size_bytes]. *)
   ; page_size : int (** page bytes per frame (#95); matches the main DB geometry *)
   ; frame_size : int (** [frame_meta_bytes + page_size + cipher_overhead] *)
   ; cipher : Crypto.t option
@@ -122,6 +128,7 @@ let default_frame_cache_capacity =
 ;;
 
 let committed_frames t = t.committed_frames
+let size_bytes t = t.size_bytes
 let sync_count t = t.sync_count
 let epoch t = t.epoch
 let salt t = t.salt
@@ -367,6 +374,7 @@ let open_
       ?(cipher = None)
       ?(page_size = Geometry.default.page_size)
       ?(frame_cache_capacity = default_frame_cache_capacity)
+      ?resize
       ~read_at
       ~write_at
       ~sync
@@ -390,6 +398,7 @@ let open_
         { read_at
         ; write_at
         ; sync
+        ; resize
         ; page_size
         ; frame_size
         ; cipher
@@ -424,6 +433,7 @@ let open_
            { read_at
            ; write_at
            ; sync
+           ; resize
            ; page_size
            ; frame_size
            ; cipher
@@ -461,6 +471,7 @@ let open_
         { read_at
         ; write_at
         ; sync
+        ; resize
         ; page_size
         ; frame_size
         ; cipher
@@ -731,6 +742,61 @@ let next_generation_marker t =
   else salt, seed
 ;;
 
+(* #612: physically reclaim the WAL file after a successful generation
+   rotation.  Everything below the new tail is dead by construction — the
+   rotation already made every byte past [header_size_bytes] fail recovery's
+   checksum — so shrinking the file to the bare header removes bytes that no
+   longer mean anything to anybody.
+
+   Why it is safe to crash anywhere in here.  The rotation is ALREADY durable
+   when this runs (it is fsynced above), which pins the two survivable states:
+
+   - the truncation never reached the device: the old frames are still there
+     and still fail the new marker, so recovery reads the WAL as empty — the
+     pre-#612 outcome, unchanged;
+   - it reached the device wholly or in part: the file is [header_size_bytes]
+     long, or some intermediate length whose trailing bytes are old-generation
+     frames that fail the new marker just the same.  Recovery reads it as empty
+     either way.
+
+   The one thing that would NOT be recoverable is losing the header, so the
+   floor is [header_size_bytes] and never 0: a 0-length WAL re-inits a fresh
+   marker at the next open, breaking the generation chain [next_generation_marker]
+   depends on.
+
+   Doing it in the other order — truncate, then rotate — is what is unsafe: a
+   crash in between leaves a short file under the OLD marker, and the next
+   generation's frames would be indistinguishable from the survivors of the old
+   one.
+
+   {b Failure is not an error.} A device that refuses [ftruncate] costs disk
+   space, not correctness, and turning that into a failed [reset] would turn a
+   benign EPERM into a failed checkpoint ([Store.checkpoint_unlocked] raises on
+   a reset error).  So the result is deliberately dropped — but [size_bytes] is
+   lowered only on success, because it and the file length have to keep
+   describing the same device.  The two errors are not symmetric: leaving
+   [size_bytes] high over a short file is harmless (a read past the real tail
+   zero-fills or fails, and its checksum fails, so the frame reads as absent),
+   while lowering it over a long file makes [read_frame_raw]'s bounds check
+   reject frames that are really there.  That asymmetry is the load-bearing
+   coupling #612 called out, and it is why the lowering follows the truncation
+   rather than preceding it. *)
+let truncate_after_rotation t =
+  match t.resize with
+  | None -> Lwt.return_unit
+  | Some resize ->
+    let floor = Int64.of_int header_size_bytes in
+    if Int64.compare t.size_bytes floor <= 0
+    then Lwt.return_unit
+    else
+      let* r = resize floor in
+      (match r with
+       | Ok () ->
+         t.size_bytes <- floor;
+         Lwt.return_unit
+       | Error _ -> Lwt.return_unit)
+;;
+
 let reset t =
   (* #562: nothing to invalidate when nothing has been written under the
      current marker.  The invariant the rotation maintains is "no frame on the
@@ -800,14 +866,24 @@ let reset t =
       Hashtbl.reset t.frame_cache;
       Queue.clear t.frame_cache_fifo;
       t.committed_frames <- 0;
-      (* #562: the previous generation's frames are still physically present
-         past the new generation's tail.  They no longer verify, so recovery
-         stops at the first of them — but [size_bytes] must keep covering them
-         or [read_frame_raw]'s bounds check would reject a frame the next
-         generation legitimately reuses.  Leave it alone — the space is reused,
-         never reclaimed, because the WAL file is never physically truncated
-         (#612). *)
+      (* #562/#612: the previous generation's frames are physically present past
+         the new generation's tail and no longer verify, so recovery stops at
+         the first of them.  [size_bytes] must keep covering whatever is
+         actually on the device — [read_frame_raw]'s bounds check would
+         otherwise reject a frame the next generation legitimately reuses — so
+         the two move TOGETHER, here, under the caller's writer lock, or not at
+         all.
+
+         The epoch is bumped BEFORE the truncation, not after: the truncation
+         yields, and [cache_frame] decides whether to install a decrypted frame
+         by comparing the epoch it captured before ITS yield against the current
+         one.  With the bump after, a read that started before this reset and
+         landed during the truncation's yield would still see the old epoch,
+         re-populate the cache we just cleared, and have that entry served for a
+         different page once the next generation reuses the index — the exact
+         stale-cache hazard [reset] clears the cache to prevent (review #210). *)
       t.epoch <- Int64.succ t.epoch;
+      let* () = truncate_after_rotation t in
       Lwt.return_ok ())
 ;;
 

@@ -1121,6 +1121,7 @@ let open_block_wal
       ~(wal_write_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(wal_sync : unit -> (unit, string) result Lwt.t)
       ~(wal_size_bytes : int64)
+      ?(wal_resize : (int64 -> (unit, string) result Lwt.t) option)
       ~(close : unit -> unit Lwt.t)
       ~(wal_close : unit -> unit Lwt.t)
       ()
@@ -1184,6 +1185,7 @@ let open_block_wal
            Wal.open_
              ~cipher
              ~page_size:(Pager.page_size pager)
+             ?resize:wal_resize
              ~read_at:wal_read_at
              ~write_at:wal_write_at
              ~sync:wal_sync
