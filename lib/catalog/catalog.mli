@@ -463,8 +463,18 @@ val rewrite_ident_in_sql : old_name:string -> new_name:string -> string -> strin
     rejected, naming the dependent objects, rather than left to break them
     silently. Drop and recreate them to proceed.
 
+    {b This is a compatibility break wider than the bug, and deliberately so.} A
+    table with ANY trigger declared [ON] it, or named by any view, can no longer
+    be renamed at all until that object is dropped — where before the rename
+    succeeded and left the object broken. Detection is a lexical token scan, so
+    it is also imprecise in the refusing direction: an identifier-shaped token
+    counts wherever it stands, including a keyword, a function name, or a table
+    ALIAS that happens to be spelled like [old_name]. A refusal is therefore
+    evidence that some definition spells the name, not proof that it depends on
+    the table.
+
     Returns [Error msg] if [old_name] does not exist, [new_name] already exists,
-    or a stored definition depends on [old_name].
+    or a stored definition names [old_name].
 
     [?txn] (#282): as for [add_column]. *)
 val rename_table
@@ -487,13 +497,28 @@ val rename_table
     that is a [Db.dump] which will not restore, since #533 made the DDL renderer
     read that index as the record of the table's key.
 
-    #609: REFUSED when a persisted view, reactive view or trigger names BOTH the
-    table and the column — see {!rename_table} for why those are not remapped.
-    Requiring both names is what keeps an unrelated definition using the same
-    column name over a different table from blocking the rename.
+    #609: REFUSED when a persisted view, reactive view or trigger names the
+    column AND names something reachable from the table — the table itself, or a
+    view that (transitively) names it. See {!rename_table} for why those are not
+    remapped, and for the imprecision this shares with it.
+
+    {b The guarantee, stated exactly.} Every stored definition whose text spells
+    the column name and can see the table — directly, or through a chain of
+    views — is refused, by name. Requiring the column name too is what keeps an
+    unrelated definition using the same column name over a different table from
+    blocking. Requiring only reachability rather than the table name itself is
+    what catches a chain through a [SELECT *] view, whose text names the table
+    but never the column; the first cut of this gate required both names in the
+    same text and let that chain through, leaving the downstream view silently
+    dead — #609's own symptom.
+
+    {b What it does not cover:} a reference that never spells the column name in
+    the stored text. That is the [*] projection itself, which re-expands on the
+    next bind and so cannot break — but anything future that reaches a column
+    without naming it would not be seen either.
 
     Returns [Error msg] if the table or column does not exist, or a stored
-    definition depends on the column.
+    definition names the column and can see the table.
 
     [?txn] (#282): as for [add_column]. *)
 val rename_column

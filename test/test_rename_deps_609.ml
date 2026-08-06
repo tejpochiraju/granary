@@ -31,15 +31,31 @@
 
     {1 What the detector matches}
 
-    A definition blocks a COLUMN rename only when it names BOTH the table and
-    the column — otherwise an unrelated view over a different table with a
-    same-named column would block it. It cannot under-refuse: to reach a column
-    of [t] a statement must name [t] somewhere, and a definition that reaches it
-    only through another view is blocked transitively by that other view.
+    A definition blocks a COLUMN rename when it names the column AND names
+    something {e reachable} from the table — the table itself, or a view that
+    (transitively) names it. Requiring the column name keeps an unrelated
+    definition over a different table from blocking. Reachability rather than
+    the table name itself is what catches a chain through a [SELECT *] view:
 
-    The match is over identifier TOKENS, so a string literal spelling the column
-    name does not count; and it is position-blind, so a qualified [v0.a] counts
-    where the (column-position-filtered) #553 rewriter would have skipped it. *)
+    {v
+      CREATE VIEW v AS SELECT * FROM t;   -- names t, never a
+      CREATE VIEW w AS SELECT a FROM v;   -- names a, never t
+    v}
+
+    The first cut of this gate demanded both names in the SAME text and let that
+    chain through, leaving [w] silently dead — #609's own symptom. [v] itself is
+    correctly not blocked: a [*] projection re-expands, so the rename leaves it
+    working.
+
+    The match is over identifier TOKENS — bare, double-quoted, backtick- and
+    bracket-delimited — outside string literals and dash-dash comments. It is
+    position-blind, so a qualified [v0.a] counts where the
+    (column-position-filtered) #553 rewriter would have skipped it, and
+    case-insensitive.
+
+    It is also ROLE-blind, which over-refuses: a table ALIAS spelled like the
+    renamed table blocks a rename it has nothing to do with. That is pinned
+    below as known behaviour, not asserted as desirable. *)
 
 module Db = Granary.Db
 
@@ -180,6 +196,89 @@ let foreign_trigger_body_blocks_rename_column () =
     exec db "CREATE TRIGGER ts AFTER INSERT ON s BEGIN UPDATE t SET a = NEW.n; END";
     let msg = exec_err db "ALTER TABLE t RENAME COLUMN a TO z" in
     check_mentions ~what:"cross-table trigger refusal" msg "trigger ts")
+;;
+
+(* The review finding. An intervening [SELECT *] view names the table but never
+   the column, and the downstream view names the column but never the table — so
+   a gate demanding both names in the same stored text passed, and [w] was left
+   dead. Reachability closes it. *)
+let select_star_view_chain_blocks_rename_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b INTEGER)";
+    exec db "CREATE VIEW v AS SELECT * FROM t";
+    exec db "CREATE VIEW w AS SELECT a FROM v";
+    exec db "INSERT INTO t VALUES (1, 2)";
+    Alcotest.(check (list string))
+      "chain works before"
+      [ "i:1" ]
+      (rows db "SELECT * FROM w");
+    let msg = exec_err db "ALTER TABLE t RENAME COLUMN a TO z" in
+    check_mentions ~what:"chained view refusal" msg "view w";
+    Alcotest.(check (list string))
+      "chain still works"
+      [ "i:1" ]
+      (rows db "SELECT * FROM w"))
+;;
+
+(* The other half of the same shape: the [*] view ALONE must not block, because
+   a star projection re-expands on the next bind and the rename leaves it
+   working. Without this, closing over reachability would have turned every
+   [SELECT *] view into a blanket rename ban on its table's columns. *)
+let select_star_view_alone_does_not_block () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b INTEGER)";
+    exec db "CREATE VIEW v AS SELECT * FROM t";
+    exec db "INSERT INTO t VALUES (1, 2)";
+    exec db "ALTER TABLE t RENAME COLUMN a TO z";
+    Alcotest.(check (list string)) "renamed" [ "i:1,i:2" ] (rows db "SELECT z, b FROM t");
+    Alcotest.(check (list string))
+      "star view re-expands"
+      [ "i:1,i:2" ]
+      (rows db "SELECT * FROM v"))
+;;
+
+(* An apostrophe inside a dash-dash comment used to open a string literal that
+   never closed, so the scan swallowed the rest of the statement and saw neither
+   the table nor the column — a silent pass, the exact failure direction the
+   detector exists to avoid. *)
+let comment_with_apostrophe_still_blocks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec
+      db
+      "CREATE VIEW cv AS\n  -- it's the positive rows\n  SELECT a FROM t WHERE a > 0";
+    exec db "INSERT INTO t VALUES (1)";
+    let msg = exec_err db "ALTER TABLE t RENAME COLUMN a TO z" in
+    check_mentions ~what:"comment refusal" msg "view cv";
+    Alcotest.(check (list string))
+      "view still works"
+      [ "i:1" ]
+      (rows db "SELECT * FROM cv"))
+;;
+
+(* [lexer.mll] accepts brackets as a third identifier delimiter, so a view body
+   may spell the column [[my col]]. Tokenized as the bare words [my] and [col]
+   it would never match. *)
+let bracket_delimited_reference_blocks_rename_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t ([my col] INTEGER)";
+    exec db "CREATE VIEW bv AS SELECT [my col] FROM t";
+    let msg = exec_err db "ALTER TABLE t RENAME COLUMN \"my col\" TO other" in
+    check_mentions ~what:"bracket refusal" msg "view bv")
+;;
+
+(* Known over-refusal, pinned rather than endorsed: the scan has no notion of
+   ROLE, so a table ALIAS spelled like the renamed table is indistinguishable
+   from the table. [v2] never touches the real [t], and the rename is refused
+   anyway. Making this precise needs the parser — the same work option (a) needs.
+   Change this test only with a deliberate decision, not to make a fix pass. *)
+let alias_collision_over_refuses () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE TABLE other (a INTEGER)";
+    exec db "CREATE VIEW v2 AS SELECT t.a FROM other AS t";
+    let msg = exec_err db "ALTER TABLE t RENAME COLUMN a TO z" in
+    check_mentions ~what:"alias over-refusal" msg "view v2")
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -381,6 +480,26 @@ let suite =
           "trigger on another table blocks RENAME COLUMN"
           `Quick
           foreign_trigger_body_blocks_rename_column
+      ; Alcotest.test_case
+          "a SELECT * view chain blocks RENAME COLUMN"
+          `Quick
+          select_star_view_chain_blocks_rename_column
+      ; Alcotest.test_case
+          "a SELECT * view alone does not block"
+          `Quick
+          select_star_view_alone_does_not_block
+      ; Alcotest.test_case
+          "an apostrophe in a comment does not hide the reference"
+          `Quick
+          comment_with_apostrophe_still_blocks
+      ; Alcotest.test_case
+          "a bracket-delimited reference blocks RENAME COLUMN"
+          `Quick
+          bracket_delimited_reference_blocks_rename_column
+      ; Alcotest.test_case
+          "a table alias over-refuses (pinned, not endorsed)"
+          `Quick
+          alias_collision_over_refuses
       ; Alcotest.test_case
           "an index does not block RENAME COLUMN"
           `Quick

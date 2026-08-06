@@ -3050,7 +3050,55 @@ let copy_bare_ident sql buf i ~old_name ~new_name =
    every byte it does not rename.
 
    Matching is case-sensitive, as every other column lookup in this module is
-   ([rename_column], [drop_column] and [clear_pk_flags] all use [String.equal]). *)
+   ([rename_column], [drop_column] and [clear_pk_flags] all use [String.equal]).
+
+   The scan itself is [rewrite_ident_in_sql] below; its per-token step is
+   [rewrite_step], and the two helpers between here and it belong to it. *)
+
+(* #609 review: the index just past the [--] comment starting at [i], or [None]
+   when [i] does not start one.  Only [--] — the lexer ([lexer.mll]) has no
+   block-comment rule, so a slash-star block comment is not a comment in this
+   dialect and must not be treated as one here.
+
+   This exists because the persisted text is the RAW statement, comments and
+   all, and an apostrophe inside one — [-- it's the positive rows] — otherwise
+   opens a string literal that never closes.  Both scanners below then swallow
+   the rest of the statement: the rewriter stops renaming half way through a
+   CHECK expression, and the #609 detector passes a definition it should have
+   blocked.  Both are silent.  A comment is copied through verbatim and never
+   searched, which is also the right answer on its own terms — a name inside a
+   comment is not a reference. *)
+let line_comment_end sql i =
+  let n = String.length sql in
+  if i + 1 < n && sql.[i] = '-' && sql.[i + 1] = '-'
+  then (
+    let rec eol k = if k < n && sql.[k] <> '\n' then eol (k + 1) else k in
+    Some (eol (i + 2)))
+  else None
+;;
+
+(* One step of the rewrite scan: consume the token at [i], appending its
+   (possibly renamed) text to [buf], and return the index just past it.  Lifted
+   out of [rewrite_ident_in_sql] so the comment case above can be added without
+   pushing the loop past merlint's nesting limit. *)
+let rewrite_step sql buf i ~old_name ~new_name =
+  match line_comment_end sql i with
+  | Some j ->
+    Buffer.add_string buf (String.sub sql i (j - i));
+    j
+  | None ->
+    let c = sql.[i] in
+    if c = '\''
+    then copy_sql_string sql buf i
+    else if c = '"' || c = '`'
+    then copy_quoted_ident sql buf i ~old_name ~new_name
+    else if is_ident_start c
+    then copy_bare_ident sql buf i ~old_name ~new_name
+    else (
+      Buffer.add_char buf c;
+      i + 1)
+;;
+
 let rewrite_ident_in_sql ~old_name ~new_name sql =
   if String.equal old_name new_name
   then sql
@@ -3058,19 +3106,7 @@ let rewrite_ident_in_sql ~old_name ~new_name sql =
     let n = String.length sql in
     let buf = Buffer.create (n + 16) in
     let rec go i =
-      if i >= n
-      then ()
-      else (
-        let c = sql.[i] in
-        if c = '\''
-        then go (copy_sql_string sql buf i)
-        else if c = '"' || c = '`'
-        then go (copy_quoted_ident sql buf i ~old_name ~new_name)
-        else if is_ident_start c
-        then go (copy_bare_ident sql buf i ~old_name ~new_name)
-        else (
-          Buffer.add_char buf c;
-          go (i + 1)))
+      if i >= n then () else go (rewrite_step sql buf i ~old_name ~new_name)
     in
     go 0;
     Buffer.contents buf)
@@ -3117,14 +3153,74 @@ let read_quoted_ident sql i =
   go (i + 1)
 ;;
 
-(* #609: does [sql] name [ident] as an identifier token — bare or delimited,
-   anywhere outside a string literal?
+(* The bracket-delimited identifier starting at [i] ([[my col]]): its undoubled
+   body and the index just past the closing bracket.  [lexer.mll:295] accepts
+   this as a third identifier delimiter, with []]] as the doubling escape, so a
+   detector that ignored it would read [[my col]] as the two bare words [my] and
+   [col] and never match the column it names — a false negative, the direction
+   this whole scan exists to avoid.  {!rewrite_ident_in_sql} still does not
+   handle brackets; it would have to re-emit them, which is a rewriter change
+   (#609 review). *)
+let read_bracket_ident sql i =
+  let n = String.length sql in
+  let body = Buffer.create 16 in
+  let rec go k =
+    if k >= n
+    then Buffer.contents body, k
+    else if sql.[k] <> ']'
+    then (
+      Buffer.add_char body sql.[k];
+      go (k + 1))
+    else if k + 1 < n && sql.[k + 1] = ']'
+    then (
+      Buffer.add_char body ']';
+      go (k + 2))
+    else Buffer.contents body, k + 1
+  in
+  go (i + 1)
+;;
+
+(* The bare word starting at [i]: the index just past it. *)
+let bare_ident_end sql i =
+  let n = String.length sql in
+  let rec go k = if k < n && is_ident_char sql.[k] then go (k + 1) else k in
+  go i
+;;
+
+(* One step of the detection scan: does the token at [i] satisfy [hit], and
+   where does it end?  Separate from the loop for the same nesting reason as
+   [rewrite_step]. *)
+let mentions_step sql i ~hit =
+  match line_comment_end sql i with
+  | Some j -> false, j
+  | None ->
+    let c = sql.[i] in
+    if c = '\''
+    then false, skip_sql_string sql i
+    else if c = '"' || c = '`'
+    then (
+      let text, j = read_quoted_ident sql i in
+      hit text, j)
+    else if c = '['
+    then (
+      let text, j = read_bracket_ident sql i in
+      hit text, j)
+    else if is_ident_start c
+    then (
+      let j = bare_ident_end sql i in
+      hit (String.sub sql i (j - i)), j)
+    else false, i + 1
+;;
+
+(* #609: does [sql] name [ident] as an identifier token — bare, double-quoted,
+   backtick- or bracket-delimited — anywhere outside a string literal or a
+   comment?
 
    This is a DETECTOR guarding a refusal, not a rewriter, and its two failure
    modes are not symmetric: a false positive costs the user a rename they could
    have had and tells them exactly why, a false negative silently leaves a view
    or trigger naming a column that no longer exists.  So it deliberately differs
-   from {!rewrite_ident_in_sql} in two ways, both erring towards refusing:
+   from {!rewrite_ident_in_sql} in three ways, all erring towards refusing:
 
    - **Position-blind.**  [is_column_ref_at] excludes a word followed by ['.'],
      which is precisely where a TABLE name stands ([v0.a]).  A detector wearing
@@ -3132,65 +3228,131 @@ let read_quoted_ident sql i =
      — the common spelling inside a view body.
    - **Case-insensitive.**  The rewriter matches case-sensitively because every
      other column lookup in this module does; a detector that did would let
-     [SELECT A FROM v0] through. *)
+     [SELECT A FROM v0] through.
+   - **Bracket-aware.**  See {!read_bracket_ident}.
+
+   It is also ROLE-blind, and that is a real cost, not just a caveat: an
+   identifier-shaped token counts wherever it stands, so a function name
+   (a [COUNT] call against a column named [count]) or a table ALIAS spelled like the
+   renamed table ([FROM other AS t]) is indistinguishable from a genuine
+   reference and will refuse a rename that was in fact safe.  The refusal is
+   loud and names the object, which is the side this design errs to; making it
+   precise needs the parser, i.e. the same work that option (a) needs. *)
 let sql_mentions_ident ~ident sql =
   let n = String.length sql in
   let want = String.lowercase_ascii ident in
   let hit s = String.equal (String.lowercase_ascii s) want in
-  let rec ident_end k = if k < n && is_ident_char sql.[k] then ident_end (k + 1) else k in
   let rec go i =
     if i >= n
     then false
     else (
-      let c = sql.[i] in
-      if c = '\''
-      then go (skip_sql_string sql i)
-      else if c = '"' || c = '`'
-      then (
-        let text, j = read_quoted_ident sql i in
-        hit text || go j)
-      else if is_ident_start c
-      then (
-        let j = ident_end i in
-        hit (String.sub sql i (j - i)) || go j)
-      else go (i + 1))
+      let found, j = mentions_step sql i ~hit in
+      found || go j)
   in
   go 0
 ;;
 
-(* #609: the stored view / reactive-view / trigger definitions that mention
-   EVERY identifier in [idents], described as ["view vv"] / ["trigger tr"].
-
-   Views and triggers are persisted as raw CREATE ... SQL TEXT (see
-   [sys_views_tid], [sys_reactive_views_tid], [sys_triggers_tid]) — there is no
-   AST here to walk and re-render, and the catalog sits BELOW the parser in the
-   dependency graph, so there cannot be one.  A lexical rewrite of that text
-   cannot scope a name to a table the way SQLite's does: a view body legitimately
-   names other tables' columns, and rewriting one of those turns a working view
-   into a wrong one silently.  So a rename that would touch such a definition is
-   REFUSED rather than guessed at.
-
-   Requiring every identifier — for a column rename, the table name AND the
-   column name — is what keeps the refusal from firing on an unrelated view that
-   merely happens to use the same column name over a different table.  It cannot
-   under-refuse: to reference a column of [t] a statement must name [t]
-   somewhere, and a definition that reaches it only through ANOTHER view is
-   blocked transitively, because that other view names [t] itself. *)
-let dependent_definitions_tx tx ~idents =
+(* #609: every stored view / reactive-view / trigger definition, as
+   [(kind, name, sql)].  Views and triggers are persisted as raw CREATE ... SQL
+   TEXT (see [sys_views_tid], [sys_reactive_views_tid], [sys_triggers_tid]) —
+   there is no AST here to walk and re-render, and the catalog sits BELOW the
+   parser in the dependency graph, so there cannot be one.  A lexical rewrite of
+   that text cannot scope a name to a table the way SQLite's does: a view body
+   legitimately names other tables' columns, and rewriting one of those turns a
+   working view into a wrong one silently.  So a rename that would touch such a
+   definition is REFUSED rather than guessed at. *)
+let load_definitions_tx tx =
   let scan tid kind =
     let%lwt pairs = load_all_pairs_in_tx tx tid in
-    Lwt.return
-      (List.filter_map
-         (fun (name, sql) ->
-            if List.for_all (fun ident -> sql_mentions_ident ~ident sql) idents
-            then Some (Printf.sprintf "%s %s" kind name)
-            else None)
-         pairs)
+    Lwt.return (List.map (fun (name, sql) -> kind, name, sql) pairs)
   in
   let%lwt views = scan sys_views_tid "view" in
   let%lwt rviews = scan sys_reactive_views_tid "reactive view" in
   let%lwt triggers = scan sys_triggers_tid "trigger" in
   Lwt.return (views @ rviews @ triggers)
+;;
+
+let describe_definition kind name = Printf.sprintf "%s %s" kind name
+
+(* #609 review: the lowercased names a rename of [root] can be seen through —
+   [root] itself, plus every definition whose text names something already in
+   the set, to a fixpoint.
+
+   The first cut of this gate required the table name AND the column name in the
+   SAME stored text, and claimed that could not under-refuse because "a
+   definition that reaches the column only through another view is blocked
+   transitively, because that other view names the table itself".  That is
+   FALSE when the intervening view projects [*]:
+
+   {v
+     CREATE TABLE t (a INTEGER, b INTEGER);
+     CREATE VIEW  v AS SELECT * FROM t;   -- names t, never a
+     CREATE VIEW  w AS SELECT a FROM v;   -- names a, never t
+     ALTER TABLE t RENAME COLUMN a TO z;  -- neither had BOTH: gate passed
+     SELECT * FROM w;                     -- unknown column: a
+   v}
+
+   [db.ml] persists the raw statement, so [SELECT *] is stored unexpanded, and
+   the residue was #609's own symptom: a view left silently dead whose dumped
+   DDL restores dead.  Closing over the intermediate names fixes it — [v] names
+   [t] so [v] joins the set, and [w] names [v] and [a] so [w] blocks.
+
+   Note [v] itself is correctly NOT blocked: it never spells [a], and a [*]
+   projection re-expands on the next bind, so the rename leaves it working. *)
+let reachable_names defs ~root =
+  let low = String.lowercase_ascii in
+  let rec grow reach =
+    let extra =
+      List.filter_map
+        (fun (_kind, name, sql) ->
+           if List.mem (low name) reach
+           then None
+           else if List.exists (fun ident -> sql_mentions_ident ~ident sql) reach
+           then Some (low name)
+           else None)
+        defs
+    in
+    if extra = [] then reach else grow (List.sort_uniq String.compare (extra @ reach))
+  in
+  grow [ low root ]
+;;
+
+(* #609: definitions that name [table], for a table rename.  No closure is
+   needed here — anything that reaches [table] indirectly does so through a
+   definition that names it directly, and that one blocks. *)
+let table_dependents_tx tx ~table =
+  let%lwt defs = load_definitions_tx tx in
+  Lwt.return
+    (List.filter_map
+       (fun (kind, name, sql) ->
+          if sql_mentions_ident ~ident:table sql
+          then Some (describe_definition kind name)
+          else None)
+       defs)
+;;
+
+(* #609: definitions that name [column] AND name something reachable from
+   [table] — see {!reachable_names} for why reachability rather than [table]
+   alone.  Requiring [column] too is what keeps an unrelated definition using
+   the same column name over a different table from blocking the rename.
+
+   What this DOES guarantee: every stored definition whose text spells the
+   column name and can see the table, directly or through a chain of views, is
+   refused by name.  What it does NOT: precision (see {!sql_mentions_ident}'s
+   role-blindness), and a reference that never spells the column name in the
+   stored text — which is exactly the [*] projection that cannot break. *)
+let column_dependents_tx tx ~table ~column =
+  let%lwt defs = load_definitions_tx tx in
+  let reach = reachable_names defs ~root:table in
+  Lwt.return
+    (List.filter_map
+       (fun (kind, name, sql) ->
+          if
+            sql_mentions_ident ~ident:column sql
+            && List.exists (fun ident -> sql_mentions_ident ~ident sql) reach
+          then Some (describe_definition kind name)
+          else None)
+       defs)
 ;;
 
 (* #609: the refusal message.  Names every dependent object, because the caller's
@@ -3408,7 +3570,7 @@ let rename_table ?txn t ~old_name ~new_name =
         (* #609: a view or trigger naming this table stores raw SQL text that
            still says [old_name] after the rename, so the rename is refused
            rather than left to break it silently. *)
-        let%lwt deps = dependent_definitions_tx tx ~idents:[ old_name ] in
+        let%lwt deps = table_dependents_tx tx ~table:old_name in
         if deps = []
         then rename_table_body t tx ~txn ~old_name ~new_name ~meta
         else
@@ -3552,11 +3714,11 @@ let rename_column ?txn t ~table_name ~old_col ~new_col =
      | Some i ->
        let col_k = column_key table_name i in
        let body tx =
-         (* #609: a view or trigger that names both this table and this column
+         (* #609: a view or trigger that can see this table and names this column
             stores raw SQL text that still says [old_col] after the rename.  The
             catalog cannot re-render that text safely — see
-            [dependent_definitions_tx] — so the rename is refused instead. *)
-         let%lwt deps = dependent_definitions_tx tx ~idents:[ table_name; old_col ] in
+            [column_dependents_tx] — so the rename is refused instead. *)
+         let%lwt deps = column_dependents_tx tx ~table:table_name ~column:old_col in
          if deps = []
          then rename_column_body t tx ~table_name ~meta ~col_k ~old_col ~new_col
          else
