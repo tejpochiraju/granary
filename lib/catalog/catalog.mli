@@ -261,11 +261,14 @@ val load_columnar_stores : t -> Granary_store.Store.t -> unit Lwt.t
     called with an RW transaction already held — use {!next_rowid_in_txn} there
     or the nested [rw_begin] self-deadlocks.
 
-    #632: the whole read-modify-write happens under that lock, and the new
-    counter reaches the shared allocator only after the commit succeeds.  An
-    allocator that publishes before it commits can be lowered again by another
-    handle's ROLLBACK recompute while this one is parked on the lock, handing the
-    same rowid out twice. *)
+    #632: the whole read-modify-write happens under that lock — the counter is
+    read, the new value published to the shared allocator, and only THEN is the
+    transaction committed.  Publishing after the commit would be outside the
+    lock, because [Store.commit] releases the writer lock before its promise
+    resolves; a continuation of it runs once another fiber can already have
+    allocated, leaving the shared counter too low and handing the same rowid out
+    twice.  The accepted residual is the other direction: a failed commit leaves
+    the counter too high, which only skips ids. *)
 val next_rowid : t -> name:string -> int64 Lwt.t
 
 (** Like [next_rowid] but operates within an already-held RW transaction.

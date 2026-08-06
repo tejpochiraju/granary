@@ -419,7 +419,20 @@ end = struct
      re-opening a catalog over a still-live store.  Since #633 that is not a
      restart — it is a worker handle, and sharing is the correct answer.  A test
      that wants a genuine restart uses a file-backed store and closes it (see
-     [test_mirror_recovers_next_rowid] in test_catalog.ml). *)
+     [test_mirror_recovers_next_rowid] in test_catalog.ml).
+
+     KNOWN RESIDUAL, accepted deliberately (PR #650 review r2).  Dropping the
+     exception means mirror recovery is invisible to a SECOND catalog opened over
+     a LIVE store when the shared counter is still at the sentinel: the recovered
+     [max(rowid) + 1] loses to the sentinel already published by the original
+     CREATE, and the second catalog allocates from 1.  Reaching it needs the data
+     tree to hold rows the allocator never issued AND the table's [_sys_tables]
+     row to be lost, on a store that is still open — i.e. corruption on a live
+     store, not a restart, because ordinary inserts advance the counter through
+     [bump_rowid]/[bump_next_rowid_in_txn] and a restart drops the whole table
+     with its [S.t].  The alternative was an exception that silently reverses a
+     sqlite_sequence reset, which is reachable without corruption; this is the
+     better trade, but it is a trade. *)
   let publish_if_absent t (m : table_meta) =
     match m.storage with
     | Row { tree_id; next_rowid; _ } when tree_id >= 0 ->

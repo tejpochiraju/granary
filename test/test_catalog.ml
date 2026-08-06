@@ -2148,15 +2148,21 @@ let mirror_path name =
   Printf.sprintf "/tmp/granary_catalog_mirror_%s_%d.db" name (Unix.getpid ())
 ;;
 
+(* Cleans the sidecars too.  These two tests use the non-WAL [S.open_file], so
+   there is nothing to clean today — but the helper is the obvious thing to copy
+   for a WAL test, and a copier inheriting a path-only cleanup would leave a
+   stale [-wal] behind for the next run to recover from. *)
 let with_mirror_file name f =
   let path = mirror_path name in
-  (try Unix.unlink path with
-   | _ -> ());
-  Fun.protect
-    ~finally:(fun () ->
-      try Unix.unlink path with
-      | _ -> ())
-    (fun () -> run (f path))
+  let cleanup () =
+    List.iter
+      (fun p ->
+         try Unix.unlink p with
+         | _ -> ())
+      [ path; path ^ "-wal"; path ^ ".aslog" ]
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () -> run (f path))
 ;;
 
 let open_store_file path =

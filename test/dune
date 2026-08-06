@@ -1221,7 +1221,7 @@
  (libraries granary granary.unix alcotest lwt.unix))
 
 ; #632/#633: the rowid allocator belongs to the store, and an allocation is
-; published only once it has committed.
+; published under the writer lock, before the commit.
 
 (test
  (name test_rowid_counter_ownership_632)

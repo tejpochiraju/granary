@@ -108,7 +108,7 @@ let int_col name : Row.column =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* #632: an allocation is published only once it has committed          *)
+(* #632: an allocation is published under the lock, before the commit   *)
 (* ------------------------------------------------------------------ *)
 
 (* THE #632 TEST. An engine-assigned rowid allocated inside a transaction that
@@ -550,10 +550,22 @@ let test_wal_two_fiber_inserts () =
        Lwt.join [ fiber db "p"; fiber wdb "w" ]);
     check "every row landed" [ string_of_int (2 * n) ] (rows db "SELECT COUNT(*) FROM t");
     check "no rowid reused" [ string_of_int (2 * n) ] (rows db "SELECT MAX(a) FROM t");
+    (* Name every surviving row, not just count them.  A reused rowid does not
+       produce a DUPLICATE key — [a] IS the rowid, so the second write OVERWRITES
+       the first — which is why "GROUP BY a HAVING COUNT(*) > 1" would be
+       vacuous here (PR #650 review).  What an overwrite actually destroys is a
+       label, so check the labels. *)
+    let expected =
+      List.sort
+        String.compare
+        (List.concat_map
+           (fun tag -> List.init n (fun i -> Printf.sprintf "%s%d" tag (i + 1)))
+           [ "p"; "w" ])
+    in
     check
-      "no duplicate rowids"
-      []
-      (rows db "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1");
+      "every label survives — nothing was overwritten"
+      expected
+      (rows db "SELECT b FROM t ORDER BY b ASC");
     run (Db.close db))
 ;;
 

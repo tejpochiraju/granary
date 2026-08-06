@@ -520,6 +520,15 @@ Two rules make the sharing correct and must survive any future edit:
   correctly shares the counter. `test_mirror_recovers_next_rowid` and
   `test_mirror_recovers_negative_next_rowid` in `test_catalog.ml` were converted
   for exactly this reason.
+
+  **Accepted residual:** with no exception, mirror recovery is invisible to a
+  *second* catalog over a *live* store whose counter is still the sentinel — the
+  recovered `max(rowid)+1` loses to the sentinel the original `CREATE`
+  published. Reaching it needs rows in the data tree that the allocator never
+  issued *and* a lost `_sys_tables` row, on a still-open store: corruption on a
+  live store, not a restart. The rejected alternative silently reverses a
+  sqlite_sequence reset and needs no corruption at all. It is the better trade,
+  but it is a trade, and nothing in the suite covers it.
 - **Every allocator allocates *and publishes* with the writer lock held (#632).**
   That — not the weaker "the allocator holds the lock" — is the property that
   makes the shared table safe, because it is what makes the interval between
