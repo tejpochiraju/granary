@@ -137,6 +137,22 @@ type query_stats =
 (** A zeroed {!query_stats} ([used_index = false]). *)
 val make_query_stats : unit -> query_stats
 
+(** #493: how many times a subquery statement has been bound and planned, as
+    opposed to served from the per-query correlated-subquery plan cache.
+    Monotone and process-global; read it either side of a query and take the
+    difference.
+
+    Diagnostic/testing only, on the same footing as
+    {!Granary_store.Store.active_reader_count} (#164).  It exists because "plan
+    once, execute N times" was otherwise unobservable: a correlated subquery
+    re-planned on every outer row and one planned once look identical in
+    {!query_stats}.  Being an integer count rather than a wall clock, a test
+    asserting on it needs no [GRANARY_BENCH_*] neutralizer.
+
+    Exposed as a function rather than the underlying [ref] so the counter
+    cannot be written from outside (merlint E351). *)
+val subquery_plans_built : unit -> int
+
 (** #417 Phase 0: one row-level mutation captured by a change-capturing
     {!dirty_tables_acc}.  [rowid] is the row's int64 rowid; rows are the full
     {!Granary_encoding.Row.t} as written/removed.  [Updated] carries both the

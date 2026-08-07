@@ -2,10 +2,16 @@
 ; ADDING A REAL-SQLITE COMPARISON EXECUTABLE?  READ THIS FIRST.  (#370, #574)
 ;
 ; Granary must not acquire a dependency on real SQLite, and CI enforces that
-; with two greps over lib/ bin/ containers/ test/: one for the `"sqlite3 ..."`
-; CLI error-string form, one for the OCaml `Sqlite3.` module.  Designated
-; comparison files — the `(optional)` stanzas below that name `sqlite3`, or
-; that shell out to the sqlite3 CLI — are allowlisted by path.
+; with four greps over lib/ bin/ containers/ test/ bench/: one for the
+; `"sqlite3 ..."` CLI error-string form, one for the OCaml `Sqlite3` module as
+; a WHOLE WORD (so `open Sqlite3` and `module S = Sqlite3` are caught, not only
+; the qualified form — #621), one against assembling that name from pieces
+; (#605), and one over `dune` files and the root `dune-project` for the
+; `(libraries ... sqlite3)` stanza that creates the dependency in the first
+; place (#621).  Designated comparison files — the `(optional)` stanzas below
+; that name `sqlite3`, or that shell out to the sqlite3 CLI — are allowlisted
+; by path.  THIS FILE is allowlisted for the dune guard, so the guard says
+; nothing about a stanza added here; the script explains why.
 ;
 ; The allowlists live in scripts/check-sqlite-policy.sh.  A new comparison
 ; file that is not listed there turns CI red on main even though it violates
@@ -601,6 +607,21 @@
  (modules test_scan_alloc)
  (libraries granary.store granary.unix alcotest lwt.unix unix))
 
+; #481: the storage cursor borrows leaf pages instead of copying them, and a
+; key-discarding scan never materialises the key.
+
+(test
+ (name test_scan_borrow_481)
+ (modules test_scan_borrow_481)
+ (libraries
+  granary
+  granary.store
+  granary.unix
+  granary.encoding
+  alcotest
+  lwt.unix
+  unix))
+
 (test
  (name test_attach)
  (modules test_attach)
@@ -633,6 +654,16 @@
  (name test_pager_versioned_cache)
  (modules test_pager_versioned_cache)
  (libraries granary.storage alcotest lwt.unix))
+
+; #611: the pager cache participates for WAL-resolved pages.  The whole risk
+; of that change is invalidation — a stale frame is a silent wrong answer —
+; so this pins all three triggers (newer frame, checkpoint/Wal.reset, older
+; snapshot) on both the copying and the borrow read paths.
+
+(test
+ (name test_pager_wal_cache_611)
+ (modules test_pager_wal_cache_611)
+ (libraries granary.storage alcotest lwt.unix unix))
 
 (test
  (name test_pager_snapshot_pin)
@@ -1034,6 +1065,13 @@
   lwt.unix
   unix))
 
+; #609: RENAME COLUMN / RENAME TO must not silently break a view or trigger.
+
+(test
+ (name test_rename_deps_609)
+ (modules test_rename_deps_609)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
 ; #513: join must not discard the driving table's access path.
 
 (test
@@ -1042,6 +1080,21 @@
  (libraries
   granary
   granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+; #489/#490: ORDER BY resolves select-list ordinals and output aliases.
+
+(test
+ (name test_order_by_ref_489)
+ (modules test_order_by_ref_489)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
   alcotest
   qcheck-core
   qcheck-alcotest
@@ -1091,6 +1144,51 @@
  (name test_agg_subquery_558)
  (modules test_agg_subquery_558)
  (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #627: a post-plan refusal (#558/#566/#592) is spelled Lwt.fail_with, so it
+; arrives as a rejected promise and escaped Db.query as a raw Failure instead
+; of Db.error.
+
+(test
+ (name test_refusal_error_627)
+ (modules test_refusal_error_627)
+ (libraries alcotest granary granary.unix granary.store lwt lwt.unix unix))
+
+; #635: an alias-qualified outer reference in a correlated subquery; #626: an
+; unresolvable one in a projection was answered NULL; #615: an outer join's
+; correlated ON subquery is now resolved rather than refused.
+
+(test
+ (name test_alias_outer_ref_635)
+ (modules test_alias_outer_ref_635)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
+(test
+ (name test_projection_subquery_626)
+ (modules test_projection_subquery_626)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
+(test
+ (name test_outer_join_subquery_615)
+ (modules test_outer_join_subquery_615)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #493: a correlated EXISTS abandoned its inner stream after the first row,
+; leaking one RO snapshot (and its page pins) per outer row; it was also
+; re-planned per outer row and evaluated ahead of the cheap conjuncts beside it.
+; The leak assertions read Store counters, so they need an on-disk database.
+
+(test
+ (name test_correlated_exists_493)
+ (modules test_correlated_exists_493)
+ (libraries
+  granary
+  granary.sql
+  granary.store
+  granary.unix
+  alcotest
+  lwt.unix
+  unix))
 
 ; #552/#539/#551: general-ON outer joins and the probe against a shadowed table.
 
@@ -1145,12 +1243,45 @@
   lwt.unix
   unix))
 
+; #629: NOT NULL on a GENERATED column is enforced on the COMPUTED value, not
+; on the placeholder the binder fills an omitted column with — before the fix
+; such a table was uninsertable.
+
+(test
+ (name test_not_null_629)
+ (modules test_not_null_629)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #600: PRAGMA not_null_check counts without retaining the rows it counts, and
 ; repair's victim buffer is bounded to one table.
 
 (test
  (name test_not_null_600)
  (modules test_not_null_600)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
+; #630: PRAGMA not_null_repair's scan streams (seek_ge), so a mostly-clean
+; table costs no resident memory; its victim buffer stays O(violations).
+
+(test
+ (name test_not_null_repair_630)
+ (modules test_not_null_repair_630)
  (libraries
   granary
   granary.unix
@@ -1175,6 +1306,14 @@
   qcheck-alcotest
   lwt.unix
   unix))
+
+; #488/#495: aggregate arguments are expressions, and an aggregate result is
+; usable in ORDER BY.  Toggles GRANARY_AGG_FASTPATH, hence unix.
+
+(test
+ (name test_agg_expr_495_488)
+ (modules test_agg_expr_495_488)
+ (libraries granary granary.encoding alcotest lwt.unix unix))
 
 ; #572: identifier quoting in stored SQL text (CHECK / GENERATED / partial and
 ; expression indexes).  Depends on lexer.mll so the reserved-word list in
@@ -1220,6 +1359,29 @@
  (modules test_worker_handle_589)
  (libraries granary granary.unix alcotest lwt.unix))
 
+; #632/#633: the rowid allocator belongs to the store, and an allocation is
+; published under the writer lock, before the commit.
+
+(test
+ (name test_rowid_counter_ownership_632)
+ (modules test_rowid_counter_ownership_632)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.catalog
+  granary.encoding
+  alcotest
+  lwt.unix
+  unix))
+
+; #634: VACUUM invalidates every other handle over the store, loudly.
+
+(test
+ (name test_vacuum_worker_634)
+ (modules test_vacuum_worker_634)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
 ; #598: routing statements refused while any schema holds a transaction.
 
 (test
@@ -1256,4 +1418,89 @@
 (test
  (name test_checkpoint_reopen_562)
  (modules test_checkpoint_reopen_562)
+ (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+
+; #638: an autocheckpoint failure must be observable — event, sticky counters
+; and PRAGMA checkpoint_status — rather than discarded by the catch-all.
+
+(test
+ (name test_checkpoint_failure_638)
+ (modules test_checkpoint_failure_638)
+ (libraries granary granary.store granary.encoding alcotest lwt.unix unix))
+
+; #612: a checkpoint must physically reclaim the WAL file, not just empty it
+; logically — its size was a permanent high-water mark. Covers the reclaim, the
+; rotate-then-truncate crash window, degradation when the device refuses, and
+; the reader gate that keeps an older snapshot from being truncated out from
+; under.
+
+(test
+ (name test_wal_truncate_612)
+ (modules test_wal_truncate_612)
+ (libraries
+  granary
+  granary.store
+  granary.storage
+  granary.unix
+  granary.encoding
+  alcotest
+  lwt.unix
+  unix))
+
+; #611: end-to-end — the pager cache participates inside a LIVE WAL
+; generation, and a checkpoint does not let it answer from a dead one.
+
+(test
+ (name test_wal_cache_e2e_611)
+ (modules test_wal_cache_e2e_611)
+ (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+
+; #585: Db.with_transaction — a scoped transaction extent carrying an owner
+; token.  Commit/rollback/re-raise, nesting refused, and the #555 poison and
+; its single ROLLBACK exit left intact.
+
+(test
+ (name test_with_transaction_585)
+ (modules test_with_transaction_585)
+ (libraries granary granary.unix alcotest lwt.unix))
+
+; #639: an explicit ON CONFLICT target beats the statement's conflict-resolution
+; modifier, so INSERT OR IGNORE ... DO UPDATE runs the update instead of
+; silently skipping.  #631: a skipped row's BEFORE INSERT trigger side effects
+; are undone inside an explicit transaction too, not only in autocommit.
+
+(test
+ (name test_or_ignore_upsert_639)
+ (modules test_or_ignore_upsert_639)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+; #491: DISTINCT inside an aggregate's argument list — COUNT(DISTINCT x) and
+; friends. Unblocks TPC-C StockLevel and TPC-H Q16.
+
+(test
+ (name test_count_distinct_491)
+ (modules test_count_distinct_491)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+; #491: CREATE VIEW v (c1, c2) AS ... — the explicit column-name list.
+
+(test
+ (name test_view_columns_491)
+ (modules test_view_columns_491)
  (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))

@@ -30,6 +30,18 @@ type t =
   | Wal_reset of { epoch : int64 }
   | Checkpoint_begin of { target_frames : int }
   | Checkpoint_end of { pages_migrated : int }
+  | Checkpoint_failed of
+      { target_frames : int
+        (** #638: an autocheckpoint failed.  The store keeps running (the
+                commit that triggered it already succeeded and the WAL frames
+                are still valid), but the WAL was NOT truncated — a repeatedly
+                failing checkpoint grows it without bound, which is exactly the
+                condition this event exists to make visible. *)
+      ; consecutive : int
+        (** Number of consecutive failures including this one; reset to 0 by
+                the next checkpoint that completes. *)
+      ; message : string (** The failure's message, best-effort. *)
+      }
   (* #384: page-level physical-I/O events.  [txn_id] is stamped by
      [Store.set_event_callback] from [Pager.get_txn_id] (the underlying
      [Pager_event.t] carries only the page id).  It is exact for write-path

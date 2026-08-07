@@ -129,7 +129,14 @@ type op =
       ; source : op
       ; on_conflict : Ast.conflict_action option
       }
-  | Op_seq_scan of { table_meta : Cat.table_meta }
+  | Op_seq_scan of
+      { table_meta : Cat.table_meta
+      ; alias : string option
+        (** #635: the FROM item's alias, when it has one.  An alias REPLACES the
+            table name as this input's scope identifier, so a correlated
+            subquery's outer reference resolves against [alias] and not against
+            [table_meta.name]. *)
+      }
   | Op_filter of
       { pred : expr
       ; child : op
@@ -174,12 +181,17 @@ type op =
             [(column ordinal, column type, value expression)] *)
       ; range : range option (** #517: range over the column after [keys] *)
       ; table_meta : Cat.table_meta (** for row decoding *)
+      ; alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
       }
   | Op_rowid_lookup of
       { table_meta : Cat.table_meta
       ; lookup_val : expr
+      ; alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
       }
-  | Op_col_seq_scan of { table_meta : Cat.table_meta }
+  | Op_col_seq_scan of
+      { table_meta : Cat.table_meta
+      ; alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
+      }
   | Op_update of
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)
@@ -209,6 +221,7 @@ type op =
   | Op_nested_loop_join of
       { left : op (** left input (any op stream) *)
       ; right_meta : Cat.table_meta (** right table for row decode *)
+      ; right_alias : string option (** #635: see {!Op_seq_scan}'s [alias] *)
       ; idx_tree : int (** right-side index tree id *)
       ; probe : probe_part list (** probe key, in index-column order *)
       ; probe_range : range option
@@ -315,6 +328,9 @@ type op =
   (** Write defer_foreign_keys flag to catalog; DDL-like, returns 0 rows. *)
   | Op_pragma_wal_checkpoint
   (** Migrate WAL contents to main DB and reset; no-op outside WAL mode. *)
+  | Op_pragma_checkpoint_status
+  (** #638 read the checkpoint-failure signal: one row of
+      (total_failures, consecutive_failures, last_error). *)
   | Op_pragma_get_wal_autocheckpoint (** Read per-connection auto-checkpoint threshold. *)
   | Op_pragma_set_wal_autocheckpoint of { n : int64 }
   (** Set per-connection auto-checkpoint threshold (0 disables). *)
@@ -425,7 +441,20 @@ and proj_item =
 
 and agg_spec =
   { func : Ast.agg_func
-  ; col_ord : int option (** [None] means COUNT-star *)
+  ; col_ord : int option (** [None] means COUNT-star, or an expression argument *)
+  ; arg_expr : expr option
+    (** #488: the aggregate's argument as a general expression, evaluated
+          against each INPUT row before accumulating.  [None] for the bare
+          column and COUNT-star forms, which stay on [col_ord] so the #247
+          fast path can keep pruning the decode to the columns it needs.
+          When this is [Some _], [col_ord] is [None] and every consumer must
+          read the argument through it — see [Exec.agg_arg_getter]. *)
+  ; distinct : bool
+    (** #491: the argument list carried [DISTINCT]; the aggregate consumes each
+            distinct argument value once.  Orthogonal to how the argument is
+            READ: it applies equally to the [col_ord] and [arg_expr] forms,
+            because the dedup key is the argument VALUE, not a column.  Always
+            [false] for a COUNT-star, which has no argument to deduplicate. *)
   }
 
 [@@@ai_disclosure "ai-generated"]

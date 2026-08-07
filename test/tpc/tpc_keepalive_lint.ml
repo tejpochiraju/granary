@@ -109,7 +109,46 @@ let is_ident_char c = is_ident_start c || (c >= '0' && c <= '9')
    this file exists to prevent, so the delimiter rule follows OCaml's lexer: '{'
    opens a literal only when an optional lowercase identifier and then '|' follow
    it immediately, and only the matching '|id}' closes it — a bare '|}' inside
-   {sql|...|sql} is ordinary text. *)
+   {sql|...|sql} is ordinary text.
+
+   THE SAME BUG A THIRD TIME (#625), in the half #602 did not touch: literals
+   were honoured in code but not INSIDE a comment, where every byte was blanked
+   without interpretation.  OCaml's own lexer does read them there — a comment
+   whose prose quotes a star-paren INSIDE a string literal ends at the LAST
+   star-paren, not at the quoted one — so the depth counter closed such a
+   comment one star-paren early and was off by one for the whole rest of the
+   file.  [comment_byte] now applies the lexer's rule at comment depth too.
+   (The offending text is deliberately not written out here: this comment would
+   then contain it, and the lexer that reads literals in comments is the whole
+   reason the bug exists.  test_sqlite_keepalive_571.ml builds it as data.)
+
+   The reason that was not simply done in the first place is real and is what
+   shapes the rule below: [check] also runs over MUTATED text — the test's
+   [without_keep_alive] deletes whole lines — and mutated text need not compile,
+   so a deleted line can orphan a quote inside a comment.  A naive skip-the-
+   string would then run to the next quote arbitrarily far away, trading one
+   fail-open for a worse one.  So the honouring is CONDITIONAL and bounded, and
+   falls back to today's blank-every-byte behaviour when the literal does not
+   close:
+
+   - a double-quote opens a string only when its closing quote is on the SAME
+     LINE (following backslash escapes).  One line is the blast radius of the
+     fallback, which is what makes an orphaned quote in mutated input harmless.
+   - a quoted-string opener — brace, optional identifier, bar — opens one only
+     when its matching closer occurs somewhere in the remaining text.  (Written
+     out in words for the same reason as above: spelled literally, an UNCLOSED
+     one right here would open a quoted string in this very comment, which is
+     the hazard under discussion.)  No line bound: that delimiter is
+     distinctive enough that a spurious match is not the hazard a bare quote is,
+     and the SQL these benchmarks embed is genuinely multi-line.
+   - a char literal is skipped, so a comment naming the double-quote CHARACTER
+     opens no string — which is exactly why OCaml's lexer reads char literals
+     inside comments too.
+
+   The residual, stated so it is not rediscovered as a surprise: a comment
+   containing an unbalanced quote whose partner sits later ON THE SAME LINE will
+   mask the text between them.  That is one line, and it is not reachable in
+   source the compiler accepts. *)
 let mask_non_code src =
   let b = Bytes.of_string src in
   let n = Bytes.length b in
@@ -119,6 +158,14 @@ let mask_non_code src =
      last byte is a backslash walked [skip_string] one byte too far and raised
      Invalid_argument here. *)
   let blank k = if k < n && at k <> '\n' then Bytes.set b k ' ' in
+  (* [blank_range a b] blanks [a, b).  Used by [comment_byte] so that a literal
+     skipped INSIDE a comment is blanked whole — delimiters included — rather
+     than left half-visible the way the code-level skips leave their quotes. *)
+  let blank_range a b =
+    for k = a to b - 1 do
+      blank k
+    done
+  in
   let depth = ref 0 in
   let i = ref 0 in
   (* [!i] is the opening quote; blank the body, leave the quotes. *)
@@ -133,6 +180,28 @@ let mask_non_code src =
       incr i
     done;
     incr i
+  in
+  (* Does the ordinary string literal opening at [!i] close before the end of
+     this line?  Only then is it honoured at comment depth (#625) — see the
+     header for why the bound is a line.  Backslash escapes are followed, so a
+     backslash-newline continuation carries the scan onto the next line exactly
+     as OCaml's own continuation does. *)
+  let string_closes_on_this_line () =
+    let j = ref (!i + 1) in
+    let closed = ref false in
+    let stop = ref false in
+    while (not !stop) && !j < n do
+      if at !j = '\n'
+      then stop := true
+      else if at !j = '\\'
+      then j := !j + 2
+      else if at !j = '"'
+      then (
+        closed := true;
+        stop := true)
+      else incr j
+    done;
+    !closed
   in
   (* '\n' and 'a' are four and three bytes; a lone quote is a type variable. *)
   let skip_char () =
@@ -176,6 +245,37 @@ let mask_non_code src =
     | Some id -> skip_quoted_string id
     | None -> incr i
   in
+  (* Does the quoted-string literal opening at [!i] with delimiter [id] have its
+     matching '|id}' anywhere in the remaining text?  At comment depth an
+     unterminated one falls back to plain blanking instead of masking to the end
+     of the file (#625); in CODE the mask-to-end behaviour stays, because there
+     the input is not a mutation and an unterminated literal is not OCaml. *)
+  let quoted_string_closes id =
+    let close = "|" ^ id ^ "}" in
+    let j = ref (!i + String.length id + 2) in
+    let closed = ref false in
+    while (not !closed) && !j < n do
+      if matches_at !j close then closed := true else incr j
+    done;
+    !closed
+  in
+  (* One byte of a comment body.  OCaml's lexer reads string, quoted-string and
+     char literals inside comments, so a star-paren within one does NOT close
+     the comment; this is what stops the depth counter going off by one and masking
+     the rest of the file (#625).  Each literal is honoured only when it closes
+     — see the header — and whatever is consumed is blanked whole. *)
+  let comment_byte () =
+    let start = !i in
+    (match at !i with
+     | '"' when string_closes_on_this_line () -> skip_string ()
+     | '\'' -> skip_char ()
+     | '{' ->
+       (match quoted_delim () with
+        | Some id when quoted_string_closes id -> skip_quoted_string id
+        | Some _ | None -> incr i)
+     | _ -> incr i);
+    blank_range start !i
+  in
   let open_comment () =
     incr depth;
     blank !i;
@@ -196,9 +296,7 @@ let mask_non_code src =
     else if c = '*' && c2 = ')' && !depth > 0
     then close_comment ()
     else if !depth > 0
-    then (
-      blank !i;
-      incr i)
+    then comment_byte ()
     else if c = '"'
     then skip_string ()
     else if c = '\''

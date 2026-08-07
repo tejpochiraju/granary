@@ -267,6 +267,20 @@ type bt_state =
        this to 0 (together with [sink_ships_in_flight]) before fd teardown.
        Distinct from [autockpt_in_flight], which is dispatch-intent (coalescing)
        only. *)
+  ; mutable last_checkpoint_error : string option
+    (* #638: message of the most recent checkpoint failure, or [None] when no
+       checkpoint has failed since the last one that completed.  Sticky across
+       commits so an operator can read it long after the failing commit
+       returned; cleared by a checkpoint that completes, or by
+       [clear_checkpoint_error]. *)
+  ; mutable checkpoint_failures_total : int
+    (* #638: count of checkpoint failures since open.  Never reset by a
+       successful checkpoint — it is the "has this store ever been unable to
+       truncate its WAL" signal. *)
+  ; mutable consecutive_checkpoint_failures : int
+    (* #638: failures since the last checkpoint that completed.  This is the one
+       that says "the WAL is growing right now": a nonzero value means every
+       attempt since then has left the WAL un-truncated. *)
   ; mutable sink_ships_in_flight : int
     (* #337: count of async sink ships dispatched but not yet completed.  The
        ship callback reads WAL frame payloads LAZILY ([Wal.read_frame]); a
@@ -294,8 +308,17 @@ type backend =
   | Mem of (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t
   | Btree of bt_state
 
+(* #589/#633: the rowid allocator's live state, keyed by TREE ID.  It hangs off
+   the store because a tree id only identifies a data tree within ONE store, and
+   because every catalog opened over this store must share exactly one
+   allocator — see the long note in catalog.ml's [Schema_cache] for what two
+   counters over one tree cost.  Owning it here is what makes that hold by
+   construction instead of by remembering to pass an argument. *)
+type rowid_counters = (tree_id, int64) Hashtbl.t
+
 type t =
   { backend : backend
+  ; rowid_counters : rowid_counters
   ; lock : Rwlock.t
   ; (* Shadow copies of Mem backend tree contents for the active RW txn.
        Writes during the txn go to the shadow — the live tree is NEVER
@@ -327,6 +350,10 @@ let geometry t =
   | Mem _ -> Geometry.default
   | Btree st -> Pager.geom st.pager
 ;;
+
+(* #633: the one accessor.  Handing the table out rather than wrapping it keeps
+   the catalog's [patch]/[publish] hot path a plain [Hashtbl] lookup. *)
+let rowid_counters t = t.rowid_counters
 
 type ro_snapshot =
   { rs_store : t
@@ -642,6 +669,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 
 let create () : t =
   { backend = Mem (Hashtbl.create 16)
+  ; rowid_counters = Hashtbl.create 16
   ; lock = Rwlock.create ()
   ; mem_rw_shadow = None
   ; mem_savepoints = []
@@ -713,9 +741,13 @@ let make_btree_store
     ; sink_ships_in_flight = 0
     ; closing = false
     ; ckpt_io_in_flight = 0
+    ; last_checkpoint_error = None
+    ; checkpoint_failures_total = 0
+    ; consecutive_checkpoint_failures = 0
     }
   in
   { backend = Btree st
+  ; rowid_counters = Hashtbl.create 16
   ; lock = Rwlock.create ()
   ; mem_rw_shadow = None
   ; mem_savepoints = []
@@ -1063,6 +1095,14 @@ let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
           match r with
           | Ok () -> Lwt.return_ok ()
           | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e))
+    ; (* #611: the pager caches WAL-resolved pages keyed by frame index and
+         needs to know when a checkpoint has recycled those indices.  [Wal.reset]
+         bumps [epoch] on both of its success arms and on neither failure path,
+         and nothing else in [Wal] ever clears the index — so this is exactly
+         the "frame indices no longer mean what they meant" signal, and the
+         pager reads it itself rather than trusting the three [Wal.reset] call
+         sites to notify it. *)
+      wal_epoch = (fun () -> Wal.epoch wal)
     }
   in
   Pager.set_wal pager (Some cb)
@@ -1121,6 +1161,7 @@ let open_block_wal
       ~(wal_write_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(wal_sync : unit -> (unit, string) result Lwt.t)
       ~(wal_size_bytes : int64)
+      ?(wal_resize : (int64 -> (unit, string) result Lwt.t) option)
       ~(close : unit -> unit Lwt.t)
       ~(wal_close : unit -> unit Lwt.t)
       ()
@@ -1184,6 +1225,7 @@ let open_block_wal
            Wal.open_
              ~cipher
              ~page_size:(Pager.page_size pager)
+             ?resize:wal_resize
              ~read_at:wal_read_at
              ~write_at:wal_write_at
              ~sync:wal_sync
@@ -1384,6 +1426,42 @@ let emit_event (st : bt_state) (ev : Store_event.t) =
   | Some f ->
     (try f ev with
      | _ -> ())
+;;
+
+(* #638: a checkpoint failure used to be discarded whole by the two auto paths,
+   so a repeatedly-failing autocheckpoint was completely invisible: the WAL grew
+   without bound, nothing was logged and nothing was counted.  Record it on the
+   store (sticky, so it outlives the commit that triggered it) AND emit a
+   [Checkpoint_failed] event so a live observer sees it at the moment it
+   happens.
+
+   Deliberately NOT an error to the caller: the commit that triggered the
+   autocheckpoint has already succeeded and its frames are still valid WAL
+   frames, so failing it would turn a deferrable maintenance problem into
+   spurious transaction failures (#638 asks for visibility, not abort). *)
+let note_checkpoint_failure (st : bt_state) ~(target : int) (exn : exn) : unit =
+  let message =
+    match exn with
+    | Failure m -> m
+    | e -> Printexc.to_string e
+  in
+  st.checkpoint_failures_total <- st.checkpoint_failures_total + 1;
+  st.consecutive_checkpoint_failures <- st.consecutive_checkpoint_failures + 1;
+  st.last_checkpoint_error <- Some message;
+  emit_event
+    st
+    (Store_event.Checkpoint_failed
+       { target_frames = target
+       ; consecutive = st.consecutive_checkpoint_failures
+       ; message
+       })
+;;
+
+(* #638: a checkpoint that ran to completion clears the "WAL is growing"
+   signal.  [checkpoint_failures_total] is intentionally NOT cleared. *)
+let note_checkpoint_success (st : bt_state) : unit =
+  st.consecutive_checkpoint_failures <- 0;
+  st.last_checkpoint_error <- None
 ;;
 
 (* The id the currently-active rw txn will commit as.  The header is not bumped
@@ -1731,6 +1809,9 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
               Read [Wal.epoch] AFTER reset for the new epoch. *)
            emit_event st (Store_event.Wal_reset { epoch = Wal.epoch wal });
            emit_event st (Store_event.Checkpoint_end { pages_migrated = !migrated });
+           (* #638: the WAL has actually been truncated — clear the sticky
+              failure signal. *)
+           note_checkpoint_success st;
            (* #298/#1: checkpoint is a full-sync durability anchor — everything
             is now durable and the WAL starts a fresh epoch at frame 0.  Reset
             the sink ship counter (new epoch) and the batched durability counters
@@ -1762,8 +1843,10 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
 
 (** Called from [commit] while [lock] is still held (exclusive). If the WAL has
     grown past the per-connection threshold, migrate it inline so
-    subsequent commits start fresh. Best-effort: a checkpoint failure
-    is swallowed (the commit itself already succeeded). *)
+    subsequent commits start fresh. Best-effort: a checkpoint failure does not
+    fail the commit (which already succeeded) — but since #638 it is no longer
+    discarded either: it is counted on the store and emitted as
+    [Store_event.Checkpoint_failed]. *)
 let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
   match st.wal with
   | None -> Lwt.return_unit
@@ -1773,7 +1856,17 @@ let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
     then Lwt.return_unit
     else if Wal.committed_frames wal < thr
     then Lwt.return_unit
-    else Lwt.catch (fun () -> checkpoint_unlocked st wal) (fun _ -> Lwt.return_unit)
+    else (
+      (* Read the target BEFORE the attempt: a failure past [Wal.reset] would
+         leave [committed_frames] at 0 and the event would report target=0. *)
+      let target = Wal.committed_frames wal in
+      Lwt.catch
+        (fun () -> checkpoint_unlocked st wal)
+        (fun exn ->
+           (* #638: record + emit rather than discard.  Still does not fail the
+              commit that got us here. *)
+           note_checkpoint_failure st ~target exn;
+           Lwt.return_unit))
 ;;
 
 (* Group-commit coordinator (#77, #151).  One fiber per [commit_queue]
@@ -1970,6 +2063,12 @@ let maybe_autockpt_after_commit t st =
   then Lwt.return_unit
   else (
     st.autockpt_in_flight <- true;
+    (* #638: captured before the attempt — see [maybe_autocheckpoint]. *)
+    let target =
+      match st.wal with
+      | Some w -> Wal.committed_frames w
+      | None -> 0
+    in
     Lwt.async (fun () ->
       Lwt.finalize
         (fun () ->
@@ -1984,7 +2083,12 @@ let maybe_autockpt_after_commit t st =
                   (fun () ->
                      Rwlock.release_write t.lock;
                      Lwt.return_unit))
-             (fun _ -> Lwt.return_unit))
+             (fun exn ->
+                (* #638: this is the background path — nobody is awaiting this
+                   fiber, so discarding here was the most invisible failure in
+                   the engine. *)
+                note_checkpoint_failure st ~target exn;
+                Lwt.return_unit))
         (fun () ->
            st.autockpt_in_flight <- false;
            (* #338: wake a [close] awaiting the in-flight checkpoint to drain. *)
@@ -2240,11 +2344,48 @@ let checkpoint (t : t) : unit Lwt.t =
      | None -> Lwt.return_unit
      | Some wal ->
        let* () = Rwlock.acquire_write t.lock in
+       (* Read under the lock, and before the attempt: a failure past
+          [Wal.reset] would leave [committed_frames] at 0. *)
+       let target = Wal.committed_frames wal in
        Lwt.finalize
-         (fun () -> checkpoint_unlocked st wal)
+         (fun () ->
+            (* #638: an explicit checkpoint already surfaces its failure by
+               raising, so this path was never silent — but it feeds the same
+               counters so [checkpoint_health] describes the store, not just its
+               automatic path.  The exception is re-raised unchanged. *)
+            Lwt.catch
+              (fun () -> checkpoint_unlocked st wal)
+              (fun exn ->
+                 note_checkpoint_failure st ~target exn;
+                 Lwt.fail exn))
          (fun () ->
             Rwlock.release_write t.lock;
             Lwt.return_unit))
+;;
+
+(** #638: the checkpoint-failure signal. *)
+type checkpoint_health =
+  { last_error : string option
+  ; total_failures : int
+  ; consecutive_failures : int
+  }
+
+let checkpoint_health (t : t) : checkpoint_health =
+  match t.backend with
+  | Mem _ -> { last_error = None; total_failures = 0; consecutive_failures = 0 }
+  | Btree st ->
+    { last_error = st.last_checkpoint_error
+    ; total_failures = st.checkpoint_failures_total
+    ; consecutive_failures = st.consecutive_checkpoint_failures
+    }
+;;
+
+let clear_checkpoint_error (t : t) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st ->
+    st.last_checkpoint_error <- None;
+    st.consecutive_checkpoint_failures <- 0
 ;;
 
 let wal_autocheckpoint (t : t) : int =
@@ -2909,6 +3050,28 @@ type seek_cursor =
 let seek_pause_interval = 256
 let mk_seek_cursor sc_impl = { sc_calls = 0; sc_impl }
 
+(* The cursor is advanced eagerly by the caller; [result] already holds this
+   call's entry (or [None]), so splicing a pause here only defers the *return*,
+   never reordering or dropping a match (#235).  We count calls, not matches:
+   every recursive consumer call nests a frame whether or not it yields a row,
+   so the terminal [None] call is counted too.
+
+   Yielding mid-stream is safe under the current concurrency model: a paused RO
+   seek streams from an immutable snapshot, and a paused RW seek holds the
+   single-writer lock — so no other fiber can mutate the tree under the cursor
+   between pause and resume.  If that invariant is ever relaxed (concurrent
+   writers), revisit this yield point.
+
+   #481: shared by [seek_next] and [seek_next_value] so the two cannot drift in
+   their stack-bounding behaviour; the counter lives on the cursor, so mixing
+   the two on one cursor still yields every [seek_pause_interval] reads. *)
+let seek_pause_tail sc result =
+  sc.sc_calls <- sc.sc_calls + 1;
+  if sc.sc_calls mod seek_pause_interval = 0
+  then Lwt.bind (Lwt.pause ()) (fun () -> result)
+  else result
+;;
+
 let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
   fun tx tid key ->
   match tx with
@@ -2981,21 +3144,34 @@ let seek_next : seek_cursor -> (bytes * bytes) option Lwt.t =
        | Error e ->
          Lwt.fail_with (Format.asprintf "Store.seek_next: %a" pp_error (map_btree_err e)))
   in
-  (* The cursor is advanced eagerly above; [result] already holds this call's
-     entry (or [None]), so splicing a pause here only defers the *return*, never
-     reordering or dropping a match (#235).  We count calls, not matches: every
-     recursive consumer call nests a frame whether or not it yields a row, so the
-     terminal [None] call is counted too.
+  seek_pause_tail sc result
+;;
 
-     Yielding mid-stream is safe under the current concurrency model: a paused RO
-     seek streams from an immutable snapshot, and a paused RW seek holds the
-     single-writer lock — so no other fiber can mutate the tree under the cursor
-     between pause and resume.  If that invariant is ever relaxed (concurrent
-     writers), revisit this yield point. *)
-  sc.sc_calls <- sc.sc_calls + 1;
-  if sc.sc_calls mod seek_pause_interval = 0
-  then Lwt.bind (Lwt.pause ()) (fun () -> result)
-  else result
+(* #481: [seek_next] that never materialises the key.  Identical traversal,
+   identical pause accounting — the B+-tree backend simply skips the per-entry
+   key copy (and, one layer down, the tag-strip copy of the value).  For a
+   sequential table scan, which binds the key as [_key] and drops it, that copy
+   was pure waste on every row.  The [Mem] backend has nothing to save: its
+   entries are already materialised pairs, so it just projects. *)
+let seek_next_value : seek_cursor -> bytes option Lwt.t =
+  fun sc ->
+  let result =
+    match sc.sc_impl with
+    | SC_mem r ->
+      (match !r () with
+       | Seq.Nil -> Lwt.return_none
+       | Seq.Cons ((_key, v), rest) ->
+         r := rest;
+         Lwt.return_some v)
+    | SC_bt c ->
+      let* r = Btree.cursor_next_value c in
+      (match r with
+       | Ok v -> Lwt.return v
+       | Error e ->
+         Lwt.fail_with
+           (Format.asprintf "Store.seek_next_value: %a" pp_error (map_btree_err e)))
+  in
+  seek_pause_tail sc result
 ;;
 
 let seek_close : seek_cursor -> unit =

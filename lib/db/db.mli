@@ -2,8 +2,20 @@
 
 type t
 
+(** #634: the invalidation cohort shared by every handle over one
+    {!Granary_store.Store.t}.  {!vacuum} closes that store and swaps a rebuilt
+    one into the handle that ran it; every other handle in the cohort is thereby
+    dead, and is marked so its next statement is refused with an error naming
+    VACUUM rather than failing later on a closed store or a stale rowid counter.
+    Opaque; obtained from {!cohort} and passed to {!of_store}. *)
+type store_cohort
+
 (** Pretty-print a summary: path, active schema, savepoint depth, total changes. *)
 val pp : Format.formatter -> t -> unit
+
+(** #634: this handle's invalidation cohort, to pass to {!of_store} for a second
+    handle over the same store.  {!create_worker_handle} does it for you. *)
+val cohort : t -> store_cohort
 
 (** Re-export value type for convenience. *)
 type value = Granary_encoding.Row.value =
@@ -83,17 +95,26 @@ val open_block
     open time without needing a raw store handle afterwards.  Used by the
     [granary.unix] driver and by ATTACH.
 
-    [rowid_counters] (#589) shares an existing catalog's rowid allocator with the
-    new handle, and must be passed whenever [store] is already open under another
-    [Db.t] — otherwise the two handles allocate rowids independently over one set
-    of data trees and silently overwrite each other's rows.
-    {!create_worker_handle} is the intended way in; a caller reaching for
-    [of_store] over a store that is already open owes the same argument. *)
+    #589/#633: it is safe to call this over a store that is ALREADY open under
+    another [Db.t].  The rowid allocator lives on the
+    {!Granary_store.Store.t} ({!Granary_store.Store.rowid_counters}), so the two
+    handles share one allocator over the one set of data trees by construction —
+    there is no longer an argument to pass, and therefore none to forget.  (It
+    used to be [?rowid_counters], and forgetting it cost silent row loss plus
+    durable index corruption.)  {!create_worker_handle} remains the intended way
+    in, because it is about more than the allocator.
+
+    [cohort] (#634) joins the new handle to an existing handle's invalidation
+    cohort, and IS still owed by any caller reaching [of_store] over a store that
+    is already open: {!vacuum} closes the store and swaps in a rebuilt one, so
+    every OTHER handle over that store is left pointing at a closed store.
+    Handles in one cohort are invalidated together and report it through
+    {!stale_after_vacuum}; a handle opened without [cohort] starts its own. *)
 val of_store
   :  ?clock:(unit -> float)
   -> ?durability:Granary_store.Store.durability
   -> ?file_path:string
-  -> ?rowid_counters:Granary_catalog.Catalog.rowid_counters
+  -> ?cohort:store_cohort
   -> Granary_store.Store.t
   -> t Lwt.t
 
@@ -124,9 +145,10 @@ val set_file_provider : file_provider -> unit
 val close : t -> unit Lwt.t
 
 (** Create a lightweight worker handle sharing the same underlying store.
-    Equivalent to [of_store ~rowid_counters:(Catalog.rowid_counters (catalog t))
-    (store t)]. Used by Jepsen-style concurrent workloads where each worker needs
-    its own [explicit_txn] without exposing the raw store.
+    Equivalent to [of_store (store t)] — since #633 the rowid allocator comes
+    from the store itself, so the two handles share it automatically. Used by
+    Jepsen-style concurrent workloads where each worker needs its own
+    [explicit_txn] without exposing the raw store.
 
     #555: this is the supported way to run explicit transactions from more than
     one fiber. Each handle gets its own transaction slot, and because they share
@@ -153,7 +175,15 @@ val close : t -> unit Lwt.t
       per-handle; a worker handle starts with none of the parent's.
     - Write transactions {b serialize} on the shared [Rwlock] rather than
       overlapping, and read-only transactions do not overlap a writer either.
-      Genuine concurrency needs #555 option 1. *)
+      Genuine concurrency needs #555 option 1.
+    - {b A {!vacuum} on ANY handle over this store kills every other one} (#634).
+      VACUUM closes the store and swaps in a rebuilt file, which the siblings
+      cannot follow. Since #634 that is loud rather than silent: the surviving
+      handles are refused with an error naming VACUUM, {!stale_after_vacuum}
+      reports it, and the only thing left to do with one is {!close} it and take
+      a fresh worker off the handle that ran the VACUUM.
+
+    Raises [Failure] if [t] is itself stale (see {!stale_after_vacuum}). *)
 val create_worker_handle : t -> t Lwt.t
 
 (** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL
@@ -197,9 +227,38 @@ val catalog : t -> Granary_catalog.Catalog.t
     {!set_file_provider}).
 
     Must not be called inside an explicit transaction.  Any open
-    prepared statements created from the previous file will continue
-    to work logically but observe the recompacted file.  Phase 37 / #120. *)
+    prepared statements created from the previous file {b on this handle} will
+    continue to work logically but observe the recompacted file.  Phase 37 /
+    #120.
+
+    {b #634: every OTHER handle over the same store dies here.}  VACUUM closes
+    the store and opens the rebuilt file into {e this} handle only, so any handle
+    from {!create_worker_handle} — and any statement prepared on one — is left
+    over a closed store and a pre-VACUUM rowid allocator.  They are now marked
+    stale: every statement on them is refused with an error naming VACUUM,
+    {!stale_after_vacuum} answers [true], and {!close} on one is a safe no-op
+    (the store is already closed).  There is no ROLLBACK recovery, unlike #555's
+    poison — the caller must take a fresh worker handle off {e this} one.  Called
+    on a handle that is itself stale, VACUUM raises [Failure]. *)
 val vacuum : t -> unit Lwt.t
+
+(** #634: whether this handle — or any ATTACHed schema on it — has been
+    invalidated by a {!vacuum} run on a {e sibling} handle over the same store.
+
+    VACUUM rebuilds the database file and re-seats only the handle that ran it.
+    Every other handle in the cohort ({!create_worker_handle}, or {!of_store}
+    passed [~cohort]) still points at the store VACUUM closed, and its catalog's
+    rowid counters describe the pre-VACUUM file.  Rather than let that surface
+    later as a closed-store failure or a rowid collision, such a handle is marked
+    stale and refuses everything: reads, writes, DDL, prepared [run]/[iter],
+    [BEGIN], [COMMIT] {e and} [ROLLBACK].
+
+    The [ROLLBACK] exemption that makes {!transaction_poisoned} recoverable
+    deliberately does {e not} apply: there is no state to roll back to, the store
+    is gone.  {!close} is the only supported operation on a stale handle, and it
+    is a no-op on the already-closed store.  Get a fresh handle from the one that
+    ran the VACUUM. *)
+val stale_after_vacuum : t -> bool
 
 (** #555: whether this connection has been {e poisoned} by an overlapping
     explicit transaction — either the top-level handle or any ATTACHed schema.
@@ -269,6 +328,162 @@ val vacuum : t -> unit Lwt.t
     Unaffected, as long as no explicit transaction is used: sharing a [Db.t]
     across fibers without [BEGIN] never poisons it. *)
 val transaction_poisoned : t -> bool
+
+(** #585: run [body] inside an explicit transaction with a scoped extent.
+
+    [with_transaction t body] issues [BEGIN], runs [body t], and then [COMMIT]s
+    on success or [ROLLBACK]s and re-raises on exception. It is the
+    exception-safe replacement for hand-written
+    [BEGIN] / … / [COMMIT] sequences, and — more importantly — it is the first
+    place the engine has a transaction {e extent} rather than a sequence of
+    unrelated statements.
+
+    {2 Why the extent matters}
+
+    #555/#584 are not "the slot is not locked"; they are "the engine cannot tell
+    which fiber owns the slot". A statement-at-a-time API gives it nothing to
+    attach an owner to: [Lwt.with_value] can only tag a fiber for the dynamic
+    extent of a callback, and a bare [Db.execute db "BEGIN"] has no enclosing
+    scope to be that extent. This combinator supplies one, and mints an owner
+    token into it (readable via {!in_transaction_scope}). Binding every
+    {e statement} to its owner is still #555 option 1's work; what the token
+    decides today is listed below.
+
+    {2 Return value}
+
+    [Ok v] where [v] is [body]'s result, once the [COMMIT] has succeeded. [Error]
+    if the [BEGIN] or the [COMMIT] failed. An exception raised by [body] is
+    {e re-raised} after the rollback, never converted into [Error] — a caller
+    that wants it as a value should catch it inside [body].
+
+    {2 Nesting: refused, deliberately}
+
+    Calling [with_transaction] again on the same handle from inside the extent —
+    directly, or from a fiber spawned inside [body], which inherits the token —
+    returns [Error (Runtime …)] without opening anything, without rolling
+    anything back, and {b without poisoning the handle}. The outer transaction is
+    untouched and the outer scope carries on normally.
+
+    The two alternatives were rejected because each has to lie to the inner
+    caller:
+
+    - {b Savepoint.} The inner scope's "commit" would be a [RELEASE], so
+      returning from it would not mean durable, and the outer scope could still
+      discard all of it. Code that reads [with_transaction] as "committed when it
+      returns" would be wrong in a way no type catches.
+    - {b No-op join.} The inner scope's rollback-on-exception would abort the
+      {e outer} transaction while returning control to code that believes only
+      its own work was undone — silent, unbounded loss of the outer scope's
+      writes.
+
+    Refusal is the only answer that is true. If a partial undo point is what you
+    want, [SAVEPOINT] / [RELEASE] / [ROLLBACK TO] say so explicitly.
+
+    Note this is the one question the owner token answers precisely today: the
+    token proves the caller is the fiber that opened the outer transaction, so
+    the engine can refuse {e without} the #555 poison, which exists only for the
+    case where it cannot tell the fibers apart.
+
+    {2 Interaction with the #555 poison}
+
+    Unchanged, and deliberately not routed around.
+
+    - A second fiber calling [with_transaction] on a handle that already holds an
+      explicit transaction is {e not} the nesting case (it has no token): its
+      [BEGIN] fails and poisons the handle exactly as a bare [BEGIN] would. The
+      combinator reports the [Error] and returns.
+    - When the [BEGIN] fails, no [ROLLBACK] is issued. [ROLLBACK] is the sole
+      exit from the poisoned state and it stays the {e caller's} to issue —
+      this combinator must not become a second exit.
+    - When the [COMMIT] fails, no compensating [ROLLBACK] is issued either. The
+      arms that leave a transaction uncommittable ([#286] in-txn DDL, a violated
+      deferred FK) already roll it back themselves, and on a poisoned handle the
+      recovery is the caller's.
+    - The rollback-on-exception path {e does} issue [ROLLBACK] — but that is the
+      prescribed exit itself, applied to this scope's own transaction, not an
+      additional one.
+
+    One consequence of that last point is worth stating, because "this scope's
+    own transaction" is not the whole truth: [ROLLBACK] clears the {e handle's}
+    poison flag unconditionally (#555 made it unconditional so a handle can
+    never be stranded), and the poison is connection state rather than
+    transaction state. So if another fiber's [BEGIN] collided and poisoned the
+    handle while this scope was running, and this scope's body then {e raises},
+    the rollback it issues also clears the poison that fiber was told to recover
+    from — and that fiber's own recovery [ROLLBACK] then answers
+    ["no active transaction"]. Nothing is lost or committed wrongly; the
+    recovering fiber is simply told the handle is already clean, which it is.
+    Making the clear conditional would strand the handle instead, so this is
+    inherited from #555 rather than introduced here.
+
+    {2 #584 is narrowed here, not closed}
+
+    If another fiber's [ROLLBACK] aborts this scope's transaction — whether it
+    then opens its own in the freed slot or leaves it empty — the scope's owner
+    token no longer matches the handle. This combinator detects that at scope
+    exit and issues {b neither} [COMMIT] nor [ROLLBACK], returning [Error]
+    instead: either would have acted on state that is no longer this scope's,
+    which is exactly #584's failure.
+
+    The detection holds for {e both} spellings of the displacing fiber — a bare
+    [Db.execute db "BEGIN"] and a second [with_transaction] — because the token
+    is invalidated by every path that ends a transaction, not merely by this
+    combinator's own exit. A [BEGIN] (and [SAVEPOINT]'s auto-begin) clears it
+    when it fills the slot; [COMMIT], [ROLLBACK], the internal forced rollback
+    and [RELEASE]'s auto-commit clear it when they empty it. A token therefore
+    never outlives the transaction it names.
+
+    That covers the scope's own boundaries. It does {b not} cover statements
+    {e inside} [body]: those still resolve the transaction from the handle's
+    mutable slot, so a displaced scope's writes land in the other fiber's
+    transaction before the boundary check reports the loss.
+
+    So this is not permission to share a handle across fibers. Use
+    {!create_worker_handle}, which gives each fiber its own slot and blocks on
+    the shared writer lock instead of contaminating.
+
+    {2 The body must not manage the transaction itself}
+
+    [body] owns the statements, not the transaction. A [BEGIN] inside it fails
+    and poisons. A [COMMIT] or [ROLLBACK] inside it empties the slot {e and}
+    clears the scope's owner token, so the scope exit takes the displacement
+    branch above: [Error], and no second [COMMIT] is issued. The body's work is
+    committed (or discarded) exactly as the body asked, but the [Error] is the
+    caller's only signal that the scope did not end the way it looks like it
+    did. That is the intended outcome rather than a wart — the alternative would
+    be a blind [COMMIT] of whatever now occupies the slot. [SAVEPOINT] /
+    [RELEASE] / [ROLLBACK TO] are fine and leave the transaction in place.
+
+    {2 ATTACH}
+
+    The [BEGIN] routes to the active schema, as it always does, so the
+    transaction belongs to that schema's sub-handle — and the owner token is
+    stamped on {e that} sub-handle, not on the top-level handle the call was
+    made on, because the sub-handle is the one whose slot the begin/commit/
+    rollback paths maintain. Since #598 refuses a [PRAGMA active_database]
+    switch while any schema holds a transaction, the routing cannot move under
+    an open scope, so the handle the token lives on is stable for the whole
+    extent. A consequence: nesting is refused per {e schema}, so a scope open on
+    ["main"] does not by itself refuse one on an attached ["aux"] — but reaching
+    ["aux"] would need the routing switch #598 already refuses. *)
+val with_transaction : t -> (t -> 'a Lwt.t) -> ('a, error) result Lwt.t
+
+(** #585: whether the {e calling fiber} is inside a {!with_transaction} extent
+    that currently owns [t]'s explicit-transaction slot.
+
+    True only when the fiber's inherited owner token equals the token stored on
+    the handle the active schema routes to, so it answers [false] for a fiber
+    that never entered a scope, for a fiber whose scope has exited, and for a
+    fiber whose scope was displaced by another's transaction (#584). It also
+    answers [false] inside a transaction opened by a bare [BEGIN] — an unscoped
+    transaction has no owner to report, and a [BEGIN] arriving in the slot
+    actively clears whatever token was there.
+
+    This is the observable half of the owner token, exposed for tests and for
+    library code that needs to know whether it may open a transaction or is
+    already inside one. It is {e not} a general "is a transaction open" predicate;
+    it says nothing about a transaction this fiber does not own. *)
+val in_transaction_scope : t -> bool
 
 (** Execute a DDL or DML statement (CREATE TABLE, INSERT, UPDATE, ...).
     Returns [Ok ()] on success, [Error e] on failure. *)

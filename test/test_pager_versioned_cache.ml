@@ -40,6 +40,7 @@ let read_byte = function
 type stub =
   { mutable frames : (int64 * Cstruct.t) array
   ; mutable committed : int
+  ; epoch : int64 (* #611: bumped by a simulated checkpoint; replaced, not mutated *)
   }
 
 let make_stub_callbacks (s : stub) : Pager.wal_callbacks =
@@ -77,6 +78,7 @@ let make_stub_callbacks (s : stub) : Pager.wal_callbacks =
   ; wal_append_commit = append_commit
   ; wal_append_commit_no_sync = append_commit_no_sync
   ; wal_sync
+  ; wal_epoch = (fun () -> s.epoch)
   }
 ;;
 
@@ -92,7 +94,7 @@ let test_snapshot_reads_isolated_from_newer_frames () =
          ~n_pages:4L
          ~freelist:Granary_storage.Freelist.empty
      in
-     let stub = { frames = [||]; committed = 0 } in
+     let stub = { frames = [||]; committed = 0; epoch = 0L } in
      Pager.set_wal pager (Some (make_stub_callbacks stub));
      (* Seed main-DB page 1 with byte 0x10 by direct write_page. *)
      let* _ = write_page ~page_id:1L (with_byte 0x10) in
@@ -127,7 +129,7 @@ let test_writer_dirty_invisible_to_concurrent_readers () =
          ~n_pages:4L
          ~freelist:Granary_storage.Freelist.empty
      in
-     let stub = { frames = [||]; committed = 0 } in
+     let stub = { frames = [||]; committed = 0; epoch = 0L } in
      Pager.set_wal pager (Some (make_stub_callbacks stub));
      let* _ = write_page ~page_id:2L (with_byte 0x20) in
      (* Writer dirties the page (no commit yet). *)

@@ -79,11 +79,20 @@ val comparison_sources : string list
     the whole rest of the file was masked; the quoted-string form was the same
     bug a second time (#602).
 
-    {b Known limit}: string literals are recognised in code but not {e inside}
-    comments, where every byte is blanked without interpretation. OCaml's own
-    lexer does read them there, so [(* "*)" *)] is valid and this masks the rest
-    of the file — #625. Rare, and [test_removing_the_keep_alive_is_caught] turns
-    whole-file masking into a loud failure rather than a silent pass. *)
+    Literals are honoured {e inside} comments too, as OCaml's own lexer does
+    (#625): a star-paren within a string in a comment does not close it, so the
+    depth counter no longer goes off by one and masks the rest of the file.
+    Because [check] is also run over MUTATED text — the tests delete whole
+    lines, and the result need not compile — the honouring is conditional and
+    bounded, and falls back to blanking every byte when the literal does not
+    close: a double-quote opens a string only when its closing quote is on the
+    same line, and a quoted-string opener only when its matching closer appears
+    in the remaining text. Char literals are skipped, so a comment naming the
+    double-quote character opens nothing.
+
+    {b Residual limit}: a comment holding an unbalanced quote whose partner sits
+    later on the {e same line} masks the text between them. That is one line
+    wide, and unreachable in source the compiler accepts. *)
 val mask_non_code : string -> string
 
 (** [contains hay needle] is whether [needle] occurs in [hay]. Exposed because

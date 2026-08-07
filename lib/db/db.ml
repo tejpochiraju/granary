@@ -34,9 +34,33 @@ type rv_entry =
   ; mutable rv_callbacks : (Sql.Exec.row_change list -> unit Lwt.t) list
   }
 
+(* #634: the shared invalidation generation for every [Db.t] sitting over ONE
+   [Store.t].  {!vacuum} closes that store and swaps a freshly opened one into
+   the vacuuming handle; every handle produced by {!create_worker_handle} keeps
+   pointing at the CLOSED store and at the pre-VACUUM rowid allocator.  Nothing
+   detected that, so the failure surfaced later and elsewhere — a closed-store
+   error, or (worse) a rowid handed out by a counter table that no longer
+   describes the live data.
+
+   The cohort record is shared by reference between a handle and every worker
+   derived from it; [handle_generation] on each handle records the generation it
+   was created at.  VACUUM bumps the cohort and re-stamps only the handle that
+   ran it, so every other handle in the cohort is now [handle_generation <>
+   cohort.vacuum_generation] — i.e. stale — and every statement on it is refused
+   loudly.  This is option 2 of #634 ("invalidate loudly"); option 3 (re-seat the
+   workers through an indirection on [Store.t]) is the clean fix and is left to
+   #633's restructuring. *)
+type store_cohort = { mutable vacuum_generation : int }
+
 type t =
   { mutable store : S.t
   ; mutable catalog : Cat.t
+  ; cohort : store_cohort
+    (** #634: shared by reference with every handle over the same [Store.t]. *)
+  ; mutable handle_generation : int
+    (** #634: the cohort generation this handle was created (or re-seated) at.
+        Differs from [cohort.vacuum_generation] exactly when a VACUUM on a
+        sibling handle has invalidated this one. *)
   ; clock : (unit -> float) option
   ; mutable explicit_txn : S.rw S.txn option
   ; mutable txn_poisoned : bool
@@ -92,7 +116,37 @@ type t =
   ; mutable rv_resync : bool
     (** #427: set when a savepoint rollback made the accumulated deltas
         untrustworthy; the next flush full-resyncs every affected view. *)
+  ; mutable txn_scope : int option
+    (** #585: the owner token of the {!with_transaction} extent that opened the
+        transaction currently sitting in [explicit_txn], or [None] when the
+        transaction (if any) was opened by a bare [BEGIN].
+
+        This is the first instance of the thing #555/#584 said the engine did not
+        have: a transaction {e extent} an owner token can be attached to.  The
+        token is minted when [with_transaction] BEGINs, stored here, and
+        simultaneously published into the calling fiber's Lwt storage under
+        {!txn_scope_key}.  A fiber is the owner iff the two agree, which is
+        exactly what {!in_transaction_scope} tests.
+
+        Today it decides exactly one question — whether a [with_transaction] call
+        is a re-entrant call by the owner (refuse cleanly, outer transaction
+        intact) or a collision with another fiber (fall through to [BEGIN], which
+        poisons as it always has).  Binding {e statements} to their owner needs
+        the same token plumbed to [resolve_txn]; that is #555 option 1's work,
+        not this field's. *)
   }
+
+(* #585: monotone source of transaction-scope owner tokens.  Process-wide rather
+   than per-handle so a token is meaningful even when it travels with a fiber
+   across handles — comparing tokens can then never produce a false match. *)
+let txn_scope_counter = ref 0
+
+(* #585: the calling fiber's transaction-scope owner token.  Same idiom as
+   [Sql.Exec]'s [txn_mode_key] and the #240 dirty-table accumulator: set with
+   [Lwt.with_value] for the dynamic extent of the [with_transaction] body, so
+   every fiber spawned inside that body inherits it and every fiber outside it
+   reads [None]. *)
+let txn_scope_key : int Lwt.key = Lwt.new_key ()
 
 let pp fmt t =
   Format.fprintf
@@ -104,6 +158,28 @@ let pp fmt t =
     t.active_schema
     (List.length t.savepoint_names)
     t.total_changes
+;;
+
+(* #634: THE staleness predicate — one spelling, used at every gate.  True when
+   a VACUUM ran on a SIBLING handle over the same store: this handle's [store] is
+   the closed pre-VACUUM one and its catalog's rowid counters describe a file
+   that no longer exists.
+
+   Unlike #555's poison there is no recovery: the store is gone, so [ROLLBACK]
+   is refused too.  The only legal operation on a stale handle is {!close}, and
+   the caller must obtain a fresh handle (a new {!create_worker_handle} off the
+   handle that ran the VACUUM). *)
+let is_stale t = t.handle_generation <> t.cohort.vacuum_generation
+
+(* #634: the message every statement gets on a handle invalidated by VACUUM.
+   Deliberately verbose and deliberately names VACUUM: the whole point of the
+   fix is that the caller learns the cause here rather than meeting a
+   closed-store failure or a bad rowid somewhere unrelated later. *)
+let stale_msg =
+  "handle invalidated by VACUUM (#634): another handle over this store ran VACUUM, which \
+   closed the store this handle points at and replaced the database file.  This handle \
+   is dead - there is no ROLLBACK recovery.  Close it and obtain a fresh one via \
+   Db.create_worker_handle on the handle that ran the VACUUM."
 ;;
 
 type value = Row.value =
@@ -250,6 +326,8 @@ let open_in_memory ?clock () =
   Lwt.return
     { store
     ; catalog
+    ; cohort = { vacuum_generation = 0 }
+    ; handle_generation = 0
     ; clock
     ; explicit_txn = None
     ; txn_poisoned = false
@@ -268,6 +346,7 @@ let open_in_memory ?clock () =
     ; rv_pending = Hashtbl.create 4
     ; rv_refreshing = false
     ; rv_resync = false
+    ; txn_scope = None
     }
 ;;
 
@@ -314,23 +393,33 @@ let load_triggers_into_hashtbl store trig_tbl =
    (Some for file-backed handles, None for in-memory / arbitrary devices).
    [durability] sets the database-wide durability knob on the store before
    loading the catalog. *)
-let of_store ?clock ?durability ?file_path ?rowid_counters store =
+let of_store ?clock ?durability ?file_path ?cohort store =
   (match clock with
    | Some c -> S.set_clock store c
    | None -> ());
   (match durability with
    | Some d -> S.set_durability store d
    | None -> ());
-  let* catalog = Cat.open_ ?rowid_counters store in
+  let* catalog = Cat.open_ store in
   (* Load persisted columnar data for columnar tables. *)
   let* () = Cat.load_columnar_stores catalog store in
   let views = Hashtbl.create 4 in
   let* () = load_views_into_hashtbl store views in
   let triggers = Hashtbl.create 4 in
   let* () = load_triggers_into_hashtbl store triggers in
+  (* #634: a handle opened without [?cohort] starts its own cohort; one opened
+     WITH it joins the caller's and is stamped with the generation current at
+     creation time, so a handle created after a VACUUM is live, not stale. *)
+  let cohort =
+    match cohort with
+    | Some c -> c
+    | None -> { vacuum_generation = 0 }
+  in
   let db =
     { store
     ; catalog
+    ; cohort
+    ; handle_generation = cohort.vacuum_generation
     ; clock
     ; explicit_txn = None
     ; txn_poisoned = false
@@ -349,6 +438,7 @@ let of_store ?clock ?durability ?file_path ?rowid_counters store =
     ; rv_pending = Hashtbl.create 4
     ; rv_refreshing = false
     ; rv_resync = false
+    ; txn_scope = None
     }
   in
   (* #427: reconstruct reactive-view registry (parse defs, rebuild delta engine
@@ -393,7 +483,11 @@ let close t =
   let attached_subs = Hashtbl.fold (fun _ sub acc -> sub :: acc) t.attached [] in
   let* () = Lwt_list.iter_s (fun sub -> S.close sub.store) attached_subs in
   Hashtbl.clear t.attached;
-  S.close t.store
+  (* #634: closing a handle invalidated by VACUUM must not close its store a
+     second time — VACUUM already did, and the teardown touches the (now closed)
+     pager/WAL fds.  Releasing the handle is still the right and only thing a
+     caller can do with it, so [close] succeeds rather than raising. *)
+  if is_stale t then Lwt.return_unit else S.close t.store
 ;;
 
 (* #589: the worker gets a fresh catalog — that is what makes DDL on one handle
@@ -401,10 +495,24 @@ let close t =
    catalogs sit over one [Store.t] and therefore over one set of data trees, and
    two counters over one tree hand the same rowid out twice: the second write
    silently overwrites the first (and, on a [TEXT PRIMARY KEY] table, leaves the
-   index pointing at the wrong row).  Sharing the allocator is the whole fix. *)
+   index pointing at the wrong row).  Sharing the allocator is the whole fix.
+
+   #633: that sharing is no longer this function's doing — the allocator hangs
+   off [Store.t], so naming the same store IS sharing it.  This call site is
+   therefore no longer special, and neither is any future one. *)
 let create_worker_handle t =
   let* () = Lwt.return_unit in
-  of_store ~rowid_counters:(Cat.rowid_counters t.catalog) t.store
+  (* #634: deriving a worker from a handle a sibling's VACUUM already killed
+     would produce a second handle over the same closed store.  Raise (as
+     {!vacuum} does) rather than hand one back. *)
+  if is_stale t
+  then Lwt.fail_with stale_msg
+  else
+    (* #634: join the parent's cohort so a later VACUUM on either handle
+       invalidates the other loudly instead of leaving it over a closed store.
+       #633: the rowid allocator is no longer passed here — it hangs off
+       [Store.t], so naming the same store already shares it. *)
+    of_store ~cohort:t.cohort t.store
 ;;
 
 let wal_sync_count t = S.wal_sync_count t.store
@@ -421,6 +529,13 @@ let tree_of_table t name =
 ;;
 
 let catalog t = t.catalog
+
+(* #634: this handle's cohort, to pass to {!of_store} for a second handle over
+   the SAME store so a VACUUM on either invalidates the other loudly.
+   {!create_worker_handle} does this for you; a caller reaching for [of_store]
+   over an already-open store owes it by hand, exactly as it owes
+   [~rowid_counters] (#589). *)
+let cohort t = t.cohort
 
 (* ------------------------------------------------------------------ *)
 (* VACUUM (#120)                                                       *)
@@ -473,34 +588,39 @@ let copy_all_trees ~src ~dst ~tids =
    caller MUST swap its [store]/[catalog] references to the freshly opened
    destination. *)
 let vacuum t : unit Lwt.t =
-  match t.file_path with
-  | None -> Lwt.fail_with "VACUUM: only supported on file-backed databases"
-  | Some path ->
-    if t.explicit_txn <> None
-    then Lwt.fail_with "VACUUM cannot run inside an explicit transaction"
-    else (
-      match !file_provider_ref with
-      | None ->
-        Lwt.fail_with
-          "VACUUM requires a file provider; link granary.unix and call \
-           Db.set_file_provider"
-      | Some prov ->
-        let tmp_path = path ^ ".vacuum-tmp" in
-        prov.remove_file tmp_path;
-        prov.remove_file (tmp_path ^ "-wal");
-        (* Rebuild at the source's geometry so a non-default page_size /
+  (* #634: a handle a sibling's VACUUM already invalidated cannot run one — its
+     store is closed and its [file_path] names a file it no longer owns. *)
+  if is_stale t
+  then Lwt.fail_with stale_msg
+  else (
+    match t.file_path with
+    | None -> Lwt.fail_with "VACUUM: only supported on file-backed databases"
+    | Some path ->
+      if t.explicit_txn <> None
+      then Lwt.fail_with "VACUUM cannot run inside an explicit transaction"
+      else (
+        match !file_provider_ref with
+        | None ->
+          Lwt.fail_with
+            "VACUUM requires a file provider; link granary.unix and call \
+             Db.set_file_provider"
+        | Some prov ->
+          let tmp_path = path ^ ".vacuum-tmp" in
+          prov.remove_file tmp_path;
+          prov.remove_file (tmp_path ^ "-wal");
+          (* Rebuild at the source's geometry so a non-default page_size /
            reserved-bytes choice survives the vacuum (#176). *)
-        let geom = S.geometry t.store in
-        let* dst_r = prov.open_store ~geom ~path:tmp_path () in
-        (match dst_r with
-         | Error e ->
-           let msg = Format.asprintf "VACUUM open tmp: %a" S.pp_error e in
-           Lwt.fail_with msg
-         | Ok dst ->
-           let* tids = S.list_tree_ids t.store in
-           let* () = copy_all_trees ~src:t.store ~dst ~tids in
-           let* () = S.close dst in
-           (* #412: preserve the as-of CAPABILITY across VACUUM.  Compaction
+          let geom = S.geometry t.store in
+          let* dst_r = prov.open_store ~geom ~path:tmp_path () in
+          (match dst_r with
+           | Error e ->
+             let msg = Format.asprintf "VACUUM open tmp: %a" S.pp_error e in
+             Lwt.fail_with msg
+           | Ok dst ->
+             let* tids = S.list_tree_ids t.store in
+             let* () = copy_all_trees ~src:t.store ~dst ~tids in
+             let* () = S.close dst in
+             (* #412: preserve the as-of CAPABILITY across VACUUM.  Compaction
               drops the pre-VACUUM roots, so the existing [<path>.aslog] (which
               records now-invalid root pages) must be discarded — appending to it
               would yield a non-monotonic log whose old targets resolve to garbage
@@ -508,29 +628,48 @@ let vacuum t : unit Lwt.t =
               the stale log below, and reopen with the sink enabled so recording
               continues fresh.  The rebuild target [dst] deliberately ran WITHOUT
               history (no orphaned [tmp_path.aslog]). *)
-           let had_history = S.history_enabled t.store in
-           let* () = S.close t.store in
-           (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
-           prov.remove_file (path ^ "-wal");
-           (* Stale as-of log: its roots predate compaction (see above). *)
-           prov.remove_file (path ^ ".aslog");
-           prov.rename_file tmp_path path;
-           let* new_store_r = prov.open_store ~as_of_history:had_history ~path () in
-           (match new_store_r with
-            | Error e ->
-              let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
-              Lwt.fail_with msg
-            | Ok new_store ->
-              let* new_catalog = Cat.open_ new_store in
-              (* Load persisted columnar data into the fresh catalog. *)
-              let* () = Cat.load_columnar_stores new_catalog new_store in
-              t.store <- new_store;
-              t.catalog <- new_catalog;
-              Hashtbl.clear t.views;
-              let* () = load_views_into_hashtbl new_store t.views in
-              Hashtbl.clear t.triggers;
-              let* () = load_triggers_into_hashtbl new_store t.triggers in
-              Lwt.return_unit)))
+             let had_history = S.history_enabled t.store in
+             let* () = S.close t.store in
+             (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
+             prov.remove_file (path ^ "-wal");
+             (* Stale as-of log: its roots predate compaction (see above). *)
+             prov.remove_file (path ^ ".aslog");
+             prov.rename_file tmp_path path;
+             let* new_store_r = prov.open_store ~as_of_history:had_history ~path () in
+             (match new_store_r with
+              | Error e ->
+                let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
+                Lwt.fail_with msg
+              | Ok new_store ->
+                (* #634: the fresh catalog deliberately gets FRESH rowid counters
+                 (no [?rowid_counters]).  It must: the counters the old catalog
+                 held describe the pre-VACUUM file, and this one is re-seeded
+                 from the rebuilt file — for a plain rowid table by rescanning
+                 the copied data tree, for an AUTOINCREMENT table from the
+                 [_sys_tables] row the copy carried over.  VACUUM preserves tree
+                 ids ([copy_all_trees] writes each tid to the same tid), so the
+                 "counters are keyed by tree id" invariant (#589) is not
+                 disturbed; the counters are replaced wholesale rather than
+                 remapped.  What the fresh table does NOT do is reach the
+                 sibling handles that still hold the old one — which is exactly
+                 why they must be invalidated below rather than left running. *)
+                let* new_catalog = Cat.open_ new_store in
+                (* Load persisted columnar data into the fresh catalog. *)
+                let* () = Cat.load_columnar_stores new_catalog new_store in
+                t.store <- new_store;
+                t.catalog <- new_catalog;
+                (* #634: bump the shared cohort and re-stamp ONLY this handle.
+                 Every sibling handle over the store just closed is now stale
+                 and every statement on it is refused with [stale_msg].  Done
+                 after the swap so a VACUUM that failed part-way leaves the
+                 cohort untouched. *)
+                t.cohort.vacuum_generation <- t.cohort.vacuum_generation + 1;
+                t.handle_generation <- t.cohort.vacuum_generation;
+                Hashtbl.clear t.views;
+                let* () = load_views_into_hashtbl new_store t.views in
+                Hashtbl.clear t.triggers;
+                let* () = load_triggers_into_hashtbl new_store t.triggers in
+                Lwt.return_unit))))
 ;;
 
 let parse sql =
@@ -652,6 +791,16 @@ let transaction_poisoned t =
   is_poisoned t || Hashtbl.fold (fun _ sub acc -> acc || is_poisoned sub) t.attached false
 ;;
 
+(** #634: whether ANY handle reachable from this one — the top-level handle or
+    any ATTACHed schema — has been invalidated by a VACUUM run on a sibling
+    handle over the same store.  Mirrors {!transaction_poisoned}'s fold for the
+    same reason: each ATTACHed schema is its own [Db.t] with its own store and
+    its own cohort, so checking only the top-level handle would answer [false]
+    for a connection whose "aux" is dead. *)
+let stale_after_vacuum t =
+  is_stale t || Hashtbl.fold (fun _ sub acc -> acc || is_stale sub) t.attached false
+;;
+
 (* #598: whether ANY schema reachable from this handle has an explicit
    transaction open.  Under ATTACH each schema is its own [Db.t] with its own
    slot, so a connection legitimately holds several at once and the question
@@ -698,6 +847,13 @@ let begin_txn t =
        already cleared by every commit/rollback path; this just hardens it.) *)
     Cat.commit_schema_changes t.catalog;
     t.explicit_txn <- Some tx;
+    (* #585: a transaction opened here has NO owner until someone stamps one.
+       [with_transaction] assigns its token immediately after this returns, so
+       clearing here is invisible to it — but for a bare BEGIN it is what stops a
+       previous scope's token from surviving into a transaction that is not that
+       scope's.  Without this the #584 boundary guard false-matches and commits
+       the new transaction on the old scope's behalf. *)
+    t.txn_scope <- None;
     Lwt.return (Ok ())
 ;;
 
@@ -721,6 +877,11 @@ let force_rollback_txn t tx =
      correct after a full rollback. *)
   let* () = Cat.load_columnar_stores t.catalog t.store in
   t.explicit_txn <- None;
+  (* #585: the transaction this token named no longer exists.  Kept adjacent to
+     the [explicit_txn] reset on purpose — the token is only meaningful while the
+     slot holds the transaction it was minted for, so the two must always be
+     cleared together or the boundary guard starts matching a dead token. *)
+  t.txn_scope <- None;
   t.savepoint_names <- [];
   t.auto_began <- false;
   Cat.clear_pending_fk_checks t.catalog;
@@ -824,6 +985,8 @@ let commit_txn t =
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
          t.explicit_txn <- None;
+         (* #585: cleared with the slot — see [force_rollback_txn]. *)
+         t.txn_scope <- None;
          t.savepoint_names <- [];
          t.auto_began <- false;
          Cat.set_defer_fks_pragma t.catalog false;
@@ -849,6 +1012,11 @@ let rollback_txn t =
   t.txn_poisoned <- false;
   match t.explicit_txn with
   | None ->
+    (* #585: no transaction left, so no owner either.  The [Some] arm below
+       clears it through [force_rollback_txn]; this arm covers the degenerate
+       poison-with-no-transaction case so no path out of [ROLLBACK] can leave a
+       token behind. *)
+    t.txn_scope <- None;
     if was_poisoned
     then Lwt.return (Ok ())
     else Lwt.return (Error (Runtime "no active transaction"))
@@ -872,6 +1040,10 @@ let savepoint_txn t name =
          savepoint transaction never inherits a prior transaction's state. *)
       Cat.commit_schema_changes t.catalog;
       t.explicit_txn <- Some tx;
+      (* #585: an auto-begun transaction has no owner — same reasoning as
+         [begin_txn]'s [None] arm.  Only reachable when the slot was empty, so
+         it cannot be clearing a live scope's token. *)
+      t.txn_scope <- None;
       t.auto_began <- true;
       Lwt.return tx
   in
@@ -921,6 +1093,8 @@ let release_savepoint t name =
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;
         t.explicit_txn <- None;
+        (* #585: cleared with the slot — see [force_rollback_txn]. *)
+        t.txn_scope <- None;
         t.auto_began <- false;
         Lwt.return (Ok ()))
     else Lwt.return (Ok ())
@@ -998,6 +1172,7 @@ let rec map_expr f e =
   | Sql.Ast.E_in (x, vs) -> Sql.Ast.E_in (go x, List.map go vs)
   | Sql.Ast.E_func (fn, args) -> Sql.Ast.E_func (fn, List.map go args)
   | Sql.Ast.E_agg (fn, arg) -> Sql.Ast.E_agg (fn, Option.map go arg)
+  | Sql.Ast.E_agg_distinct (fn, arg) -> Sql.Ast.E_agg_distinct (fn, go arg)
   | Sql.Ast.E_case { scrutinee; branches; else_ } ->
     Sql.Ast.E_case
       { scrutinee = Option.map go scrutinee
@@ -1662,6 +1837,15 @@ let rv_owned_table top tbl =
    latter maps the [unit] result to a [0] change count. *)
 let execute_control_op top t sql op =
   match op with
+  (* #634: checked ABOVE the ROLLBACK exemption, unlike #555's poison.  A
+     poisoned handle is recoverable and ROLLBACK is the recovery; a handle
+     invalidated by a sibling's VACUUM is not — its store is closed and its
+     transaction, if any, died with the file.  Letting ROLLBACK through would
+     drive [S.rollback] into a closed store to no purpose.  Both the routed
+     handle and the top-level one are tested: the caller holds [top], and a
+     statement routed to a live ATTACHed schema off a dead main would otherwise
+     look healthy. *)
+  | _ when is_stale t || is_stale top -> Some (Lwt.return (Error (Runtime stale_msg)))
   (* #555: ROLLBACK is checked first so it stays reachable on a poisoned
      connection — it is the defined way to clear the poison. *)
   | Sql.Plan.Op_rollback -> Some (rollback_txn t)
@@ -2020,6 +2204,10 @@ let execute_core top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   match op with
+  (* #634: ahead of everything, including the INSTEAD OF path below, which
+     bypasses [execute_control_op] and would otherwise run a trigger body's
+     statements against a closed store. *)
+  | _ when is_stale t || is_stale top -> Lwt.return (Error (Runtime stale_msg))
   (* #555 (F4): checked ahead of the [Error] branches so a malformed statement on
      a poisoned handle reports the poison rather than a parse error — [query_impl]
      orders it the same way, and the two disagreeing was gratuitous.  Scoped to
@@ -2047,6 +2235,8 @@ let execute_change_count_core top sql =
     | Error e -> Lwt.return (Error e)
   in
   match op with
+  (* #634: same ordering as [execute_core]. *)
+  | _ when is_stale t || is_stale top -> Lwt.return (Error (Runtime stale_msg))
   (* #555 (F4): same ordering as [execute_core]. *)
   | Error _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
   | Error (Sema (Sql.Sema.Unknown_table view_name)) when Hashtbl.mem t.views view_name ->
@@ -2100,6 +2290,136 @@ let drive_reactive top ~core =
 
 let execute top sql = drive_reactive top ~core:(fun () -> execute_core top sql)
 
+(* ------------------------------------------------------------------ *)
+(* #585: scoped transactions                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* #585: a re-entrant [with_transaction] from inside its own extent.  Refused,
+   NOT turned into a savepoint and NOT joined onto the outer transaction — see
+   the .mli for why either of those would have to lie to the inner caller.
+
+   This is the one case the owner token lets the engine answer precisely, and it
+   is answered WITHOUT poisoning: the token proves the caller is the fiber that
+   opened the outer transaction, so there is no cross-fiber contamination to
+   contain and no reason to doom work that is provably the caller's own. *)
+let nested_txn_msg =
+  "Db.with_transaction refused: this fiber is already inside a with_transaction scope on \
+   this handle (#585).  Nesting is deliberately not supported - it cannot be a savepoint \
+   (the inner scope would RELEASE rather than commit, so returning from it would not \
+   mean durable) and it cannot join the outer transaction (the inner scope's rollback \
+   would abort the OUTER transaction while returning to code that believes only its own \
+   work was undone).  Use SAVEPOINT / RELEASE / ROLLBACK TO explicitly if a partial undo \
+   point is what you want.  Nothing was rolled back, the outer transaction is intact and \
+   this handle is NOT poisoned."
+;;
+
+(* #585: the scope's transaction is no longer the one in the handle's slot.
+   Reachable through #584: another fiber's ROLLBACK aborted this scope's
+   transaction, after which the slot was either left empty or refilled by that
+   fiber's own BEGIN.  Neither COMMIT nor ROLLBACK is issued here — both would
+   act on state that is no longer this scope's, which is precisely the
+   contamination #584 describes.
+
+   The guard only works because the token is invalidated by every path that ends
+   a transaction, not just by this combinator's own exit: [begin_txn] and
+   [savepoint_txn]'s auto-begin clear it when they fill the slot, and
+   [force_rollback_txn], [commit_txn], [rollback_txn] and [release_savepoint]'s
+   auto-commit clear it when they empty it.  Before those clears existed the
+   token outlived its transaction, so [Some 1 = Some 1] matched a slot holding
+   somebody else's transaction and this scope cheerfully COMMITted it — #584
+   verbatim, with an [Ok] returned to the caller. *)
+let stolen_txn_msg =
+  "Db.with_transaction: the transaction this scope opened is gone - another fiber's \
+   ROLLBACK aborted it, and the handle's transaction slot is now either empty or holding \
+   a different transaction (#584).  This scope's writes are lost.  Neither COMMIT nor \
+   ROLLBACK was issued, because either would have acted on state that is no longer this \
+   scope's.  Give each fiber its own handle with Db.create_worker_handle."
+;;
+
+(* #585: the handle whose transaction slot a scope's BEGIN actually lands in.
+   Under ATTACH that is the active schema's sub-handle, not the top-level handle
+   the caller holds — and it is the sub-handle whose [txn_scope] the
+   begin/commit/rollback paths clear, so the token must be stamped and checked
+   there or the guard reads a field nothing maintains.  Stable for the scope's
+   whole extent: since #598 a [PRAGMA active_database] switch is refused while
+   any schema holds a transaction. *)
+let scope_handle t = active_handle t
+
+(* Drop the token only if it is still ours: a scope that was displaced (#584)
+   must not clear the token of the transaction that displaced it. *)
+let clear_txn_scope owner token =
+  if owner.txn_scope = Some token then owner.txn_scope <- None
+;;
+
+let in_transaction_scope t =
+  match (scope_handle t).txn_scope, Lwt.get txn_scope_key with
+  | Some held, Some tok -> Int.equal held tok
+  | _, _ -> false
+;;
+
+let owns_txn_scope owner token = owner.txn_scope = Some token
+
+(* Success arm: COMMIT, then release the scope.  A COMMIT error is reported as
+   [Error] and no compensating ROLLBACK is issued — [commit_txn] already rolls
+   back the arms that leave the transaction uncommittable (#286 in-txn DDL,
+   deferred-FK violation), and on a poisoned handle (#555) ROLLBACK is the
+   caller's prescribed single exit, not this combinator's to take on their
+   behalf. *)
+let scoped_commit t owner token v =
+  if not (owns_txn_scope owner token)
+  then Lwt.return (Error (Runtime stolen_txn_msg))
+  else
+    let* cr = execute t "COMMIT" in
+    clear_txn_scope owner token;
+    match cr with
+    | Ok () -> Lwt.return (Ok v)
+    | Error e -> Lwt.return (Error e)
+;;
+
+(* Failure arm: ROLLBACK, release the scope, re-raise the original exception.
+   The ROLLBACK's own result is discarded on purpose — the exception the body
+   raised is the interesting one, and swallowing it to report a rollback error
+   would hide the cause.  Skipped entirely when the scope was displaced (#584):
+   there is nothing of ours left to roll back and the statement would abort
+   whatever replaced it. *)
+let scoped_rollback t owner token exn =
+  if not (owns_txn_scope owner token)
+  then Lwt.fail exn
+  else
+    let* _ = execute t "ROLLBACK" in
+    clear_txn_scope owner token;
+    Lwt.fail exn
+;;
+
+let run_txn_scope t owner token body =
+  Lwt.catch
+    (fun () ->
+       let* v = Lwt.with_value txn_scope_key (Some token) (fun () -> body t) in
+       scoped_commit t owner token v)
+    (fun exn -> scoped_rollback t owner token exn)
+;;
+
+let with_transaction t body =
+  if in_transaction_scope t
+  then Lwt.return (Error (Runtime nested_txn_msg))
+  else
+    let* r = execute t "BEGIN" in
+    match r with
+    (* The BEGIN failed.  Nothing was opened, so nothing is rolled back — and
+       critically, if it failed because the handle already held a transaction
+       then #555 has just poisoned it, and ROLLBACK is the caller's sole exit.
+       Issuing one here would make this combinator a second exit. *)
+    | Error e -> Lwt.return (Error e)
+    | Ok () ->
+      incr txn_scope_counter;
+      let token = !txn_scope_counter in
+      (* Stamped AFTER the BEGIN, which clears the slot's token as it fills it —
+         so this is the re-stamp that makes the scope the owner. *)
+      let owner = scope_handle t in
+      owner.txn_scope <- Some token;
+      run_txn_scope t owner token body
+;;
+
 let execute_change_count top sql =
   drive_reactive top ~core:(fun () -> execute_change_count_core top sql)
 ;;
@@ -2139,6 +2459,10 @@ let query_impl ?stats ?mode top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   match op with
+  (* #634: a read on a handle invalidated by a sibling's VACUUM would descend
+     into the CLOSED pre-VACUUM store, or (for the canned control ops) answer
+     from counters describing a file that no longer exists. *)
+  | _ when is_stale t || is_stale top -> Lwt.return (Error (Runtime stale_msg))
   (* #555: a read on a poisoned handle would resolve [In_txn] from the
      transaction that won the BEGIN race and see its uncommitted writes.  Reject
      it — there is no ROLLBACK to exempt on the read path. *)
@@ -2191,11 +2515,25 @@ let query_impl ?stats ?mode top sql =
          | None -> Sql.Exec.Auto
          | Some tx -> Sql.Exec.In_txn tx)
     in
-    (match Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op with
-     | exception Failure msg -> Lwt.return (Error (Runtime msg))
-     | lwt_stream ->
-       let* stream = lwt_stream in
-       Lwt.return (Ok stream))
+    (* #627: a post-plan refusal (#558's [agg_subquery_refusal], #592's
+       [correlated_filter_refusal], #566's outer-join ON raise) is spelled
+       [Lwt.fail_with] / [failwith] *inside* an Lwt callback, so it arrives as a
+       REJECTED PROMISE, not a synchronous exception.  The old
+       [| exception Failure msg ->] arm only saw the synchronous spelling, so
+       every one of those refusals sailed past it and escaped [Db.query] as a
+       raw [Failure] — a caller matching [Ok _ | Error _] got an unhandled
+       exception instead of the [Error] branch.  [Lwt.catch] covers both
+       spellings ([Sql.Exec.query] is applied inside the thunk, so a synchronous
+       raise during plan-to-stream construction is caught too), which is exactly
+       the shape [iter_impl] and [run_core] already use.  Non-[Failure]
+       exceptions still propagate unchanged. *)
+    Lwt.catch
+      (fun () ->
+         let* stream = Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op in
+         Lwt.return (Ok stream))
+      (function
+        | Failure msg -> Lwt.return (Error (Runtime msg))
+        | exn -> Lwt.fail exn)
 ;;
 
 let query top sql = query_impl top sql
@@ -2264,6 +2602,10 @@ let query_as_of top (target : Granary_store.History.target) sql =
           transaction is stuck is legitimate, and is arguably the most useful
           thing to be able to do at that moment.  Not an oversight. *)
        match op with
+       (* #634: it IS gated on staleness, though — unlike a poisoned handle, a
+          stale one's store is closed and VACUUM deleted the [.aslog] whose roots
+          this snapshot would resolve against. *)
+       | _ when is_stale t || is_stale top -> Lwt.return (Error (Runtime stale_msg))
        | Error e -> Lwt.return (Error e)
        | Ok op ->
          let* ro = S.ro_begin_as_of t.store target in
@@ -2308,7 +2650,17 @@ let query_as_of top (target : Granary_store.History.target) sql =
                 Lwt.return (Ok wrapped))
            (fun exn ->
               let* () = end_ro () in
-              Lwt.fail exn))
+              match exn with
+              (* #627: same hole as [query_impl] — the [| exception Failure msg ->]
+                 arm above only catches the synchronous spelling, so a post-plan
+                 refusal (a rejected promise) reached this handler and was
+                 re-raised out of [query_as_of].  Map it to the same
+                 [Error (Runtime msg)] the synchronous arm produces; the snapshot
+                 has already been ended by the idempotent [end_ro] above.
+                 [S.History_error] is not a [Failure], so the outer handler's
+                 [History_unavailable] / [History_pruned] mapping is untouched. *)
+              | Failure msg -> Lwt.return (Error (Runtime msg))
+              | exn -> Lwt.fail exn))
     (function
       | S.History_error S.History_unavailable -> Lwt.return (Error History_unavailable)
       | S.History_error S.History_pruned -> Lwt.return (Error History_pruned)
@@ -2348,16 +2700,21 @@ let query_columns top sql =
 (* ------------------------------------------------------------------ *)
 
 let prepare top sql =
-  match parse sql with
-  | Error e -> Lwt.return (Error e)
-  | Ok ast ->
-    let t = resolve_target_ast top ast in
-    let* bound = Sql.Sema.bind_returning_params ~views:t.views t.catalog ast in
-    (match bound with
-     | Error e -> Lwt.return (Error (Sema e))
-     | Ok (b, names) ->
-       let plan = Sql.Planner.plan ~cat:t.catalog b in
-       Lwt.return (Ok { db_ref = t; plan; param_names = names; finalized = false }))
+  (* #634: fail at prepare rather than handing back a statement whose [db_ref]
+     is already dead. *)
+  if is_stale top
+  then Lwt.return (Error (Runtime stale_msg))
+  else (
+    match parse sql with
+    | Error e -> Lwt.return (Error e)
+    | Ok ast ->
+      let t = resolve_target_ast top ast in
+      let* bound = Sql.Sema.bind_returning_params ~views:t.views t.catalog ast in
+      (match bound with
+       | Error e -> Lwt.return (Error (Sema e))
+       | Ok (b, names) ->
+         let plan = Sql.Planner.plan ~cat:t.catalog b in
+         Lwt.return (Ok { db_ref = t; plan; param_names = names; finalized = false })))
 ;;
 
 let param_slot st name = List.assoc_opt name st.param_names
@@ -2377,6 +2734,14 @@ let params_of_named st named =
 let run_core st ~params =
   if st.finalized
   then Lwt.return (Error (Runtime "statement already finalized"))
+  else if
+    (* #634: a statement prepared before a sibling's VACUUM holds [db_ref] to a
+       handle over the closed store, and its plan embeds [table_meta] from the
+       pre-VACUUM catalog.  Refuse it — the db.mli note that prepared statements
+       "continue to work logically" across VACUUM is true only for statements
+       prepared on the handle that RAN the vacuum. *)
+    is_stale st.db_ref
+  then Lwt.return (Error (Runtime stale_msg))
   else if
     (* #555: a prepared write resolves its mode from [explicit_txn] just like a
              one-shot statement, so it is exposed to the same contamination.
@@ -2476,6 +2841,11 @@ let run_with_dirty st ~params =
 let iter_impl ?stats st ~params =
   if st.finalized
   then Lwt.return (Error (Runtime "statement already finalized"))
+  else if
+    (* #634: as in [run_core] — a statement prepared before a sibling's VACUUM
+       would read from the closed pre-VACUUM store. *)
+    is_stale st.db_ref
+  then Lwt.return (Error (Runtime stale_msg))
   else if
     (* #555: as in [run_core] — the mode below is resolved from
              [explicit_txn], which on a poisoned handle is somebody else's. *)

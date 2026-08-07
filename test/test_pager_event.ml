@@ -132,6 +132,7 @@ let attach_mock_wal p ~page_id ~frame_idx =
        ; wal_append_commit = unused_commit
        ; wal_append_commit_no_sync = unused_commit
        ; wal_sync = (fun () -> Lwt.return_ok ())
+       ; wal_epoch = (fun () -> 0L)
        })
 ;;
 

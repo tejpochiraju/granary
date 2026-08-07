@@ -489,7 +489,37 @@ let parallel_run st ~n_commits ~n_readers ~read_ops =
   Lwt.return (!writer_done, !reader_done)
 ;;
 
-let path = "/tmp/granary_bench_fsync_overlap.db"
+(* The database this bench writes, drawn PER PROCESS (#628).
+
+   It used to be the fixed constant [/tmp/granary_bench_fsync_overlap.db], and
+   CLAUDE.md states plainly that sibling agents run suites in parallel on this
+   box as normal practice — the gates' own troubleshooting advice is to check
+   [uptime] first for exactly that reason.  So the documented normal working
+   mode was the one that corrupted this bench's input: two runs shared one
+   database and overwrote each other's mid-measurement.  A reviewer hit it
+   during the review of PR #608, losing two measurements before working out why.
+
+   The failure is badly shaped for diagnosis, which is why it is worth more than
+   a one-line fix: it does not error, it produces a WRONG TIMING, which then
+   reads as either a flaky gate or a genuine regression.  That is #549's
+   category — a gate people learn to distrust — and the same class as the shared
+   scratchpad collision CLAUDE.md documents at length.  A fixed name in a shared
+   namespace is the pattern; [refs/stash] and this were two instances.
+
+   [Filename.temp_file] rather than a pid, following [bench_slow_read_yield],
+   which already did this: a pid is reused, and a crashed predecessor would hand
+   its successor the same collision.  The file is unlinked immediately because
+   the store creates it; [at_exit] removes both it and its WAL sidecar, so a
+   full suite run does not leave a trail behind. *)
+let fresh_db_path () =
+  let f = Filename.temp_file "granary_bench_fsync_overlap" ".db" in
+  (try Unix.unlink f with
+   | _ -> ());
+  f
+;;
+
+let path = fresh_db_path ()
+let () = at_exit (fun () -> cleanup path)
 
 type config_result =
   { wall : float
@@ -1822,8 +1852,31 @@ let early_exit_stops_only_on_a_pass () =
     ]
 ;;
 
+(* #628: the database path must be drawn per run, not shared.  Two concurrent
+   suite runs on this box is the DOCUMENTED normal working mode, and a shared
+   path corrupts the input silently — the run still completes and reports a
+   number no configuration actually produced.  Cheap to pin, and the pin is what
+   stops the constant coming back as a "simplification". *)
+let the_db_path_is_drawn_per_run () =
+  Alcotest.(check bool)
+    "not the fixed shared name #628 was about"
+    false
+    (String.equal path "/tmp/granary_bench_fsync_overlap.db");
+  let a = fresh_db_path () in
+  let b = fresh_db_path () in
+  Alcotest.(check bool) "two draws differ" false (String.equal a b);
+  Alcotest.(check bool)
+    "this run's path is not a name another run would draw"
+    false
+    (String.equal path a)
+;;
+
 let statistics_tests =
   [ Alcotest.test_case
+      "the db path is drawn per run (#628)"
+      `Quick
+      the_db_path_is_drawn_per_run
+  ; Alcotest.test_case
       "composed speedup is a trial's own (#603)"
       `Quick
       composed_speedup_must_be_a_trials_own

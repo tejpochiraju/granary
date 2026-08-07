@@ -23,6 +23,18 @@
    installed, so this runs — and must run — even where those benchmarks are
    not built. *)
 
+(* sqlite3-policy: names-only — this test NAMES the bindings' module as a bare
+   word, in string literals, because [test_binding_module_is_unsplit_in_the_
+   source] pins the lint's binding line as SOURCE TEXT and cannot do that
+   without spelling the name.  It links nothing: the module never appears as a
+   qualifier here, only as data.
+
+   The entry in SQLITE3_NAMES_ONLY_ALLOWLIST is new in #621, and the file did
+   not change to earn it — the guard did.  Its pattern was the fixed string
+   `Sqlite3.` WITH THE DOT, which missed every mention below along with `open
+   Sqlite3` and `module S = Sqlite3` in real code; widening it to the whole word
+   is what brought this honest naming into view. *)
+
 module L = Granary_tpc.Tpc_keepalive_lint
 
 let show findings =
@@ -271,6 +283,125 @@ let test_unterminated_quoted_string_masks_to_end () =
   Alcotest.(check int) "no findings" 0 (List.length (L.check ~file:"x.ml" s))
 ;;
 
+(* --- literals INSIDE comments (#625) ---------------------------------- *)
+
+(* OCaml's lexer reads string, quoted-string and char literals inside comments,
+   so a star-paren sitting inside one does NOT end the comment.  [mask_non_code]
+   counted depth without interpreting those bytes: it closed the comment at the
+   quoted star-paren, and the depth bookkeeping was off by one from there to the
+   end of the file — masking (or unmasking) everything after it.  That is the
+   same shape as #602 and the original paren-star bug, and the same failure
+   mode: a lint that quietly reports nothing.
+
+   EVERY FIXTURE BELOW IS BUILT AS DATA rather than written into a comment, for
+   the reason [test_unterminated_ordinary_string_does_not_raise] gives above:
+   this file is OCaml too, and its own lexer would read the literal back out of
+   any comment we wrote it into.
+
+   The fix is bounded rather than a straight port of the lexer's rule, because
+   [check] also runs over MUTATED text ([without_keep_alive] deletes whole
+   lines) which need not compile — so each fixture whose literal does NOT close
+   pins the FALLBACK, and would fail against a naive "always skip the literal"
+   fix just as surely as against the unfixed masker. *)
+
+let quote = "\""
+
+let test_a_string_in_a_comment_does_not_end_the_comment () =
+  (* The issue's own case: a comment whose prose quotes a star-paren.  Before
+     #625 the comment closed at the quoted star-paren, the trailing real one
+     re-opened nothing, and the quote after it opened a string that swallowed
+     the rest of the file — so the call below went unreported. *)
+  let s =
+    Printf.sprintf
+      "(* the closer is spelled %s*)%s in the stub *)\nlet go s = %s.finalize s\n"
+      quote
+      quote
+      L.binding_module
+  in
+  Alcotest.(check int) "line" 2 (one_finding ~file:"x.ml" s).L.line
+;;
+
+let test_a_string_in_a_comment_is_still_not_code () =
+  (* The converse of the case above: honouring the literal must not UNMASK it.
+     Prose quoting the call is prose. *)
+  let s =
+    Printf.sprintf
+      "(* the stub says %s%s.finalize s%s *)\nlet x = 1\n"
+      quote
+      L.binding_module
+      quote
+  in
+  Alcotest.(check int) "no findings" 0 (List.length (L.check ~file:"x.ml" s))
+;;
+
+let test_an_orphan_quote_in_a_comment_does_not_swallow_the_file () =
+  (* Mutated input: a deleted line can leave a comment holding one unpaired
+     quote, which the compiler would reject and this lint must survive.  The
+     quote has no partner on its line, so the masker falls back to blanking it
+     and the comment still ends at its star-paren.  A naive skip-the-string fix
+     runs to end of file here and reports nothing. *)
+  let s =
+    Printf.sprintf
+      "(* a 6%s wafer, which the compiler would refuse *)\nlet go s = %s.finalize s\n"
+      quote
+      L.binding_module
+  in
+  Alcotest.(check int) "line" 2 (one_finding ~file:"x.ml" s).L.line
+;;
+
+let test_a_quoted_string_in_a_comment_does_not_open_a_comment () =
+  (* A commented-out line of the benchmarks' own SQL: COUNT of star-in-parens
+     inside {|...|}.  Unhonoured, its paren-star opened a nested comment that
+     the following star-paren did not balance, and the file stayed masked. *)
+  let s =
+    Printf.sprintf
+      "(* the SQL was {|SELECT COUNT(*) FROM t|} in v1 *)\nlet go s = %s.finalize s\n"
+      L.binding_module
+  in
+  Alcotest.(check int) "line" 2 (one_finding ~file:"x.ml" s).L.line
+;;
+
+let test_an_unclosed_quoted_string_in_a_comment_falls_back () =
+  (* The quoted-string half of the fallback: no matching closer anywhere in the
+     remaining text, so the opener is treated as an ordinary comment byte rather
+     than masking to end of file. *)
+  let s =
+    Printf.sprintf "(* see {|unclosed *)\nlet go s = %s.finalize s\n" L.binding_module
+  in
+  Alcotest.(check int) "line" 2 (one_finding ~file:"x.ml" s).L.line
+;;
+
+let test_a_char_literal_in_a_comment_opens_no_string () =
+  (* A comment naming the double-quote CHARACTER, then a string quoting a
+     star-paren.  Without char literals being skipped the first quote pairs with
+     the wrong partner, the parity flips, and the file is masked from there —
+     which is why OCaml's lexer reads char literals inside comments too. *)
+  let s =
+    Printf.sprintf
+      "(* the char '%s' and the closer %s*)%s *)\nlet go s = %s.finalize s\n"
+      quote
+      quote
+      quote
+      L.binding_module
+  in
+  Alcotest.(check int) "line" 2 (one_finding ~file:"x.ml" s).L.line
+;;
+
+let test_comment_literals_preserve_offsets () =
+  let s =
+    Printf.sprintf
+      "(* a %s*)%s\n   b *)\nlet go s = %s.finalize s\n"
+      quote
+      quote
+      L.binding_module
+  in
+  Alcotest.(check int)
+    "length preserved"
+    (String.length s)
+    (String.length (L.mask_non_code s));
+  Alcotest.(check int) "line" 3 (one_finding ~file:"x.ml" s).L.line
+;;
+
 (* --- #605: the name is one literal, in the SOURCE ---------------------- *)
 
 let test_binding_module_value () =
@@ -398,6 +529,36 @@ let () =
             "unterminated ordinary"
             `Quick
             test_unterminated_ordinary_string_does_not_raise
+        ] )
+    ; ( "literals inside comments (#625)"
+      , [ Alcotest.test_case
+            "a string does not end the comment"
+            `Quick
+            test_a_string_in_a_comment_does_not_end_the_comment
+        ; Alcotest.test_case
+            "a string in a comment is still not code"
+            `Quick
+            test_a_string_in_a_comment_is_still_not_code
+        ; Alcotest.test_case
+            "an orphan quote does not swallow the file"
+            `Quick
+            test_an_orphan_quote_in_a_comment_does_not_swallow_the_file
+        ; Alcotest.test_case
+            "a quoted string does not open a comment"
+            `Quick
+            test_a_quoted_string_in_a_comment_does_not_open_a_comment
+        ; Alcotest.test_case
+            "an unclosed quoted string falls back"
+            `Quick
+            test_an_unclosed_quoted_string_in_a_comment_falls_back
+        ; Alcotest.test_case
+            "a char literal opens no string"
+            `Quick
+            test_a_char_literal_in_a_comment_opens_no_string
+        ; Alcotest.test_case
+            "offsets preserved"
+            `Quick
+            test_comment_literals_preserve_offsets
         ] )
     ; ( "the lint's own source"
       , [ Alcotest.test_case "binding module value" `Quick test_binding_module_value

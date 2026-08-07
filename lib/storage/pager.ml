@@ -1,8 +1,12 @@
 (** Pager: page cache + allocator over a BLOCK backend.
 
     Maintains:
-    - A bounded FIFO cache of pages (read from BLOCK).  Capacity defaults to
+    - A bounded FIFO cache of pages (read from BLOCK, or — since #611 —
+      resolved from a WAL frame).  Capacity defaults to
       [default_cache_capacity] and is overridable via [GRANARY_PAGE_CACHE].
+      Entries are keyed by [cache_key = (page_id, version)]: [-1] for the main
+      file, the WAL frame index otherwise.  See the comment on [main_version]
+      for how the WAL-resolved entries are invalidated.
     - A dirty table of pages modified since the last flush.
     - A pin table (#159): pages referenced by a live RO snapshot are pinned
       so the writer's CoW churn can't FIFO out a reader's working set.
@@ -27,7 +31,23 @@ let cache_capacity_from_env () =
 
 type cache_key = int64 * int (* (page_id, version);  -1 = main DB *)
 
-let cache_key_main pid : cache_key = pid, -1
+(* #611: the version slot of a [cache_key].  [main_version] tags a page whose
+   bytes came from the main file; any value >= 0 is the WAL FRAME INDEX the
+   page was resolved from.  Keying WAL-resolved pages by frame index — rather
+   than by page id alone — is what makes the three invalidation triggers fall
+   out of the key instead of needing a notification:
+
+   (a) a NEWER frame for the same page lands at a different index, so the next
+       resolution builds a different key and cannot hit the older entry;
+   (b) an OLDER-snapshot reader ([wal_find_page_at], the #266 as-of path)
+       resolves to the frame its snapshot bound allows and looks that frame up
+       by index, so it can never be served the newest one;
+   (c) a checkpoint ([Wal.reset]) RECYCLES frame indices, which the key alone
+       cannot distinguish — that one is handled by [sync_wal_epoch] below. *)
+let main_version = -1
+let cache_key_main pid : cache_key = pid, main_version
+let cache_key_wal pid frame_idx : cache_key = pid, frame_idx
+let is_wal_key ((_, v) : cache_key) = v >= 0
 
 type wal_callbacks =
   { wal_find_page : int64 -> int option
@@ -36,6 +56,16 @@ type wal_callbacks =
   ; wal_append_commit : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
   ; wal_append_commit_no_sync : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
   ; wal_sync : unit -> (unit, string) result Lwt.t
+  ; wal_epoch : unit -> int64
+    (** #611: the WAL's generation counter ([Wal.epoch]).  It is bumped by
+        exactly the operation that recycles frame indices — [Wal.reset] bumps
+        it on both of its arms and on neither of its failure paths, and nothing
+        else in [Wal] ever clears the index — so comparing it on every WAL
+        resolution is a complete guard against serving a frame from a dead
+        generation.  Deliberately a callback rather than a notification from
+        the checkpoint sites: the pager then cannot be left stale by a
+        [Wal.reset] call site nobody remembered to hook up (there are three —
+        [Store.checkpoint], [Replication], [Standby.promote]). *)
   }
 
 type t =
@@ -72,6 +102,11 @@ type t =
         been freed.  [alloc] consults this pool before the main
         freelist. *)
   ; mutable wal : wal_callbacks option
+  ; mutable cached_wal_epoch : int64
+    (** #611: the WAL generation every WAL-keyed entry currently in [cache] was
+        built under.  [sync_wal_epoch] compares it against the live
+        [wal_epoch ()] on every WAL resolution and purges the WAL-keyed
+        entries wholesale when they differ. *)
   ; mutable write_tag : int32
     (** #174: schema-fingerprint stamp to write into the reserved header bytes
         of the next Branch/Leaf page built.  Set per tree-operation by the
@@ -124,6 +159,7 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   ; n_pages_at_rw_begin = 0L
   ; txn_owned_pool = []
   ; wal = None
+  ; cached_wal_epoch = 0L
   ; write_tag = 0l
   ; on_page_event = None
   }
@@ -200,20 +236,74 @@ let max_data_bytes t = Geometry.max_data_bytes t.geom
 let max_overflow_payload_bytes t = Geometry.max_overflow_payload_bytes t.geom
 let max_freelist_entries_per_page t = Geometry.max_freelist_entries_per_page t.geom
 
+(* #611: drop every WAL-keyed cache entry, keeping the main-file ones.  The
+   FIFO is rebuilt rather than filtered in place so it never accumulates keys
+   that are no longer in [cache] (a stale FIFO entry would let [cache_add] push
+   the same key twice on re-insert, and [maybe_evict] would waste a pass on
+   it).  Main-file entries survive: their bytes came from the main DB, which a
+   checkpoint only ever brings FORWARD to what the WAL already said. *)
+let purge_wal_cache t =
+  let stale =
+    Hashtbl.fold (fun k _ acc -> if is_wal_key k then k :: acc else acc) t.cache []
+  in
+  if stale <> []
+  then (
+    List.iter (fun k -> Hashtbl.remove t.cache k) stale;
+    let old_fifo = Queue.copy t.fifo in
+    Queue.clear t.fifo;
+    Queue.iter (fun k -> if Hashtbl.mem t.cache k then Queue.push k t.fifo) old_fifo)
+;;
+
+(* #611: invalidation trigger (b) — a checkpoint recycled the frame indices, so
+   every cached (page_id, frame_idx) entry now names a slot the new generation
+   will overwrite with unrelated bytes.  Detected by comparing the WAL's own
+   generation counter, which is bumped by exactly that operation.  This runs
+   BEFORE the cache is consulted on every WAL resolution, so a stale entry
+   cannot be served even once.  Cost on the hot path: one closure call and an
+   [Int64] compare. *)
+(* [cb] is annotated because {!wal_callbacks} and the pager's own [t] both
+   carry a [wal_epoch] field — the callback (unit -> int64) and the cached
+   generation (int64).  Without the annotation OCaml resolves the label to the
+   later-defined record, [t], and the call does not typecheck. *)
+let sync_wal_epoch t (cb : wal_callbacks) =
+  let e = cb.wal_epoch () in
+  if not (Int64.equal e t.cached_wal_epoch)
+  then (
+    purge_wal_cache t;
+    t.cached_wal_epoch <- e)
+;;
+
 let set_wal t cb =
   (* Any cache entries built before the WAL hook was attached came from
      the main DB only. If a WAL frame exists for those pages it is more
      recent — so clear the cache when transitioning into WAL mode so a
-     subsequent [read] re-resolves through the WAL index. *)
+     subsequent [read] re-resolves through the WAL index.
+     #611: detaching the overlay (or swapping in a different one) must drop the
+     WAL-keyed entries too, or a page would keep being served from a frame
+     index that no longer means anything. *)
   (match cb, t.wal with
-   | Some _, None ->
+   | Some _, (None | Some _) ->
      Hashtbl.reset t.cache;
      Queue.clear t.fifo
-   | _ -> ());
-  t.wal <- cb
+   | None, Some _ -> purge_wal_cache t
+   | None, None -> ());
+  t.wal <- cb;
+  t.cached_wal_epoch
+  <- (match cb with
+      | None -> 0L
+      | Some (c : wal_callbacks) -> c.wal_epoch ())
 ;;
 
 let wal_mode t = t.wal <> None
+
+(* #611: number of WAL-resolved frames currently held in the page cache.
+   Exposed for the invalidation tests, which must be able to assert that a
+   checkpoint actually PURGED the entries rather than merely failing to hit
+   them (a key-mismatch miss and a purge are indistinguishable from the
+   answers alone). *)
+let wal_cached_count t =
+  Hashtbl.fold (fun k _ n -> if is_wal_key k then n + 1 else n) t.cache 0
+;;
 
 (** Evict the oldest cache entry if the cache is at capacity.
     Never evicts dirty or pinned (#159) pages. *)
@@ -229,7 +319,14 @@ let maybe_evict t =
     let temp = Queue.create () in
     while (not !evicted) && not (Queue.is_empty t.fifo) do
       let key = Queue.pop t.fifo in
-      if Hashtbl.mem t.dirty (fst key) || Hashtbl.mem t.pinned key
+      (* #611: the dirty guard is MAIN-key only.  A WAL-keyed entry holds
+         committed frame bytes; that the same page also happens to be dirty in
+         the current write txn says nothing about it, and treating it as
+         un-evictable would let a hot dirty page pin an unbounded number of
+         its own superseded frames in the cache. *)
+      if
+        ((not (is_wal_key key)) && Hashtbl.mem t.dirty (fst key))
+        || Hashtbl.mem t.pinned key
       then
         (* dirty or pinned — put back at end so we don't lose track of it *)
         Queue.push key temp
@@ -294,25 +391,87 @@ let cstruct_dup src =
 ;;
 
 (* Resolve [page_id] from the WAL, if any.  [finder] picks the relevant frame
-   (latest, or latest <= a snapshot bound).  WAL frames are NOT cached: frame
-   indices are recycled after a WAL reset (checkpoint), so a cached
-   (page_id, frame_idx) entry could be served stale.  Returns a fresh Cstruct.
+   (latest, or latest <= a snapshot bound).  Returns a fresh Cstruct.
    #392: emits [Wal_read page_id] on the frame-served path (the WAL-overlay
-   counterpart of [emit_read] in [load_main_page]). *)
-let resolve_wal_page t ~page_id finder =
+   counterpart of [emit_read] in [load_main_page]) — on a MISS only, matching
+   [load_main_page]'s [emit_read], so the counter keeps meaning "a resolution
+   that went to the backend".
+
+   #611: WAL frames ARE cached now, keyed by (page_id, frame_idx).  Frame
+   indices are recycled after a WAL reset (checkpoint), which used to be the
+   reason not to cache at all; [sync_wal_epoch] closes that hole by purging on
+   the generation bump that recycling implies.  The buffer stored is the one
+   [wal_read_frame] returned, without a defensive copy: [Wal.read_frame]'s
+   contract (#246) is that its result is immutable for the life of the
+   generation and dropped wholesale on [reset], never mutated in place — the
+   same invariant the main page cache relies on — and callers of THIS function
+   are handed a [cstruct_dup], never the stored buffer.
+
+   The cache-miss half lives in [read_and_cache_frame] just below, shared with
+   [resolve_wal_page_borrow] so the caching rule exists in exactly one place. *)
+
+(* #611: read frame [frame_idx], publish it under [key] (unless the caller
+   asked to bypass the cache), and hand back the very buffer [wal_read_frame]
+   returned.
+
+   [expected_epoch] is the whole subtlety, and it is the SAME guard the layer
+   below already carries — see [Wal.cache_frame]'s [~expected_epoch] and
+   [read_committed_frame]'s deliberate refusal to prime the frame cache
+   (reviews #209/#210).  [sync_wal_epoch] runs BEFORE the yield in
+   [wal_read_frame]; a checkpoint that lands DURING that yield would otherwise
+   let this [cache_add] install a dead generation's bytes AFTER a later fiber
+   had already purged and repopulated the same [key], and — because
+   [t.cached_wal_epoch] would by then already be the new epoch — no later
+   [sync_wal_epoch] would ever purge it again.  The result is a permanently
+   poisoned entry and a silent wrong answer for every subsequent reader.  The
+   window is real: [Store.checkpoint_unlocked]'s reader gate is
+   [ro_readers_below] ([m < target]), so a reader at the WAL head is not gated
+   and runs concurrently with [Wal.reset].
+
+   Both conjuncts are checked deliberately.  [t.cached_wal_epoch] cannot currently
+   differ from [cb.wal_epoch ()] here without the first conjunct also failing
+   (epochs are monotone and [t.cached_wal_epoch] is only ever assigned from
+   [cb.wal_epoch ()]), so the second is redundant today — but it is what keeps
+   this correct if the pager's own epoch bookkeeping ever gains another writer,
+   and it costs an [Int64] compare on a path that has just done device I/O.
+
+   The frame's BYTES are still returned to the caller when the epoch moved.
+   That is unchanged pre-#611 behaviour and matches [Wal.read_frame], which
+   also returns what it read and merely declines to cache it: the resolving
+   reader picked [frame_idx] under its own snapshot before the checkpoint, and
+   deciding what a reader at the head owes a concurrent checkpoint is #555/#585
+   territory, not this cache's. *)
+let read_and_cache_frame ~bypass_cache t cb ~page_id ~frame_idx ~key =
   let open Lwt.Syntax in
+  let expected_epoch = cb.wal_epoch () in
+  let* r = cb.wal_read_frame frame_idx in
+  match r with
+  | Error s -> Lwt.return_error (Block_error s)
+  | Ok page ->
+    emit_wal_read t page_id;
+    if
+      (not bypass_cache)
+      && Int64.equal (cb.wal_epoch ()) expected_epoch
+      && Int64.equal t.cached_wal_epoch expected_epoch
+    then cache_add t key page;
+    Lwt.return_ok page
+;;
+
+let resolve_wal_page ?(bypass_cache = false) t ~page_id finder =
   match t.wal with
   | None -> Lwt.return_ok None
   | Some cb ->
+    sync_wal_epoch t cb;
     (match finder cb with
      | None -> Lwt.return_ok None
      | Some frame_idx ->
-       let* r = cb.wal_read_frame frame_idx in
-       (match r with
-        | Error s -> Lwt.return_error (Block_error s)
-        | Ok page ->
-          emit_wal_read t page_id;
-          Lwt.return_ok (Some (cstruct_dup page))))
+       let key = cache_key_wal page_id frame_idx in
+       (match Hashtbl.find_opt t.cache key with
+        | Some buf -> Lwt.return_ok (Some (cstruct_dup buf))
+        | None ->
+          Lwt.map
+            (Result.map (fun page -> Some (cstruct_dup page)))
+            (read_and_cache_frame ~bypass_cache t cb ~page_id ~frame_idx ~key)))
 ;;
 
 (* Load [page_id] from the shared cache, or from the block device on a miss
@@ -341,7 +500,7 @@ let load_main_page ?(bypass_cache = false) t pin_set page_id =
 let read ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
   let open Lwt.Syntax in
   let load_after_wal finder =
-    let* wal_r = resolve_wal_page t ~page_id finder in
+    let* wal_r = resolve_wal_page ~bypass_cache t ~page_id finder in
     match wal_r with
     | Error e -> Lwt.return_error e
     | Ok (Some page) -> Lwt.return_ok page
@@ -373,20 +532,26 @@ let read ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
    place), exactly like the main page cache's borrow invariant above.  A future
    in-place mutation of a [Wal.read_frame] result would corrupt the cache and
    every concurrent borrower — see [Wal.read_frame]'s contract. *)
-let resolve_wal_page_borrow t ~page_id finder =
-  let open Lwt.Syntax in
+(* #611: on a hit this borrows the PAGER cache's entry for that frame, which is
+   the very buffer [Wal.read_frame] returned, so the contract above is
+   unchanged.  Eviction and [purge_wal_cache] only drop the hashtable entry —
+   the buffer itself stays live for as long as the borrower holds it, exactly
+   as in [load_main_page_borrow]. *)
+let resolve_wal_page_borrow ?(bypass_cache = false) t ~page_id finder =
   match t.wal with
   | None -> Lwt.return_ok None
   | Some cb ->
+    sync_wal_epoch t cb;
     (match finder cb with
      | None -> Lwt.return_ok None
      | Some frame_idx ->
-       let* r = cb.wal_read_frame frame_idx in
-       (match r with
-        | Error s -> Lwt.return_error (Block_error s)
-        | Ok page ->
-          emit_wal_read t page_id;
-          Lwt.return_ok (Some page)))
+       let key = cache_key_wal page_id frame_idx in
+       (match Hashtbl.find_opt t.cache key with
+        | Some buf -> Lwt.return_ok (Some buf)
+        | None ->
+          Lwt.map
+            (Result.map Option.some)
+            (read_and_cache_frame ~bypass_cache t cb ~page_id ~frame_idx ~key)))
 ;;
 
 (* Like [load_main_page] but returns the cache's own buffer WITHOUT a defensive
@@ -426,7 +591,7 @@ let read_borrow ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id f =
     Lwt.return_ok v
   in
   let load_after_wal finder =
-    let* wal_r = resolve_wal_page_borrow t ~page_id finder in
+    let* wal_r = resolve_wal_page_borrow ~bypass_cache t ~page_id finder in
     match wal_r with
     | Error e -> Lwt.return_error e
     | Ok (Some page) -> borrow page
@@ -440,6 +605,61 @@ let read_borrow ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id f =
   | None ->
     (match Hashtbl.find_opt t.dirty page_id with
      | Some buf -> borrow buf
+     | None -> load_after_wal (fun cb -> cb.wal_find_page page_id))
+  | Some max_frame -> load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
+;;
+
+(* #481: [read] without the defensive [cstruct_dup], for callers that RETAIN
+   the buffer past a single scope but only ever read it.  [read_borrow] already
+   hands out the pager's own buffer, but only for the extent of a callback; a
+   B+-tree cursor holds its leaf page across the K [cursor_next] calls that
+   consume it, which is not a scope [read_borrow] can express.  Before this,
+   that cursor used [read], paying a full ~4 KB page copy per leaf advance —
+   even on a cache hit — which lands in the major heap and dominated the
+   allocation of a "SELECT COUNT(*)" scan (#481, cause 3).
+
+   CONTRACT — the caller MUST treat the result as read-only and MUST NOT
+   mutate it.  Soundness rests on the same invariant as [read_borrow]: cache
+   and WAL-frame buffers are immutable once stored (replaced wholesale, never
+   written in place — see [write]/[write_owned]/[cache_add]/[Wal.read_frame]),
+   and eviction only drops the hashtbl entry, so a retained buffer stays live
+   and stays correct for as long as the caller holds it.  Retention is
+   therefore safe for an unbounded time, at the cost of keeping one page alive.
+
+   DIRTY PAGES ARE STILL COPIED, deliberately.  A dirty page is the one buffer
+   in the pager that IS mutated in place — [dirty_buffer] grants the writer
+   exactly that right (#356), and the B+-tree insert path uses it.  Handing a
+   retaining reader the live dirty buffer would let a writer shift entries
+   under a positioned cursor.  Copying keeps this function's observable
+   behaviour identical to [read] on the writer path.
+
+   WHAT THIS ADDS TO THE INVARIANT ANY FUTURE WAL CHANGE MUST KEEP.  Retention
+   is unbounded in time, so "immutable once stored" now has to hold for the
+   whole life of a scan, not just the extent of a [read_borrow] callback.  Two
+   changes in flight touch exactly that: #611 (PR #649) caches WAL-resolved
+   frames in the pager, and #612 (PR #644) truncates the WAL at checkpoint.
+   Both are fine as long as they keep dropping-and-rebuilding rather than
+   recycling: a retained borrower keeps its buffer alive through the GC, so
+   evicting a cache entry, resetting a hashtable or truncating the WAL file
+   costs it nothing.  What would break it is REUSING a frame or page buffer for
+   different content — reading a new frame into a buffer some cache still
+   hands out, or writing a checkpointed page back into the buffer a cursor is
+   mid-leaf on.  That was already forbidden by [read_borrow]'s contract; this
+   function widens the window in which violating it is observable from
+   microseconds to the length of a table scan. *)
+let read_shared ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
+  let open Lwt.Syntax in
+  let load_after_wal finder =
+    let* wal_r = resolve_wal_page_borrow t ~page_id finder in
+    match wal_r with
+    | Error e -> Lwt.return_error e
+    | Ok (Some page) -> Lwt.return_ok page
+    | Ok None -> load_main_page_borrow ~bypass_cache t pin_set page_id
+  in
+  match snapshot_frames with
+  | None ->
+    (match Hashtbl.find_opt t.dirty page_id with
+     | Some buf -> Lwt.return_ok (cstruct_dup buf)
      | None -> load_after_wal (fun cb -> cb.wal_find_page page_id))
   | Some max_frame -> load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
 ;;

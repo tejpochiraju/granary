@@ -1425,6 +1425,18 @@ type cursor =
        [None] wherever [leaf_page] changes (leaf advance / seek), so it always
        matches the current leaf and a fixed snapshot never sees stale bytes. *)
     mutable leaf_buf : Cstruct.t option
+  ; (* #481: [n_keys] of the leaf in [leaf_buf].  [cursor_next] used to call
+       [Page.read_common] — which allocates a 6-word record — once PER ROW to
+       re-read a field that is invariant for the whole leaf.  It is now read
+       (and the page kind validated, exactly as before) once per leaf load, in
+       [read_cur_leaf].  Only meaningful while [leaf_buf] is [Some]; the two
+       are always set together. *)
+    mutable leaf_n_keys : int
+  ; (* #481: the cursor's single reusable entry span.  Refilled by
+       [cursor_step] on every entry and never carried across a leaf change, so
+       it always describes an entry inside the CURRENT [leaf_buf].  Owning one
+       is what makes stepping a leaf allocate nothing per row. *)
+    c_span : Page.leaf_span
   ; mutable finished : bool
   }
 
@@ -1487,6 +1499,8 @@ let cursor_open t : (cursor, error) result Lwt.t =
       ; offset = Page.data_offset
       ; leaf_idx = 0
       ; leaf_buf = None
+      ; leaf_n_keys = 0
+      ; c_span = Page.leaf_span_create ()
       ; finished = true
       }
   else
@@ -1510,6 +1524,8 @@ let cursor_open t : (cursor, error) result Lwt.t =
         ; offset = Page.data_offset
         ; leaf_idx = 0
         ; leaf_buf = None
+        ; leaf_n_keys = 0
+        ; c_span = Page.leaf_span_create ()
         ; finished = false
         }
 ;;
@@ -1518,13 +1534,27 @@ let cursor_open t : (cursor, error) result Lwt.t =
    repeated [cursor_next]/[cursor_scan_for_key] calls that walk a single leaf.
    The cache is invalidated ([leaf_buf <- None]) whenever [leaf_page] changes,
    so it always reflects the current leaf; under a fixed snapshot the page is
-   immutable, so reusing the buffer cannot observe stale bytes. *)
+   immutable, so reusing the buffer cannot observe stale bytes.
+
+   #481: the buffer now comes from [Pager.read_shared] rather than [Pager.read],
+   so a cache-resident leaf costs no page copy at all.  The cursor RETAINS that
+   buffer, which is exactly what [read_shared]'s contract permits: it is
+   read-only here (nothing in the cursor writes to a page) and pager cache /
+   WAL-frame buffers are immutable once stored, so retaining one across yields
+   — including the [Lwt.pause] [Store.seek_next] splices in, and an overflow
+   chain read — can neither observe a mutation nor be invalidated by eviction.
+   Dirty (writer-visible) pages are still copied by [read_shared], so the #262
+   read-your-own-writes path keeps the stable per-leaf snapshot it had before.
+
+   [n_keys] is captured here, once per leaf, instead of per row.  Reading it
+   through [Page.read_common] keeps the page-kind validation that call used to
+   perform on every row — same check, same page, once. *)
 let read_cur_leaf c : (Cstruct.t, Pager.error) result Lwt.t =
   match c.leaf_buf with
   | Some buf -> return_ok buf
   | None ->
     let* r =
-      Pager.read
+      Pager.read_shared
         ?snapshot_frames:c.c_snapshot_frames
         ?pin_set:c.c_pin_set
         c.c_pager
@@ -1533,7 +1563,9 @@ let read_cur_leaf c : (Cstruct.t, Pager.error) result Lwt.t =
     (match r with
      | Error _ as e -> Lwt.return e
      | Ok buf ->
+       let common = Page.read_common buf in
        c.leaf_buf <- Some buf;
+       c.leaf_n_keys <- common.Page.n_keys;
        return_ok buf)
 ;;
 
@@ -1577,51 +1609,128 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
         return_ok true)
 ;;
 
-(* Read the entry at the cursor's current position.  If at end-of-leaf, use
-   the path to walk to the next leaf.  Returns the (key, value) and advances
-   the cursor past it.
+(* Position the cursor at its current entry.  If at end-of-leaf, use the path
+   to walk to the next leaf, skipping empty leaves (which lazy [del] leaves
+   behind).  Advances the cursor past the entry it reports.
 
-   Also skips over empty leaves (which can result from lazy [del]). *)
-let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
+   #481: position the cursor on the next live entry and describe it in
+   [c.c_span], WITHOUT copying anything out of the page.  Returns the leaf
+   buffer the span refers to (the caller must pass that same buffer to
+   [Page.copy_span] / [decode_value_span]), or [None] at end of tree.  The
+   cursor is already advanced past the entry on return, exactly as the old
+   [cursor_next] did before decoding.
+
+   Shared by [cursor_next] and [cursor_next_value] so the two can never drift
+   in how they walk leaves, skip empty ones, or bound the walk.
+
+   REQUIRES at most one [cursor_next]/[cursor_next_value] in flight per cursor,
+   and this function is why.  It can yield (a leaf miss in [read_cur_leaf], or
+   [advance_to_next_leaf]), and its callers read [c.c_span] in the continuation
+   AFTER that yield; a second overlapping call's [leaf_span_at] would overwrite
+   the span first and the earlier continuation would then copy the wrong
+   entry's bytes.  Before #481 the copies happened synchronously inside
+   [Page.leaf_entry_at], so overlapping pulls could reorder or skip rows but
+   never tear one.  Documented on [cursor_next] in the .mli; if a consumer ever
+   needs overlapping pulls, give each its own cursor rather than making the
+   span a return value again (that would put the per-row allocation back). *)
+let rec cursor_step c : (Cstruct.t option, error) result Lwt.t =
   if c.finished
   then return_ok None
   else
     let* r = read_cur_leaf c in
     bind_pager r (fun buf ->
-      let common = Page.read_common buf in
       (* #230: detect end-of-leaf by entry count, not by re-decoding the whole
          leaf into a list every call.  Trailing bytes past the last entry are
-         zeros that [leaf_entry_at] would mis-read as a spurious empty entry, so
-         the count guard ([leaf_idx >= n_keys]) is what bounds the walk. *)
-      if c.leaf_idx >= common.n_keys
+         zeros that [leaf_span_at] would mis-read as a spurious empty entry, so
+         the count guard ([leaf_idx >= n_keys]) is what bounds the walk.  [||]
+         short-circuits, so the span is only filled when the guard passes. *)
+      if
+        c.leaf_idx >= c.leaf_n_keys
+        || not (Page.leaf_span_at buf ~offset:c.offset c.c_span)
       then
-        (* Exhausted this leaf — advance via the path. *)
+        (* Exhausted this leaf (or ran off its end) — advance via the path. *)
         let* a = advance_to_next_leaf c in
         match a with
         | Error e -> return_error e
         | Ok false -> return_ok None
-        | Ok true -> cursor_next c
+        | Ok true -> cursor_step c
       else (
-        match Page.leaf_entry_at buf ~offset:c.offset with
-        | `End ->
-          let* a = advance_to_next_leaf c in
-          (match a with
-           | Error e -> return_error e
-           | Ok false -> return_ok None
-           | Ok true -> cursor_next c)
-        | `Entry e ->
-          c.offset <- e.next_offset;
-          c.leaf_idx <- c.leaf_idx + 1;
-          let* dv =
-            decode_leaf_value
-              ?snapshot_frames:c.c_snapshot_frames
-              ?pin_set:c.c_pin_set
-              c.c_pager
-              e.value
-          in
-          (match dv with
-           | Ok v -> return_ok (Some (e.key, v))
-           | Error err -> return_error err)))
+        c.offset <- c.c_span.Page.sp_next_offset;
+        c.leaf_idx <- c.leaf_idx + 1;
+        return_ok (Some buf)))
+;;
+
+(* #481: decode the value described by [span] straight out of the leaf page.
+   The old path copied the stored value out of the page ([Page.leaf_entry_at])
+   and then copied it AGAIN in [decode_leaf_value] just to drop the leading
+   one-byte inline tag; this makes exactly one copy, of exactly the payload.
+   Byte-for-byte equivalent to [decode_leaf_value] on the same stored bytes,
+   including its error messages.
+
+   [buf] must be the buffer [span] was filled from.  Both the tag and the
+   overflow marker's fields are read BEFORE the first [Lwt] bind, so nothing
+   here depends on [buf] or [span] surviving the chain read. *)
+let decode_value_span c buf (span : Page.leaf_span) : (bytes, error) result Lwt.t =
+  let off = span.Page.sp_val_off in
+  let len = span.Page.sp_val_len in
+  if len = 0
+  then return_ok Bytes.empty
+  else (
+    let tag = Cstruct.get_uint8 buf off in
+    if tag = tag_inline
+    then return_ok (Page.copy_span buf ~off:(off + 1) ~len:(len - 1))
+    else if tag = tag_overflow
+    then
+      if len <> overflow_marker_size
+      then
+        return_error
+          (Tree_corrupt
+             (Printf.sprintf
+                "overflow marker size %d (expected %d)"
+                len
+                overflow_marker_size))
+      else (
+        let head_pid = Cstruct.BE.get_uint64 buf (off + 1) in
+        let total_size = Int64.to_int (Cstruct.BE.get_uint64 buf (off + 9)) in
+        read_overflow_chain
+          ?snapshot_frames:c.c_snapshot_frames
+          ?pin_set:c.c_pin_set
+          c.c_pager
+          ~head_pid
+          ~total_size)
+    else return_error (Tree_corrupt (Printf.sprintf "unknown leaf-value tag 0x%02x" tag)))
+;;
+
+let cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
+  let* s = cursor_step c in
+  match s with
+  | Error e -> return_error e
+  | Ok None -> return_ok None
+  | Ok (Some buf) ->
+    (* Copy the key out before yielding: cheap, and it keeps the two reads of
+       [c.c_span] adjacent to the step that filled it. *)
+    let key =
+      Page.copy_span buf ~off:c.c_span.Page.sp_key_off ~len:c.c_span.Page.sp_key_len
+    in
+    let* dv = decode_value_span c buf c.c_span in
+    (match dv with
+     | Ok v -> return_ok (Some (key, v))
+     | Error err -> return_error err)
+;;
+
+(* #481: [cursor_next] without the key.  Every aggregate/COUNT scan and
+   [Exec.stream_seq_scan] itself bind the key as [_key] and drop it, so
+   materialising it was pure waste on the commonest scan there is. *)
+let cursor_next_value c : (bytes option, error) result Lwt.t =
+  let* s = cursor_step c in
+  match s with
+  | Error e -> return_error e
+  | Ok None -> return_ok None
+  | Ok (Some buf) ->
+    let* dv = decode_value_span c buf c.c_span in
+    (match dv with
+     | Ok v -> return_ok (Some v)
+     | Error err -> return_error err)
 ;;
 
 (* Descend from [page_id] toward [key], recording the path deepest-first.
@@ -1668,8 +1777,12 @@ let rec cursor_scan_for_key c key =
   else
     let* rr = read_cur_leaf c in
     bind_pager rr (fun buf ->
-      let common = Page.read_common buf in
-      if c.leaf_idx >= common.n_keys
+      (* #481: span + in-place key comparison — the probe no longer copies the
+         key (or the value!) of every entry it steps over on the way to the
+         seek target. *)
+      if
+        c.leaf_idx >= c.leaf_n_keys
+        || not (Page.leaf_span_at buf ~offset:c.offset c.c_span)
       then
         let* a = advance_to_next_leaf c in
         match a with
@@ -1677,23 +1790,24 @@ let rec cursor_scan_for_key c key =
         | Ok false -> return_ok (`Not_found_after key)
         | Ok true -> cursor_scan_for_key c key
       else (
-        match Page.leaf_entry_at buf ~offset:c.offset with
-        | `End ->
-          let* a = advance_to_next_leaf c in
-          (match a with
-           | Error e -> return_error e
-           | Ok false -> return_ok (`Not_found_after key)
-           | Ok true -> cursor_scan_for_key c key)
-        | `Entry e ->
-          let cmp = Bytes.compare e.key key in
-          if cmp = 0
-          then return_ok `Found
-          else if cmp > 0
-          then return_ok (`Not_found_after key)
-          else (
-            c.offset <- e.next_offset;
-            c.leaf_idx <- c.leaf_idx + 1;
-            cursor_scan_for_key c key)))
+        (* [compare_key_at] compares TARGET against STORED, i.e. the opposite
+           order from the copying version's [Bytes.compare stored key] — so
+           "stored sorts after the target" is [cmp < 0] here, not [> 0]. *)
+        let cmp =
+          Page.compare_key_at
+            buf
+            ~kstart:c.c_span.Page.sp_key_off
+            ~klen:c.c_span.Page.sp_key_len
+            ~key
+        in
+        if cmp = 0
+        then return_ok `Found
+        else if cmp < 0
+        then return_ok (`Not_found_after key)
+        else (
+          c.offset <- c.c_span.Page.sp_next_offset;
+          c.leaf_idx <- c.leaf_idx + 1;
+          cursor_scan_for_key c key)))
 ;;
 
 let cursor_seek c key : ([ `Found | `Not_found_after of bytes ], error) result Lwt.t =

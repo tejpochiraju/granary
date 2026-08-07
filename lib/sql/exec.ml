@@ -2184,7 +2184,15 @@ let eval_check_constraints
 (* #567: a column whose stored cell is allowed to be [V_null] even though the
    schema says NOT NULL.  VIRTUAL generated columns are stored as NULL and
    recomputed on read ([decode_with_virtual]), so their stored cell says
-   nothing about the value the schema declares. *)
+   nothing about the value the schema declares.
+
+   #629: this is a fallback, not the answer.  "The stored cell says nothing"
+   is a reason to look at the COMPUTED value, not a reason to stop checking —
+   exempting outright made a NOT NULL VIRTUAL generated column unenforceable.
+   [not_null_violation] now recomputes the virtual cells first whenever it can
+   and consults this only when it cannot (a short row, i.e. one that does not
+   cover every column, where evaluating the generated expression would raise).
+   Do not re-broaden it: the exemption is the degraded mode. *)
 let not_null_exempt_col (col : Row.column) : bool =
   match col.Row.generated_as with
   | Some (_, false) -> true (* VIRTUAL: not materialised in the stored row *)
@@ -2229,15 +2237,56 @@ let not_null_exempt_col (col : Row.column) : bool =
    [enforce_not_null] because UPDATE has no [OR IGNORE] form to consult.
 
    Returns the message for the FIRST violating column, matching the column
-   order the raising version reported. *)
-let not_null_violation (table_meta : Cat.table_meta) (row : Row.t) : string option =
+   order the raising version reported.
+
+   #629: [clock]/[params] are how a VIRTUAL generated column gets checked
+   against the value it actually holds.  The write paths set a VIRTUAL cell to
+   [V_null] on purpose ([compute_stored_generated_cols]) and recompute it on
+   read, so the row handed in here says NULL for a column that is not NULL —
+   which is why #567 exempted them wholesale.  Recomputing the virtuals into a
+   copy first narrows WHEN the check runs (after the generated value exists)
+   rather than WHETHER, so a genuinely NULL-valued generated expression is
+   still caught.  Both are optional and default to the same values
+   [compute_stored_generated_cols] is already called with elsewhere in this
+   module ([None], [[||]]); a generated expression is DDL and cannot reference
+   a parameter, so the default is only ever wrong for a clock-dependent one.
+
+   The STORED half of #629 rests on an ordering claim, and the claim is about
+   the ROW-STORE sites only — stating it as "every enforcement site" was wrong
+   when this shipped, so here it is enumerated.  [compute_stored_generated_cols]
+   runs before the check at [execute_insert] (feeding [execute_insert_write]),
+   [execute_upsert_update], [update_col_in_tx] and [apply_update_row] (feeding
+   [write_row_rekeyed]).  It is NOT called on either columnar arm: both build
+   the row with [Array.make n_cols Row.V_null] and pass it straight to
+   [not_null_skip_or_fail].  That is sound only because
+   [Sema.bind_create] now refuses a GENERATED column on a COLUMNSTORE table
+   outright (#660) — no generated column can reach those two sites, so the
+   ordering question does not arise there.  If that refusal is ever lifted, the
+   two arms need the call before the check, and the VIRTUAL read path needs a
+   recompute, or a columnar generated column reads NULL forever. *)
+let not_null_violation
+      ?(clock : (unit -> float) option = None)
+      ?(params : Row.value array = [||])
+      (table_meta : Cat.table_meta)
+      (row : Row.t)
+  : string option
+  =
   let n = Array.length row in
+  (* Only safe when the row covers every column: [compute_virtual_generated_cols]
+     writes into [row.(i)] for each virtual column and would raise on a short
+     row.  When it is not safe the #567 exemption stands. *)
+  let virtuals_computed =
+    has_virtual_cols table_meta.Cat.columns && n = List.length table_meta.Cat.columns
+  in
+  let row =
+    if virtuals_computed then with_computed_virtuals clock params table_meta row else row
+  in
   let rec go i = function
     | [] -> None
     | (col : Row.column) :: rest ->
       let violated =
         col.Row.not_null
-        && (not (not_null_exempt_col col))
+        && ((not (not_null_exempt_col col)) || virtuals_computed)
         && i < n
         && row.(i) = Row.V_null
       in
@@ -2253,8 +2302,8 @@ let not_null_violation (table_meta : Cat.table_meta) (row : Row.t) : string opti
   go 0 table_meta.Cat.columns
 ;;
 
-let enforce_not_null (table_meta : Cat.table_meta) (row : Row.t) : unit =
-  match not_null_violation table_meta row with
+let enforce_not_null ?clock ?params (table_meta : Cat.table_meta) (row : Row.t) : unit =
+  match not_null_violation ?clock ?params table_meta row with
   | None -> ()
   | Some msg -> failwith msg
 ;;
@@ -2274,12 +2323,14 @@ let enforce_not_null (table_meta : Cat.table_meta) (row : Row.t) : unit =
      caller's value is a bigger surprise than the error.  Pinned in
      [test_not_null_599.ml]. *)
 let not_null_skip_or_fail
+      ?clock
+      ?params
       (table_meta : Cat.table_meta)
       (row : Row.t)
       ~(on_conflict : Ast.conflict_action option)
   : bool
   =
-  match not_null_violation table_meta row with
+  match not_null_violation ?clock ?params table_meta row with
   | None -> false
   | Some msg -> if on_conflict = Some Ast.CA_ignore then true else failwith msg
 ;;
@@ -3509,9 +3560,104 @@ let unique_constraint_failed_msg ~(table : string) ~(columns : string list) : st
     (String.concat ", " (List.map (fun c -> table ^ "." ^ c) columns))
 ;;
 
-(* UNIQUE pre-check for INSERT: fold over [idxs] returning (skip, rowids to
-   delete for REPLACE, optional rowid to update for UPSERT). Raises on a plain
-   UNIQUE violation. *)
+(* Probe ONE unique index for a conflict with [row_for_idx], returning the
+   conflicting row's rowid.  [None] means "no conflict", which includes the two
+   cases that exempt the row from the probe entirely: a partial index whose
+   WHERE the row does not match, and #290's NULL exemption (SQLite treats every
+   NULL as distinct in a UNIQUE index — such a row is still written to the index
+   tree, it just never conflicts).  Callers must have checked [idx_unique]. *)
+let probe_unique_conflict
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row_for_idx : Row.t)
+      (idx : Cat.index_info)
+  : int64 option Lwt.t
+  =
+  if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
+  then Lwt.return_none
+  else (
+    let key_vals = get_index_key_values clock params idx table_meta.columns row_for_idx in
+    if any_null_val key_vals
+    then Lwt.return_none
+    else (
+      let iks = List.map row_value_to_index_value key_vals in
+      let prefix, plen = encode_index_key_prefix iks in
+      let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+      (* O(log n) native probe: only the first entry >= seek_key is needed to
+         detect a duplicate prefix — never drain the whole index (#229). *)
+      let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
+      let* first = S.seek_next cur in
+      let conflict_rowid_opt =
+        match first with
+        | None -> None
+        | Some (ikey, _) ->
+          if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+          then (
+            let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
+            Some (Rowid.decode rid_bytes))
+          else None
+      in
+      S.seek_close cur;
+      Lwt.return conflict_rowid_opt))
+;;
+
+(* #639: does this index carry the constraint an ON CONFLICT clause names?
+   [idx_unique] is part of the test on purpose — a conflict target must name a
+   uniqueness constraint, so a non-unique index with the same column list is not
+   one, and falls through to the modifier like any other index. *)
+let index_is_conflict_target
+      (idx : Cat.index_info)
+      ~(upsert_update : (string list * (int * Plan.expr) list) option)
+  : bool
+  =
+  match upsert_update with
+  | None -> false
+  | Some (conflict_cols, _) ->
+    idx.Cat.idx_unique
+    && List.sort String.compare idx.Cat.idx_columns
+       = List.sort String.compare conflict_cols
+;;
+
+(* UNIQUE pre-check for INSERT: returns (skip, rowids to delete for REPLACE,
+   optional rowid to update for UPSERT). Raises on a plain UNIQUE violation.
+
+   #639: the conflict TARGET is probed first, in its own pass, and supersedes
+   everything else when it hits. That is not a micro-optimisation — it is what
+   makes the answer well-defined. The single fold this replaced let a conflict
+   on ANY index decide, so with two unique indexes and a row conflicting on
+   both, the outcome depended on the order [Cat.indexes_for_table] happened to
+   return them in (newest-first, i.e. on `CREATE UNIQUE INDEX` order): the
+   target seen first gave an upsert, the other seen first gave a skip under
+   [CA_ignore]. Same schema, same statement, two answers.
+
+   When the target hits, the accumulator is reset to [(false, [], Some rid)]:
+
+   - [skip] must be false. The upsert supersedes the insert, and a skip decided
+     against a row that is no longer being inserted is meaningless.
+   - [dels] must be EMPTY. Those rowids were queued for deletion because they
+     conflicted with the row being INSERTED — and that row is discarded in
+     favour of updating [rid], so nothing should be displaced. Dropping them
+     silently would be worse than either answer: [execute_insert]'s upsert
+     branch never calls [delete_replace_conflicts], so a non-empty [dels] there
+     is a queued delete that never happens.
+
+   What is NOT true, and was claimed here in the first revision of #639: that
+   the DO UPDATE's result is re-checked against the other unique indexes.
+   [write_row_rekeyed] does no uniqueness probe at all — its index loop is an
+   unconditional [S.del] of the old key and [S.put] of the new one, and
+   [check_index_unique_on_update] is defined AFTER it in this file and is
+   reached only from [validate_update_unique], the plain-UPDATE pre-pass.
+
+   So discarding the other indexes' verdicts here loses a check that nothing
+   downstream replaces. That is sound for the verdicts this pass drops — they
+   were computed against the row being INSERTED, which is discarded, and the
+   DO UPDATE may not touch those columns at all — but a DO UPDATE that WRITES a
+   duplicate into another unique index is accepted silently. That gap is
+   pre-existing (it is the upsert path's share of "DO UPDATE is not
+   uniqueness-checked", true on main for the secondary-index shape) and is
+   tracked as #667. Do not read this pass as covering it. *)
 let check_insert_unique
       tx
       (table_meta : Cat.table_meta)
@@ -3523,59 +3669,46 @@ let check_insert_unique
       (idxs : Cat.index_info list)
   : (bool * int64 list * int64 option) Lwt.t
   =
-  Lwt_list.fold_left_s
-    (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
-       if skip || not idx.idx_unique
-       then Lwt.return (skip, dels, upsert_rid)
-       else if
-         not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
-       then Lwt.return (skip, dels, upsert_rid)
-       else (
-         let key_vals =
-           get_index_key_values clock params idx table_meta.columns row_for_idx
-         in
-         (* #290: SQLite treats every NULL as distinct in a UNIQUE index — a row
-            whose key has ANY NULL column is exempt from the uniqueness probe (it
-            is still inserted into the index tree, it just never conflicts). *)
-         if any_null_val key_vals
-         then Lwt.return (false, dels, upsert_rid)
-         else (
-           let iks = List.map row_value_to_index_value key_vals in
-           let prefix, plen = encode_index_key_prefix iks in
-           let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-           (* O(log n) native probe: only the first entry >= seek_key is needed
-            to detect a duplicate prefix — never drain the whole index (#229). *)
-           let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
-           let* first = S.seek_next cur in
-           let conflict_rowid_opt =
-             match first with
-             | None -> None
-             | Some (ikey, _) ->
-               if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-               then (
-                 let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
-                 Some (Rowid.decode rid_bytes))
-               else None
+  let targets, others =
+    List.partition (fun idx -> index_is_conflict_target idx ~upsert_update) idxs
+  in
+  let* target_hit =
+    Lwt_list.fold_left_s
+      (fun acc idx ->
+         match acc with
+         | Some _ -> Lwt.return acc
+         | None -> probe_unique_conflict tx table_meta ~clock ~params ~row_for_idx idx)
+      None
+      targets
+  in
+  match target_hit with
+  | Some old_rowid -> Lwt.return (false, [], Some old_rowid)
+  | None ->
+    (* No target conflict (or no target at all): the modifier governs, exactly
+       as it did before #639. [upsert_rid] can only stay [None] here — every
+       index that could have set it is in [targets]. *)
+    Lwt_list.fold_left_s
+      (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
+         if skip || not idx.idx_unique
+         then Lwt.return (skip, dels, upsert_rid)
+         else
+           let* conflict =
+             probe_unique_conflict tx table_meta ~clock ~params ~row_for_idx idx
            in
-           S.seek_close cur;
-           match conflict_rowid_opt with
-           | None -> Lwt.return (false, dels, upsert_rid)
+           match conflict with
+           | None -> Lwt.return (skip, dels, upsert_rid)
            | Some old_rowid ->
-             (match on_conflict, upsert_update with
-              | Some Ast.CA_ignore, _ ->
+             (match on_conflict with
+              | Some Ast.CA_ignore ->
                 Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
-              | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
-              | _, Some (conflict_cols, _)
-                when List.sort String.compare idx.idx_columns
-                     = List.sort String.compare conflict_cols ->
-                Lwt.return (false, dels, Some old_rowid)
+              | Some Ast.CA_replace -> Lwt.return (false, old_rowid :: dels, upsert_rid)
               | _ ->
                 Lwt.fail_with
                   (unique_constraint_failed_msg
                      ~table:table_meta.Cat.name
-                     ~columns:idx.idx_columns)))))
-    (false, [], None)
-    idxs
+                     ~columns:idx.idx_columns)))
+      (false, [], None)
+      others
 ;;
 
 (* Write [row]'s index entries (honoring each index's WHERE predicate). *)
@@ -3750,8 +3883,9 @@ let write_row_rekeyed
   (* #567: every single-row UPDATE path (UPDATE, UPSERT DO UPDATE, ON UPDATE
      CASCADE / SET NULL / SET DEFAULT) funnels through here, so this is the one
      place the new row's NULLs have to be checked.  Raises before any index or
-     row write. *)
-  enforce_not_null table_meta new_row;
+     row write.  #629: [clock]/[params] let it see a VIRTUAL generated column's
+     computed value — an UPDATE to a base column can make one NULL. *)
+  enforce_not_null ~clock ~params table_meta new_row;
   let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
   let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
   let* () =
@@ -3894,7 +4028,9 @@ let execute_insert_write
      modifier already did for a UNIQUE conflict; every other resolution
      raises.  Not evaluated when [skip] is already set: that only happens under
      [CA_ignore], which would answer the same way. *)
-  let null_skip = (not skip) && not_null_skip_or_fail table_meta row ~on_conflict in
+  let null_skip =
+    (not skip) && not_null_skip_or_fail ~clock ~params table_meta row ~on_conflict
+  in
   if skip || null_skip
   then
     (* IGNORE from secondary-index pre-check: rollback if owned.
@@ -3967,7 +4103,42 @@ let execute_insert_write
          put_x returns a sentinel [Some Bytes.empty] — callers that need the
          old row bytes (CA_replace) fetch them via S.get below. *)
       let col_name = Option.value alias_col_name ~default:"rowid" in
+      (* #639: same reorder as [check_insert_unique] — an explicit ON CONFLICT
+         clause naming this alias PK beats the statement's modifier, so
+         `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` runs the DO UPDATE
+         instead of silently skipping.  A modifier still governs a conflict the
+         ON CONFLICT clause does not name (it falls through to the arms below).
+
+         BACKSTOP, not the primary path: since the review of PR #652 the
+         alias-PK target is probed in [execute_insert] BEFORE
+         [check_insert_unique], because a secondary-index conflict resolved here
+         would otherwise have already set [skip] or run
+         [delete_replace_conflicts] by the time [put_x] discovers this one.  The
+         arm is kept because it costs nothing and its absence would turn any
+         hole in that probe into a bare "UNIQUE constraint failed" rather than
+         the DO UPDATE the caller asked for. *)
       (match on_conflict, upsert_update with
+       | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
+         (* Alias PK is always a single column, so single-element equality
+            suffices — no sort needed.  Fire AFTER DELETE for any secondary
+            REPLACE displaced rows before handing off to the upsert path. *)
+         let* () =
+           match on_replace_delete with
+           | None -> Lwt.return_unit
+           | Some f -> Lwt_list.iter_s (fun r -> f ~tx ~old_row:r) displaced_rows
+         in
+         execute_upsert_update
+           tx
+           cat
+           table_meta
+           ~clock
+           ~params
+           ~owned
+           ~row
+           ~assigns
+           ~old_rowid:rowid
+           ~on_upsert_update_before
+           ~on_upsert_update
        | Some Ast.CA_ignore, _ ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.return false
@@ -4034,27 +4205,6 @@ let execute_insert_write
          in
          let* () = release_txn ~cat tx owned in
          Lwt.return true
-       | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
-         (* Alias PK is always a single column, so single-element equality
-            suffices — no sort needed.  Fire AFTER DELETE for any secondary
-            REPLACE displaced rows before handing off to the upsert path. *)
-         let* () =
-           match on_replace_delete with
-           | None -> Lwt.return_unit
-           | Some f -> Lwt_list.iter_s (fun r -> f ~tx ~old_row:r) displaced_rows
-         in
-         execute_upsert_update
-           tx
-           cat
-           table_meta
-           ~clock
-           ~params
-           ~owned
-           ~row
-           ~assigns
-           ~old_rowid:rowid
-           ~on_upsert_update_before
-           ~on_upsert_update
        | _ ->
          Lwt.fail_with
            (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name))
@@ -4081,6 +4231,74 @@ let build_insert_row
       ordinals
       values;
     r
+;;
+
+(* #631: a statement-level undo point for a row an [OR IGNORE] INSERT may skip.
+
+   A skipped row must leave nothing behind.  The row-store path is otherwise
+   scrupulous about that — the skip returns before [S.put], the index writes,
+   the FTS/AFTER-trigger hook, the IVM change feed and the #240 dirty mark —
+   but a BEFORE INSERT trigger has ALREADY run, inside the parent txn, and its
+   nested DML is real.  In autocommit that vanished with [S.rollback tx]
+   ([owned = true]); inside an explicit [BEGIN] it survived, because the undo
+   was keyed on WHO OWNS the transaction rather than on WHAT THE STATEMENT
+   DECIDED.  The same statement therefore left a trace or not depending on
+   whether the caller happened to open a transaction.
+
+   The fix is a savepoint taken around the row and rolled back when the row is
+   skipped.  Three properties matter:
+
+   - It is taken ONLY when [not owned] (autocommit already undoes everything),
+     a BEFORE INSERT trigger actually exists ([Option.is_some before_hook] —
+     [Db] returns [None] when no trigger matches table/timing/event), and the
+     statement can skip at all ([CA_ignore]).  Outside that intersection not a
+     single savepoint is pushed, so the TPC-C write path is untouched; a B-tree
+     savepoint clones the pager's dirty set and is not free.
+   - It never aborts the caller's transaction and never touches
+     [Db.explicit_txn] or the #555 poison flag — it is opened and resolved
+     within one statement, so it adds no second way out of a poisoned handle
+     and nothing in #555/#584/#598 changes shape.
+   - The name is unique per row, so nesting (a trigger body whose own INSERT
+     takes one) stays LIFO over [Store]'s savepoint stack.
+
+   On an exception the savepoint is RELEASED, not rolled back: a statement that
+   raises mid-way still leaves its partial effects in an explicit transaction
+   (see [with_ddl_txn]'s #286 note), and changing that is a different issue.
+   Releasing keeps the stack from growing without changing what is kept. *)
+let stmt_savepoint_seq = ref 0
+
+let stmt_savepoint_begin ~(cat : Cat.t) tx ~(take : bool) : string option Lwt.t =
+  if not take
+  then Lwt.return_none
+  else (
+    incr stmt_savepoint_seq;
+    let name = Printf.sprintf "__granary_stmt_%d" !stmt_savepoint_seq in
+    let* () = S.savepoint_begin tx name in
+    Cat.savepoint_begin_schema cat name;
+    Lwt.return_some name)
+;;
+
+let stmt_savepoint_release ~(cat : Cat.t) tx (sp : string option) : unit Lwt.t =
+  match sp with
+  | None -> Lwt.return_unit
+  | Some name ->
+    let* () = S.savepoint_release tx name in
+    Cat.savepoint_release_schema cat name;
+    Lwt.return_unit
+;;
+
+let stmt_savepoint_finish ~(cat : Cat.t) tx ~(wrote : bool) (sp : string option)
+  : unit Lwt.t
+  =
+  let* () =
+    match sp with
+    | Some name when not wrote ->
+      let* () = S.savepoint_rollback tx name in
+      Cat.savepoint_rollback_schema cat name;
+      Lwt.return_unit
+    | _ -> Lwt.return_unit
+  in
+  stmt_savepoint_release ~cat tx sp
 ;;
 
 (** Run [Op_insert] against the store: write the new row to the table
@@ -4123,6 +4341,18 @@ let execute_insert
      INSERT fires inside the parent txn so its nested DML shares the tx and
      its writes roll back atomically with the parent on failure. *)
   let* tx, owned = acquire_txn store mode in
+  (* #631: undo point for a row this statement may skip.  Only when the
+     transaction is the caller's ([not owned] — autocommit already undoes
+     everything through [S.rollback]), a BEFORE INSERT trigger exists whose
+     nested DML could outlive the skip, and the statement has a resolution that
+     can skip at all.  [Option.is_some], not [<> None]: the payload is a
+     closure and structural comparison would raise. *)
+  let* sp =
+    stmt_savepoint_begin
+      ~cat
+      tx
+      ~take:((not owned) && Option.is_some before_hook && on_conflict = Some Ast.CA_ignore)
+  in
   Lwt.catch
     (fun () ->
        let* () =
@@ -4148,24 +4378,99 @@ let execute_insert
        (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
          before extracting index keys so VIRTUAL cells contribute their value. *)
        let row_for_idx = with_computed_virtuals clock params table_meta row in
-       let* skip, to_delete, upsert_rowid =
-         check_insert_unique
-           tx
-           table_meta
-           ~clock
-           ~params
-           ~row_for_idx
-           ~on_conflict
-           ~upsert_update
-           idxs
+       (* #639/#599: an ON CONFLICT clause only ever intercepts a UNIQUENESS
+          conflict, never a NOT NULL one — the modifier governs the INSERT half.
+          So the row being inserted is checked for NULLs BEFORE any conflict
+          resolution is consulted, and the modifier decides what that means:
+          [OR IGNORE] skips the row, every other resolution raises.
+
+          Two entry conditions, and the second one is the review fix.
+          [CA_ignore] is there so `INSERT OR IGNORE` skips identically whichever
+          index the row collides with — the check used to live only in
+          [execute_insert_write], which an alias-PK conflict reaches and a
+          secondary-index conflict does not.  [Option.is_some upsert_update]
+          extends the same reasoning to the raising resolutions, which have the
+          same asymmetry for the same reason and which the alias pre-probe below
+          would otherwise route past [execute_insert_write] entirely: on `main`,
+          `INSERT INTO t VALUES (1, NULL_param) ON CONFLICT(k) DO UPDATE ...`
+          with row 1 present raised NOT NULL, and the pre-probe silently turned
+          that into a successful DO UPDATE.  It now raises again, and the
+          secondary-index shape — which never raised — agrees with it.
+
+          Deliberately NOT extended to plain INSERTs: with no upsert clause,
+          [execute_insert_write] still owns the check, so a statement without an
+          ON CONFLICT clause keeps `main`'s exact behaviour, including the
+          precedence between a UNIQUE error and a NOT NULL one.
+          [execute_insert_write] never double-evaluates — its [null_skip] is
+          guarded by [not skip], and for a raising resolution this call has
+          already raised. *)
+       let null_skip =
+         (on_conflict = Some Ast.CA_ignore || Option.is_some upsert_update)
+         && not_null_skip_or_fail table_meta row ~on_conflict
        in
-       (* #243 (T1): alias PK conflict detection is now folded into put_x
+       (* #243 (T1): alias PK conflict detection is normally folded into put_x
           inside execute_insert_write (#350) — no pre-read needed. *)
        let alias_col_name =
          match alias_idx with
          | Some i when alias_explicit -> Some (List.nth table_meta.columns i).Row.name
          | _ -> None
        in
+       (* #639: the rowid-alias PK is the OTHER thing an ON CONFLICT clause can
+          name, and when it names that one the target has to be resolved before
+          [check_insert_unique] gets a say — for exactly the reason spelled out
+          there. The alias PK has no index, so it is invisible to that fold: a
+          secondary conflict would set [skip] (under [OR IGNORE], losing the DO
+          UPDATE the caller asked for) or queue deletes (under [OR REPLACE],
+          displacing rows for an insert that then never happens, since
+          [delete_replace_conflicts] runs before [put_x] discovers the alias
+          conflict). Both are the same defect as the multi-index case, mirrored.
+
+          The probe costs one [S.get] and is only paid when an ON CONFLICT
+          clause actually names the alias column — never on the plain INSERT
+          path #350 optimised, which has no upsert clause at all. When it hits,
+          the result is the same shape the secondary-index target produces:
+          [(false, [], Some rowid)], with [old_rowid = rowid] by the alias-PK
+          invariant (the conflict is on this very key). *)
+       let alias_is_conflict_target =
+         match upsert_update, alias_col_name with
+         | Some (conflict_cols, _), Some name -> conflict_cols = [ name ]
+         | _ -> false
+       in
+       let* alias_target_hit =
+         if null_skip || not alias_is_conflict_target
+         then Lwt.return false
+         else
+           let* existing =
+             S.get
+               tx
+               (let x, _, _, _ = Cat.row_storage table_meta in
+                x)
+               (Rowid.encode rowid)
+           in
+           Lwt.return (Option.is_some existing)
+       in
+       let* skip, to_delete, upsert_rowid =
+         if null_skip
+         then Lwt.return (true, [], None)
+         else if alias_target_hit
+         then Lwt.return (false, [], Some rowid)
+         else
+           check_insert_unique
+             tx
+             table_meta
+             ~clock
+             ~params
+             ~row_for_idx
+             ~on_conflict
+             ~upsert_update
+             idxs
+       in
+       (* #639 (review): [skip] and [to_delete] are BOTH meaningless when
+          [upsert_rowid] is [Some _], and the branch below discards them. That is
+          sound only because every producer of a [Some] returns [(false, [], _)]
+          — [check_insert_unique]'s target pass and the alias probe above. Do not
+          reintroduce a path that sets [upsert_rowid] alongside a live [skip] or
+          a non-empty [to_delete]: the delete would be queued and never run. *)
        match upsert_update, upsert_rowid with
        | Some (_, assigns), Some old_rowid ->
          (* Secondary-index upsert conflict: update the conflicting row.
@@ -4187,6 +4492,7 @@ let execute_insert
              ~on_upsert_update
          in
          if updated then mark_dirty table_meta.Cat.name;
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:updated sp in
          Lwt.return updated
        | _ ->
          let* inserted =
@@ -4221,9 +4527,15 @@ let execute_insert
          then (
            mark_dirty table_meta.Cat.name;
            record_change table_meta.Cat.name (Inserted { rowid; row }));
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:inserted sp in
          Lwt.return inserted)
     (fun exn ->
-       (* On any exception: rollback if we own the txn, then re-raise. *)
+       (* On any exception: rollback if we own the txn, then re-raise.  #631:
+          the statement savepoint is released, not rolled back — a raising
+          statement's partial effects already survive in a borrowed
+          transaction, and this fix is about a SKIP, not about statement
+          atomicity on error.  Releasing only keeps the stack bounded. *)
+       let* () = stmt_savepoint_release ~cat tx sp in
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
 ;;
@@ -6432,8 +6744,8 @@ let execute_drop_index
 (* ------------------------------------------------------------------ *)
 
 let op_name = function
-  | Plan.Op_seq_scan { table_meta } -> "SeqScan(" ^ table_meta.Cat.name ^ ")"
-  | Plan.Op_col_seq_scan { table_meta } -> "ColSeqScan(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_seq_scan { table_meta; _ } -> "SeqScan(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_col_seq_scan { table_meta; _ } -> "ColSeqScan(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_filter _ -> "Filter"
   | Plan.Op_project _ -> "Project"
   | Plan.Op_expr_project _ -> "ExprProject"
@@ -6503,6 +6815,7 @@ let op_name = function
   | Plan.Op_pragma_set_defer_fk { on } ->
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_pragma_wal_checkpoint -> "Pragma(wal_checkpoint)"
+  | Plan.Op_pragma_checkpoint_status -> "Pragma(checkpoint_status)"
   | Plan.Op_pragma_get_wal_autocheckpoint -> "Pragma(get_wal_autocheckpoint)"
   | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
     Printf.sprintf "Pragma(set_wal_autocheckpoint=%Ld)" n
@@ -6630,15 +6943,66 @@ let current_txn_mode () =
   | None -> Auto
 ;;
 
-(* #262: re-establish BOTH per-query Lwt-storage contexts (the stats record and
-   the txn mode) for work that runs at pull time — outside [query]'s
-   construction-time [with_value] scope — currently the correlated-subquery
-   re-eval in [stream_filter] / [stream_expr_project].  Bundling the pair here
-   keeps them in lock-step: a future pull-time site cannot restore one and
-   silently drop the other (the exact omission #262 corrected for the mode). *)
-let with_pull_context ~stats ~mode f =
+(* #493: the per-query plan cache for correlated subqueries, keyed by the inner
+   [Ast.stmt] as it stands AFTER outer-reference substitution.
+
+   It is only sound to install because #493 also changed that substitution to
+   emit a positional PARAMETER for each outer reference rather than the row's
+   literal value: with a literal the substituted statement differed on every
+   outer row, so the table would have grown without bound and never hit.  With a
+   parameter the substituted statement is structurally identical for every row,
+   so one bind+plan serves the whole scan and the table holds one entry per
+   subquery site.
+
+   Anything that reinstates literal substitution at a cached site MUST pass
+   [~cache:None] there, or the cache becomes a per-row memory leak.
+
+   The value is an OPTION so that a statement which does not bind — the #592
+   unresolvable correlation — is remembered as such rather than re-bound per
+   row.
+
+   KNOWN LIMIT (#493 review): the table is created inside [stream_filter] /
+   [stream_expr_project], which run once per [to_stream].  For a NESTED
+   correlated subquery — an EXISTS inside an EXISTS — [to_stream] on the cached
+   outer plan is invoked once per outer row, so the inner [stream_filter]
+   allocates a fresh table each time and the innermost subquery still pays a
+   full bind+plan per outer row.  Correct, just not accelerated; it is the one
+   shape where "plan once, execute N times" does not apply.  Lifting the table
+   to the whole query (a [Lwt.with_value] at [query]) would fix it, and is
+   deliberately out of scope here. *)
+type subplan_cache = (Ast.stmt, Plan.op option) Hashtbl.t
+
+let subplan_cache_key : subplan_cache Lwt.key = Lwt.new_key ()
+
+(* #493 review: the count-shaped observable for "plan once, execute N times".
+
+   That was the one claim in #493 with nothing in the tree able to see it: the
+   leak has [Store.active_reader_count], the seek has [index_entries], the
+   short-circuit has [rows_examined], but a subquery re-planned per outer row
+   and one planned once are indistinguishable in every counter that existed.
+   This is the missing one — a monotone count of the times a subquery statement
+   was actually bound and planned, as opposed to served from the cache.
+
+   Diagnostic/testing only, exactly like [Store.active_reader_count] and
+   [Store.pinned_page_count] (#164): a process-global counter, not per-query, so
+   a test reads it either side of one query and takes the difference. It is an
+   integer count with no clock in it, so a gate built on it needs no
+   [GRANARY_BENCH_*] neutralizer. *)
+let subquery_plans_built_ref = ref 0
+let subquery_plans_built () = !subquery_plans_built_ref
+
+(* #262: re-establish the per-query Lwt-storage contexts (the stats record, the
+   txn mode, and #493's subquery plan cache) for work that runs at pull time —
+   outside [query]'s construction-time [with_value] scope — currently the
+   correlated-subquery re-eval in [stream_filter] / [stream_expr_project].
+   Bundling them here keeps them in lock-step: a future pull-time site cannot
+   restore one and silently drop the other (the exact omission #262 corrected
+   for the mode). *)
+let with_pull_context ~stats ~mode ~(cache : subplan_cache option) f =
   Lwt.with_value query_stats_key stats
-  @@ fun () -> Lwt.with_value txn_mode_key (Some mode) f
+  @@ fun () ->
+  Lwt.with_value txn_mode_key (Some mode)
+  @@ fun () -> Lwt.with_value subplan_cache_key cache f
 ;;
 
 (* Increment via the closure-captured option; never calls [Lwt.get] at pull time
@@ -7505,7 +7869,7 @@ let execute_with_count
                    into a NOT NULL column here.  #599: [OR IGNORE] drops the
                    offending row here too, so the modifier means the same thing
                    on both storage engines. *)
-                if not_null_skip_or_fail table_meta row ~on_conflict
+                if not_null_skip_or_fail ~clock ~params table_meta row ~on_conflict
                 then None
                 else Some row)
              values
@@ -7552,7 +7916,7 @@ let execute_with_count
                  the check has to be here.  Raised before the txn is acquired,
                  so nothing has been written when it fires.  #599: under
                  [OR IGNORE] the row is dropped instead. *)
-              if not_null_skip_or_fail table_meta dest ~on_conflict
+              if not_null_skip_or_fail ~clock ~params table_meta dest ~on_conflict
               then None
               else Some dest)
            src_rows)
@@ -7824,6 +8188,7 @@ let execute_with_count
   | Plan.Op_sqlite_master
   | Plan.Op_sqlite_sequence
   | Plan.Op_pragma_get_synchronous
+  | Plan.Op_pragma_checkpoint_status
   | Plan.Op_pragma_get_wal_batch_commits
   | Plan.Op_pragma_get_wal_batch_interval_ms ->
     failwith "Exec.execute: use Exec.query for read operations"
@@ -8315,8 +8680,8 @@ let rec plan_expr_has_subquery : Plan.expr -> bool = function
     join's right-hand columns and a projection between the two would move
     them. *)
 let rec outer_row_width : Plan.op -> int option = function
-  | Plan.Op_seq_scan { table_meta }
-  | Plan.Op_col_seq_scan { table_meta }
+  | Plan.Op_seq_scan { table_meta; _ }
+  | Plan.Op_col_seq_scan { table_meta; _ }
   | Plan.Op_index_lookup { table_meta; _ }
   | Plan.Op_rowid_lookup { table_meta; _ } -> Some (List.length table_meta.Cat.columns)
   | Plan.Op_filter { child; _ } | Plan.Op_sort { child; _ } | Plan.Op_limit { child; _ }
@@ -8328,8 +8693,27 @@ let rec outer_row_width : Plan.op -> int option = function
   | _ -> None
 ;;
 
-(** #592: every base table feeding a plan subtree, paired with the ordinal of
-    its first column in that subtree's output row.
+(** #592/#635: one base-table input of a plan subtree.
+
+    [oi_ident] is the input's {b scope identifier} — the FROM item's alias where
+    one was given, otherwise the table name. That is the single rule an outer
+    reference resolves by, and it is the same rule [inner_scope_of] applies to a
+    subquery's own FROM: an alias {i replaces} the table name rather than adding
+    to it. *)
+type outer_input =
+  { oi_meta : Cat.table_meta
+  ; oi_ident : string
+  ; oi_offset : int (** ordinal of this input's first column in the emitted row *)
+  }
+
+(** #635: the scope identifier of a plan leaf — its alias where it has one. *)
+let scan_ident (m : Cat.table_meta) (alias : string option) =
+  Option.value alias ~default:m.Cat.name
+;;
+
+(** #592/#635: every base table feeding a plan subtree, paired with the ordinal
+    of its first column in that subtree's output row and with the identifier an
+    outer reference may name it by.
 
     This replaces the single-table [get_outer_scan_meta] that answered [None]
     over a join — the reason a correlated subquery in an INNER join's ON clause
@@ -8337,69 +8721,293 @@ let rec outer_row_width : Plan.op -> int option = function
     [right] ([Array.append lrow rrow]), so the offsets are exactly the widths
     to the left of each input.
 
-    Two inputs sharing a table name (a self-join) answers [None]: resolution is
-    by name, so keeping both would silently pick one. The caller refuses
-    instead. *)
-let get_outer_scan_metas (op : Plan.op) : (Cat.table_meta * int) list option =
-  let rec go base : Plan.op -> (Cat.table_meta * int) list option = function
-    | Plan.Op_seq_scan { table_meta }
-    | Plan.Op_col_seq_scan { table_meta }
-    | Plan.Op_index_lookup { table_meta; _ }
-    | Plan.Op_rowid_lookup { table_meta; _ } -> Some [ table_meta, base ]
+    Two inputs sharing an {b identifier} answers [None]: resolution is by
+    identifier, so keeping both would silently pick one. The caller refuses
+    instead. #635 narrowed that from "sharing a table name" —
+    [FROM l AS x JOIN l AS y] carries two distinct identifiers and now resolves,
+    while the unaliased [FROM l JOIN l] still cannot and is still refused. *)
+let get_outer_scan_metas (op : Plan.op) : outer_input list option =
+  let leaf table_meta alias base =
+    Some
+      [ { oi_meta = table_meta; oi_ident = scan_ident table_meta alias; oi_offset = base }
+      ]
+  in
+  let rec go base : Plan.op -> outer_input list option = function
+    | Plan.Op_seq_scan { table_meta; alias } | Plan.Op_col_seq_scan { table_meta; alias }
+      -> leaf table_meta alias base
+    | Plan.Op_index_lookup { table_meta; alias; _ }
+    | Plan.Op_rowid_lookup { table_meta; alias; _ } -> leaf table_meta alias base
     | Plan.Op_filter { child; _ } | Plan.Op_sort { child; _ } | Plan.Op_limit { child; _ }
       -> go base child
     | Plan.Op_hash_join { left; right; _ } ->
       (match go base left, outer_row_width left with
        | Some ls, Some w -> Option.map (fun rs -> ls @ rs) (go (base + w) right)
        | _ -> None)
-    | Plan.Op_nested_loop_join { left; right_meta; right_col_offset; _ } ->
-      Option.map (fun ls -> ls @ [ right_meta, base + right_col_offset ]) (go base left)
+    | Plan.Op_nested_loop_join { left; right_meta; right_alias; right_col_offset; _ } ->
+      Option.map
+        (fun ls ->
+           ls
+           @ [ { oi_meta = right_meta
+               ; oi_ident = scan_ident right_meta right_alias
+               ; oi_offset = base + right_col_offset
+               }
+             ])
+        (go base left)
     | _ -> None
   in
   match go 0 op with
   | None -> None
-  | Some metas ->
-    let names = List.map (fun ((m : Cat.table_meta), _) -> m.Cat.name) metas in
-    if List.length (List.sort_uniq String.compare names) <> List.length names
+  | Some inputs ->
+    let idents = List.map (fun i -> i.oi_ident) inputs in
+    if List.length (List.sort_uniq String.compare idents) <> List.length idents
     then None
-    else Some metas
+    else Some inputs
 ;;
 
 (** #592: how a correlated subquery's outer column references are resolved
     against one row of the enclosing operator. Both lookups answer [None] when
     the name is not an outer reference, in which case the reference is left
     alone (it belongs to the subquery's own scope, or it is unresolvable and
-    the caller refuses the query). *)
+    the caller refuses the query).
+
+    #493: the two lookups answer an [Ast.expr] rather than a [Row.value],
+    because there are now two ways to pin an outer reference — as the row's
+    literal value ({!binding_of_metas}) or as a positional parameter addressing
+    that row slot ({!param_binding_of_metas}). The substitution walk is shared
+    and does not care which. *)
 type outer_binding =
-  { bind_qual : string -> string -> Row.value option (** [table] then [column] *)
-  ; bind_unqual : string -> Row.value option
+  { bind_qual : string -> string -> Ast.expr option (** [table] then [column] *)
+  ; bind_unqual : string -> Ast.expr option
   }
 
 (** Build an [outer_binding] over a row whose layout is described by
-    [get_outer_scan_metas]. An unqualified name that more than one input
-    carries is ambiguous and is left unresolved. *)
-let binding_of_metas (metas : (Cat.table_meta * int) list) (row : Row.t) : outer_binding =
-  let at (m : Cat.table_meta) off col =
-    match find_col_idx_by_name m.Cat.columns col with
-    | i when off + i < Array.length row -> Some row.(off + i)
+    [get_outer_scan_metas].
+
+    #635: a qualified reference matches an input's {b scope identifier} — the
+    alias where the FROM item has one, the table name otherwise — so
+    [FROM l AS x] resolves [x.a] and leaves [l.a] unresolved, which the caller
+    then refuses. An unqualified name that more than one input carries is
+    ambiguous and is likewise left unresolved rather than guessed at.
+
+    #493: the binding yields an {!Ast.expr}, not a {!Row.value}, so that
+    {!param_binding_of_metas} can pin an outer value as a positional parameter
+    instead of a literal and keep the inner statement identical across rows.
+    This binder is the literal spelling of the same interface. *)
+let binding_of_metas (inputs : outer_input list) (row : Row.t) : outer_binding =
+  let at (i : outer_input) col =
+    match find_col_idx_by_name i.oi_meta.Cat.columns col with
+    | k when i.oi_offset + k < Array.length row ->
+      Some (Ast.E_lit (value_to_literal row.(i.oi_offset + k)))
     | _ -> None
     | exception Failure _ -> None
   in
   { bind_qual =
       (fun tbl col ->
-        match
-          List.find_opt
-            (fun ((m : Cat.table_meta), _) -> String.equal m.Cat.name tbl)
-            metas
-        with
+        match List.find_opt (fun i -> String.equal i.oi_ident tbl) inputs with
         | None -> None
-        | Some (m, off) -> at m off col)
+        | Some i -> at i col)
   ; bind_unqual =
       (fun col ->
-        match List.filter_map (fun (m, off) -> at m off col) metas with
+        match List.filter_map (fun i -> at i col) inputs with
         | [ v ] -> Some v
         | _ -> None)
   }
+;;
+
+(** #493: the same binding as {!binding_of_metas}, except each outer reference
+    is pinned as a positional PARAMETER addressing the row slot it came from
+    rather than as that slot's literal value.
+
+    [base] is where the outer row is spliced into the parameter array — the
+    caller runs the subquery with [Array.append params row], so outer row slot
+    [k] is parameter [base + k] (0-based), spelled [Ast.Param_index] which
+    {!Sema.resolve_param} reads 1-based.
+
+    Why this exists: with literals the substituted subquery statement differs on
+    every outer row, so it has to be re-bound and re-planned per row — the whole
+    of #493's cost. With parameters it is structurally identical for every row,
+    which is what makes the {!subplan_cache} hit, and the planner still gets an
+    index seek out of it because {!Planner.recognise_eq_col_lit} accepts a bound
+    parameter on the value side exactly as it accepts a literal (#228's prepared
+    point lookup).
+
+    [row_len] must be the width of the rows being scanned, so that the
+    "is this actually an outer reference?" decision matches the literal
+    binding's bound check exactly.
+
+    #635: this resolves qualified references against the input's {b scope
+    identifier} exactly as {!binding_of_metas} does — alias where the FROM item
+    has one, table name otherwise. The two binders must agree on WHICH
+    references resolve; they differ only in what they substitute (a parameter
+    here, a literal there). If they diverge, the same query answers differently
+    depending on whether its subquery happened to take the cached path. *)
+let param_binding_of_metas ~(base : int) ~(row_len : int) (inputs : outer_input list)
+  : outer_binding
+  =
+  let at (i : outer_input) col =
+    match find_col_idx_by_name i.oi_meta.Cat.columns col with
+    | k when i.oi_offset + k < row_len ->
+      Some (Ast.E_param (Ast.Param_index (base + i.oi_offset + k + 1)))
+    | _ -> None
+    | exception Failure _ -> None
+  in
+  { bind_qual =
+      (fun tbl col ->
+        match List.find_opt (fun i -> String.equal i.oi_ident tbl) inputs with
+        | None -> None
+        | Some i -> at i col)
+  ; bind_unqual =
+      (fun col ->
+        match List.filter_map (fun i -> at i col) inputs with
+        | [ v ] -> Some v
+        | _ -> None)
+  }
+;;
+
+(** #493: does [e] mention a bound parameter anywhere, including inside a nested
+    subquery?
+
+    The parameter substitution above splices the outer row in at [base =
+    Array.length params], which is safe only while the inner statement has no
+    parameters of its own: {!Sema.resolve_param} numbers an inner statement's
+    placeholders from 0 with a fresh counter, and an explicit [Param_index] also
+    {i advances} that counter, so a subquery that mixes its own [?] with the
+    injected ones could have a placeholder land on a row slot. Rather than
+    reason about encounter order, the caller falls back to the pre-#493
+    literal-substitution path whenever this answers [true]. *)
+let rec ast_expr_uses_param : Ast.expr -> bool = function
+  | Ast.E_param _ -> true
+  | Ast.E_binop (_, a, b) -> ast_expr_uses_param a || ast_expr_uses_param b
+  | Ast.E_not a
+  | Ast.E_is_null a
+  | Ast.E_is_not_null a
+  | Ast.E_neg a
+  | Ast.E_bitnot a
+  | Ast.E_collate (a, _)
+  | Ast.E_cast (a, _) -> ast_expr_uses_param a
+  | Ast.E_between (x, lo, hi) ->
+    ast_expr_uses_param x || ast_expr_uses_param lo || ast_expr_uses_param hi
+  | Ast.E_in (x, vs) -> ast_expr_uses_param x || List.exists ast_expr_uses_param vs
+  | Ast.E_agg (_, a) -> Option.fold ~none:false ~some:ast_expr_uses_param a
+  (* #491: a DISTINCT aggregate's argument is walked like a plain one — #493's
+     gate is about whether a placeholder could land on an injected row slot,
+     and DISTINCT changes nothing about that. *)
+  | Ast.E_agg_distinct (_, a) -> ast_expr_uses_param a
+  | Ast.E_func (_, args) -> List.exists ast_expr_uses_param args
+  | Ast.E_subquery s | Ast.E_exists s -> ast_stmt_uses_param s
+  | Ast.E_in_select (x, s) -> ast_expr_uses_param x || ast_stmt_uses_param s
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:false ~some:ast_expr_uses_param scrutinee
+    || List.exists (fun (c, r) -> ast_expr_uses_param c || ast_expr_uses_param r) branches
+    || Option.fold ~none:false ~some:ast_expr_uses_param else_
+  | Ast.E_window { args; window; _ } ->
+    List.exists ast_expr_uses_param args
+    || List.exists ast_expr_uses_param window.Ast.partition_by
+    || List.exists
+         (fun (k : Ast.order_key) -> ast_expr_uses_param k.Ast.expr)
+         window.Ast.order_by
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_match _ | Ast.E_fts_snippet _ ->
+    false
+
+(** #493: the statement-level half of {!ast_expr_uses_param}. Anything that is
+    not a SELECT-shaped statement answers [true] — conservatively refusing the
+    parameterized path rather than enumerating write-statement shapes that
+    cannot appear in a subquery position anyway. *)
+and ast_stmt_uses_param : Ast.stmt -> bool = function
+  | Ast.S_select r ->
+    (match r.proj with
+     | `All | `Cols _ -> false
+     | `Exprs es -> List.exists (fun (e, _) -> ast_expr_uses_param e) es)
+    || Option.fold ~none:false ~some:ast_expr_uses_param r.where
+    || Option.fold ~none:false ~some:ast_expr_uses_param r.having
+    || List.exists (fun (j : Ast.join_clause) -> ast_expr_uses_param j.Ast.on) r.joins
+    || List.exists (fun (k : Ast.order_key) -> ast_expr_uses_param k.Ast.expr) r.order
+  | Ast.S_compound { left; right; order; _ } ->
+    ast_stmt_uses_param left
+    || ast_stmt_uses_param right
+    || List.exists (fun (k : Ast.order_key) -> ast_expr_uses_param k.Ast.expr) order
+  | Ast.S_with_cte { def; query; _ } ->
+    ast_stmt_uses_param def || ast_stmt_uses_param query
+  | _ -> true
+;;
+
+(** #493: does any subquery embedded in this plan expression use a parameter of
+    its own?  Only the three subquery-carrying nodes are inspected; the plan
+    expression's own [P_param] nodes are irrelevant, because they address the
+    OUTER statement's parameter array, whose slots all sit below [base]. *)
+let rec plan_expr_subqueries_use_param : Plan.expr -> bool = function
+  | Plan.P_subquery s | Plan.P_exists s -> ast_stmt_uses_param s
+  | Plan.P_in_select (x, s) -> plan_expr_subqueries_use_param x || ast_stmt_uses_param s
+  | Plan.P_binop (_, a, b) ->
+    plan_expr_subqueries_use_param a || plan_expr_subqueries_use_param b
+  | Plan.P_not e
+  | Plan.P_is_null e
+  | Plan.P_is_not_null e
+  | Plan.P_neg e
+  | Plan.P_bitnot e
+  | Plan.P_cast (e, _)
+  | Plan.P_collate (e, _) -> plan_expr_subqueries_use_param e
+  | Plan.P_between (x, lo, hi) ->
+    plan_expr_subqueries_use_param x
+    || plan_expr_subqueries_use_param lo
+    || plan_expr_subqueries_use_param hi
+  | Plan.P_in (x, vs) ->
+    plan_expr_subqueries_use_param x || List.exists plan_expr_subqueries_use_param vs
+  | Plan.P_func (_, args) -> List.exists plan_expr_subqueries_use_param args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:false ~some:plan_expr_subqueries_use_param scrutinee
+    || List.exists
+         (fun (c, r) ->
+            plan_expr_subqueries_use_param c || plan_expr_subqueries_use_param r)
+         branches
+    || Option.fold ~none:false ~some:plan_expr_subqueries_use_param else_
+  | _ -> false
+;;
+
+(** #493: every [Ast.stmt] a plan expression carries in a subquery position.
+
+    Used by {!refuse_unresolved_correlation} to decide the #592 refusal from the
+    PLAN rather than from a row. Only the top level is collected — a subquery
+    nested inside one of these statements is resolved by that statement's own
+    [stream_filter] when it runs, which is exactly where the pre-#493 per-row
+    check placed it too. *)
+let rec plan_expr_embedded_stmts : Plan.expr -> Ast.stmt list = function
+  | Plan.P_subquery s | Plan.P_exists s -> [ s ]
+  | Plan.P_in_select (x, s) -> s :: plan_expr_embedded_stmts x
+  | Plan.P_binop (_, a, b) -> plan_expr_embedded_stmts a @ plan_expr_embedded_stmts b
+  | Plan.P_not e
+  | Plan.P_is_null e
+  | Plan.P_is_not_null e
+  | Plan.P_neg e
+  | Plan.P_bitnot e
+  | Plan.P_cast (e, _)
+  | Plan.P_collate (e, _) -> plan_expr_embedded_stmts e
+  | Plan.P_between (x, lo, hi) ->
+    plan_expr_embedded_stmts x @ plan_expr_embedded_stmts lo @ plan_expr_embedded_stmts hi
+  | Plan.P_in (x, vs) ->
+    plan_expr_embedded_stmts x @ List.concat_map plan_expr_embedded_stmts vs
+  | Plan.P_func (_, args) -> List.concat_map plan_expr_embedded_stmts args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:[] ~some:plan_expr_embedded_stmts scrutinee
+    @ List.concat_map
+        (fun (c, r) -> plan_expr_embedded_stmts c @ plan_expr_embedded_stmts r)
+        branches
+    @ Option.fold ~none:[] ~some:plan_expr_embedded_stmts else_
+  | _ -> []
+;;
+
+(** #493: flatten a plan predicate's top-level [AND] spine.
+
+    [stream_filter] evaluates the conjuncts left to right and stops at the first
+    that is not truthy, so a correlated subquery written after a cheap
+    restriction — TPC-H Q4's shape exactly — is never run for a row the
+    restriction already rejected. Filtering is a two-valued decision (a row
+    passes iff every conjunct is truthy), so per-conjunct truthiness agrees with
+    [value_truthy] over the whole [AND] tree, NULL operands included. The
+    conjuncts are NOT reordered: only short-circuited in the order written. *)
+let rec plan_and_conjuncts : Plan.expr -> Plan.expr list = function
+  | Plan.P_binop (Plan.And, a, b) -> plan_and_conjuncts a @ plan_and_conjuncts b
+  | e -> [ e ]
 ;;
 
 (** #558: the message used when a subquery beside an aggregate cannot be
@@ -8418,7 +9026,7 @@ let agg_subquery_refusal () =
     describes the {b child} row layout, so each group ordinal is mapped back to
     the table and column it came from. *)
 let binding_of_group_cols
-      (metas : (Cat.table_meta * int) list)
+      (inputs : outer_input list)
       (group_cols : int list)
       (agg_row : Row.t)
   : outer_binding
@@ -8429,14 +9037,19 @@ let binding_of_group_cols
     else (
       match
         List.find_opt
-          (fun ((m : Cat.table_meta), off) ->
-             child_ord >= off && child_ord < off + List.length m.Cat.columns)
-          metas
+          (fun (oi : outer_input) ->
+             child_ord >= oi.oi_offset
+             && child_ord < oi.oi_offset + List.length oi.oi_meta.Cat.columns)
+          inputs
       with
       | None -> None
-      | Some (m, off) ->
-        let c : Row.column = List.nth m.Cat.columns (child_ord - off) in
-        Some (m.Cat.name, c.Row.name, agg_row.(i)))
+      | Some oi ->
+        let c : Row.column = List.nth oi.oi_meta.Cat.columns (child_ord - oi.oi_offset) in
+        (* #635: the qualifier recorded here is the input's scope identifier, so
+           an alias-qualified reference to a grouped column resolves too.
+           #493: wrapped as an expr here rather than by the walker, so the
+           parameterized binder can substitute a [Param_index] instead. *)
+        Some (oi.oi_ident, c.Row.name, Ast.E_lit (value_to_literal agg_row.(i))))
   in
   let entries = List.filter_map Fun.id (List.mapi entry group_cols) in
   { bind_qual =
@@ -8462,7 +9075,40 @@ let binding_of_group_cols
 let correlated_filter_refusal () =
   "Exec: a correlated subquery in this predicate cannot be resolved — its outer column \
    reference has no source in the rows being filtered (#592). Rewrite it as an \
-   uncorrelated subquery, or qualify the outer column with its table name."
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
+;;
+
+(** #626: the projection's counterpart to {!correlated_filter_refusal}.
+
+    [stream_expr_project] used to keep a non-raising fallback when the
+    correlation source could not be located: every such subquery evaluated to
+    [Row.V_null]. A NULL there is indistinguishable from a legitimately-NULL
+    aggregate, so the caller could not tell "no matching rows" from "the engine
+    could not resolve this correlation" — the #592 failure mode wearing a
+    different hat, a column of plausible NULLs instead of zero rows. The same
+    shape in a WHERE or an ON clause was already refused, so the two spellings
+    disagreed about the same unresolvable reference. *)
+let correlated_projection_refusal () =
+  "Exec: a correlated subquery in this projection cannot be resolved — its outer column \
+   reference has no source in the rows being projected (#626). Rewrite it as an \
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
+;;
+
+(** #615: the outer join's counterpart.
+
+    #566 refused every correlated subquery in an outer join's ON predicate,
+    because the correlation source could not be located over a join node. #592
+    built that source ([get_outer_scan_metas]), so the resolvable shapes are now
+    evaluated and only the genuinely unresolvable ones reach this message —
+    which is the same boundary the INNER spelling has. *)
+let correlated_on_refusal () =
+  "Exec: a correlated subquery in an outer join's ON predicate cannot be resolved — its \
+   outer column reference has no source in the joined row (#615; #566 refused every \
+   spelling of this before the correlation source existed). Rewrite it as an \
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
 ;;
 
 (** #592: what the {i inner} SELECT already has in scope, so a reference the
@@ -8482,41 +9128,26 @@ type inner_scope =
   ; has_table : string -> bool
   }
 
-(** Substitute outer column refs with literal values drawn from [bnd], leaving
-    anything [scope] says the subquery owns alone. *)
-let rec substitute_outer_in_expr
-          ~(scope : inner_scope)
-          (bnd : outer_binding)
-          (e : Ast.expr)
-  : Ast.expr
-  =
-  let go = substitute_outer_in_expr ~scope bnd in
-  match e with
-  | Ast.E_tbl_col (tbl, col) when not (scope.has_table tbl) ->
-    (match bnd.bind_qual tbl col with
-     | Some v -> Ast.E_lit (value_to_literal v)
-     | None -> e)
-  | Ast.E_col name when not (scope.has_col name) ->
-    (match bnd.bind_unqual name with
-     | Some v -> Ast.E_lit (value_to_literal v)
-     | None -> e)
-  | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
-  | Ast.E_not a -> Ast.E_not (go a)
-  | Ast.E_is_null a -> Ast.E_is_null (go a)
-  | Ast.E_is_not_null a -> Ast.E_is_not_null (go a)
-  | Ast.E_neg a -> Ast.E_neg (go a)
-  | Ast.E_bitnot a -> Ast.E_bitnot (go a)
-  | Ast.E_between (x, lo, hi) -> Ast.E_between (go x, go lo, go hi)
-  | Ast.E_in (x, vals) -> Ast.E_in (go x, List.map go vals)
-  | Ast.E_func (f, args) -> Ast.E_func (f, List.map go args)
-  | Ast.E_cast (x, ty) -> Ast.E_cast (go x, ty)
-  | Ast.E_case { scrutinee; branches; else_ } ->
-    Ast.E_case
-      { scrutinee = Option.map go scrutinee
-      ; branches = List.map (fun (c, r) -> go c, go r) branches
-      ; else_ = Option.map go else_
-      }
-  | _ -> e
+(** #635: the scope an outer reference is judged against when the substitution
+    descends through {i more than one} level of subquery nesting.
+
+    SQL resolves innermost-first, and "innermost" is cumulative: a name owned by
+    an {i intermediate} subquery belongs to that subquery, not to the outer row,
+    even when the innermost SELECT knows nothing about it.  Descending with only
+    the innermost scope would rewrite such a name from the outer row — a
+    plausible wrong answer, the failure class this whole area is about — so the
+    scopes are unioned on the way down. *)
+let scope_union (a : inner_scope) (b : inner_scope) : inner_scope =
+  { has_col = (fun n -> a.has_col n || b.has_col n)
+  ; has_table = (fun n -> a.has_table n || b.has_table n)
+  }
+;;
+
+(** The scope enclosing the {i outermost} correlated subquery: the operator
+    holding the outer row owns no identifier the subquery could be shadowed by,
+    so nothing is hidden at that level. *)
+let no_inner_scope : inner_scope =
+  { has_col = (fun _ -> false); has_table = (fun _ -> false) }
 ;;
 
 (** #592: build the [inner_scope] of a SELECT.
@@ -8568,16 +9199,95 @@ let inner_scope_of (cat_opt : Cat.t option) (s : Ast.stmt) : inner_scope =
   | _ -> { has_col = (fun _ -> true); has_table = (fun _ -> true) }
 ;;
 
+(** Substitute outer column refs with literal values drawn from [bnd], leaving
+    anything [scope] says the subquery owns alone.
+
+    #635: the [E_subquery] / [E_exists] / [E_in_select] arms are what make this
+    work at {i any} nesting depth.  They used to fall to the catch-all, so a
+    reference from a doubly-nested subquery to the outermost query was never
+    substituted — it survived, and the caller refused the query.  Descending
+    carries the union of every enclosing subquery's scope (see {!scope_union}),
+    so an intermediate level still shadows what it owns. *)
+let rec substitute_outer_in_expr
+          ~(cat : Cat.t option)
+          ~(scope : inner_scope)
+          (bnd : outer_binding)
+          (e : Ast.expr)
+  : Ast.expr
+  =
+  let go = substitute_outer_in_expr ~cat ~scope bnd in
+  let go_s = substitute_outer_in_stmt ~cat ~enclosing:scope bnd in
+  match e with
+  (* #493: the binding already yields an expr — a literal from
+     {!binding_of_metas}, a [Param_index] from {!param_binding_of_metas}.  Do
+     NOT re-wrap here: that is what keeps the parameterized spelling, and with
+     it the single cached plan, reachable. *)
+  | Ast.E_tbl_col (tbl, col) when not (scope.has_table tbl) ->
+    (match bnd.bind_qual tbl col with
+     | Some pinned -> pinned
+     | None -> e)
+  | Ast.E_col name when not (scope.has_col name) ->
+    (match bnd.bind_unqual name with
+     | Some pinned -> pinned
+     | None -> e)
+  | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
+  | Ast.E_not a -> Ast.E_not (go a)
+  | Ast.E_is_null a -> Ast.E_is_null (go a)
+  | Ast.E_is_not_null a -> Ast.E_is_not_null (go a)
+  | Ast.E_neg a -> Ast.E_neg (go a)
+  | Ast.E_bitnot a -> Ast.E_bitnot (go a)
+  | Ast.E_between (x, lo, hi) -> Ast.E_between (go x, go lo, go hi)
+  | Ast.E_in (x, vals) -> Ast.E_in (go x, List.map go vals)
+  | Ast.E_func (f, args) -> Ast.E_func (f, List.map go args)
+  | Ast.E_cast (x, ty) -> Ast.E_cast (go x, ty)
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Ast.E_case
+      { scrutinee = Option.map go scrutinee
+      ; branches = List.map (fun (c, r) -> go c, go r) branches
+      ; else_ = Option.map go else_
+      }
+  | Ast.E_subquery inner -> Ast.E_subquery (go_s inner)
+  | Ast.E_exists inner -> Ast.E_exists (go_s inner)
+  | Ast.E_in_select (x, inner) -> Ast.E_in_select (go x, go_s inner)
+  | _ -> e
+
+(** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST
+    stmt.  [enclosing] is the union of the scopes of every subquery between this
+    one and the row [bnd] describes; it is {!no_inner_scope} at the top. *)
+and substitute_outer_in_stmt
+      ~(cat : Cat.t option)
+      ~(enclosing : inner_scope)
+      (bnd : outer_binding)
+      (s : Ast.stmt)
+  : Ast.stmt
+  =
+  let scope = scope_union (inner_scope_of cat s) enclosing in
+  let go_e = substitute_outer_in_expr ~cat ~scope bnd in
+  let go_s = substitute_outer_in_stmt ~cat ~enclosing bnd in
+  match s with
+  | Ast.S_select r ->
+    Ast.S_select
+      { r with
+        where = Option.map go_e r.where
+      ; having = Option.map go_e r.having
+      ; joins = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins
+      }
+  | Ast.S_compound { op; left; right; order; limit; offset } ->
+    Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
+  | Ast.S_with_cte { name; def; query; recursive } ->
+    Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
+  | _ -> s
+
 (** Substitute outer column refs in any embedded Ast.stmt nodes inside a
     Plan.expr (correlated subqueries / EXISTS / IN). *)
-let rec substitute_outer_in_plan_expr
-          ~(cat : Cat.t option)
-          (bnd : outer_binding)
-          (e : Plan.expr)
+and substitute_outer_in_plan_expr
+      ~(cat : Cat.t option)
+      (bnd : outer_binding)
+      (e : Plan.expr)
   : Plan.expr
   =
   let go = substitute_outer_in_plan_expr ~cat bnd in
-  let go_s = substitute_outer_in_stmt ~cat bnd in
+  let go_s = substitute_outer_in_stmt ~cat ~enclosing:no_inner_scope bnd in
   match e with
   | Plan.P_exists inner -> Plan.P_exists (go_s inner)
   | Plan.P_in_select (x, inner) -> Plan.P_in_select (go x, go_s inner)
@@ -8598,27 +9308,74 @@ let rec substitute_outer_in_plan_expr
       ; else_ = Option.map go else_
       }
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
-  | _ -> e
+  (* #493 review: there is NO [P_collate] arm here, while
+     {!plan_expr_has_subquery}, {!plan_expr_subqueries_use_param} and
+     {!plan_expr_embedded_stmts} all recurse into it — a four-way walker set
+     over one node set, of which this one is the odd member. The consequence:
+     a correlated subquery under a COLLATE ([x = (SELECT …) COLLATE NOCASE])
+     falls to the catch-all with its outer reference unsubstituted, and is
+     therefore REFUSED rather than answered.
 
-(** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST stmt. *)
-and substitute_outer_in_stmt ~(cat : Cat.t option) (bnd : outer_binding) (s : Ast.stmt)
-  : Ast.stmt
-  =
-  let go_e = substitute_outer_in_expr ~scope:(inner_scope_of cat s) bnd in
-  let go_s = substitute_outer_in_stmt ~cat bnd in
-  match s with
-  | Ast.S_select r ->
-    Ast.S_select
-      { r with
-        where = Option.map go_e r.where
-      ; having = Option.map go_e r.having
-      ; joins = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins
-      }
-  | Ast.S_compound { op; left; right; order; limit; offset } ->
-    Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
-  | Ast.S_with_cte { name; def; query; recursive } ->
-    Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
-  | _ -> s
+     The arm was added in the first round of this PR and is deliberately
+     reverted. Adding it is an error-to-answer change — it turns a refusal into
+     rows — and this PR cannot be built, so it could not be given the test that
+     such a change needs; nothing in [test/] exercises COLLATE over a subquery
+     today. A PR whose other half is about not letting refusals move silently
+     should not move one silently on the way past. Tracked as #670; the one-line
+     fix is [| Plan.P_collate (e, c) -> Plan.P_collate (go e, c)] plus a test
+     that pins the answer it produces. *)
+  | _ -> e
+;;
+
+(** #635: does [s] carry a {b free} column reference — a name no scope inside
+    [s] owns, which can therefore only come from an enclosing query?
+
+    That is the definition of "this subquery is correlated", and it is the
+    question {!Sema.bind} cannot answer. [Sema] treats [E_subquery] / [E_exists]
+    / [E_in_select] as opaque leaves: it never descends into a nested subquery,
+    so a reference buried TWO levels down is invisible to it and the enclosing
+    statement binds cleanly. The callers below read "it bound" as "it is
+    uncorrelated" and evaluate it eagerly — before any outer row exists to
+    substitute from. The reference is then met for the first time by the
+    intermediate query's own [stream_filter], whose inputs are the intermediate
+    FROM, and refused there (#592) because the outermost input is nowhere in
+    sight.
+
+    That is what made
+    [... FROM l AS x WHERE EXISTS (SELECT 1 FROM r WHERE EXISTS (SELECT 1 FROM k
+    WHERE v < x.a))] a refusal even after #635 taught
+    {!substitute_outer_in_expr} to descend through nesting: the descent was
+    correct but never ran, because nothing had classified the middle subquery as
+    correlated.
+
+    It is deliberately implemented by RUNNING {!substitute_outer_in_stmt} with a
+    binding that resolves nothing and records that it was asked. The detector
+    and the substituter therefore agree by construction about which references
+    are free — the same discipline the two binders are held to. A hand-written
+    second walker would be one more member of a set that already disagrees
+    (#670).
+
+    It can only ever move a statement from "evaluate eagerly" to "treat as
+    correlated": when it answers [false] the caller does exactly what it did
+    before, and when a statement it flags turns out to have no resolvable outer
+    source, the refusal it eventually raises is the one that was raised before.
+    [inner_scope_of] answers "owned" for everything it cannot resolve, so an
+    unresolvable FROM never manufactures a free reference. *)
+let stmt_has_free_column_ref (cat : Cat.t option) (s : Ast.stmt) : bool =
+  let seen = ref false in
+  let probe : outer_binding =
+    { bind_qual =
+        (fun _ _ ->
+          seen := true;
+          None)
+    ; bind_unqual =
+        (fun _ ->
+          seen := true;
+          None)
+    }
+  in
+  ignore (substitute_outer_in_stmt ~cat ~enclosing:no_inner_scope probe s : Ast.stmt);
+  !seen
 ;;
 
 let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) : Plan.op =
@@ -8708,6 +9465,131 @@ let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_r
     Lwt.return scored
 ;;
 
+(** #493: bind and plan a subquery's [Ast.stmt], reusing the plan when this
+    query has already planned the same statement.
+
+    This is the "plan once, execute N times" half of #493. Before it, a
+    correlated subquery paid a full {!Sema.bind} + {!Planner.plan} — catalog
+    resolution, type checking, index-candidate enumeration — on every outer row.
+    The cache is installed by {!with_pull_context} only at the call sites that
+    substitute outer references as PARAMETERS, because only there is the
+    statement identical across rows; with no cache in scope this degrades to the
+    previous per-call bind+plan and nothing else changes.
+
+    [None] means the statement cannot stand on its own, which every caller
+    reports by leaving its expression unresolved, exactly as before.
+
+    #635: "cannot stand on its own" is two questions, and {!Sema.bind} answers
+    only the first. It does not descend into a nested subquery, so a statement
+    whose correlation sits TWO levels down binds cleanly and would be evaluated
+    eagerly, before any outer row exists to substitute from — see
+    {!stmt_has_free_column_ref}, which answers the second. Both are asked here,
+    at the one chokepoint all four callers share, so
+    {!refuse_unresolved_correlation} and the three [eval_*_subquery] functions
+    cannot disagree about which statements are correlated.
+
+    The FAILURE is memoized too (the cache holds [Plan.op option], not
+    [Plan.op]). A statement that will not bind is the #592 unresolvable
+    correlation, and re-running {!Sema.bind} on it once per outer row only to
+    reach the same refusal is pure waste. {!refuse_unresolved_correlation}
+    normally raises on the first row, but the negative entry keeps the cost
+    bounded on any path that does not. *)
+let plan_subquery_cached (cat : Cat.t) (inner_ast : Ast.stmt) : Plan.op option Lwt.t =
+  let cache = Lwt.get subplan_cache_key in
+  match Option.bind cache (fun tbl -> Hashtbl.find_opt tbl inner_ast) with
+  | Some cached -> Lwt.return cached
+  | None ->
+    let* result =
+      if stmt_has_free_column_ref (Some cat) inner_ast
+      then Lwt.return None
+      else (
+        (* Counted here and nowhere else: this is the branch a cache hit skips,
+           so the counter measures exactly "how many times did we pay
+           bind+plan". A statement rejected above pays neither. *)
+        incr subquery_plans_built_ref;
+        let* bound_r = Sema.bind cat inner_ast in
+        Lwt.return
+          (match bound_r with
+           | Error _ -> None
+           | Ok bound -> Some (Planner.plan ~cat bound)))
+    in
+    (match cache with
+     | Some tbl -> Hashtbl.replace tbl inner_ast result
+     | None -> ());
+    Lwt.return result
+;;
+
+(** #493 review: decide #592's "an unresolvable correlation is refused, not
+    silently answered" ONCE, over EVERY correlated conjunct, before any row is
+    filtered.
+
+    The AND short-circuit introduced by #493 made that invariant
+    data-dependent: [correlated_row_passes] returns [false] the moment a
+    conjunct is not truthy, so a refusal sitting in a LATER conjunct was only
+    reached for rows that passed every earlier one. On TPC-H Q4's own shape —
+    a cheap date restriction written before the [EXISTS] —
+    [WHERE a.x = -1 AND EXISTS (<unresolvable>)] with no row satisfying
+    [a.x = -1] returned an empty result set and no error at all. That is
+    precisely the "empty result that reads as a legitimate nothing-matched"
+    #592 removed, reintroduced through the back door.
+
+    Resolvability is a property of the PLAN, not of the row: the substitution
+    decides what to pin from the column NAMES in [metas] and [inner_scope_of]
+    plus the row's WIDTH, none of which vary across the rows of one scan — only
+    the pinned VALUES do. So one probe, on the first row pulled, settles it for
+    the whole stream, and the short-circuit can then never suppress a refusal.
+
+    The probe binds and plans; it does not execute. It also warms the plan
+    cache, so the row that triggers it pays nothing extra. An empty child
+    stream probes nothing and raises nothing — as it did before #493, since
+    [Lwt_stream.filter_s] over an empty stream never ran the check either. *)
+let refuse_unresolved_correlation (cat : Cat.t option) (substituted : Plan.expr list)
+  : unit Lwt.t
+  =
+  match cat with
+  | None -> Lwt.return_unit
+  | Some c ->
+    Lwt_list.iter_s
+      (fun s ->
+         let* op = plan_subquery_cached c s in
+         if Option.is_none op
+         then Lwt.fail_with (correlated_filter_refusal ())
+         else Lwt.return_unit)
+      (List.concat_map plan_expr_embedded_stmts substituted)
+;;
+
+(** #493: run a subquery's stream under a read transaction the CALLER owns, and
+    end it unconditionally.
+
+    This is the fix for the super-linear term the issue observed, and it is not
+    a cost optimisation so much as a leak repair. A leaf scanner in [Auto] mode
+    opens its own RO snapshot ([rh_begin] → [S.ro_begin]) and releases it from
+    the stream's [finish], which runs only when the stream is drained to
+    exhaustion or raises. An [EXISTS] subquery stops at the first row and
+    abandons the rest, so [finish] never ran: [S.ro_end] — and with it
+    [Pager.unpin_all] over that snapshot's pinned pages, the [active_readers]
+    decrement and [Rwlock.release_read] — was skipped once per outer row. The
+    pins are what make the cost super-linear: every page the abandoned scan
+    touched stays un-evictable for the rest of the query, so the pager's cache
+    grows monotonically with the number of outer rows and stops being a cache.
+    Blocked checkpoints and a read-lock count that never returns to zero are the
+    same bug's other two faces.
+
+    Opening the snapshot here instead makes the leaf scanners {i borrow} it
+    ([RH_borrowed_ro], whose [rh_finish] is a no-op), so abandoning the stream
+    releases nothing and [Lwt.finalize] releases everything.
+
+    #262 is preserved: when an explicit transaction is already active the
+    subquery keeps reading through it, so read-your-own-writes is unchanged and
+    the caller's transaction is never ended here. *)
+let with_subquery_txn (store : S.t) (f : txn_mode -> 'a Lwt.t) : 'a Lwt.t =
+  match current_txn_mode () with
+  | (In_txn _ | In_ro_txn _) as m -> f m
+  | Auto ->
+    let* tx = S.ro_begin store in
+    Lwt.finalize (fun () -> f (In_ro_txn tx)) (fun () -> S.ro_end tx)
+;;
+
 let rec pre_eval_subquery
           (clock : (unit -> float) option)
           (store : S.t)
@@ -8793,23 +9675,25 @@ and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
   match cat_opt with
   | None -> Lwt.return (Plan.P_lit Ast.L_null)
   | Some cat ->
-    let* bound_r = Sema.bind cat inner_ast in
-    (match bound_r with
-     | Error _ -> Lwt.return e
-     | Ok bound ->
-       let op = Planner.plan ~cat bound in
-       (* #262: run the subquery under the active txn (read-your-own-writes). *)
-       let* stream =
-         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
-       in
-       let* rows = Lwt_stream.to_list stream in
-       let v =
-         match rows with
-         | [] -> Ast.L_null
-         | row :: _ when Array.length row >= 1 -> value_to_literal row.(0)
-         | _ -> Ast.L_null
-       in
-       Lwt.return (Plan.P_lit v))
+    let* op_r = plan_subquery_cached cat inner_ast in
+    (match op_r with
+     | None -> Lwt.return e
+     | Some op ->
+       (* #262: run the subquery under the active txn (read-your-own-writes);
+          #493: or under one this call owns and ends. *)
+       with_subquery_txn store (fun mode ->
+         let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+         (* #493: a scalar subquery needs only its first row, and every stream
+            it pulls from is lazy, so [get] stops the inner scan there. Safe to
+            abandon the rest only because [with_subquery_txn] owns the snapshot
+            the abandoned stream would otherwise have leaked. *)
+         let* first = Lwt_stream.get stream in
+         let v =
+           match first with
+           | Some row when Array.length row >= 1 -> value_to_literal row.(0)
+           | _ -> Ast.L_null
+         in
+         Lwt.return (Plan.P_lit v)))
 
 (* EXISTS subquery: 1 if [inner_ast] yields any row, else 0. *)
 and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
@@ -8818,17 +9702,17 @@ and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
   match cat_opt with
   | None -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
   | Some cat ->
-    let* bound_r = Sema.bind cat inner_ast in
-    (match bound_r with
-     | Error _ -> Lwt.return e
-     | Ok bound ->
-       let op = Planner.plan ~cat bound in
-       (* #262: run the subquery under the active txn (read-your-own-writes). *)
-       let* stream =
-         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
-       in
-       let* first = Lwt_stream.get stream in
-       Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L))))
+    let* op_r = plan_subquery_cached cat inner_ast in
+    (match op_r with
+     | None -> Lwt.return e
+     | Some op ->
+       (* #262 / #493, as in [eval_scalar_subquery]. EXISTS pulls exactly one
+          row and abandons the stream; the owned snapshot is what makes that
+          safe rather than a per-outer-row page-pin leak. *)
+       with_subquery_txn store (fun mode ->
+         let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+         let* first = Lwt_stream.get stream in
+         Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L)))))
 
 (* IN (subquery): materialize [inner_ast]'s first column into the IN value list. *)
 and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
@@ -8837,16 +9721,18 @@ and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
   match cat_opt with
   | None -> Lwt.return (Plan.P_in (x, []))
   | Some cat ->
-    let* bound_r = Sema.bind cat inner_ast in
-    (match bound_r with
-     | Error _ -> Lwt.return e
-     | Ok bound ->
-       let op = Planner.plan ~cat bound in
-       (* #262: run the subquery under the active txn (read-your-own-writes). *)
-       let* stream =
-         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
+    let* op_r = plan_subquery_cached cat inner_ast in
+    (match op_r with
+     | None -> Lwt.return e
+     | Some op ->
+       (* #262 / #493. This one drains the stream, so it never leaked; it takes
+          the owned snapshot for the same reason the others do — one place
+          decides how a subquery gets its read transaction. *)
+       let* rows =
+         with_subquery_txn store (fun mode ->
+           let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+           Lwt_stream.to_list stream)
        in
-       let* rows = Lwt_stream.to_list stream in
        let vals =
          List.filter_map
            (fun row ->
@@ -9367,12 +10253,15 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
     Lwt_stream.from (fun () ->
       Lwt.catch
         (fun () ->
-           let* kv = S.seek_next cur in
+           (* #481: [seek_next_value], not [seek_next] — this scan binds the key
+              as [_key] and drops it, and materialising it cost a [Bytes.create]
+              + blit out of the leaf page on EVERY row of EVERY table scan. *)
+           let* kv = S.seek_next_value cur in
            match kv with
            | None ->
              let%lwt () = finish () in
              Lwt.return_none
-           | Some (_key, vbytes) ->
+           | Some vbytes ->
              incr_examined s_opt;
              let row = decode_with_virtual clock params table_meta vbytes in
              Lwt.return_some row)
@@ -9411,23 +10300,153 @@ and stream_filter clock params store mode cat pred child =
 
        [get_outer_scan_metas] now resolves the correlation source over a join
        (that was the whole of #566's and #592's blocker), so the common shapes
-       evaluate. What is still unresolvable is refused rather than answered. *)
+       evaluate. What is still unresolvable is refused rather than answered —
+       and since #493 added the AND short-circuit below, that refusal is decided
+       by {!refuse_unresolved_correlation} over EVERY conjunct on the first row
+       pulled, not by whichever conjunct a given row happened to reach. Deciding
+       it per row would have made the invariant data-dependent: a refusal behind
+       a cheap restriction that no row satisfies would never fire, and the
+       silent empty result would be back. *)
     match get_outer_scan_metas child with
     | None -> Lwt.fail_with (correlated_filter_refusal ())
     | Some metas ->
-      Lwt.return
-        (Lwt_stream.filter_s
-           (fun row ->
-              let bnd = binding_of_metas metas row in
-              let subst_pred = substitute_outer_in_plan_expr ~cat bnd pred' in
-              let* resolved =
-                with_pull_context ~stats:s_opt ~mode (fun () ->
-                  pre_eval_subquery clock store params cat subst_pred)
-              in
-              if plan_expr_has_subquery resolved
-              then Lwt.fail_with (correlated_filter_refusal ())
-              else Lwt.return (value_truthy (eval_expr clock params row resolved)))
-           child_stream))
+      (* #493, three changes, all inside this branch:
+
+         - the predicate is split into its top-level AND conjuncts and evaluated
+           left to right, stopping at the first that is not truthy, so a
+           correlated subquery written after a cheap restriction runs only for
+           the rows that restriction kept (TPC-H Q4 evaluated its EXISTS for
+           every row of [orders], date range or not);
+         - outer references are pinned as PARAMETERS rather than literals, which
+           makes the substituted inner statement identical for every row;
+         - which in turn lets one bind+plan per subquery site serve the whole
+           scan, through the cache [with_pull_context] installs.
+
+         The parameterized path is taken only when no inner statement carries
+         parameters of its own — see {!ast_stmt_uses_param}. Otherwise this
+         falls back to per-row literal substitution with no cache, which is
+         exactly the pre-#493 behaviour, and the short-circuit still applies. *)
+      let cs = plan_and_conjuncts pred' in
+      let parameterized = not (List.exists plan_expr_subqueries_use_param cs) in
+      let cache = if parameterized then Some (Hashtbl.create 4) else None in
+      let base = Array.length params in
+      let correlated_cs = List.filter plan_expr_has_subquery cs in
+      (* Decided once, over every correlated conjunct — see
+         {!refuse_unresolved_correlation}. The first row pulled settles it,
+         because resolvability depends on the substituted NAMES and the row
+         WIDTH, neither of which varies across one scan.
+
+         The flag is set AFTER the probe resolves, not before. [filter_s] pulls
+         strictly sequentially, so [keep] is never re-entered while a probe is
+         in flight and either order works today — but setting it first would
+         make the invariant depend on that sequencing, and a row sailing past a
+         refusal that has not finished being decided is the failure this whole
+         pre-pass exists to prevent.
+
+         Cost note: on the parameterized path the probe runs against the SAME
+         cache the rows then use, so it warms rather than duplicates. With
+         [cache = None] (an inner statement carrying its own parameters) its
+         bind+plan is discarded, and it is paid even for a conjunct the
+         short-circuit would have skipped for every row. That is bounded by the
+         number of subquery SITES, not by rows, so it does not reintroduce the
+         per-row cost #493 removed. *)
+      let refusal_decided = ref false in
+      let decide_refusal bnd =
+        if !refusal_decided
+        then Lwt.return_unit
+        else
+          let* () =
+            with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+              refuse_unresolved_correlation
+                cat
+                (List.map (substitute_outer_in_plan_expr ~cat bnd) correlated_cs))
+          in
+          refusal_decided := true;
+          Lwt.return_unit
+      in
+      let keep row =
+        let bnd =
+          if parameterized
+          then param_binding_of_metas ~base ~row_len:(Array.length row) metas
+          else binding_of_metas metas row
+        in
+        let row_params = if parameterized then Array.append params row else params in
+        let* () = decide_refusal bnd in
+        correlated_row_passes
+          clock
+          params
+          store
+          mode
+          cat
+          ~s_opt
+          ~cache
+          ~bnd
+          ~row_params
+          row
+          cs
+      in
+      Lwt.return (Lwt_stream.filter_s keep child_stream))
+
+(* #493: does [row] satisfy every conjunct?  Evaluated left to right in the
+   order written — NOT reordered — and stopped at the first conjunct that is not
+   truthy, so the subquery in a later conjunct is never run for a row an earlier
+   one already rejected.
+
+   This agrees with the pre-#493 [value_truthy] over the whole AND tree: row
+   filtering is a two-valued decision (the row passes iff every conjunct is
+   truthy), so a NULL conjunct rejects the row either way. *)
+and correlated_row_passes
+      clock
+      params
+      store
+      mode
+      cat
+      ~s_opt
+      ~cache
+      ~bnd
+      ~row_params
+      (row : Row.t)
+      conjuncts
+  : bool Lwt.t
+  =
+  match conjuncts with
+  | [] -> Lwt.return true
+  | c :: rest ->
+    let* ok =
+      if not (plan_expr_has_subquery c)
+      then Lwt.return (value_truthy (eval_expr clock params row c))
+      else (
+        let subst = substitute_outer_in_plan_expr ~cat bnd c in
+        let* resolved =
+          with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+            pre_eval_subquery clock store row_params cat subst)
+        in
+        (* A backstop, not the guarantee. {!refuse_unresolved_correlation} has
+           already decided the refusal over EVERY conjunct on the first row, so
+           an unresolved subquery cannot reach here — which is the point: with
+           only this check, whether a refusal fired depended on how many
+           conjuncts the row got past. Kept because answering [V_null] for an
+           unresolved subquery is the silent-wrong-answer failure #592 was
+           about, and it should never be reachable by any route. *)
+        if plan_expr_has_subquery resolved
+        then Lwt.fail_with (correlated_filter_refusal ())
+        else Lwt.return (value_truthy (eval_expr clock params row resolved)))
+    in
+    if not ok
+    then Lwt.return false
+    else
+      correlated_row_passes
+        clock
+        params
+        store
+        mode
+        cat
+        ~s_opt
+        ~cache
+        ~bnd
+        ~row_params
+        row
+        rest
 
 and stream_expr_project clock params store mode cat exprs child =
   (* #257: as in [stream_filter], re-establish the stats scope around per-row
@@ -9443,24 +10462,42 @@ and stream_expr_project clock params store mode cat exprs child =
     let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
     Lwt.return (Lwt_stream.map eval_exprs inner))
   else (
+    (* #626: what cannot be resolved is refused, exactly as [stream_filter]
+       refuses it. The fallback this replaces answered [Row.V_null] for every
+       such expression — silent, and indistinguishable from a legitimate NULL. *)
     match get_outer_scan_metas child with
-    | None ->
-      let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
-      Lwt.return (Lwt_stream.map eval_exprs inner)
+    | None -> Lwt.fail_with (correlated_projection_refusal ())
     | Some metas ->
+      (* #493: same parameterize-and-cache treatment as [stream_filter]; there
+         is no AND spine to short-circuit in a projection. *)
+      let parameterized = not (List.exists plan_expr_subqueries_use_param exprs') in
+      let cache = if parameterized then Some (Hashtbl.create 4) else None in
+      let base = Array.length params in
       Lwt.return
         (Lwt_stream.map_s
            (fun row ->
-              let bnd = binding_of_metas metas row in
+              let bnd =
+                if parameterized
+                then param_binding_of_metas ~base ~row_len:(Array.length row) metas
+                else binding_of_metas metas row
+              in
+              let row_params =
+                if parameterized then Array.append params row else params
+              in
               let* vals =
                 Lwt_list.map_s
                   (fun e ->
                      let e_subst = substitute_outer_in_plan_expr ~cat bnd e in
                      let* resolved =
-                       with_pull_context ~stats:s_opt ~mode (fun () ->
-                         pre_eval_subquery clock store params cat e_subst)
+                       with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+                         pre_eval_subquery clock store row_params cat e_subst)
                      in
-                     Lwt.return (eval_expr clock params row resolved))
+                     (* A subquery that survives the substitution named an outer
+                        column no input carries, or an ambiguous one. Refuse
+                        rather than let [eval_expr] answer NULL for it. *)
+                     if plan_expr_has_subquery resolved
+                     then Lwt.fail_with (correlated_projection_refusal ())
+                     else Lwt.return (eval_expr clock params row resolved))
                   exprs'
               in
               Lwt.return (Array.of_list vals))
@@ -9701,6 +10738,26 @@ and stream_nested_loop_join
   (* #239: captured under [query]'s [with_value] scope; counts right-side index
      probes (the left input's base scan is counted via [to_stream] below). *)
   let s_opt = Lwt.get query_stats_key in
+  (* #615: this operator expresses its ON predicate as an index probe, and
+     [plan_join] only builds it from a recognised [col = col] equality whose
+     remaining key columns are pinned by literal equalities — so a subquery
+     cannot reach [probe] or [probe_range] through the planner today.
+     [Op_nested_loop_join] is a public constructor, and an unresolved
+     [P_subquery] here would encode as NULL and silently drop every driving row,
+     which is the exact failure class #566/#592/#615 are about.  Refuse it. *)
+  let expr_corr = plan_expr_has_subquery in
+  let range_corr (r : Plan.range) =
+    Option.fold ~none:false ~some:expr_corr r.Plan.r_lo
+    || Option.fold ~none:false ~some:expr_corr r.Plan.r_hi
+  in
+  if
+    List.exists
+      (function
+        | Plan.Probe_const e -> expr_corr e
+        | Plan.Probe_from_left _ -> false)
+      probe
+    || Option.fold ~none:false ~some:range_corr probe_range
+  then failwith (correlated_on_refusal ());
   let* left_stream = to_stream clock params store ~mode ~cat left in
   let* left_rows = Lwt_stream.to_list left_stream in
   (* #262: probe the inner index through the active txn so the join sees inner
@@ -9780,71 +10837,136 @@ and stream_hash_join
        filter above the join would reject the very null-extended row it has to
        let through.  With [on_pred = None] every pair matches and the caller
        filters, which is what an INNER join still does. *)
+    (* Uncorrelated subqueries in the ON predicate are resolved once, as
+       [stream_filter] does.  What survives [pre_eval_subquery] is correlated.
+
+       #566 refused that outright, because the correlation source could not be
+       located over a join node: a surviving [P_subquery] evaluates to
+       [Row.V_null], so [matches] is false for every pair, [any] is never set,
+       and an outer join null-extends {i every} left row — a complete result set
+       of the right cardinality with the ON predicate silently unevaluated.
+
+       #615 reopens that decision, because #592 built the source: the joined row
+       is [lrow @ rrow] and [get_outer_scan_metas] describes both inputs, so the
+       correlation resolves here exactly as it does in the [Op_filter] above an
+       INNER join.  The two spellings of the same query agreed on nothing before
+       this; now they agree on both the answer and the refusal.
+
+       The cost is that the pairing loop becomes Lwt and the substitution runs
+       once per (left, right) {i pair} rather than once per surviving row — an
+       outer join has no choice, since the ON predicate {b is} the match test and
+       a filter above the join would reject the null-extended row it must emit
+       (#552).  The pure loop below is kept for the arm where no subquery
+       survives, which is every join that has no correlated ON. *)
+    let s_opt = Lwt.get query_stats_key in
     let* pred =
       match on_pred with
       | None -> Lwt.return None
       | Some p ->
-        (* Uncorrelated subqueries in the ON predicate are resolved once, as
-           [stream_filter] does.  A correlated one cannot be resolved here, and
-           could not be resolved by the filter this replaces either — that
-           filter's [get_outer_scan_meta] answers [None] over a join.
-
-           #566: refuse it rather than answer.  A [P_subquery] that survives
-           [pre_eval_subquery] is correlated, and [eval_expr] answers
-           [Row.V_null] for it — so [matches] is false for every pair, [any] is
-           never set, and an outer join null-extends {i every} left row.  That
-           is a complete result set of the right cardinality with the ON
-           predicate silently unevaluated: indistinguishable from the correct
-           answer for the uncorrelated case, which [pre_eval_subquery] has
-           already resolved by this point and which stays correct.  Supporting
-           it needs per-row re-evaluation with a correlation source
-           [get_outer_scan_meta] cannot resolve over a join node (#566 option
-           2); until then a visible error beats a quiet wrong answer.
-
-           #592: this covers the OUTER case only, because [on_pred] is [Some]
-           only for [`Left] — [general_on_join] puts an INNER join's ON predicate
-           in an [Op_filter] above the join instead.  That path used to have the
-           same defect and drop every row silently; it now resolves the
-           correlation through [get_outer_scan_metas] and answers.  The same
-           machinery would serve here — the joined row is [lrow @ rrow] and both
-           inputs' metas are in hand — but an outer join has to evaluate the
-           predicate per {i pair} inside this loop rather than per row above it,
-           and reopening #566's refusal is a separate decision.  Until then the
-           two spellings differ deliberately. *)
-        let* p = pre_eval_subquery clock store params cat p in
-        if plan_expr_has_subquery p
-        then
-          failwith
-            "Exec: a correlated subquery in an outer join's ON predicate is not \
-             supported — its correlation source cannot be resolved over a join (#566). \
-             Rewrite it as a WHERE-clause subquery or an uncorrelated one.";
-        Lwt.return (Some p)
+        let+ p = pre_eval_subquery clock store params cat p in
+        Some p
     in
-    let matches joined =
+    let correlated =
       match pred with
-      | None -> true
-      | Some p -> value_truthy (eval_expr clock params joined p)
+      | Some p -> plan_expr_has_subquery p
+      | None -> false
+    in
+    (* #615: both inputs of this join, re-based into the joined row.  The right
+       input's offsets shift by the left input's width, and the identifiers must
+       still be unique across the two — a self-join with no aliases is refused
+       here for the same reason [get_outer_scan_metas] refuses one. *)
+    let joined_inputs () =
+      match get_outer_scan_metas left, outer_row_width left with
+      | Some ls, Some w ->
+        (match get_outer_scan_metas right with
+         | None -> None
+         | Some rs ->
+           let all =
+             ls @ List.map (fun oi -> { oi with oi_offset = oi.oi_offset + w }) rs
+           in
+           let idents = List.map (fun oi -> oi.oi_ident) all in
+           if List.length (List.sort_uniq String.compare idents) <> List.length idents
+           then None
+           else Some all)
+      | _, _ -> None
     in
     let* left_rows = Lwt_stream.to_list left_stream in
     let out = ref [] in
-    List.iter
-      (fun lrow ->
-         let any = ref false in
-         List.iter
-           (fun rrow ->
-              let joined = Array.append lrow rrow in
-              if matches joined
-              then (
-                out := joined :: !out;
-                any := true))
-           right_rows;
-         match join_kind with
-         | `Left when not !any ->
-           let null_right = Array.make n_right_cols Row.V_null in
-           out := Array.append lrow null_right :: !out
-         | _ -> ())
-      left_rows;
-    Lwt.return (Lwt_stream.of_list (List.rev !out)))
+    let null_extend lrow any =
+      match join_kind with
+      | `Left when not any ->
+        out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out
+      | _ -> ()
+    in
+    if not correlated
+    then (
+      (* The pre-#615 loop, unchanged and still pure: every join whose ON
+         predicate carries no surviving subquery takes this arm. *)
+      let matches joined =
+        match pred with
+        | None -> true
+        | Some p -> value_truthy (eval_expr clock params joined p)
+      in
+      List.iter
+        (fun lrow ->
+           let any = ref false in
+           List.iter
+             (fun rrow ->
+                let joined = Array.append lrow rrow in
+                if matches joined
+                then (
+                  out := joined :: !out;
+                  any := true))
+             right_rows;
+           null_extend lrow !any)
+        left_rows;
+      Lwt.return (Lwt_stream.of_list (List.rev !out)))
+    else (
+      match joined_inputs () with
+      | None -> Lwt.fail_with (correlated_on_refusal ())
+      | Some inputs ->
+        let p = Option.get pred in
+        let matches_s joined =
+          let bnd = binding_of_metas inputs joined in
+          let* resolved =
+            (* #493 + #615: [binding_of_metas] pins literals, so the substituted
+               statement differs on every (left, right) pair and a cache would
+               only grow — same reasoning as the aggregate site below.  The
+               parameterized spelling is not available here: the ON predicate is
+               the match test, so it is evaluated per pair rather than per
+               surviving row (#552). *)
+            with_pull_context ~stats:s_opt ~mode ~cache:None (fun () ->
+              pre_eval_subquery
+                clock
+                store
+                params
+                cat
+                (substitute_outer_in_plan_expr ~cat bnd p))
+          in
+          if plan_expr_has_subquery resolved
+          then Lwt.fail_with (correlated_on_refusal ())
+          else Lwt.return (value_truthy (eval_expr clock params joined resolved))
+        in
+        let* () =
+          Lwt_list.iter_s
+            (fun lrow ->
+               let any = ref false in
+               let* () =
+                 Lwt_list.iter_s
+                   (fun rrow ->
+                      let joined = Array.append lrow rrow in
+                      let+ keep = matches_s joined in
+                      if keep
+                      then (
+                        out := joined :: !out;
+                        any := true))
+                   right_rows
+               in
+               null_extend lrow !any;
+               Lwt.return_unit)
+            left_rows
+        in
+        Lwt.return (Lwt_stream.of_list (List.rev !out))))
   else (
     let tbl = hash_build right_rows right_key in
     let* left_rows = Lwt_stream.to_list left_stream in
@@ -9873,23 +10995,35 @@ and stream_hash_join
       left_rows;
     Lwt.return (Lwt_stream.of_list (List.rev !out)))
 
-(* SUM over a group's column [i]: preserve INT vs REAL like SQLite-lite. *)
-and agg_sum group_rows i : Row.value =
+(* #488: how an aggregate reads its argument out of one INPUT row.  [None] is
+   the COUNT-star case — no argument at all.  A bare column stays an array
+   index (what the whole engine did before #488); anything else is an
+   expression evaluated per row, which is why this needs [clock] and [params].
+   Every consumer of a [Plan.agg_spec] must go through here: reading
+   [col_ord] directly answers [None] for an expression argument and would
+   silently turn [SUM(a * b)] into COUNT-star's "no argument" arm. *)
+and agg_arg_getter clock params (spec : Plan.agg_spec) : (Row.t -> Row.value) option =
+  match spec.Plan.arg_expr, spec.Plan.col_ord with
+  | Some e, _ -> Some (fun row -> eval_expr clock params row e)
+  | None, Some i -> Some (fun row -> row.(i))
+  | None, None -> None
+
+(* SUM over one group's already-extracted argument values: preserve INT vs REAL
+   like SQLite-lite. *)
+and agg_sum (vals : Row.value list) : Row.value =
   let any_real =
     List.exists
-      (fun r ->
-         match r.(i) with
-         | Row.V_real _ -> true
-         | _ -> false)
-      group_rows
+      (function
+        | Row.V_real _ -> true
+        | _ -> false)
+      vals
   in
   let any_non_null =
     List.exists
-      (fun r ->
-         match r.(i) with
-         | Row.V_null -> false
-         | _ -> true)
-      group_rows
+      (function
+        | Row.V_null -> false
+        | _ -> true)
+      vals
   in
   if not any_non_null
   then Row.V_null
@@ -9897,93 +11031,140 @@ and agg_sum group_rows i : Row.value =
   then (
     let s =
       List.fold_left
-        (fun acc r ->
-           match r.(i) with
+        (fun acc v ->
+           match v with
            | Row.V_null -> acc
            | Row.V_int n -> acc +. Int64.to_float n
            | Row.V_real f -> acc +. f
            | _ -> failwith "SUM on non-numeric value")
         0.0
-        group_rows
+        vals
     in
     Row.V_real s)
   else (
     let s =
       List.fold_left
-        (fun acc r ->
-           match r.(i) with
+        (fun acc v ->
+           match v with
            | Row.V_null -> acc
            | Row.V_int n -> Int64.add acc n
            | _ -> failwith "SUM on non-numeric value")
         0L
-        group_rows
+        vals
     in
     Row.V_int s)
 
-(* Evaluate one aggregate [spec] over the rows of a group. *)
-and aggregate_one (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
-  match spec.func, spec.col_ord with
-  | Ast.Agg_count, None -> Row.V_int (Int64.of_int (List.length group_rows))
-  | Ast.Agg_count, Some i ->
+(* #491 x #488: the DISTINCT dedup key, defined ONCE and used by both the batch
+   ([aggregate_one]) and incremental ([make_agg_acc]) paths, so the two cannot
+   drift apart the way #488's comment warns about.
+
+   The key is [row_key]'s rendering of the ARGUMENT VALUE — not of a column.
+   That is the whole composition: #491 landed dedup on a column ordinal, which
+   #488's expression arguments do not have ([col_ord] is [None] for
+   [COUNT(DISTINCT a * b)]), so a column-keyed dedup had no correct answer for
+   the shape only both features together can express.  Keying on the value the
+   aggregate is about to consume works for both spellings and is the same key
+   SELECT DISTINCT and the hash joins already use — so #536's decisions are
+   inherited verbatim: all NaNs collapse to one, and none collapses into NULL.
+   No fifth value comparator is introduced.
+
+   Returns a stateful predicate: [true] the first time a value is seen, [false]
+   afterwards.  A NULL is "seen" like any other value, so it survives the dedup
+   as ONE entry and is then dropped by each aggregate's own NULL handling —
+   which is why [COUNT(DISTINCT x)] skips NULLs exactly as [COUNT(x)] does. *)
+and distinct_filter () : Row.value -> bool =
+  let seen = Hashtbl.create 64 in
+  fun v ->
+    let k = row_key [| v |] in
+    if Hashtbl.mem seen k
+    then false
+    else (
+      Hashtbl.replace seen k ();
+      true)
+
+(* Evaluate one aggregate [spec] over the argument values of a group. *)
+and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.value =
+  match func with
+  | Ast.Agg_count ->
     let n =
       List.fold_left
-        (fun acc r ->
-           match r.(i) with
+        (fun acc v ->
+           match v with
            | Row.V_null -> acc
            | _ -> acc + 1)
         0
-        group_rows
+        vals
     in
     Row.V_int (Int64.of_int n)
-  | Ast.Agg_sum, Some i -> agg_sum group_rows i
-  | Ast.Agg_avg, Some i ->
+  | Ast.Agg_sum -> agg_sum vals
+  | Ast.Agg_avg ->
     let sum, n =
       List.fold_left
-        (fun (s, n) r ->
-           match r.(i) with
+        (fun (s, n) v ->
+           match v with
            | Row.V_null -> s, n
            | Row.V_int x -> s +. Int64.to_float x, n + 1
            | Row.V_real f -> s +. f, n + 1
            | _ -> failwith "AVG on non-numeric value")
         (0.0, 0)
-        group_rows
+        vals
     in
     if n = 0 then Row.V_null else Row.V_real (sum /. float_of_int n)
-  | Ast.Agg_min, Some i ->
+  | Ast.Agg_min ->
     List.fold_left
-      (fun acc r ->
-         match r.(i), acc with
+      (fun acc v ->
+         match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
          | v, cur -> if compare_values v cur < 0 then v else cur)
       Row.V_null
-      group_rows
-  | Ast.Agg_max, Some i ->
+      vals
+  | Ast.Agg_max ->
     List.fold_left
-      (fun acc r ->
-         match r.(i), acc with
+      (fun acc v ->
+         match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
          | v, cur -> if compare_values v cur > 0 then v else cur)
       Row.V_null
-      group_rows
-  | Ast.Agg_group_concat sep, Some i ->
+      vals
+  | Ast.Agg_group_concat sep ->
     let separator = Option.value sep ~default:"," in
     let parts =
       List.filter_map
-        (fun r ->
-           match r.(i) with
-           | Row.V_null -> None
-           | Row.V_int n -> Some (Int64.to_string n)
-           | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
-           | Row.V_text s -> Some s
-           | Row.V_blob _ -> Some "")
-        group_rows
+        (function
+          | Row.V_null -> None
+          | Row.V_int n -> Some (Int64.to_string n)
+          | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+          | Row.V_text s -> Some s
+          | Row.V_blob _ -> Some "")
+        vals
     in
     if parts = [] then Row.V_null else Row.V_text (String.concat separator parts)
-  | Ast.Agg_group_concat _, None -> failwith "GROUP_CONCAT requires a column argument"
-  | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max), None ->
-    failwith "non-COUNT aggregate must have a column argument"
+
+(* Evaluate one aggregate [spec] over the rows of a group. *)
+and aggregate_one clock params (spec : Plan.agg_spec) (group_rows : Row.t list)
+  : Row.value
+  =
+  match agg_arg_getter clock params spec with
+  | None ->
+    (match spec.Plan.func with
+     (* #491: a COUNT-star cannot carry DISTINCT — the grammar has no
+        [COUNT(DISTINCT * )] and [E_agg_distinct] holds a mandatory argument, so
+        this is unreachable.  It raises rather than counting rows, because the
+        one thing worse than refusing the shape is silently ignoring a modifier
+        the caller wrote. *)
+     | Ast.Agg_count when not spec.Plan.distinct ->
+       Row.V_int (Int64.of_int (List.length group_rows))
+     | Ast.Agg_count -> failwith "COUNT(DISTINCT ...) requires an argument"
+     | Ast.Agg_group_concat _ -> failwith "GROUP_CONCAT requires a column argument"
+     | _ -> failwith "non-COUNT aggregate must have a column argument")
+  | Some get ->
+    let vals = List.map get group_rows in
+    let vals =
+      if spec.Plan.distinct then List.filter (distinct_filter ()) vals else vals
+    in
+    aggregate_over_values spec.Plan.func vals
 
 (* Partition [rows] into (group_key, group_rows) by [group_cols] (stable). *)
 and aggregate_build_groups group_cols rows : (Row.value list * Row.t list) list =
@@ -10054,96 +11235,127 @@ and aggregate_apply_windows clock params agg_windows after_having =
    spec the fast-path doesn't handle (e.g. a non-COUNT aggregate with no column),
    which makes the caller fall back to the general [stream_aggregate] path.  The
    per-type logic here MUST stay byte-identical to [aggregate_one]/[agg_sum]. *)
-and make_agg_acc (spec : Plan.agg_spec) : ((Row.t -> unit) * (unit -> Row.value)) option =
-  match spec.Plan.func, spec.Plan.col_ord with
-  | Ast.Agg_count, None ->
+and make_agg_acc clock params (spec : Plan.agg_spec)
+  : ((Row.t -> unit) * (unit -> Row.value)) option
+  =
+  match agg_arg_getter clock params spec with
+  | None ->
+    (* No argument at all: COUNT-star, which counts rows and cannot be
+       DISTINCT (see [aggregate_one]).  Every other aggregate without an
+       argument is refused here, which drops the query onto the general
+       [stream_aggregate] path exactly as before. *)
+    (match spec.Plan.func with
+     | Ast.Agg_count when not spec.Plan.distinct ->
+       let c = ref 0 in
+       Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
+     | _ -> None)
+  | Some get ->
+    let update_v, finalize = make_agg_acc_over_values spec.Plan.func in
+    (* #491: DISTINCT keeps the #247 fast path rather than falling back to the
+       general path — a no-GROUP-BY distinct count is exactly TPC-C
+       StockLevel's shape.  The filter wraps the GETTER's result, not the row,
+       so the argument is evaluated ONCE per row: wrapping [update] instead
+       would re-evaluate an [arg_expr] per row, and a clock-dependent argument
+       could then differ between the dedup key and the accumulated value. *)
+    let update =
+      if spec.Plan.distinct
+      then (
+        let keep = distinct_filter () in
+        fun (row : Row.t) ->
+          let v = get row in
+          if keep v then update_v v)
+      else fun (row : Row.t) -> update_v (get row)
+    in
+    Some (update, finalize)
+
+(* The per-type accumulator, over ARGUMENT VALUES rather than rows.  #488 made
+   every consumer read its argument through [agg_arg_getter]; hoisting the
+   getter out to the caller leaves this function a pure function of [func] and
+   a value — structurally the same shape as [aggregate_over_values], which is
+   what makes "these two MUST stay byte-identical" checkable by reading them
+   side by side instead of by trusting a comment.  It is also what lets #491's
+   DISTINCT filter sit between the getter and the accumulator. *)
+and make_agg_acc_over_values (func : Ast.agg_func)
+  : (Row.value -> unit) * (unit -> Row.value)
+  =
+  match func with
+  | Ast.Agg_count ->
     let c = ref 0 in
-    Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
-  | Ast.Agg_count, Some i ->
-    let c = ref 0 in
-    Some
-      ( (fun row ->
-          match row.(i) with
-          | Row.V_null -> ()
-          | _ -> incr c)
-      , fun () -> Row.V_int (Int64.of_int !c) )
-  | Ast.Agg_sum, Some i ->
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | _ -> incr c)
+    , fun () -> Row.V_int (Int64.of_int !c) )
+  | Ast.Agg_sum ->
     (* INT vs REAL preserved exactly like [agg_sum]: REAL iff any real seen;
        NULL iff no non-null seen. *)
     let si = ref 0L
     and sf = ref 0.0
     and any_real = ref false
     and any_nn = ref false in
-    Some
-      ( (fun row ->
-          match row.(i) with
-          | Row.V_null -> ()
-          | Row.V_int n ->
-            any_nn := true;
-            si := Int64.add !si n;
-            sf := !sf +. Int64.to_float n
-          | Row.V_real f ->
-            any_nn := true;
-            any_real := true;
-            sf := !sf +. f
-          | _ -> failwith "SUM on non-numeric value")
-      , fun () ->
-          if not !any_nn
-          then Row.V_null
-          else if !any_real
-          then Row.V_real !sf
-          else Row.V_int !si )
-  | Ast.Agg_avg, Some i ->
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | Row.V_int n ->
+          any_nn := true;
+          si := Int64.add !si n;
+          sf := !sf +. Int64.to_float n
+        | Row.V_real f ->
+          any_nn := true;
+          any_real := true;
+          sf := !sf +. f
+        | _ -> failwith "SUM on non-numeric value")
+    , fun () ->
+        if not !any_nn
+        then Row.V_null
+        else if !any_real
+        then Row.V_real !sf
+        else Row.V_int !si )
+  | Ast.Agg_avg ->
     let sf = ref 0.0
     and n = ref 0 in
-    Some
-      ( (fun row ->
-          match row.(i) with
-          | Row.V_null -> ()
-          | Row.V_int x ->
-            sf := !sf +. Int64.to_float x;
-            incr n
-          | Row.V_real f ->
-            sf := !sf +. f;
-            incr n
-          | _ -> failwith "AVG on non-numeric value")
-      , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
-  | Ast.Agg_min, Some i ->
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | Row.V_int x ->
+          sf := !sf +. Int64.to_float x;
+          incr n
+        | Row.V_real f ->
+          sf := !sf +. f;
+          incr n
+        | _ -> failwith "AVG on non-numeric value")
+    , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
+  | Ast.Agg_min ->
     let best = ref Row.V_null in
-    Some
-      ( (fun row ->
-          match row.(i), !best with
-          | Row.V_null, _ -> ()
-          | v, Row.V_null -> best := v
-          | v, cur -> if compare_values v cur < 0 then best := v)
-      , fun () -> !best )
-  | Ast.Agg_max, Some i ->
+    ( (fun v ->
+        match v, !best with
+        | Row.V_null, _ -> ()
+        | v, Row.V_null -> best := v
+        | v, cur -> if compare_values v cur < 0 then best := v)
+    , fun () -> !best )
+  | Ast.Agg_max ->
     let best = ref Row.V_null in
-    Some
-      ( (fun row ->
-          match row.(i), !best with
-          | Row.V_null, _ -> ()
-          | v, Row.V_null -> best := v
-          | v, cur -> if compare_values v cur > 0 then best := v)
-      , fun () -> !best )
-  | Ast.Agg_group_concat sep, Some i ->
+    ( (fun v ->
+        match v, !best with
+        | Row.V_null, _ -> ()
+        | v, Row.V_null -> best := v
+        | v, cur -> if compare_values v cur > 0 then best := v)
+    , fun () -> !best )
+  | Ast.Agg_group_concat sep ->
     let separator = Option.value sep ~default:"," in
     let parts = ref [] in
     (* newest-first; reversed at finalize to preserve scan order *)
-    Some
-      ( (fun row ->
-          match row.(i) with
-          | Row.V_null -> ()
-          | Row.V_int n -> parts := Int64.to_string n :: !parts
-          | Row.V_real f -> parts := Printf.sprintf "%.17g" f :: !parts
-          | Row.V_text s -> parts := s :: !parts
-          | Row.V_blob _ -> parts := "" :: !parts)
-      , fun () ->
-          match !parts with
-          | [] -> Row.V_null
-          | l -> Row.V_text (String.concat separator (List.rev l)) )
-  | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max | Ast.Agg_group_concat _), None
-    -> None
+    ( (fun v ->
+        match v with
+        | Row.V_null -> ()
+        | Row.V_int n -> parts := Int64.to_string n :: !parts
+        | Row.V_real f -> parts := Printf.sprintf "%.17g" f :: !parts
+        | Row.V_text s -> parts := s :: !parts
+        | Row.V_blob _ -> parts := "" :: !parts)
+    , fun () ->
+        (match !parts with
+         | [] -> Row.V_null
+         | l -> Row.V_text (String.concat separator (List.rev l))) )
 
 (* #247: cursor-level fast path for a no-GROUP-BY aggregate directly over a
    (optionally filtered) sequential scan.  Folds the accumulators over the scan
@@ -10190,16 +11402,16 @@ and aggregate_fast_path
   then Lwt.return None
   else (
     match child with
-    | Plan.Op_seq_scan { table_meta } ->
+    | Plan.Op_seq_scan { table_meta; _ } ->
       run_aggregate_fast_path clock params store mode cat table_meta None aggs proj
-    | Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta } }
+    | Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta; _ } }
       when not (plan_expr_has_subquery pred) ->
       run_aggregate_fast_path clock params store mode cat table_meta (Some pred) aggs proj
     | _ -> Lwt.return None)
 
 and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs proj =
   match
-    let accs = List.map make_agg_acc aggs in
+    let accs = List.map (make_agg_acc clock params) aggs in
     if List.exists Option.is_none accs
     then None
     else Some (Array.of_list (List.map Option.get accs))
@@ -10224,11 +11436,41 @@ and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs
         (-1)
         aggs
     in
-    let need_decode = pred_opt <> None || max_col >= 0 in
+    (* #488: an aggregate over an EXPRESSION reads whichever columns the
+       expression names, and [max_col] cannot see them — its [col_ord] is
+       [None].  Both of the decode shortcuts below are keyed off [max_col], so
+       both must be switched off for such a spec: skipping the decode entirely
+       would accumulate over an empty row (a silent wrong answer, not a crash),
+       and pruning to a [max_col] of -1 would decode no columns at all.  The
+       test is on the spec list, not on the projection, because an expression
+       aggregate combined with a COUNT-star in one select list must still
+       decode.
+       Widening the prefix to the columns an argument expression mentions is a
+       later optimisation; correctness first. *)
+    let any_arg_expr =
+      List.exists (fun (s : Plan.agg_spec) -> s.Plan.arg_expr <> None) aggs
+    in
+    (* #491 x #488: DISTINCT deliberately adds NO term to either shortcut below,
+       and that is a proof rather than an omission.  DISTINCT is a modifier on
+       an argument that must EXIST — the grammar has no [COUNT(DISTINCT * )] and
+       [Ast.E_agg_distinct] carries a mandatory expression — so every DISTINCT
+       spec has either [col_ord = Some i] (which already lifts [max_col] to
+       [>= i], forcing the decode AND keeping [i] inside the pruned prefix) or
+       [arg_expr = Some _] (which [any_arg_expr] already catches).  The dedup
+       reads exactly the argument value and nothing else, so it can never widen
+       the set of columns that must be decoded beyond what the argument itself
+       already forces.  If DISTINCT ever becomes legal without an argument,
+       this reasoning dies with it — which is why [make_agg_acc] refuses that
+       shape rather than letting it reach here. *)
+    let need_decode = pred_opt <> None || max_col >= 0 || any_arg_expr in
     (* #247: when no filter reads other columns and there are no virtual columns
        to recompute, decode only the [0, max_col] prefix — skipping trailing
        columns (e.g. a TEXT payload) the aggregate never touches. *)
-    let can_prune = pred_opt = None && not (has_virtual_cols table_meta.Cat.columns) in
+    let can_prune =
+      pred_opt = None
+      && (not any_arg_expr)
+      && not (has_virtual_cols table_meta.Cat.columns)
+    in
     let decode_row vbytes =
       if can_prune
       then Row.decode_prefix table_meta.Cat.columns vbytes ~upto:max_col
@@ -10366,8 +11608,12 @@ and stream_aggregate
         | None -> Lwt.fail_with (agg_subquery_refusal ())
         | Some metas ->
           let bnd = binding_of_group_cols metas group_cols agg_row in
+          (* #493: no cache here — this site still substitutes LITERALS, so the
+             substituted statement differs per aggregate output row and a cache
+             would only grow. The number of rows is bounded by the group count
+             rather than the input, so it was never the #493 hot path. *)
           let* r =
-            with_pull_context ~stats:s_opt ~mode (fun () ->
+            with_pull_context ~stats:s_opt ~mode ~cache:None (fun () ->
               pre_eval_subquery
                 clock
                 store
@@ -10383,7 +11629,9 @@ and stream_aggregate
     let agg_output_rows =
       List.map
         (fun (group_key, group_rows) ->
-           let agg_vals = List.map (fun spec -> aggregate_one spec group_rows) aggs in
+           let agg_vals =
+             List.map (fun spec -> aggregate_one clock params spec group_rows) aggs
+           in
            Array.of_list (group_key @ agg_vals))
         groups
     in
@@ -10646,8 +11894,15 @@ and stream_pragma_integrity_check store cat =
 
 (* #563: the (ordinal, name) of every column whose loaded schema declares NOT
    NULL and whose stored cell therefore has to hold a value.  VIRTUAL
-   generated columns are excluded for exactly the reason [enforce_not_null]
-   exempts them: they are stored as NULL and recomputed on read. *)
+   generated columns are excluded because they are stored as NULL and
+   recomputed on read.
+
+   #629 deliberately does NOT follow the write path here.  [not_null_violation]
+   stopped exempting VIRTUAL columns and recomputes them instead, because a
+   write can be refused; this scan reports on cells that are already on disk and
+   whose only repair action is to rewrite the cell — which is meaningless for a
+   column that is never read from disk in the first place.  The exclusion is
+   about what [repair] can act on, not about where the truth lives. *)
 and not_null_scan_cols (meta : Cat.table_meta) : (int * string) list =
   meta.Cat.columns
   |> List.mapi (fun i (c : Row.column) -> i, c)
@@ -10674,7 +11929,8 @@ and not_null_count_columnar (meta : Cat.table_meta) (cols : (int * string) list)
    ever needs — it emits (table, column, count) and nothing else.
 
    [not_null_scan_table] below retains every violating row so the repair can
-   delete it, and the shape this command exists for is a legacy file whose
+   delete it (and, before #630, drained the whole tree to find them), and the
+   shape this command exists for is a legacy file whose
    declared-NOT NULL column is wholly NULL: retaining there costs O(table)
    resident memory in the one command an operator runs FIRST, on a database
    whose scope of damage is still unknown.  Being OOM-killed while surveying
@@ -10719,54 +11975,82 @@ and not_null_count_table : type m. m S.txn -> Cat.table_meta -> (string * int) l
            counters))
 
 (* #563: scan one table for stored NULLs in a declared-NOT NULL column.
-   Returns one entry per VIOLATING column: its name, how many rows violate it,
-   and — for a row-store table — those rows with their rowids, which is what
-   the repair deletes.  Columns with no violation are dropped, so an empty
-   result means the table honours its own schema.
+   Returns the per-column violation counts — one entry per VIOLATING column,
+   clean columns dropped, so empty counts mean the table honours its own
+   schema — paired with the violating rows themselves, which is what the
+   repair deletes.  A row violating two NOT NULL columns is counted under both
+   but appears ONCE in the victim list.
 
    #600: this is the REPAIR path only; the report uses [not_null_count_table],
-   which retains nothing.  The retention here is deliberate and must stay —
-   #541 found that fetching in index-key order costs up to a page read per row
-   once the table outgrows the pager cache, so the candidate rowids have to be
-   collected and sorted before they are fetched.  The bound on this buffer is
-   one TABLE's violations (see [stream_pragma_not_null_repair]), not the whole
-   database's. *)
+   which retains nothing.
+
+   #630: the SCAN streams and the VICTIM BUFFER retains — the two halves are
+   separate and only the first was ever the defect.
+
+   - The scan runs on [S.seek_ge]/[S.seek_next], not [S.cursor_open].
+     [cursor_open] drains the entire tree into a list before the first
+     violation is examined (the #228/#229 finding), so [PRAGMA
+     not_null_repair] on a large but mostly CLEAN table paid O(table) resident
+     memory to find a handful of violators.  [seek_ge] from the empty key
+     positions before the first entry in O(log n) and yields one [(key, value)]
+     at a time, so what the scan holds is now one decoded row, not the table.
+     This is the same move #600 made for the report path.
+   - The victim buffer stays collected-and-sorted before the rows are fetched,
+     and that is deliberate: #541 found that fetching in index-key order costs
+     up to a page read per row once the table outgrows the pager cache.  Its
+     bound is one TABLE's violations (see [stream_pragma_not_null_repair]), not
+     the whole database's, and it is O(violations) rather than O(table) — a
+     clean table now costs nothing at all.
+
+   Splitting the counts from the victims (they used to share one per-column
+   bucket of retained rows) is what makes the second bound exact: a row
+   violating [k] columns previously occupied [k] list cells and was deduped
+   only later, in [repair_not_null_table]. *)
 and not_null_scan_table
-  : type m. m S.txn -> Cat.table_meta -> (string * int * (int64 * Row.t) list) list Lwt.t
+  : type m.
+    m S.txn -> Cat.table_meta -> ((string * int) list * (int64 * Row.t) list) Lwt.t
   =
   fun tx meta ->
   let cols = not_null_scan_cols meta in
   if cols = []
-  then Lwt.return []
+  then Lwt.return ([], [])
   else (
     match meta.Cat.storage with
-    | Cat.Columnar _ ->
-      Lwt.return (List.map (fun (n, c) -> n, c, []) (not_null_count_columnar meta cols))
+    | Cat.Columnar _ -> Lwt.return (not_null_count_columnar meta cols, [])
     | Cat.Row { tree_id; _ } ->
-      let buckets = List.map (fun (i, name) -> i, name, ref []) cols in
-      let* cur = S.cursor_open tx tree_id in
-      let _sr = S.cursor_first cur in
-      let note row rowid (i, _, bucket) =
+      let counters = List.map (fun (i, name) -> i, name, ref 0) cols in
+      let victims = ref [] in
+      (* One pass over the row: bump EVERY column it violates (the counts are
+         per column) but retain the row at most ONCE.  Both helpers are lifted
+         out of [go] so the scan loop stays flat. *)
+      let bump row hit (i, _, n) =
         if i < Array.length row && row.(i) = Row.V_null
-        then bucket := (rowid, row) :: !bucket
+        then (
+          incr n;
+          hit := true)
       in
+      let note k row =
+        let hit = ref false in
+        List.iter (bump row hit) counters;
+        if !hit then victims := (Rowid.decode k, row) :: !victims
+      in
+      let* cur = S.seek_ge tx tree_id Bytes.empty in
       let rec go () =
-        match S.cursor_next cur with
-        | None -> ()
+        let* nxt = S.seek_next cur in
+        match nxt with
+        | None -> Lwt.return_unit
         | Some (k, v) ->
-          let row = Row.decode meta.Cat.columns v in
-          List.iter (note row (Rowid.decode k)) buckets;
+          note k (Row.decode meta.Cat.columns v);
           go ()
       in
-      go ();
-      S.cursor_close cur;
-      Lwt.return
-        (List.filter_map
-           (fun (_i, name, bucket) ->
-              match List.rev !bucket with
-              | [] -> None
-              | l -> Some (name, List.length l, l))
-           buckets))
+      let* () = go () in
+      S.seek_close cur;
+      let counts =
+        List.filter_map
+          (fun (_i, name, n) -> if !n = 0 then None else Some (name, !n))
+          counters
+      in
+      Lwt.return (counts, List.rev !victims))
 
 (* #563: the report row shape shared by check and repair — (table, column, n).
    [n] is the number of offending rows for [not_null_check] and the number of
@@ -10843,8 +12127,8 @@ and stream_pragma_not_null_repair store mode cat =
        let* per_table =
          Lwt_list.map_s
            (fun (meta : Cat.table_meta) ->
-              let* found = not_null_scan_table tx meta in
-              repair_not_null_table tx cat_val meta found)
+              let* counts, victims = not_null_scan_table tx meta in
+              repair_not_null_table tx cat_val meta ~counts ~victims)
            tables
        in
        let* () = release_txn ~cat:cat_val tx owned in
@@ -10862,7 +12146,7 @@ and stream_pragma_not_null_repair store mode cat =
    unrepairable table crash the caller instead of informing it.
 
    {b The count-0 row is a standalone signal, not a cross-reference.}  A table
-   with nothing to fix produces NO row at all (the [found = []] branch below),
+   with nothing to fix produces NO row at all (the [counts = []] branch below),
    so a row whose count is 0 is emitted in exactly one situation: findings that
    could not be deleted.  "Nothing to fix" and "cannot fix" are therefore
    distinguishable from the repair output alone — empty versus a 0-count row —
@@ -10876,9 +12160,8 @@ and stream_pragma_not_null_repair store mode cat =
    expressible from this path at all, for the reason above; #588 tracks fixing
    the [Db.query_impl] guard, and closing it should turn this branch back into
    a raise. *)
-and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) found =
-  let counts = List.map (fun (name, n, _) -> name, n) found in
-  if found = []
+and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~victims =
+  if counts = []
   then Lwt.return []
   else if Cat.is_columnar meta
   then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) counts)
@@ -10889,10 +12172,12 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) found =
       then build_child_refs cat_val ~parent_table_name:meta.Cat.name
       else Lwt.return []
     in
-    let victims =
-      List.concat_map (fun (_name, _n, rows) -> rows) found
-      |> List.sort_uniq (fun (a, _) (b, _) -> Int64.compare a b)
-    in
+    (* #541: the rows are fetched in ascending rowid order, never index-key
+       order.  [not_null_scan_table] already yields them that way (its seek
+       walks the data tree ascending) and already deduplicates; the sort is
+       kept because THIS is where the ordering the delete depends on is
+       required, and it must not become an accident of the scan. *)
+    let victims = List.sort_uniq (fun (a, _) (b, _) -> Int64.compare a b) victims in
     let* () =
       Lwt_list.iter_s
         (fun ((rowid, row) as m) ->
@@ -11404,8 +12689,9 @@ and to_stream
   : Row.t Lwt_stream.t Lwt.t
   =
   match op with
-  | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store mode table_meta
-  | Plan.Op_col_seq_scan { table_meta } ->
+  | Plan.Op_seq_scan { table_meta; _ } ->
+    stream_seq_scan clock params store mode table_meta
+  | Plan.Op_col_seq_scan { table_meta; _ } ->
     stream_col_seq_scan clock params store mode table_meta
   | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
   | Plan.Op_project { ordinals; child } ->
@@ -11432,13 +12718,14 @@ and to_stream
               Hashtbl.replace seen k ();
               true))
          inner)
-  | Plan.Op_index_lookup { table_tree; idx_tree; keys; range; table_meta } ->
+  | Plan.Op_index_lookup { table_tree; idx_tree; keys; range; table_meta; _ } ->
     stream_index_lookup clock params store mode table_tree idx_tree keys range table_meta
-  | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
+  | Plan.Op_rowid_lookup { table_meta; lookup_val; _ } ->
     stream_rowid_lookup clock params store mode lookup_val table_meta
   | Plan.Op_nested_loop_join
       { left
       ; right_meta
+      ; right_alias = _
       ; idx_tree
       ; probe
       ; probe_range
@@ -11534,6 +12821,22 @@ and to_stream
   | Plan.Op_pragma_get_synchronous ->
     let s = S.string_of_durability (S.durability store) in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_text s |] ])
+  (* #638: (total_failures, consecutive_failures, last_error).  [last_error] is
+     NULL when no checkpoint has failed since the last one that completed. *)
+  | Plan.Op_pragma_checkpoint_status ->
+    let h = S.checkpoint_health store in
+    let last =
+      match h.S.last_error with
+      | None -> Row.V_null
+      | Some m -> Row.V_text m
+    in
+    Lwt.return
+      (Lwt_stream.of_list
+         [ [| Row.V_int (Int64.of_int h.S.total_failures)
+            ; Row.V_int (Int64.of_int h.S.consecutive_failures)
+            ; last
+           |]
+         ])
   | Plan.Op_pragma_get_wal_batch_commits ->
     let n = S.sync_batch_commits store in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])

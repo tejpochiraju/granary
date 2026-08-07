@@ -9,6 +9,12 @@ type wal_callbacks =
   ; wal_append_commit : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
   ; wal_append_commit_no_sync : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
   ; wal_sync : unit -> (unit, string) result Lwt.t
+  ; wal_epoch : unit -> int64
+    (** #611: the WAL's generation counter ([Wal.epoch]).  The pager caches
+        WAL-resolved pages keyed by frame index and reads this on every
+        resolution: a checkpoint recycles frame indices, and bumping the epoch
+        is exactly what [Wal.reset] does when it does so.  Must move whenever
+        frame indices stop meaning what they meant. *)
   }
 
 type t
@@ -68,11 +74,20 @@ val max_overflow_payload_bytes : t -> int
 (** Maximum freelist entries that fit on one page. *)
 val max_freelist_entries_per_page : t -> int
 
-(** Attach or detach the WAL overlay.  Clears cache on transition into WAL mode. *)
+(** Attach or detach the WAL overlay.  Clears the cache when a (possibly
+    different) overlay is attached, and drops the WAL-keyed entries when one is
+    detached (#611). *)
 val set_wal : t -> wal_callbacks option -> unit
 
 (** True when a WAL overlay is attached. *)
 val wal_mode : t -> bool
+
+(** #611: number of WAL-resolved frames currently held in the page cache.
+    WAL-resolved pages participate in the cache keyed by
+    [(page_id, frame_idx)]; entries are dropped wholesale when the WAL's
+    generation counter moves (a checkpoint recycles frame indices).  Exposed so
+    the invalidation tests can distinguish a purge from a key-mismatch miss. *)
+val wal_cached_count : t -> int
 
 (** Read [page_id], consulting dirty (writer path) or the WAL snapshot.
     When [~bypass_cache:true], the page is read from the block device but NOT
@@ -99,6 +114,28 @@ val read_borrow
   -> int64
   -> (Cstruct.t -> 'a Lwt.t)
   -> ('a, error) result Lwt.t
+
+(** #481: like {!read}, but for callers that RETAIN the page buffer past a
+    single scope and only ever read it — the shape {!read_borrow}'s callback
+    cannot express (a B+-tree cursor holds one leaf across the many
+    [cursor_next] calls that consume it).  Returns the pager's own cache or
+    WAL-frame buffer with no defensive copy, saving a full page copy per leaf
+    advance.
+
+    The caller MUST treat the result as read-only.  Sound because cache and
+    WAL-frame buffers are immutable once stored and eviction only drops the
+    hashtbl entry, so a retained buffer stays live and stays correct.
+
+    Dirty pages are still copied: a dirty buffer is the one the writer may
+    mutate in place (see {!dirty_buffer}), so on the writer path this is
+    byte-for-byte {!read}. *)
+val read_shared
+  :  ?snapshot_frames:int
+  -> ?pin_set:(int64, unit) Hashtbl.t
+  -> ?bypass_cache:bool
+  -> t
+  -> int64
+  -> (Cstruct.t, error) result Lwt.t
 
 (** Write [buf] to [page_id] (defensive copy). *)
 val write : t -> int64 -> Cstruct.t -> unit

@@ -83,15 +83,25 @@ O(n²) bulk insert, a lost reader/writer overlap:
 | `bench_wal_reader_scaling` | #149 parallel-read regression | parallel ≤ 2.0x serial | `GRANARY_BENCH_PARALLEL_MAX` |
 | `bench_slow_read_yield` | reader starving the writer | writer ≤ 3.0 s | `GRANARY_BENCH_MAX_WRITER_S` |
 
-One gate is **not** wall-clock and therefore **not** neutralized anywhere:
+Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
 
 | test | guards | gate | knob |
 |---|---|---|---|
 | `test_not_null_600` | #600 `PRAGMA not_null_check` retaining every violating row | marginal peak live heap < 4 words/row when the table doubles | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
+| `test_not_null_repair_630` | #630 `PRAGMA not_null_repair`'s **scan** draining the tree via `cursor_open` | same gate, but with the violation count held FIXED at 5 while the table doubles, so only the scan can move it | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
+| `test_correlated_exists_493` | #493 a correlated `EXISTS` leaking one RO snapshot per outer row | peak live RO snapshots does not grow when the outer rows go 100 → 400 | `GRANARY_MAX_LIVE_READERS` |
 
-It measures *allocation* (peak live major-heap words, sampled through a `Gc`
-alarm), so a loaded runner does not move it — ±0.02% across runs, which no
-wall-clock gate manages. That is why it runs armed in `ci.yml`, `coverage.yml`
+The first two are complements, not duplicates: #600's doubles the violations along
+with the table and so cannot tell a retaining scan from a retaining victim
+buffer; #630's holds the violations fixed and therefore measures the scan
+alone. The repair's victim buffer is *supposed* to be O(violations) — #541's
+finding is that the rows must be collected and sorted before they are fetched,
+because fetching in index-key order costs up to a page read per row once the
+table outgrows the pager cache. Do not "bound" that by streaming it.
+
+They measure *allocation* (peak live major-heap words, sampled through a `Gc`
+alarm), so a loaded runner does not move them — ±0.02% across runs, which no
+wall-clock gate manages. That is why they run armed in `ci.yml`, `coverage.yml`
 and `cross-arch.yml` alongside the ones those jobs disarm. What load cannot
 change, a different allocator or word size can, and `cross-arch.yml`'s arm64
 arm has never run it, so `GRANARY_MEM_MAX_WORDS_PER_ROW` exists as the escape
@@ -100,6 +110,49 @@ same test makes. Reach for it only after ruling out the thing it guards: the
 measured slopes are ≈20-23 words/row retaining (19.61-23.52 across three runs;
 the 40 000-row point is the noisy one) and 1.6-1.9 counting, so a failure
 anywhere between those two bands is a regression, not a platform difference.
+
+`test_correlated_exists_493` measures a *count* — `Store.active_reader_count`,
+an integer folded from a refcount table — sampled between outer rows, so load
+cannot move it either. It has **two** assertions and they are not equally
+trustworthy:
+
+- the **ratio** (`peak(400) ≤ peak(100) + 2`) needs no prediction about what the
+  healthy number is, and is the real gate;
+- the **ceiling** (`peak(400) ≤ GRANARY_MAX_LIVE_READERS`, default 32) does, and
+  **that default is a prediction, not a measurement** — this test shipped in a
+  batch whose build and benchmark pass was deferred, and no armed run has ever
+  been observed. A leaked run reports ≈400, so the ceiling has ~12x headroom
+  over the expected healthy value; if it nonetheless fails while the ratio
+  passes, the default was simply wrong and raising it is correct. If the
+  **ratio** fails, that is the leak and no knob should be touched.
+
+It must run **on disk**: the `Mem` backend answers 0 for the reader counters
+unconditionally, so an in-memory version passes vacuously.
+
+**Being non-wall-clock is necessary but not sufficient to run armed
+everywhere — being *measured* is the other half.** A second allocation gate
+exists and is deliberately **not** armed by default:
+
+| test | guards | gate | knob |
+|---|---|---|---|
+| `test_scan_borrow_481` | #481 the scan path copying the key, the value twice, and a 4 KB page per leaf | scan allocates < 2.0 bytes per byte of payload it never reads | `GRANARY_MEM_MAX_PAYLOAD_SLOPE` |
+
+The unit is *copies of the payload*: 1.0 is the one copy the caller asked for,
+3.0 is the three #481 removed, and word-size rounding moves it by ~0.02, so the
+2.0 boundary is an integer boundary rather than a tuned number. That derivation
+is why the ceiling is defensible; the fact that **nobody has run it yet** is why
+it is unarmed. Unset (the default in `ci.yml`, `coverage.yml`, `cross-arch.yml`
+and on your box), the test measures and prints the slope and still asserts every
+correctness property around it — it just does not block. It is armed in exactly
+one place, `bench-nightly.yml`, which sets `GRANARY_MEM_MAX_PAYLOAD_SLOPE=2.0`
+and reports through an auto-filed issue rather than failing a PR.
+
+This is the shape to copy for any future allocation gate: **derive the ceiling,
+arm it nightly, and promote it to armed-by-default only once a real measurement
+backs it.** Arming a guessed ceiling on every PR is how a gate gets silently
+neutralized later, which is the honour system #549 removed. When #481's
+benchmark pass produces the number, flip the default in the test and move its
+row into the table above.
 
 **Where they run armed.** `ci.yml`, `coverage.yml` and `cross-arch.yml` — all
 six files, Forgejo and GitHub — neutralize every one of them, because those
@@ -332,8 +385,12 @@ EOF
 
   **The skip is decided in exactly one place, and it is the runtime one.**
   `Exec.not_null_skip_or_fail` is called from the INSERT sites only —
-  `execute_insert_write` and the two columnstore `Op_insert` /
-  `Op_insert_select` arms. `Exec.enforce_not_null` is unchanged and still
+  `execute_insert`, `execute_insert_write` and the two columnstore `Op_insert`
+  / `Op_insert_select` arms. (`execute_insert`'s call is #639's: it is guarded
+  by `CA_ignore` and runs *before* conflict resolution, so the skip no longer
+  depends on which index the row collides with;
+  `execute_insert_write`'s is guarded by `not skip` and so never
+  double-evaluates it.) `Exec.enforce_not_null` is unchanged and still
   raises unconditionally. Since #620 it has exactly ONE call site left —
   `write_row_rekeyed` — but three write paths funnel through it: plain
   `UPDATE`, `UPSERT ... DO UPDATE`, and `ON UPDATE CASCADE`. None of the three
@@ -355,7 +412,333 @@ EOF
   in `test/test_not_null_599.ml` pins all four spellings together for that
   reason.
 
+- **One rule resolves a correlated subquery's outer references (#635/#626/#615, 2026-08-06).**
+  An input's **scope identifier** is its FROM item's alias where it has one and
+  its table name otherwise — an alias *replaces* the name. A qualified outer
+  reference names a scope identifier; an unqualified one names a column exactly
+  one input carries; **anything else is an error, never a silent empty or NULL
+  result.** That rule holds at any nesting depth and in every clause a
+  correlated subquery can sit in — WHERE, an INNER or OUTER join's ON,
+  a projection, and HAVING.
+
+  It is implemented at **three** levels and they must not be allowed to drift
+  apart again, because each pair that disagreed produced a different silent
+  wrong answer:
+  - `Sema.from_ident` for the binder's two qualified lookups (`bind_expr_join`,
+    `select_qual_lookup`);
+  - `Exec.inner_scope_of` for a subquery's *own* FROM (this one was always
+    right);
+  - `Exec.scan_ident` / `get_outer_scan_metas` for the outer inputs, which
+    needs `alias` on `Plan.Op_seq_scan` / `Op_col_seq_scan` /
+    `Op_index_lookup` / `Op_rowid_lookup` and `right_alias` on
+    `Op_nested_loop_join`, carried from `Sema.BS_select.table_alias` and
+    `Sema.bound_join.right_alias`.
+
+  Consequences worth knowing before editing this area:
+  - **`SELECT t.x FROM t s` is now an error**, matching sqlite3. It used to
+    answer rows, and that is what made an alias-hidden name inside a subquery
+    resolve *inward*: the subquery was never recognised as correlated, was
+    folded to a constant, and rows were lost with no error (#635's comment).
+  - The duplicate guard in `get_outer_scan_metas` is by **identifier**, not by
+    table name. `FROM l AS x JOIN l AS y` therefore resolves; the unaliased
+    `FROM l JOIN l` still cannot and is still refused. #592's
+    `self_join_is_refused_not_emptied` was rewritten to the unaliased spelling
+    for exactly this reason — a green suite on the aliased one would now mean
+    the opposite of what it used to. `test/test_refusal_error_627.ml` was
+    written in parallel and had to be rewritten for the same reason, in two of
+    its four categories: it provoked #627's refusals with the *aliased*
+    self-join and with a plain correlated ON in an outer join, and #635 and
+    #615 respectively turned both into answers. They are now the unaliased
+    self-join and `l.a` under `FROM l AS x` in an outer join's ON. **Anything
+    that resolves those spellings too must replace them again, not delete the
+    row** — #627 covers seven public surfaces, and a category that quietly
+    stops firing takes all seven with it.
+  - `substitute_outer_in_expr` descends into nested `E_subquery` / `E_exists` /
+    `E_in_select` carrying the **union** of every enclosing subquery's scope.
+    Carrying only the innermost scope is the obvious implementation and is
+    wrong: it rewrites an *intermediate* subquery's own column from the outer
+    row.
+  - **That descent is necessary but was not sufficient, and the missing half is
+    "what counts as correlated".** `Sema` treats `E_subquery` / `E_exists` /
+    `E_in_select` as opaque leaves and never descends into them, so a statement
+    whose correlation sits TWO levels down *binds cleanly*. Every caller read
+    "it bound" as "it is uncorrelated" and evaluated it eagerly, before any
+    outer row existed to substitute from; the reference was then met for the
+    first time by the intermediate query's own `stream_filter`, whose inputs are
+    the intermediate FROM, and refused there. So the two-level shape
+    `FROM l AS x WHERE EXISTS (SELECT 1 FROM r WHERE EXISTS (… v < x.a))` was
+    refused with the descent in place — the descent was correct but never ran.
+    `Exec.stmt_has_free_column_ref` answers the second question and is consulted
+    at the one chokepoint all four callers share, `plan_subquery_cached`, so
+    `refuse_unresolved_correlation` and the three `eval_*_subquery` functions
+    cannot disagree about which statements are correlated. It is implemented by
+    *running* `substitute_outer_in_stmt` with a binding that resolves nothing and
+    records that it was asked, so the detector and the substituter agree by
+    construction about which references are free — the same discipline the two
+    binders are held to, and the reason not to hand-write a second walker
+    (`substitute_outer_in_plan_expr` is already the odd member of a four-walker
+    set, #670). It can only move a statement from "evaluate eagerly" to "treat
+    as correlated", and `inner_scope_of` answers "owned" for everything it
+    cannot resolve, so an unresolvable FROM never manufactures a free reference.
+    Pinned by `two_nesting_levels` in `test/test_alias_outer_ref_635.ml`.
+  - **#566's refusal of a correlated ON subquery in an OUTER join is
+    reopened (#615).** Its stated blocker — no correlation source over a join
+    node — was removed by #592, so the `Left` arm now substitutes per (left,
+    right) *pair* inside the join. It has to be per pair, not per surviving
+    row: for an outer join the ON predicate **is** the match test, and a filter
+    above the join rejects the null-extended row it must emit (#552). The pure
+    pairing loop is kept as the arm taken when no subquery survives.
+  - `Op_nested_loop_join` cannot carry a subquery in its probe through the
+    planner, but it is a public constructor, so `stream_nested_loop_join`
+    refuses one explicitly rather than encoding it as NULL.
+- **A GENERATED column's NOT NULL is enforced on its COMPUTED value, at both
+  levels (#629).** This was the third instance of the same shape as #567 and
+  #599 — a check running where it cannot see the truth — and the fix narrows
+  *when* each check runs, never *whether*.
+
+  The caller is forbidden from supplying a generated column, so it is always
+  omitted, and `Sema.bind_insert_row` fills an omitted column with a literal-NULL
+  placeholder. Judging that placeholder made a `NOT NULL GENERATED` column reject
+  **every** INSERT: no spelling could succeed, so the table was uninsertable.
+  `bind_insert_row` therefore exempts generated columns of **both** storage
+  classes — at bind time neither has a value. It keeps its literal-NULL error for
+  every other column.
+
+  Two neighbouring binders were out of step with that and had to move too, or
+  the headline symptom survived the fix. `bind_insert`'s **implicit column list**
+  now omits generated columns, so bare `INSERT INTO g VALUES (…)` works — before,
+  it was `Arity_mismatch` with one value per base column and "cannot INSERT into
+  generated column" when padded out. That was not a new divergence decision: the
+  `INSERT … SELECT` binder's `columns = []` arm already applied exactly that
+  filter, and `Db.dump` already emits an explicit list that omits them; the
+  VALUES binder was the odd one out. And `bind_upsert_assignments` now refuses
+  `DO UPDATE SET <generated> = …` the way `bind_update_assignments` always did —
+  it was the third assignment spelling and the only unguarded one, so the
+  assignment bound fine and `compute_stored_generated_cols` overwrote the column
+  immediately after, making the statement silently do nothing.
+
+  The runtime half had the mirror-image gap. `Exec.not_null_exempt_col` exempted
+  VIRTUAL generated columns outright (#567's reasoning: their stored cell is
+  `V_null` by design), which meant a NOT NULL VIRTUAL column was *unenforceable*.
+  `Exec.not_null_violation` now recomputes the virtuals into a copy of the row
+  before judging it, and consults the exemption only when it cannot — a row that
+  does not cover every column, where evaluating the generated expression would
+  raise. **The exemption is the degraded mode; do not re-broaden it.**
+
+  **STORED columns rest on an ordering claim, and the claim covers the
+  ROW-STORE sites only** — do not restate it as "every enforcement site", which
+  is how it shipped and is false. `compute_stored_generated_cols` runs before
+  the check at `execute_insert`, `execute_upsert_update`, `update_col_in_tx` and
+  `apply_update_row`. It is **not** called on either columnar arm: both build the
+  row with `Array.make n_cols Row.V_null` and pass it straight to
+  `not_null_skip_or_fail`. Nor does `stream_col_seq_scan` recompute VIRTUAL ones
+  on the way out. So a generated column on a columnstore table read NULL forever
+  in **both** classes, silently. `Sema.bind_create` now **refuses** a GENERATED
+  column on a `USING COLUMNSTORE` table (#660) — which is what makes the ordering
+  question not arise at those two sites, rather than a claim that it was already
+  answered there. Wiring the computation into the write arms alone was rejected:
+  it fixes STORED and leaves VIRTUAL reading NULL, deepening the asymmetry. If
+  #660 lifts the refusal, both halves are owed at once.
+
+  Consequences worth knowing: a generated expression that genuinely evaluates to
+  NULL is still rejected — on INSERT (skipped under `OR IGNORE`, per #599, since
+  the row now reaches the runtime site that decides that), and on an UPDATE of
+  the base column it reads (always raises; `write_row_rekeyed` has no `OR IGNORE`
+  form). `not_null_scan_cols` (`PRAGMA not_null_check`/`repair`) deliberately did
+  **not** follow — it reports on cells already on disk whose only repair is to
+  rewrite them, which is meaningless for a column never read from disk. Pinned by
+  `test/test_not_null_629.ml`.
+- **An explicit `ON CONFLICT` target beats the statement's conflict-resolution
+  modifier, for the index it names (#639, decided 2026-08-06).** The modifier
+  still governs every *other* index. Before this, `CA_ignore` matched above the
+  upsert arm in both places that resolve a conflict — `check_insert_unique` for
+  a secondary UNIQUE index and `execute_insert_write`'s `put_x` arm for the
+  rowid-alias PK — so `INSERT OR IGNORE ... ON CONFLICT(k) DO UPDATE` silently
+  skipped for *any* conflict: a caller who wrote both got "insert, or do
+  nothing".
+
+  **The target is resolved in its own pass, before the modifier sees anything,
+  and that is what makes the answer well-defined rather than a micro-
+  optimisation.** `check_insert_unique` used to fold over every unique index in
+  one pass and let whichever conflicted first decide. With two unique indexes
+  and a row conflicting on both, the outcome then depended on the order
+  `Cat.indexes_for_table` returned them in — newest-first, i.e. on `CREATE
+  UNIQUE INDEX` order: target first gave an upsert, the other first gave a skip
+  under `OR IGNORE`. Same schema, same statement, two answers. When the target
+  hits, the accumulator is reset to `(false, [], Some rid)`: `skip` is
+  meaningless because the insert it was decided against is discarded, and
+  `dels` **must** be empty because `execute_insert`'s upsert branch never calls
+  `delete_replace_conflicts` — a non-empty `dels` there is a queued delete that
+  never happens.
+
+  **What this pass does NOT do — and an earlier revision of this bullet claimed
+  it did — is hand the check downstream.** `write_row_rekeyed` performs *no*
+  uniqueness probe: its index loop is an unconditional `S.del` of the old key
+  and `S.put` of the new one. `check_index_unique_on_update` is defined after it
+  in `exec.ml` and is reached only from `validate_update_unique`, the
+  plain-`UPDATE` pre-pass. Discarding the other indexes' verdicts is still
+  sound — they were computed against the row being INSERTED, which is discarded,
+  and a `SET v = 42` does not touch the column they were about — but **a DO
+  UPDATE that writes a duplicate into another unique index is accepted
+  silently**. That is pre-existing (true on `main` for the secondary-index
+  shape) and is tracked as **#667**. Do not read the target pass as covering it.
+
+  One consequence of the target pass is a change for the *raising* modifiers:
+  bare / `OR ABORT` / `OR FAIL` / `OR ROLLBACK` used to report
+  `UNIQUE constraint failed` for a second index the discarded insert row
+  collided with, and now run the DO UPDATE. That was a false positive — the
+  conflicting row is never written — and it is pinned by
+  `raising_modifiers_no_longer_report_the_discarded_rows_conflict`.
+
+  The **rowid-alias PK** is the other thing an ON CONFLICT clause can name, and
+  it has no index, so it is invisible to that fold. When the clause names it,
+  `execute_insert` probes the row key with one `S.get` *before*
+  `check_insert_unique` — otherwise a secondary conflict would set `skip`
+  (losing the DO UPDATE) or run `delete_replace_conflicts` (displacing rows for
+  an insert that then never happens, because `put_x` discovers the alias
+  conflict afterwards). The probe is only paid when an upsert clause names the
+  alias column, so #350's plain-INSERT path is untouched. The arm in
+  `execute_insert_write` is kept as a backstop, not the primary path.
+
+  **Two things ride on that pre-probe, both decided rather than incidental**,
+  because routing a conflicting row to the upsert branch skips
+  `execute_insert_write` entirely and that function did more than one job:
+
+  - **The insert row's NOT NULL check moved up, for upserts only.** It is now in
+    `execute_insert`, entered when the statement is `OR IGNORE` *or* carries an
+    upsert clause. Without that, `INSERT INTO t VALUES (1, ?) ON CONFLICT(k) DO
+    UPDATE …` bound to NULL raised on `main` and silently became a successful DO
+    UPDATE. The rule stands: an `ON CONFLICT` clause never intercepts a NOT NULL
+    violation. The *secondary-index* shape is the one that changed to agree — it
+    never raised here — and a statement with **no** upsert clause is untouched,
+    including the precedence between a UNIQUE error and a NOT NULL one.
+  - **`last_insert_rowid()` is no longer set by a DO UPDATE.** No row was
+    inserted, so it should not move. Before #639 the alias-PK shape set it (it
+    returned through the INSERT branch) and the secondary-index shape never did —
+    the same "answer depends on which constraint you hit" split #639 is about.
+    `test_upsert_on_pk_last_rowid` in `test/test_rowid_alias.ml` asserted the old
+    answer **vacuously** (it seeded rowid 5 and upserted rowid 5, so the seed's
+    own value satisfied it); it now seeds 7, upserts 5, and pins the new one. The
+    comment it carried claimed SQLite parity for the opposite answer and was
+    never oracle-checked; the reasoning runs the other way (SQLite sets the value
+    at `OP_Insert` under `OPFLAG_LASTROWID`, and a DO UPDATE is generated as an
+    UPDATE). If the oracle disagrees, set it in **both** shapes — do not restore
+    the split.
+
+  **An unremarked improvement, recorded so nobody finds it by bisect:** the
+  pre-probe also removes a bogus #417 delta. The old alias-PK upsert path emitted
+  *both* an `Updated` and a phantom `Inserted { rowid; row }` — with `row` being
+  the *attempted insert* row, not the stored one — so any reactive view over the
+  table saw a row that was never written. The upsert branch emits only `Updated`.
+
+  **A conflict target that names no PRIMARY KEY or UNIQUE constraint is silently
+  ignored, where SQLite rejects the statement** ("ON CONFLICT clause does not
+  match any PRIMARY KEY or UNIQUE constraint"). Granary treats it as a plain
+  INSERT and drops the `DO UPDATE`. Pre-existing, pinned by
+  `a_non_unique_index_is_not_a_conflict_target`, and tracked as **#668** — it is
+  #639's failure mode reached through a schema mistake instead of a modifier.
+  `Exec.index_is_conflict_target` does require `idx_unique`, so a non-unique
+  index can never be *promoted* into a target; what is missing is the rejection.
+
+  **`OR REPLACE` defers to the target too, and that is a decision, not a side
+  effect of the arm order (#639, decided 2026-08-06).** `INSERT OR REPLACE ...
+  ON CONFLICT(k) DO UPDATE` now updates the conflicting row in place instead of
+  deleting it and inserting the new one. The alternative — `CA_replace` keeping
+  precedence over the named target — reproduces #639 exactly, for `REPLACE`
+  instead of `IGNORE`: the caller writes an explicit `DO UPDATE` and the engine
+  silently does something else with it. One rule for all six modifiers is the
+  only reading under which writing both clauses means anything. This is
+  **believed** to match SQLite but was **not oracle-checked**; if the oracle
+  disagrees, the divergence is deliberate under "inspired by, not a port" and
+  whoever changes it is re-deciding, not fixing an oversight.
+
+  **NOT NULL is not a uniqueness conflict, so an `ON CONFLICT` clause never
+  intercepts it** — the modifier does, per #599 above. The two directions
+  differ and both are pinned in `test/test_or_ignore_upsert_639.ml`: a NULL in
+  the row being *inserted* skips under `OR IGNORE`, while a NULL *assigned by
+  the DO UPDATE* raises, because that write funnels through
+  `write_row_rekeyed` → `enforce_not_null`. `Sema.bind_upsert_assignments`'s
+  static literal-NULL check is therefore **not** suspended under `CA_ignore`
+  (unlike `bind_insert_row`'s): the runtime answer below it is "raise", so the
+  two levels agree rather than disagreeing. #639 noted that binder check was
+  load-bearing while the runtime path was unreachable; the path is reachable
+  now, and the check stays as the earlier, better-located error.
+
+  `INSERT ... SELECT ... ON CONFLICT DO UPDATE` has no grammar at all
+  (`S_insert_select` carries no `upsert_update`) and must stay a **parse
+  error** rather than a silently-dropped clause — that would be #639 again in
+  a new place.
+
+- **A skipped `INSERT` leaves nothing behind in the STORE and the CATALOG,
+  including its BEFORE INSERT trigger's nested DML, in an explicit transaction
+  as well as in autocommit (#631, fixed 2026-08-06).** Read the scope literally:
+  the two things it does *not* revert are the #240 dirty-table set and the #417
+  row-level change feed. A spurious dirty mark is over-invalidation of an
+  external cache and is safe; a stale `record_change` delta is a phantom row for
+  a reactive view whose base table the trigger wrote to. **Neither is a
+  regression** — autocommit's `S.rollback` never cleared them either — but the
+  invariant above is about `Store` and `Schema_cache` state only. Tracked as
+  #666. The undo used to be `if owned then S.rollback`,
+  keyed on *who owns the transaction* rather than on *what the statement
+  decided*, so the same statement left a trace or not depending on whether the
+  caller had opened a `BEGIN`. It is now a statement-level savepoint
+  (`Store.savepoint_begin` plus #280's schema-undo marker, which also restores
+  #303's rowid counters), rolled back when the statement wrote nothing — so it
+  covers the long-standing UNIQUE skip and #599's NOT NULL skip alike.
+
+  It is taken **only** when the transaction is borrowed, a BEFORE INSERT
+  trigger exists on the table, and the resolution is `CA_ignore`; outside that
+  intersection no savepoint is pushed, which is what keeps it off the TPC-C
+  write path (a B-tree savepoint clones the pager dirty set, and
+  `Schema_cache.savepoint_begin` also encodes every columnar store). It is
+  opened and resolved within one statement and never touches `explicit_txn` or
+  the #555 poison flag, so it is **not** a second exit from a poisoned handle
+  and "ROLLBACK is the sole exit" stays true. On an *exception* the savepoint
+  is released, not rolled back: a raising statement's partial effects already
+  survive in a borrowed transaction, and statement atomicity on error is a
+  different problem.
+
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
+
+### A failing autocheckpoint is surfaced, never raised (#638)
+
+Both auto paths used to run the checkpoint under
+`Lwt.catch … (fun _ -> Lwt.return_unit)`, so every failure was discarded whole.
+The background one (`maybe_autockpt_after_commit`) was the worse of the two —
+nobody awaits that fiber — and a checkpoint that failed on every attempt was
+completely invisible: the WAL grew without bound with no counter, no event and
+no log, and the first symptom was a full disk or a very slow recovery. On a long
+TPC-C run that reads as a performance cliff.
+
+Since #638 a failure is **recorded and emitted, and still not raised to the
+caller of the commit that triggered it**. That asymmetry is the decision, not an
+oversight: the commit has already succeeded and its WAL frames are still valid
+frames, so failing it would convert a deferrable maintenance problem into
+spurious transaction failures. Three surfaces, all fed from the one
+`Store.note_checkpoint_failure` chokepoint:
+
+- `Store_event.Checkpoint_failed { target_frames; consecutive; message }` — the
+  live signal, and the thing that finally balances the `Checkpoint_begin` an
+  aborting checkpoint used to leave dangling.
+- `Store.checkpoint_health` — sticky, so an operator can read it long after the
+  failing commit returned. `consecutive_failures` (and `last_error`) are cleared
+  by any checkpoint that completes and by `Store.clear_checkpoint_error`;
+  `total_failures` is never cleared by success, because "this store has been
+  unable to truncate its WAL at least once" is a different question from "is it
+  failing right now".
+- `PRAGMA checkpoint_status` — one row of
+  `(total_failures, consecutive_failures, last_error)`; `last_error` is NULL
+  when nothing has failed since the last completing checkpoint.
+
+The **explicit** `Store.checkpoint` path already surfaced its failure by
+raising, and still does — it merely feeds the same counters, so
+`checkpoint_health` describes the store rather than only its automatic path. Do
+not "fix" the remaining silence by making the auto path raise; the escalation
+this issue asks for is visibility. `test/test_checkpoint_failure_638.ml` pins
+both halves (observable, and the triggering commit still succeeds with its data
+readable) by failing the main-file `write_page` — in WAL mode the main file is
+written *only* by a checkpoint, so commits keep succeeding while every
+checkpoint fails.
 
 ### One `Db.t`, one explicit transaction (#555)
 
@@ -444,6 +827,88 @@ execution time.
   when the detach target itself has none. Narrowing it to the target's own slot
   would be defensible; it is not what is implemented.
 
+### `Db.with_transaction` — the scoped extent (#585)
+
+`Db.with_transaction db (fun db -> …)` BEGINs, runs the body, COMMITs on
+success, ROLLBACKs and **re-raises** on exception. An exception is never
+converted into `Error`; `Error` is reserved for a failed BEGIN or COMMIT.
+
+Its point is not convenience. It is the first place a transaction has a dynamic
+*extent*, so an owner token can live in an Lwt key for its duration — the thing
+#555 and #584 both name as the missing prerequisite. The token is minted at
+BEGIN, stored on the handle (`txn_scope`) and published into the calling fiber's
+Lwt storage (`txn_scope_key`); a fiber owns the transaction iff the two agree,
+which is what `Db.in_transaction_scope` reports.
+
+**Nesting is refused, and that is a decision, not an omission.** A nested
+`with_transaction` on the same handle — directly, or from a fiber spawned inside
+the body, which inherits the token — returns `Error` without opening anything,
+without rolling anything back and **without poisoning**. A savepoint would make
+the inner scope's "commit" a `RELEASE`, so returning from it would not mean
+durable and the outer scope could still discard it. A no-op join would make the
+inner scope's rollback-on-exception abort the *outer* transaction while
+returning to code that believes only its own work was undone. Refusal is the
+only answer that does not lie; `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` inside the
+body is the supported partial-undo point.
+
+The clean refusal is also the token's only live decision today, and it is worth
+seeing why it is sound: the token *proves* the caller is the fiber that opened
+the outer transaction, so there is nothing to contain. The #555 poison exists
+precisely for the case where the engine cannot tell the fibers apart, and that
+case is untouched — a second *fiber* on a shared handle holds no token, so its
+BEGIN collides and poisons exactly as a bare `BEGIN` does.
+
+**The poison contract is preserved, deliberately.** `with_transaction` issues no
+`ROLLBACK` when its BEGIN fails, and none when its COMMIT fails — otherwise it
+would be a second exit from the poisoned state and "ROLLBACK is the sole exit"
+would become false. It rolls back only its *own* transaction, on the
+body-raised-an-exception path.
+
+**#584 is narrowed at the scope boundary, not closed.** If another fiber's
+`ROLLBACK` aborts this scope's transaction — whether it then refills the slot or
+leaves it empty — the token no longer matches; the combinator detects that at
+scope exit and issues **neither** COMMIT nor ROLLBACK, returning `Error`, since
+either would act on state that is no longer the scope's. It does *not* cover
+statements *inside* the body: those still resolve the transaction from the
+handle's mutable slot, so a displaced scope's writes land in the other fiber's
+transaction before the boundary check reports the loss. Binding statements to
+their owner is #555 option 1's work. **This is not permission to share a handle
+across fibers** — `create_worker_handle` still is.
+
+**The token must be invalidated by every path that ends a transaction, not just
+by `with_transaction`'s own exit.** This shipped wrong once and the failure was
+the guard's own headline case: `txn_scope` was written only by the combinator,
+so after `B: BEGIN` (collide) → `B: ROLLBACK` (A's transaction aborted) →
+`B: BEGIN` (B's transaction now in the slot), A's stale `Some 1` still equalled
+the handle's `Some 1`, and A's scope exit COMMITted **B's** transaction and
+returned `Ok`. `stolen_txn_msg` only fired when the displacing fiber also used
+`with_transaction` — i.e. never in the spelling #584 is written in. The clears
+now sit next to every `explicit_txn` assignment: `begin_txn` and `savepoint_txn`'s
+auto-begin clear it when they *fill* the slot; `force_rollback_txn`, `commit_txn`,
+`rollback_txn` and `release_savepoint`'s auto-commit clear it when they *empty*
+it. Keep them adjacent — a token that outlives its transaction turns the guard
+into a false match, which is worse than no guard at all.
+
+**The token lives on the handle the BEGIN routed to** (`active_handle`), not on
+the top-level handle, because that sub-handle is the one whose slot those clears
+maintain. #598 keeps the routing from moving under an open scope, so the handle
+is stable for the extent.
+
+One inherited wrinkle: the rollback-on-exception path issues `ROLLBACK`, which
+clears the handle's *poison* flag unconditionally (#555 made it unconditional so
+a handle can never be stranded). Poison is connection state, not transaction
+state, so an unwinding scope can clear a poison another fiber was told to
+recover from; that fiber's own `ROLLBACK` then answers "no active transaction".
+Nothing is lost, and making the clear conditional would strand the handle.
+
+The body owns the statements, not the transaction: a `BEGIN` inside it poisons,
+and a `COMMIT`/`ROLLBACK` inside it empties the slot *and clears the token*, so
+the scope exit takes the displacement branch and returns `Error` without issuing
+a second COMMIT. The body's work lands as the body asked; the `Error` is the
+caller's only signal that the scope did not end the way it looks like it did.
+`SAVEPOINT`/`RELEASE`/`ROLLBACK TO` are fine and leave the transaction in place.
+Pinned by `test/test_with_transaction_585.ml`.
+
 ### Running explicit transactions from more than one fiber
 
 `Db.create_worker_handle` is the mechanism, and it is sound: it is `of_store`
@@ -459,13 +924,23 @@ anyway, because the fix's invariant is what keeps it that way.
 
 Each handle still gets a *fresh catalog* — that is what makes DDL invisible
 across handles — but it no longer gets a fresh **rowid allocator**. The
-allocator's live state was lifted out of the cached `table_meta` and into
-`Schema_cache.rowid_counters`, a table `Cat.open_ ?rowid_counters` accepts so a
-second catalog over the same store shares it. Every read of a cached
-`table_meta` is patched from that table on the way out and every write publishes
-to it on the way in, which keeps `table_meta` the only type the rest of the
-engine sees. Two rules make the sharing correct and must survive any future
-edit:
+allocator's live state was lifted out of the cached `table_meta` and into a
+tree-id-keyed table that **`Store.t` owns** (`Store.rowid_counters`, #633), so
+every catalog opened over one store shares one allocator by construction. Every
+read of a cached `table_meta` is patched from that table on the way out and
+every write publishes to it on the way in, which keeps `table_meta` the only
+type the rest of the engine sees.
+
+**#633 moved the ownership; do not move it back.** It was originally threaded by
+hand as `Cat.open_ ?rowid_counters` / `Db.of_store ?rowid_counters`, with
+`create_worker_handle` as the only caller that remembered — and the penalty for
+the next caller forgetting was #589 verbatim (silent row loss plus durable index
+corruption). A tree id is only an identity within one store, so the store is the
+only correct home. This also makes ATTACH right by type rather than by accident:
+an attached schema is a different `Store.t` and therefore, necessarily, a
+different set of counters.
+
+Two rules make the sharing correct and must survive any future edit:
 
 - **Keyed by tree id, not by table name** — a tree id identifies the data tree
   the counter counts for and survives `ALTER TABLE … RENAME`; keying by name
@@ -492,7 +967,61 @@ edit:
   overwrite a counter that is already live. A worker re-reads the catalog off
   disk, and disk is never fresher than the running allocator; clobbering would
   reintroduce the same collision with the roles exchanged, making the **parent**
-  go stale.
+  go stale. **The rule is absolute: an entry that exists is never overwritten,
+  whatever its value.** PR #650 briefly carved out an exception for
+  `empty_next_rowid` ("a sentinel has never allocated, so seeding over it can
+  only move the counter up") and it was wrong twice over — the sentinel is *also*
+  written deliberately by the sqlite_sequence reset paths
+  (`reset_next_rowid_in_txn`, `reset_all_next_rowid_in_txn`) *inside* an open
+  transaction, so a concurrent `open_` would clobber the reset with the committed
+  pre-reset high-water; and the obvious guard (skip tables dirty in
+  `rowid_bumped`) does not work, because `rowid_bumped` is **per-cache** — the
+  resetting transaction's flag lives on its own cache and the seeding cache is a
+  brand-new one whose set is empty. There is no cheap store-wide discriminator,
+  so there is no exception.
+
+  **A test that wants a genuine restart must close a file-backed store**, not
+  re-open a catalog over a live one: since #633 the latter is a worker handle and
+  correctly shares the counter. `test_mirror_recovers_next_rowid` and
+  `test_mirror_recovers_negative_next_rowid` in `test_catalog.ml` were converted
+  for exactly this reason.
+
+  **Accepted residual:** with no exception, mirror recovery is invisible to a
+  *second* catalog over a *live* store whose counter is still the sentinel — the
+  recovered `max(rowid)+1` loses to the sentinel the original `CREATE`
+  published. Reaching it needs rows in the data tree that the allocator never
+  issued *and* a lost `_sys_tables` row, on a still-open store: corruption on a
+  live store, not a restart. The rejected alternative silently reverses a
+  sqlite_sequence reset and needs no corruption at all. It is the better trade,
+  but it is a trade, and nothing in the suite covers it.
+- **Every allocator allocates *and publishes* with the writer lock held (#632).**
+  That — not the weaker "the allocator holds the lock" — is the property that
+  makes the shared table safe, because it is what makes the interval between
+  reading the counter and publishing the new one an interval in which nothing
+  else can allocate. `next_rowid_in_txn` and `bump_next_rowid_in_txn` have it by
+  construction (they are handed a txn). `Catalog.next_rowid`, the autocommit
+  allocator, used to publish *before* `S.rw_begin`: another handle could take
+  the lock, `ROLLBACK`, and *lower* the counter through #293's recompute,
+  discarding an allocation already handed out. It now takes the lock first and
+  publishes immediately after the allocation, with no `Lwt` yield in between.
+
+  **`S.commit` does not count as "under the lock", and this is the trap to
+  know.** It releases the writer lock *before* its promise resolves —
+  `commit_wal` calls `unlock_once ()` (`store.ml:2071`) and only then awaits the
+  fsync; the non-WAL arm releases from a `Lwt.finalize` handler
+  (`store.ml:2184`). So publishing in a `let%lwt () = S.commit tx in …`
+  continuation runs *after* other fibers can take the lock, leaving the shared
+  counter too LOW for the whole fsync — the direction that collides. (Too HIGH
+  merely skips ids, and is the residual this design accepts if a commit fails.)
+  PR #650 shipped that ordering for one round before review caught it.
+  **The in-memory backend cannot detect the difference** — its commit releases
+  and returns an already-resolved promise (`store.ml:2164`), so the bind runs
+  synchronously and both orderings pass. Any test for this class of bug must be
+  **WAL-mode and on disk**; `wal_two_fiber_catalog_next_rowid` and
+  `wal_two_fiber_inserts` in `test/test_rowid_counter_ownership_632.ml` are.
+
+  The unknown-table `Failure` stays *synchronous* (raised before any `Lwt.t`
+  exists) — `test_rowid_unknown_table` in `test_catalog.ml` pins the contract.
 
 What it used to do, and what the tests now assert the opposite of — two counters
 over one data tree, neither invalidating the other, so an `INSERT` with an
@@ -531,8 +1060,48 @@ sequences.
   a read-only transaction does not overlap a writer either. Genuine write
   concurrency still needs #555 option 1.
 - Anything else that reaches `Db.of_store` over an **already-open** store owes
-  it `~rowid_counters` by hand; `create_worker_handle` is the only caller that
-  does so today.
+  it `~cohort` by hand; `create_worker_handle` is the only caller that does so
+  today. It no longer owes `~rowid_counters` — see below.
+
+`Db.of_store` over an already-open store no longer has a rowid-allocator
+argument to forget, as of #633: the allocator hangs off `Store.t`, so naming the
+same store *is* sharing it. `test/test_rowid_counter_ownership_632.ml` exercises
+that path directly (bare `of_store`, no `create_worker_handle`) alongside the
+#632 rollback cases and the four invariants above. **`~cohort` is the one
+argument still owed**, and for a different reason: it is about handle lifetime,
+not allocator identity.
+
+**A `VACUUM` on any handle kills every other handle over the same store (#634).**
+VACUUM closes the `Store.t`, rebuilds the file and swaps a freshly opened store
+into the handle that ran it. Siblings cannot follow: they keep the closed store
+*and* the pre-VACUUM `rowid_counters` table. Since #634 that is **loud** — the
+issue's option 2, not option 3. Handles over one store share a
+`Db.store_cohort`; VACUUM bumps it and re-stamps only the vacuuming handle, so
+every sibling is stale and every statement on it is refused with an error naming
+VACUUM. `Db.stale_after_vacuum` exposes it.
+
+**`ROLLBACK` is *not* an exit, and that is the deliberate difference from #555's
+poison.** A poisoned handle is recoverable because its store is still there; a
+stale handle's store is closed, so there is nothing to roll back into. The
+`Op_rollback` arm of `execute_control_op` is exempt from the poison gate and
+**below** the staleness gate for exactly that reason. The only supported
+operation on a stale handle is `Db.close`, which deliberately skips `S.close`
+(VACUUM already closed that store; a second teardown touches closed fds).
+
+Two consequences worth knowing before editing this:
+
+- **VACUUM does not move tree ids.** `copy_all_trees` writes each tid to the
+  same tid in the rebuilt file, so #589's "counters are keyed by tree id" rule is
+  untouched: the vacuuming handle gets a *fresh* counter table (`Cat.open_
+  new_store`, no `?rowid_counters`), re-seeded from the copied data — rescanned
+  for a plain rowid table, read from the copied `_sys_tables` row for
+  AUTOINCREMENT. The table is **replaced wholesale, not remapped**. Anything
+  that makes VACUUM renumber trees must remap or clear that table with it.
+- **A worker handle cannot itself run VACUUM**, because `create_worker_handle`
+  passes no `~file_path` — the statement is refused as "not file-backed" long
+  before the cohort is consulted. So the symmetric "worker vacuums, parent goes
+  stale" case is unreachable today; forwarding `file_path` to workers would make
+  it reachable, and the cohort already handles it.
 
 `Tpcc_driver`'s one-deep worker pool predates this and serializes whole
 transactions on a single handle; that is why its terminal-count sweep flatlines

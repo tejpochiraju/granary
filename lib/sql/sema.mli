@@ -51,6 +51,14 @@ type bound_expr =
   | BE_window_slot of int
   (** Reference to the i-th window function result appended after input columns by Op_window. *)
   | BE_collate of bound_expr * Ast.collation (** expr COLLATE collation_name *)
+  | BE_out_col of int
+  (** #489/#490: the i-th (0-based) column of a SELECT's OUTPUT row, not of its
+      input row.  Produced only for an ORDER BY term naming a select-list
+      position (an ordinal) or an output alias, and only where the sort runs
+      AFTER projection: an aggregated SELECT, and a compound's post-set-op
+      sort.  Shapes that sort BEFORE projection resolve such a term to the
+      select item's own input-row expression instead, so this constructor
+      never reaches them. *)
 
 type bound_order_key =
   { key : bound_expr
@@ -73,6 +81,15 @@ type window_sema =
 type agg_spec =
   { func : Ast.agg_func
   ; col_ord : int option
+  ; arg_expr : bound_expr option
+    (** #488: the aggregate's argument as a general expression over the INPUT
+        row, evaluated per row before accumulating ([SUM(a * (1 - b))]).
+        [None] for the bare-column and COUNT-star forms; when it is [Some _],
+        [col_ord] is [None]. *)
+  ; distinct : bool
+    (** #491: the argument list carried [DISTINCT], so the aggregate consumes
+        each distinct argument value once.  Independent of which of the two
+        fields above carries the argument. Always [false] for a COUNT-star. *)
   }
 
 (** Projection item in an aggregated SELECT.  The output row of
@@ -98,6 +115,9 @@ type agg_proj_item =
 type bound_join =
   { kind : Ast.join_kind
   ; right_meta : Granary_catalog.Catalog.table_meta
+  ; right_alias : string option
+    (** #635: the JOIN item's alias, carried through to the plan so a
+        correlated subquery's outer reference can resolve against it. *)
   ; on : bound_expr
   ; right_col_offset : int
     (** ordinal of the first right-table column in the combined row *)
@@ -160,6 +180,10 @@ type bound_stmt =
   | BS_select of
       { distinct : bool
       ; table_meta : Granary_catalog.Catalog.table_meta
+      ; table_alias : string option
+        (** #635: the FROM item's alias for [table_meta], carried through to the
+            plan's leaf scan so a correlated subquery's outer reference can
+            resolve against it. *)
       ; proj : int list
         (** column ordinals to project
                                             (refer to the combined row when [join] is set)
@@ -191,6 +215,13 @@ type bound_stmt =
       ; windows : window_sema list
       ; agg_windows : window_sema list
         (** Window functions computed AFTER aggregation, over the aggregated output rows. *)
+      ; agg_order_keys : bound_order_key list
+        (** #495: ORDER BY keys of an aggregated SELECT, bound over the
+            AGGREGATE OUTPUT row ([group_cols @ aggs]) exactly as [having] is,
+            because the sort runs on the post-aggregation rows.  Non-empty only
+            when the ORDER BY clause mentions an aggregate; in that case
+            [order] is empty, and the planner appends each key to the aggregate
+            projection as a hidden column, sorts on it, and trims it away. *)
       }
   | BS_create_index of
       { name : string

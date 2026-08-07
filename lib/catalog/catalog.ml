@@ -171,21 +171,14 @@ type fts_table_meta =
 module Schema_cache : sig
   type t
 
-  (** #589: the rowid allocator's live state, keyed by TREE ID and shareable
-      between caches.  See the implementation note below for why it exists and
-      why the key is a tree id rather than a table name. *)
-  type rowid_counters
-
   (** [stamp] re-stamps the #174 tree-tag for a [table_meta]; wired to
       [register_tag store].  Every [table_meta] entering the cache is stamped so the
       page-stamp stays consistent automatically, and an undo re-stamps the prior.
-      [rowid_counters], when given, makes this cache share another cache's rowid
-      allocator state (#589) instead of starting its own. *)
-  val create : ?rowid_counters:rowid_counters -> stamp:(table_meta -> unit) -> unit -> t
-
-  (** This cache's rowid allocator state, to hand to [create] for a second cache
-      over the SAME data trees. *)
-  val rowid_counters : t -> rowid_counters
+      [rowid_counters] is the STORE's rowid allocator state (#589/#633) — it is
+      mandatory, and there is exactly one right value for it: [S.rowid_counters]
+      of the store this cache describes.  See the implementation note below for
+      why it exists and why the key is a tree id rather than a table name. *)
+  val create : rowid_counters:S.rowid_counters -> stamp:(table_meta -> unit) -> unit -> t
 
   (* reads — never touch the undo log *)
   val find_table : t -> string -> table_meta option
@@ -213,7 +206,10 @@ module Schema_cache : sig
   (** #589: open-time seeding ONLY.  Identical to [put_table_durable] except that
       it does not overwrite a shared rowid counter that is already live — a
       worker handle re-reads the catalog off disk, and disk is by definition no
-      fresher than the counter the sharing handles are already using. *)
+      fresher than the counter the sharing handles are already using.  The rule
+      is absolute — an existing entry is never overwritten, whatever its value;
+      see [publish_if_absent] for why the [empty_next_rowid] exception that PR
+      #650 briefly carried had to go. *)
   val seed_table : t -> name:string -> table_meta -> unit
 
   val remove_table_durable : t -> name:string -> unit
@@ -324,14 +320,36 @@ end = struct
      them.
 
      Sharing is safe under the store's single-writer lock, which is what makes
-     the two handles serialize: a counter can only be observed by another handle
-     between writes, and the two directions of staleness that mattered — a
-     counter too LOW, which collides — cannot happen when the allocation is
-     published immediately.  A ROLLBACK lowers it again through
-     [set_rowid_durable] (#293's recompute) and [restore_rowids] (#303's
-     savepoint restore), by which point no other handle can hold the lock. *)
-  type rowid_counters = (S.tree_id, int64) Hashtbl.t
+     the two handles serialize.  The direction of staleness that costs rows is a
+     counter too LOW — that is the one that collides — and what keeps it from
+     being observed is that every allocator both ALLOCATES AND PUBLISHES with the
+     writer lock held: [next_rowid_in_txn] and [bump_next_rowid_in_txn] by
+     construction (they are handed a txn), [next_rowid] since #632.
 
+     Read that as the precise claim it is.  It is NOT "the allocator holds the
+     lock", which would be satisfied by publishing in a continuation of
+     [S.commit] — and would be false, because [S.commit] releases the lock before
+     its promise resolves (store.ml:2071 [unlock_once ()] ahead of the fsync
+     await; store.ml:2184 for the non-WAL arm).  The publish has to happen at a
+     point where the lock is still held, which for [next_rowid] means before
+     [S.commit] is called at all.  Anything that moves a publish past a commit
+     re-opens #589 by way of #632.
+
+     A ROLLBACK lowers the counter again through [set_rowid_durable] (#293's
+     recompute) and [restore_rowids] (#303's savepoint restore), by which point
+     no other handle can hold the lock either.
+
+     #633: the table itself is owned by [S.t] ([S.rowid_counters]), not by this
+     cache and not by a caller.  It used to be threaded through
+     [Cat.open_ ?rowid_counters] / [Db.of_store ?rowid_counters], which meant
+     every future caller reaching [of_store] over an ALREADY-OPEN store owed it
+     the argument by hand — and the penalty for forgetting was #589 verbatim
+     (silent row loss plus index corruption, durable and surviving reopen).  A
+     tree id is only an identity within one store, so the store is where the
+     table belongs; sharing is now a consequence of naming the same store rather
+     than of remembering an argument.  It also makes ATTACH right by type: an
+     attached schema is a different [S.t] and therefore, necessarily, a
+     different set of counters. *)
   type t =
     { tables : (string, table_meta) Hashtbl.t
     ; indexes : (string, index_info) Hashtbl.t
@@ -342,10 +360,10 @@ end = struct
     ; mutable savepoints : savepoint list
     ; mutable poisoned : bool
     ; rowid_bumped : (string, unit) Hashtbl.t
-    ; counters : rowid_counters
+    ; counters : S.rowid_counters
     }
 
-  let create ?rowid_counters ~stamp () =
+  let create ~rowid_counters ~stamp () =
     { tables = Hashtbl.create 16
     ; indexes = Hashtbl.create 16
     ; indexes_by_table = Hashtbl.create 16
@@ -355,14 +373,9 @@ end = struct
     ; savepoints = []
     ; poisoned = false
     ; rowid_bumped = Hashtbl.create 8
-    ; counters =
-        (match rowid_counters with
-         | Some c -> c
-         | None -> Hashtbl.create 16)
+    ; counters = rowid_counters
     }
   ;;
-
-  let rowid_counters t = t.counters
 
   (* Patch a cached [table_meta] with the shared counter on the way out. *)
   let patch t (m : table_meta) =
@@ -384,7 +397,42 @@ end = struct
   ;;
 
   (* Open-time seeding: never overwrite a counter another cache is already
-     using — disk is no fresher than the live allocator. *)
+     using — disk is no fresher than the live allocator.
+
+     THE RULE IS ABSOLUTE: an entry that exists is never overwritten, whatever
+     its value.  PR #650 briefly carved out an exception for [empty_next_rowid]
+     ("a sentinel has never allocated, so seeding over it can only move the
+     counter up"), and it was wrong twice over.  The sentinel is ALSO written on
+     purpose: the sqlite_sequence reset paths ([reset_next_rowid_in_txn] for
+     [DELETE FROM sqlite_sequence WHERE name = 't'], [reset_all_next_rowid_in_txn]
+     for the bare DELETE) set it INSIDE an open transaction, so an [open_] landing
+     on the same store mid-transaction would read the committed pre-reset
+     high-water off disk and clobber the reset — AUTOINCREMENT then resumes from
+     the old value once the reset commits.  And the obvious guard against that
+     (skip tables marked dirty in [rowid_bumped]) does not work, because
+     [rowid_bumped] is PER-CACHE: the resetting transaction's dirty flag lives on
+     its own cache, and the cache doing the seeding is a brand-new one whose set
+     is empty.  There is no cheap store-wide discriminator, so there is no
+     exception.
+
+     The exception existed only to let a test simulate a process restart by
+     re-opening a catalog over a still-live store.  Since #633 that is not a
+     restart — it is a worker handle, and sharing is the correct answer.  A test
+     that wants a genuine restart uses a file-backed store and closes it (see
+     [test_mirror_recovers_next_rowid] in test_catalog.ml).
+
+     KNOWN RESIDUAL, accepted deliberately (PR #650 review r2).  Dropping the
+     exception means mirror recovery is invisible to a SECOND catalog opened over
+     a LIVE store when the shared counter is still at the sentinel: the recovered
+     [max(rowid) + 1] loses to the sentinel already published by the original
+     CREATE, and the second catalog allocates from 1.  Reaching it needs the data
+     tree to hold rows the allocator never issued AND the table's [_sys_tables]
+     row to be lost, on a store that is still open — i.e. corruption on a live
+     store, not a restart, because ordinary inserts advance the counter through
+     [bump_rowid]/[bump_next_rowid_in_txn] and a restart drops the whole table
+     with its [S.t].  The alternative was an exception that silently reverses a
+     sqlite_sequence reset, which is reachable without corruption; this is the
+     better trade, but it is a trade. *)
   let publish_if_absent t (m : table_meta) =
     match m.storage with
     | Row { tree_id; next_rowid; _ } when tree_id >= 0 ->
@@ -675,10 +723,6 @@ end = struct
   let mark_poisoned t = t.poisoned <- true
   let is_poisoned t = t.poisoned
 end
-
-(* #589: re-export so a second catalog over the same store can be opened with
-   the first's rowid allocator. *)
-type rowid_counters = Schema_cache.rowid_counters
 
 type t =
   { store : S.t
@@ -1862,7 +1906,7 @@ let set_fk_constraints t ~table_name ~fks =
 (* Public API                                                           *)
 (* ------------------------------------------------------------------ *)
 
-let open_ ?rowid_counters store =
+let open_ store =
   let%lwt cache = load_all_tables store in
   let%lwt indexes = load_all_indexes store in
   let%lwt fts = load_all_fts store in
@@ -1981,14 +2025,20 @@ let open_ ?rowid_counters store =
   (* #283: seed the sealed cache durably (no undo, this is open-time state).
      [put_table_durable] re-stamps each table's #174 page-header tag, replacing
      the old explicit [register_tag] iteration. *)
+  (* #633: the allocator belongs to the STORE.  Every catalog over this store —
+     [Db.create_worker_handle]'s included — therefore shares it by construction,
+     with no argument to pass and none to forget. *)
   let sc =
-    Schema_cache.create ?rowid_counters ~stamp:(fun m -> register_tag store m) ()
+    Schema_cache.create
+      ~rowid_counters:(S.rowid_counters store)
+      ~stamp:(fun m -> register_tag store m)
+      ()
   in
-  (* #589: [seed_table], not [put_table_durable] — when [rowid_counters] came
-     from a sibling handle over the same store, the counters it already holds are
-     at least as fresh as what we just read off disk, and clobbering them with
-     the disk values would reintroduce the very collision this fixes (in the
-     opposite direction: the PARENT would go stale). *)
+  (* #589: [seed_table], not [put_table_durable] — when a sibling handle over the
+     same store is already using these counters, what it holds is at least as
+     fresh as what we just read off disk, and clobbering it with the disk values
+     would reintroduce the very collision this fixes (in the opposite direction:
+     the PARENT would go stale). *)
   Hashtbl.iter (fun name m -> Schema_cache.seed_table sc ~name m) cache;
   Hashtbl.iter (fun name i -> Schema_cache.put_index_durable sc ~name i) indexes;
   Hashtbl.iter (fun name m -> Schema_cache.put_fts_durable sc ~name m) fts;
@@ -2002,11 +2052,6 @@ let open_ ?rowid_counters store =
     ; last_inserted_rowid = 0L
     }
 ;;
-
-(* #589: hand this catalog's rowid allocator state to a second catalog opened
-   over the SAME store, so the two cannot allocate the same rowid twice.  See the
-   [rowid_counters] note in [Schema_cache]. *)
-let rowid_counters t = Schema_cache.rowid_counters t.sc
 
 (* #243 (T1): last-inserted rowid accessors for [last_insert_rowid()]. *)
 let set_last_inserted_rowid t rowid = t.last_inserted_rowid <- rowid
@@ -2351,9 +2396,59 @@ let alloc_rowid (next_rowid : int64) : int64 * int64 =
   id, next
 ;;
 
+(* #632: the autocommit allocator.  The read-modify-write of the counter used to
+   straddle [rw_begin]: find -> alloc -> [set_rowid_durable] -> rw_begin ->
+   put -> commit.  That was defensible while each catalog owned its own counter,
+   but since #589 [set_rowid_durable] publishes into the store-wide table, so the
+   window between the publish and the commit is a window in which the allocation
+   is visible to every other handle and yet has not happened:
+
+   - another handle can take the writer lock while this fiber is parked in
+     [rw_begin], ROLLBACK, and LOWER the shared counter through #293's
+     post-rollback recompute — discarding an allocation already handed out, so
+     the next allocation collides with the row this fiber is about to write
+     (#589's symptom by a different route); and
+   - if the commit itself fails, the counter stays advanced for a write that
+     never landed.
+
+   Same shape as #223 (a WAL counter lost-update found by Jepsen): a read-modify-
+   write straddling a lock acquisition.  The fix is to take the lock FIRST and do
+   the entire read-modify-write under it.
+
+   PUBLISHING AFTER [S.commit] WOULD NOT BE UNDER THE LOCK, and is the trap this
+   function fell into once (PR #650 review).  [S.commit] releases the writer lock
+   BEFORE its promise resolves: [commit_wal] calls [unlock_once ()]
+   (store.ml:2071) and only then awaits [group_commit_sync]'s fsync, and the
+   non-WAL btree arm releases from a [Lwt.finalize] handler (store.ml:2184).  So
+   a continuation bound with [let%lwt () = S.commit tx in ...] runs after other
+   fibers have had the chance to take the lock and read the counter.  Publishing
+   there leaves the shared counter too LOW for the whole duration of the fsync —
+   another fiber's [next_rowid_in_txn] reads the stale value and allocates the
+   same id, which is #589's symptom.  Too LOW is the dangerous direction; too
+   HIGH only skips ids.  (The in-memory backend hides this completely — its
+   commit releases and returns an already-resolved promise, store.ml:2164 — so
+   an in-memory test cannot tell the two orderings apart.  That is why
+   [wal_two_fiber_*] in test_rowid_counter_ownership_632.ml are WAL-mode.)
+
+   So the publish sits immediately after the allocation: still under the lock,
+   and with no Lwt yield point at all between reading the counter and writing it
+   back, which makes the read-modify-write atomic against other fibers on both
+   counts.  The residual is "the commit fails => the counter is too high", the
+   safe direction, and exactly what the pre-#632 code already lived with.
+
+   The unknown-table check stays SYNCHRONOUS (it raises before any [Lwt.t] is
+   constructed) because that is the documented behaviour and [test_catalog]'s
+   [test_rowid_unknown_table] pins it. *)
 let next_rowid t ~name =
+  if not (Schema_cache.mem_table t.sc name)
+  then failwith (Printf.sprintf "no table '%s'" name);
+  let%lwt tx = S.rw_begin t.store in
   match Schema_cache.find_table t.sc name with
-  | None -> failwith (Printf.sprintf "no table '%s'" name)
+  | None ->
+    (* Unreachable: nothing can drop the table between the check above and here
+       (no yield point but [rw_begin], and DDL needs the very lock we hold). *)
+    let%lwt () = S.rollback tx in
+    Lwt.fail_with (Printf.sprintf "no table '%s'" name)
   | Some m ->
     let tree_id, nrid, without_rowid, autoincrement = row_storage m in
     let id, next = alloc_rowid nrid in
@@ -2362,11 +2457,9 @@ let next_rowid t ~name =
         storage = Row { tree_id; next_rowid = next; without_rowid; autoincrement }
       }
     in
-    (* Update the cache BEFORE [rw_begin] (which yields), matching the original
-       order: find -> alloc -> cache-write stays atomic under Lwt so two
-       concurrent autocommit callers cannot read the same stale counter. *)
+    (* #632: publish HERE — under the writer lock, and with no yield between the
+       read and the write.  Not after [S.commit]; see the note above. *)
     Schema_cache.set_rowid_durable t.sc ~name m';
-    let%lwt tx = S.rw_begin t.store in
     let%lwt () = put_table_counter_tx tx m' in
     let%lwt () = S.commit tx in
     Lwt.return id
@@ -3050,7 +3143,55 @@ let copy_bare_ident sql buf i ~old_name ~new_name =
    every byte it does not rename.
 
    Matching is case-sensitive, as every other column lookup in this module is
-   ([rename_column], [drop_column] and [clear_pk_flags] all use [String.equal]). *)
+   ([rename_column], [drop_column] and [clear_pk_flags] all use [String.equal]).
+
+   The scan itself is [rewrite_ident_in_sql] below; its per-token step is
+   [rewrite_step], and the two helpers between here and it belong to it. *)
+
+(* #609 review: the index just past the [--] comment starting at [i], or [None]
+   when [i] does not start one.  Only [--] — the lexer ([lexer.mll]) has no
+   block-comment rule, so a slash-star block comment is not a comment in this
+   dialect and must not be treated as one here.
+
+   This exists because the persisted text is the RAW statement, comments and
+   all, and an apostrophe inside one — [-- it's the positive rows] — otherwise
+   opens a string literal that never closes.  Both scanners below then swallow
+   the rest of the statement: the rewriter stops renaming half way through a
+   CHECK expression, and the #609 detector passes a definition it should have
+   blocked.  Both are silent.  A comment is copied through verbatim and never
+   searched, which is also the right answer on its own terms — a name inside a
+   comment is not a reference. *)
+let line_comment_end sql i =
+  let n = String.length sql in
+  if i + 1 < n && sql.[i] = '-' && sql.[i + 1] = '-'
+  then (
+    let rec eol k = if k < n && sql.[k] <> '\n' then eol (k + 1) else k in
+    Some (eol (i + 2)))
+  else None
+;;
+
+(* One step of the rewrite scan: consume the token at [i], appending its
+   (possibly renamed) text to [buf], and return the index just past it.  Lifted
+   out of [rewrite_ident_in_sql] so the comment case above can be added without
+   pushing the loop past merlint's nesting limit. *)
+let rewrite_step sql buf i ~old_name ~new_name =
+  match line_comment_end sql i with
+  | Some j ->
+    Buffer.add_string buf (String.sub sql i (j - i));
+    j
+  | None ->
+    let c = sql.[i] in
+    if c = '\''
+    then copy_sql_string sql buf i
+    else if c = '"' || c = '`'
+    then copy_quoted_ident sql buf i ~old_name ~new_name
+    else if is_ident_start c
+    then copy_bare_ident sql buf i ~old_name ~new_name
+    else (
+      Buffer.add_char buf c;
+      i + 1)
+;;
+
 let rewrite_ident_in_sql ~old_name ~new_name sql =
   if String.equal old_name new_name
   then sql
@@ -3058,22 +3199,265 @@ let rewrite_ident_in_sql ~old_name ~new_name sql =
     let n = String.length sql in
     let buf = Buffer.create (n + 16) in
     let rec go i =
-      if i >= n
-      then ()
-      else (
-        let c = sql.[i] in
-        if c = '\''
-        then go (copy_sql_string sql buf i)
-        else if c = '"' || c = '`'
-        then go (copy_quoted_ident sql buf i ~old_name ~new_name)
-        else if is_ident_start c
-        then go (copy_bare_ident sql buf i ~old_name ~new_name)
-        else (
-          Buffer.add_char buf c;
-          go (i + 1)))
+      if i >= n then () else go (rewrite_step sql buf i ~old_name ~new_name)
     in
     go 0;
     Buffer.contents buf)
+;;
+
+(* The string literal starting at [i] (its opening quote): the index just past
+   it.  [copy_sql_string] without the buffer — the detector below only needs to
+   step over a literal, never to reproduce it. *)
+let skip_sql_string sql i =
+  let n = String.length sql in
+  let q = sql.[i] in
+  let rec go k =
+    if k >= n
+    then k
+    else if sql.[k] <> q
+    then go (k + 1)
+    else if k + 1 < n && sql.[k + 1] = q
+    then go (k + 2)
+    else k + 1
+  in
+  go (i + 1)
+;;
+
+(* The delimited identifier starting at [i]: its undoubled body and the index
+   just past the closing delimiter.  An unterminated one yields the rest of the
+   text, which cannot equal any identifier we look for and so is simply skipped. *)
+let read_quoted_ident sql i =
+  let n = String.length sql in
+  let q = sql.[i] in
+  let body = Buffer.create 16 in
+  let rec go k =
+    if k >= n
+    then Buffer.contents body, k
+    else if sql.[k] <> q
+    then (
+      Buffer.add_char body sql.[k];
+      go (k + 1))
+    else if k + 1 < n && sql.[k + 1] = q
+    then (
+      Buffer.add_char body q;
+      go (k + 2))
+    else Buffer.contents body, k + 1
+  in
+  go (i + 1)
+;;
+
+(* The bracket-delimited identifier starting at [i] ([[my col]]): its undoubled
+   body and the index just past the closing bracket.  [lexer.mll:295] accepts
+   this as a third identifier delimiter, with []]] as the doubling escape, so a
+   detector that ignored it would read [[my col]] as the two bare words [my] and
+   [col] and never match the column it names — a false negative, the direction
+   this whole scan exists to avoid.  {!rewrite_ident_in_sql} still does not
+   handle brackets; it would have to re-emit them, which is a rewriter change
+   (#609 review). *)
+let read_bracket_ident sql i =
+  let n = String.length sql in
+  let body = Buffer.create 16 in
+  let rec go k =
+    if k >= n
+    then Buffer.contents body, k
+    else if sql.[k] <> ']'
+    then (
+      Buffer.add_char body sql.[k];
+      go (k + 1))
+    else if k + 1 < n && sql.[k + 1] = ']'
+    then (
+      Buffer.add_char body ']';
+      go (k + 2))
+    else Buffer.contents body, k + 1
+  in
+  go (i + 1)
+;;
+
+(* The bare word starting at [i]: the index just past it. *)
+let bare_ident_end sql i =
+  let n = String.length sql in
+  let rec go k = if k < n && is_ident_char sql.[k] then go (k + 1) else k in
+  go i
+;;
+
+(* One step of the detection scan: does the token at [i] satisfy [hit], and
+   where does it end?  Separate from the loop for the same nesting reason as
+   [rewrite_step]. *)
+let mentions_step sql i ~hit =
+  match line_comment_end sql i with
+  | Some j -> false, j
+  | None ->
+    let c = sql.[i] in
+    if c = '\''
+    then false, skip_sql_string sql i
+    else if c = '"' || c = '`'
+    then (
+      let text, j = read_quoted_ident sql i in
+      hit text, j)
+    else if c = '['
+    then (
+      let text, j = read_bracket_ident sql i in
+      hit text, j)
+    else if is_ident_start c
+    then (
+      let j = bare_ident_end sql i in
+      hit (String.sub sql i (j - i)), j)
+    else false, i + 1
+;;
+
+(* #609: does [sql] name [ident] as an identifier token — bare, double-quoted,
+   backtick- or bracket-delimited — anywhere outside a string literal or a
+   comment?
+
+   This is a DETECTOR guarding a refusal, not a rewriter, and its two failure
+   modes are not symmetric: a false positive costs the user a rename they could
+   have had and tells them exactly why, a false negative silently leaves a view
+   or trigger naming a column that no longer exists.  So it deliberately differs
+   from {!rewrite_ident_in_sql} in three ways, all erring towards refusing:
+
+   - **Position-blind.**  [is_column_ref_at] excludes a word followed by ['.'],
+     which is precisely where a TABLE name stands ([v0.a]).  A detector wearing
+     the rewriter's column-position filter would miss every qualified reference
+     — the common spelling inside a view body.
+   - **Case-insensitive.**  The rewriter matches case-sensitively because every
+     other column lookup in this module does; a detector that did would let
+     [SELECT A FROM v0] through.
+   - **Bracket-aware.**  See {!read_bracket_ident}.
+
+   It is also ROLE-blind, and that is a real cost, not just a caveat: an
+   identifier-shaped token counts wherever it stands, so a function name
+   (a [COUNT] call against a column named [count]) or a table ALIAS spelled like the
+   renamed table ([FROM other AS t]) is indistinguishable from a genuine
+   reference and will refuse a rename that was in fact safe.  The refusal is
+   loud and names the object, which is the side this design errs to; making it
+   precise needs the parser, i.e. the same work that option (a) needs. *)
+let sql_mentions_ident ~ident sql =
+  let n = String.length sql in
+  let want = String.lowercase_ascii ident in
+  let hit s = String.equal (String.lowercase_ascii s) want in
+  let rec go i =
+    if i >= n
+    then false
+    else (
+      let found, j = mentions_step sql i ~hit in
+      found || go j)
+  in
+  go 0
+;;
+
+(* #609: every stored view / reactive-view / trigger definition, as
+   [(kind, name, sql)].  Views and triggers are persisted as raw CREATE ... SQL
+   TEXT (see [sys_views_tid], [sys_reactive_views_tid], [sys_triggers_tid]) —
+   there is no AST here to walk and re-render, and the catalog sits BELOW the
+   parser in the dependency graph, so there cannot be one.  A lexical rewrite of
+   that text cannot scope a name to a table the way SQLite's does: a view body
+   legitimately names other tables' columns, and rewriting one of those turns a
+   working view into a wrong one silently.  So a rename that would touch such a
+   definition is REFUSED rather than guessed at. *)
+let load_definitions_tx tx =
+  let scan tid kind =
+    let%lwt pairs = load_all_pairs_in_tx tx tid in
+    Lwt.return (List.map (fun (name, sql) -> kind, name, sql) pairs)
+  in
+  let%lwt views = scan sys_views_tid "view" in
+  let%lwt rviews = scan sys_reactive_views_tid "reactive view" in
+  let%lwt triggers = scan sys_triggers_tid "trigger" in
+  Lwt.return (views @ rviews @ triggers)
+;;
+
+let describe_definition kind name = Printf.sprintf "%s %s" kind name
+
+(* #609 review: the lowercased names a rename of [root] can be seen through —
+   [root] itself, plus every definition whose text names something already in
+   the set, to a fixpoint.
+
+   The first cut of this gate required the table name AND the column name in the
+   SAME stored text, and claimed that could not under-refuse because "a
+   definition that reaches the column only through another view is blocked
+   transitively, because that other view names the table itself".  That is
+   FALSE when the intervening view projects [*]:
+
+   {v
+     CREATE TABLE t (a INTEGER, b INTEGER);
+     CREATE VIEW  v AS SELECT * FROM t;   -- names t, never a
+     CREATE VIEW  w AS SELECT a FROM v;   -- names a, never t
+     ALTER TABLE t RENAME COLUMN a TO z;  -- neither had BOTH: gate passed
+     SELECT * FROM w;                     -- unknown column: a
+   v}
+
+   [db.ml] persists the raw statement, so [SELECT *] is stored unexpanded, and
+   the residue was #609's own symptom: a view left silently dead whose dumped
+   DDL restores dead.  Closing over the intermediate names fixes it — [v] names
+   [t] so [v] joins the set, and [w] names [v] and [a] so [w] blocks.
+
+   Note [v] itself is correctly NOT blocked: it never spells [a], and a [*]
+   projection re-expands on the next bind, so the rename leaves it working. *)
+let reachable_names defs ~root =
+  let low = String.lowercase_ascii in
+  let rec grow reach =
+    let extra =
+      List.filter_map
+        (fun (_kind, name, sql) ->
+           if List.mem (low name) reach
+           then None
+           else if List.exists (fun ident -> sql_mentions_ident ~ident sql) reach
+           then Some (low name)
+           else None)
+        defs
+    in
+    if extra = [] then reach else grow (List.sort_uniq String.compare (extra @ reach))
+  in
+  grow [ low root ]
+;;
+
+(* #609: definitions that name [table], for a table rename.  No closure is
+   needed here — anything that reaches [table] indirectly does so through a
+   definition that names it directly, and that one blocks. *)
+let table_dependents_tx tx ~table =
+  let%lwt defs = load_definitions_tx tx in
+  Lwt.return
+    (List.filter_map
+       (fun (kind, name, sql) ->
+          if sql_mentions_ident ~ident:table sql
+          then Some (describe_definition kind name)
+          else None)
+       defs)
+;;
+
+(* #609: definitions that name [column] AND name something reachable from
+   [table] — see {!reachable_names} for why reachability rather than [table]
+   alone.  Requiring [column] too is what keeps an unrelated definition using
+   the same column name over a different table from blocking the rename.
+
+   What this DOES guarantee: every stored definition whose text spells the
+   column name and can see the table, directly or through a chain of views, is
+   refused by name.  What it does NOT: precision (see {!sql_mentions_ident}'s
+   role-blindness), and a reference that never spells the column name in the
+   stored text — which is exactly the [*] projection that cannot break. *)
+let column_dependents_tx tx ~table ~column =
+  let%lwt defs = load_definitions_tx tx in
+  let reach = reachable_names defs ~root:table in
+  Lwt.return
+    (List.filter_map
+       (fun (kind, name, sql) ->
+          if
+            sql_mentions_ident ~ident:column sql
+            && List.exists (fun ident -> sql_mentions_ident ~ident sql) reach
+          then Some (describe_definition kind name)
+          else None)
+       defs)
+;;
+
+(* #609: the refusal message.  Names every dependent object, because the caller's
+   only way forward is to drop and recreate them. *)
+let dependents_error ~what ~deps =
+  Printf.sprintf
+    "cannot %s: it is referenced by %s; drop and recreate %s first"
+    what
+    (String.concat ", " deps)
+    (match deps with
+     | [ _ ] -> "it"
+     | _ -> "them")
 ;;
 
 (* An index with [old_col] renamed to [new_col]: a plain column matches by name,
@@ -3250,6 +3634,24 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
   Lwt.return (Ok ())
 ;;
 
+(* The store half of [rename_table], lifted to the top level (#609) so the
+   dependency gate can sit in front of it without deepening the nesting. *)
+let rename_table_body t tx ~txn ~old_name ~new_name ~(meta : table_meta) =
+  (* Remove old sys_tables entry *)
+  let%lwt () = S.del tx sys_tables_tid (Bytes.of_string old_name) in
+  (* Insert new sys_tables entry *)
+  let%lwt () =
+    S.put tx sys_tables_tid (Bytes.of_string new_name) (encode_table_value meta)
+  in
+  (* Re-key all column entries; return Error if any entry is missing *)
+  let%lwt col_result =
+    rekey_table_columns tx ~old_name ~new_name ~n_cols:(List.length meta.columns)
+  in
+  match col_result with
+  | Error msg -> Lwt.return (Error msg)
+  | Ok () -> finish_rename t tx ~txn ~old_name ~new_name ~meta
+;;
+
 let rename_table ?txn t ~old_name ~new_name =
   match Schema_cache.find_table t.sc old_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" old_name))
@@ -3258,19 +3660,16 @@ let rename_table ?txn t ~old_name ~new_name =
     then Lwt.return (Error (Printf.sprintf "table already exists: %s" new_name))
     else (
       let body tx =
-        (* Remove old sys_tables entry *)
-        let%lwt () = S.del tx sys_tables_tid (Bytes.of_string old_name) in
-        (* Insert new sys_tables entry *)
-        let%lwt () =
-          S.put tx sys_tables_tid (Bytes.of_string new_name) (encode_table_value meta)
-        in
-        (* Re-key all column entries; return Error if any entry is missing *)
-        let%lwt col_result =
-          rekey_table_columns tx ~old_name ~new_name ~n_cols:(List.length meta.columns)
-        in
-        match col_result with
-        | Error msg -> Lwt.return (Error msg)
-        | Ok () -> finish_rename t tx ~txn ~old_name ~new_name ~meta
+        (* #609: a view or trigger naming this table stores raw SQL text that
+           still says [old_name] after the rename, so the rename is refused
+           rather than left to break it silently. *)
+        let%lwt deps = table_dependents_tx tx ~table:old_name in
+        if deps = []
+        then rename_table_body t tx ~txn ~old_name ~new_name ~meta
+        else
+          Lwt.return
+            (Error
+               (dependents_error ~what:(Printf.sprintf "rename table %s" old_name) ~deps))
       in
       match txn with
       | Some tx -> body tx
@@ -3364,7 +3763,41 @@ let rewrite_indexes_tx tx ~table_name ~old_col ~new_col =
    was.  Leaving any of them behind leaves the catalog naming a column the table
    does not have; for the implicit PRIMARY KEY index that is a dump which will
    not restore, because since #533 the DDL renderer reads that index as the
-   record of the table's key. *)
+   record of the table's key.
+
+   #609: the two stored-SQL trees the remap does NOT reach — [sys_views_tid] and
+   [sys_triggers_tid], plus [sys_reactive_views_tid] — hold whole [CREATE ...]
+   statements as raw text, and a lexical rewrite of one of those cannot be
+   scoped to this table.  A rename that would touch one is therefore REFUSED by
+   [rename_column]'s gate below rather than guessed at; this function is the
+   store half that runs once the gate passes. *)
+let rename_column_body t tx ~table_name ~(meta : table_meta) ~col_k ~old_col ~new_col =
+  match%lwt S.get tx sys_columns_tid col_k with
+  | None -> Lwt.return (Error "column entry missing from catalog")
+  | Some _ ->
+    let%lwt () =
+      rewrite_columns_tx tx ~table_name ~columns:meta.columns ~old_col ~new_col
+    in
+    let new_meta =
+      { meta with
+        columns = List.map (rename_col_in_column ~old_col ~new_col) meta.columns
+      ; fk_constraints =
+          List.map
+            (rename_col_in_fk ~owner:table_name ~table:table_name ~old_col ~new_col)
+            meta.fk_constraints
+      }
+    in
+    let%lwt () =
+      if new_meta.fk_constraints = meta.fk_constraints
+      then Lwt.return_unit
+      else put_fks_tx tx ~table:table_name ~fks:new_meta.fk_constraints
+    in
+    let%lwt () = put_mirror_tx tx new_meta in
+    let%lwt children = rewrite_child_fks_tx t tx ~table_name ~old_col ~new_col in
+    let%lwt indexes = rewrite_indexes_tx tx ~table_name ~old_col ~new_col in
+    Lwt.return (Ok (new_meta, indexes, children))
+;;
+
 let rename_column ?txn t ~table_name ~old_col ~new_col =
   match Schema_cache.find_table t.sc table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
@@ -3374,34 +3807,19 @@ let rename_column ?txn t ~table_name ~old_col ~new_col =
      | Some i ->
        let col_k = column_key table_name i in
        let body tx =
-         match%lwt S.get tx sys_columns_tid col_k with
-         | None -> Lwt.return (Error "column entry missing from catalog")
-         | Some _ ->
-           let%lwt () =
-             rewrite_columns_tx tx ~table_name ~columns:meta.columns ~old_col ~new_col
-           in
-           let new_meta =
-             { meta with
-               columns = List.map (rename_col_in_column ~old_col ~new_col) meta.columns
-             ; fk_constraints =
-                 List.map
-                   (rename_col_in_fk
-                      ~owner:table_name
-                      ~table:table_name
-                      ~old_col
-                      ~new_col)
-                   meta.fk_constraints
-             }
-           in
-           let%lwt () =
-             if new_meta.fk_constraints = meta.fk_constraints
-             then Lwt.return_unit
-             else put_fks_tx tx ~table:table_name ~fks:new_meta.fk_constraints
-           in
-           let%lwt () = put_mirror_tx tx new_meta in
-           let%lwt children = rewrite_child_fks_tx t tx ~table_name ~old_col ~new_col in
-           let%lwt indexes = rewrite_indexes_tx tx ~table_name ~old_col ~new_col in
-           Lwt.return (Ok (new_meta, indexes, children))
+         (* #609: a view or trigger that can see this table and names this column
+            stores raw SQL text that still says [old_col] after the rename.  The
+            catalog cannot re-render that text safely — see
+            [column_dependents_tx] — so the rename is refused instead. *)
+         let%lwt deps = column_dependents_tx tx ~table:table_name ~column:old_col in
+         if deps = []
+         then rename_column_body t tx ~table_name ~meta ~col_k ~old_col ~new_col
+         else
+           Lwt.return
+             (Error
+                (dependents_error
+                   ~what:(Printf.sprintf "rename column %s.%s" table_name old_col)
+                   ~deps))
        in
        let finalize (new_meta, indexes, children) =
          let put_table, put_index =

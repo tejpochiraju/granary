@@ -25,6 +25,11 @@ type t =
   | Wal_reset of { epoch : int64 }
   | Checkpoint_begin of { target_frames : int }
   | Checkpoint_end of { pages_migrated : int }
+  | Checkpoint_failed of
+      { target_frames : int
+      ; consecutive : int
+      ; message : string
+      }
   | Page_read of
       { txn_id : int64
       ; tree : int
@@ -63,6 +68,7 @@ let label = function
   | Wal_reset _ -> "WAL_RESET"
   | Checkpoint_begin _ -> "CKPT_BEGIN"
   | Checkpoint_end _ -> "CKPT_END"
+  | Checkpoint_failed _ -> "CKPT_FAIL"
   | Page_read _ -> "PAGE_READ"
   | Wal_read _ -> "WAL_READ"
   | Page_write _ -> "PAGE_WRITE"
@@ -83,7 +89,7 @@ let txn_id = function
   | Page_write { txn_id; _ }
   | Page_alloc { txn_id; _ }
   | Page_free { txn_id; _ } -> Some txn_id
-  | Wal_reset _ | Checkpoint_begin _ | Checkpoint_end _ -> None
+  | Wal_reset _ | Checkpoint_begin _ | Checkpoint_end _ | Checkpoint_failed _ -> None
 ;;
 
 let tree_id_of = function
@@ -113,6 +119,14 @@ let pp fmt ev =
     Format.fprintf fmt "%s target=%d" tag target_frames
   | Checkpoint_end { pages_migrated } ->
     Format.fprintf fmt "%s migrated=%d" tag pages_migrated
+  | Checkpoint_failed { target_frames; consecutive; message } ->
+    Format.fprintf
+      fmt
+      "%s target=%d consecutive=%d msg=%s"
+      tag
+      target_frames
+      consecutive
+      message
   | Page_read { txn_id; tree; page } | Wal_read { txn_id; tree; page } ->
     Format.fprintf fmt "%s txn=%Ld tree=%d page=%Ld" tag txn_id tree page
   | Page_write { txn_id; tree; page } ->

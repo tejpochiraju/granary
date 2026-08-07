@@ -37,6 +37,20 @@ type 'a txn
     System trees use IDs 0–15; user tables use 16+. *)
 type tree_id = int
 
+(** #589/#633: the rowid allocator's live state for this store's data trees,
+    keyed by TREE ID.  It lives here rather than on a catalog because a tree id
+    is only meaningful within one {!t}, and because every catalog opened over
+    one store must share exactly one allocator: two counters over one data tree
+    hand the same rowid out twice, and the second write silently overwrites the
+    first.  Two stores (an ATTACHed schema, say) are two sets of trees and so
+    two tables, which is correct by construction. *)
+type rowid_counters = (tree_id, int64) Hashtbl.t
+
+(** This store's rowid allocator state.  Every catalog opened over the same
+    store gets this same table — there is nothing to pass by hand and nothing
+    to forget (#633). *)
+val rowid_counters : t -> rowid_counters
+
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
 type error =
@@ -136,6 +150,12 @@ val open_block_wal
   -> wal_write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> wal_sync:(unit -> (unit, string) result Lwt.t)
   -> wal_size_bytes:int64
+  -> ?wal_resize:(int64 -> (unit, string) result Lwt.t)
+       (** (#612) Shrink the WAL device to a byte length.  Supplied, a
+           checkpoint physically truncates the WAL back to its 24-byte header
+           instead of leaving the file at its all-time high-water mark;
+           omitted, the space is reused but never returned.  Optional because
+           not every backing device can shrink. *)
   -> close:(unit -> unit Lwt.t)
   -> wal_close:(unit -> unit Lwt.t)
   -> unit
@@ -222,18 +242,30 @@ val commit : rw txn -> unit Lwt.t
     writer lock. Phase 3 introduces true rollback. *)
 val rollback : rw txn -> unit Lwt.t
 
-(** Push a named savepoint by snapshotting current Mem tree state.
-    No-op on the B-tree backend (deferred). *)
+(** Push a named savepoint, snapshotting the current shadow state (#178).
+    Implemented on {b both} backends: the Mem arm snapshots the shadow tree map,
+    the B-tree arm snapshots the meta root, every tree root, the freelist,
+    [n_pages], the pager's dirty set and its txn-owned pool. Names form a stack
+    and are matched newest-first, so identical names nest LIFO.
+
+    The B-tree snapshot is proportional to the dirty set, so this is not free —
+    see #631's use of it as a statement-level undo point, which is gated to a
+    narrow case for that reason. *)
 val savepoint_begin : rw txn -> string -> unit Lwt.t
 
 (** Release the named savepoint and all newer ones.
     Writes accumulated since the savepoint remain in the outer transaction.
-    No-op on the B-tree backend. *)
+    Unknown name: no-op. *)
 val savepoint_release : rw txn -> string -> unit Lwt.t
 
 (** Restore to the named savepoint, dropping all newer savepoints.
     The named savepoint is kept so ROLLBACK TO can be repeated.
-    No-op on the B-tree backend. *)
+    Unknown name: no-op.
+
+    This restores {b store} state only. Callers that also hold catalog state
+    derived from those trees — cached rowid counters, columnar stores, the
+    schema-undo log — must pair it with {!Granary_catalog.Catalog.savepoint_rollback_schema}
+    (#280/#303), as the db layer's [ROLLBACK TO] handler does. *)
 val savepoint_rollback : rw txn -> string -> unit Lwt.t
 
 (** End a read-only transaction. *)
@@ -318,6 +350,20 @@ val seek_ge : _ txn -> tree_id -> bytes -> seek_cursor Lwt.t
     (the first with key [>=] the seek key), not the one after it. *)
 val seek_next : seek_cursor -> (bytes * bytes) option Lwt.t
 
+(** #481: {!seek_next} without the key.  Same traversal, same values, same
+    stack-bounding pause schedule (the two share one call counter, so they may
+    be mixed on one cursor); the B+-tree backend simply never copies the entry
+    key out of the leaf page.  Use it wherever the key is discarded — the
+    sequential table scan and every aggregate over it.
+
+    Like {!seek_next}, at most ONE call may be in flight per cursor — mixing the
+    two still means one of either.  Since #481 the B+-tree backend describes the
+    current entry in cursor-level mutable state across a possible yield, so
+    overlapping pulls on one cursor can return a value from the wrong entry
+    (before #481 they could only reorder or skip). Give each fiber its own
+    cursor. *)
+val seek_next_value : seek_cursor -> bytes option Lwt.t
+
 (** Release any resources held by a {!seek_cursor}. *)
 val seek_close : seek_cursor -> unit
 
@@ -329,6 +375,31 @@ val wal_mode : t -> bool
     reset the WAL. No-op outside WAL mode. Acquires the RW mutex
     internally so it serialises with commits. *)
 val checkpoint : t -> unit Lwt.t
+
+(** #638: the checkpoint-failure signal.  [last_error] is the message of the
+    most recent failure and [consecutive_failures] the number of failures since
+    the last checkpoint that completed — both cleared by a completing
+    checkpoint, so a nonzero [consecutive_failures] means the WAL is growing
+    right now.  [total_failures] counts every failure since open and is never
+    cleared by success. *)
+type checkpoint_health =
+  { last_error : string option
+  ; total_failures : int
+  ; consecutive_failures : int
+  }
+
+(** Current checkpoint-failure state (#638).  An {i auto}checkpoint failure is
+    not raised to any caller — the commit that triggered it already succeeded
+    and its WAL frames are still valid — so this (together with
+    {!Store_event.Checkpoint_failed}) is how a failing checkpoint becomes
+    observable at all.  Returns the all-clear on the in-memory backend, which
+    has no WAL. *)
+val checkpoint_health : t -> checkpoint_health
+
+(** Clear the sticky checkpoint-failure signal ([last_error] and
+    [consecutive_failures]); [total_failures] is left alone.  For an operator
+    who has acknowledged the condition.  No-op on the in-memory backend. *)
+val clear_checkpoint_error : t -> unit
 
 (** #298: per-deployment durability mode (analogue of SQLite [synchronous]).
     [Full] fsyncs the WAL on every group-commit before acking (the default,
