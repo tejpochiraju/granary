@@ -1,0 +1,11 @@
+host=otp-infra-1
+date=2026-08-07T08:58:31Z
+nproc=8
+loadavg_at_start=0.45
+sqlite_version=3.45.1
+granary_sha=9f1e61e
+config=warehouses=1 terminals=4 seconds=5 warmup=1 seed=42 retries=3 workers=1
+runs=3
+note=post-#671 batch. Same config as 2026-08-02-tpcc-w1-vs-sqlite.csv so the two compare.
+note=granary spread across the 3 runs is +/-3%; sqlite's is +/-19%, so the REFERENCE is the noisy side here.
+note=profiles below payment commit only 10-14 transactions in 5s; their percentiles and service_ms are sample noise, not signal.
