@@ -183,21 +183,70 @@ for stability.
 
 CSV under `bench/results/`. Every number below is from the invocation printed
 beside it, on a shared dev host under concurrent load from other work, so treat
-run-to-run spread of a few tens of percent as noise — the 40x engine gap is not.
+run-to-run spread of a few tens of percent as noise — the engine gap is not.
 
-### NewOrder/sec, W=1, granary vs reference SQLite
+### NewOrder/sec, W=1, granary vs reference SQLite — after the #671 batch
 
-`bench/results/2026-08-02-tpcc-w1-vs-sqlite.csv`, 4 terminals, 5 s measured,
-1 s warm-up, each engine in its own process:
+`bench/results/2026-08-07-tpcc-w1-post-batch.csv`, **three runs**, 4 terminals,
+5 s measured, 1 s warm-up, on `main` at `9f1e61e` (loadavg 0.45 at start):
+
+| engine | NewOrder/sec (3 runs) | mean | new_order service |
+|---|---|---|---|
+| granary | 26.28 / 26.28 / 24.60 | **25.7** | ~15.7 ms |
+| sqlite | 827.1 / 784.6 / 564.1 | 725.3 | 0.79 ms |
+
+Roughly **28-32x**, against 42x before the batch.
+
+**Read the two spreads before the ratio.** granary's three runs span ±3%;
+reference SQLite's span **±19%**. The noisy side of this comparison is the
+*reference*, because SQLite commits ~4 100 NewOrders in the interval and granary
+commits ~134 — SQLite's number moves with whatever else the box is doing, while
+granary's is pinned by its own service time. Quote the ratio as a band, not a
+figure.
+
+### The previous figure, and how much of the gain is real
+
+`bench/results/2026-08-02-tpcc-w1-vs-sqlite.csv`, same config, before the batch:
 
 | engine | NewOrder/sec | new_order mean | service | wait |
 |---|---|---|---|---|
 | granary | 19.32 | 84.9 ms | 19.8 ms | 65.1 ms |
 | sqlite | 808.59 | 0.79 ms | 0.79 ms | 0.00 ms |
 
-Reference SQLite is about **42x** granary's NewOrder rate on this workload. Its
-`wait` is zero throughout: the bindings are blocking, so a transaction never
-yields and a terminal never queues.
+19.32 → 25.7 is **+33%**, and granary's own ±3% spread puts that well outside
+its noise. But **the baseline is a single run on a host that was under
+concurrent load**, where the post-batch figure is three runs on a quiet one. The
+*direction* is solid; the *magnitude* is soft, and a like-for-like re-measure of
+the old tree would be needed to make it precise. The honest claim is "new_order
+service fell from 19.8 ms to ~15.7 ms", which is the same thing measured where
+the batch actually worked.
+
+Reference SQLite's `wait` is zero throughout: the bindings are blocking, so a
+transaction never yields and a terminal never queues.
+
+### Per-profile service time, and where the cost now is
+
+Mean granary `service_ms` across the three runs, against reference SQLite:
+
+| profile | granary | sqlite | committed / 5 s |
+|---|---|---|---|
+| new_order | ~15.7 ms | 0.79 ms | 134 |
+| payment | ~4.6 ms | 0.15 ms | 112 |
+| order_status | ~2.4 ms | 0.54 ms | 10 |
+| **delivery** | **~181 ms** | 1.66 ms | 12 |
+| stock_level | ~29 ms | 0.80 ms | 14 |
+
+**Delivery is now the dominant per-transaction cost by two orders of magnitude**
+and the batch did not move it — #512 measured 166 ms for it after the
+composite-seek fix, and it is ~181 ms here. Tracked as #674.
+
+**Everything below `payment` is weak.** Those three profiles commit 10-14
+transactions in the measured interval, so their percentiles are drawn from a
+handful of samples and their `service_ms` swings accordingly — stock_level read
+19 / 42 / 27 ms across the three runs, which is sample noise, not signal. A
+longer interval is needed before anything is claimed about them; the delivery
+figure is called out above because ~181 ms against 1.66 ms survives that caveat
+by a wide margin, not because 12 samples are enough on their own.
 
 ### Terminal sweep, W=1, granary
 
@@ -219,3 +268,12 @@ per transaction, and every additional terminal is queued behind it.
 
 The one-terminal figure (25.7 NewOrder/sec) is therefore the honest ceiling for
 this workload today, and it is a *single-connection* ceiling — see #555.
+
+**That sweep is from before the #671 batch and has NOT been re-measured.** Its
+shape (flat throughput, all the latency rise in `wait`) is structural and will
+not have changed — the pool is still one deep. Its *values* have: the batch's
+post-batch **4-terminal** figure is 25.7 NewOrder/sec, which is exactly what this
+table records as the pre-batch **1-terminal** ceiling. So the whole curve has
+moved up by roughly the queueing penalty this table was measuring, and the
+sentence above understates today's ceiling. Re-run the sweep before quoting any
+row of it.
