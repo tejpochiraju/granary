@@ -8702,6 +8702,45 @@ let rec plan_expr_has_subquery : Plan.expr -> bool = function
   | _ -> false
 ;;
 
+(* #674 (item 1 of 3): does [e] read only columns [ok] accepts, and carry no
+   subquery/excluded-row/window reference?  Used by the index-covering
+   aggregate fast path to decide whether a residual predicate or an
+   aggregate's argument expression can be evaluated straight off a decoded
+   index key, without a [rh_get] of the table row.  [ok] is expected to gate
+   on "is this column part of the index AND declared NOT NULL" — see the
+   #536 NaN/NULL ambiguity discussion at the call site. *)
+let rec plan_expr_reads_only_cols (ok : int -> bool) : Plan.expr -> bool = function
+  | Plan.P_lit _ | Plan.P_param _ -> true
+  | Plan.P_col i -> ok i
+  | Plan.P_binop (_, a, b) ->
+    plan_expr_reads_only_cols ok a && plan_expr_reads_only_cols ok b
+  | Plan.P_not e
+  | Plan.P_is_null e
+  | Plan.P_is_not_null e
+  | Plan.P_neg e
+  | Plan.P_bitnot e -> plan_expr_reads_only_cols ok e
+  | Plan.P_between (x, lo, hi) ->
+    plan_expr_reads_only_cols ok x
+    && plan_expr_reads_only_cols ok lo
+    && plan_expr_reads_only_cols ok hi
+  | Plan.P_in (x, vs) ->
+    plan_expr_reads_only_cols ok x && List.for_all (plan_expr_reads_only_cols ok) vs
+  | Plan.P_func (_, args) -> List.for_all (plan_expr_reads_only_cols ok) args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:true ~some:(plan_expr_reads_only_cols ok) scrutinee
+    && List.for_all
+         (fun (c, r) -> plan_expr_reads_only_cols ok c && plan_expr_reads_only_cols ok r)
+         branches
+    && Option.fold ~none:true ~some:(plan_expr_reads_only_cols ok) else_
+  | Plan.P_cast (e, _) -> plan_expr_reads_only_cols ok e
+  | Plan.P_collate (e, _) -> plan_expr_reads_only_cols ok e
+  | Plan.P_subquery _
+  | Plan.P_exists _
+  | Plan.P_in_select _
+  | Plan.P_excluded_col _
+  | Plan.P_window_slot _ -> false
+;;
+
 (** #592: the width of the row a plan subtree emits, or [None] when a node
     reshapes it (projection, aggregate, set operation, …). Only the
     layout-preserving spine is walked, because the width is used to place a
@@ -9723,6 +9762,47 @@ and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
          in
          Lwt.return (Plan.P_lit v)))
 
+(* #674 (item 3 of 3): unwrap the layout-only nodes a trivial subquery like
+   [SELECT 1 FROM t WHERE ...] plans through — projection, distinct, sort,
+   limit — none of which change whether the subquery yields at least one row.
+   Stops at anything that could (a filter, join, aggregate, ...), so the
+   caller only takes the covering-existence shortcut for the exact shape it
+   knows how to answer without a table fetch. *)
+and unwrap_for_existence : Plan.op -> Plan.op = function
+  | Plan.Op_project { child; _ }
+  | Plan.Op_expr_project { child; _ }
+  | Plan.Op_distinct { child }
+  | Plan.Op_sort { child; _ }
+  | Plan.Op_limit { child; _ } -> unwrap_for_existence child
+  | op -> op
+
+(* #674 (item 3 of 3): does the equality-bound (+ optional #517 range) prefix
+   [keys]/[range] match at least one entry of [idx_tree]?  No column is ever
+   read — existence needs only "did the seek find a qualifying key", so unlike
+   [run_index_cover_walk] this needs no NOT-NULL gate at all: NULL/NaN
+   ambiguity only matters when a VALUE is read back, and none is here.  Opens
+   and closes its own read handle synchronously (no stream, nothing to
+   abandon), so this carries none of the #493 leak risk [eval_exists_subquery]
+   already reasons about for the general path. *)
+and index_lookup_exists clock params store mode idx_tree keys range =
+  let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
+  match index_lookup_values vs with
+  | None -> Lwt.return false
+  | Some lookup_vs ->
+    let prefix, plen = encode_index_key_prefix lookup_vs in
+    let seek_key, past_end = range_seek_bounds clock params ~prefix ~plen range in
+    let* rh = rh_begin store mode in
+    let* cur = rh_seek_ge rh idx_tree seek_key in
+    let s_opt = Lwt.get query_stats_key in
+    let* kv = S.seek_next cur in
+    S.seek_close cur;
+    let* () = rh_finish rh in
+    (match kv with
+     | Some (ikey, _ivalue) when index_key_in_range ~prefix ~plen ~past_end ikey ->
+       incr_index_entries s_opt;
+       Lwt.return true
+     | _ -> Lwt.return false)
+
 (* EXISTS subquery: 1 if [inner_ast] yields any row, else 0. *)
 and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
   : Plan.expr Lwt.t
@@ -9734,13 +9814,24 @@ and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
     (match op_r with
      | None -> Lwt.return e
      | Some op ->
-       (* #262 / #493, as in [eval_scalar_subquery]. EXISTS pulls exactly one
-          row and abandons the stream; the owned snapshot is what makes that
-          safe rather than a per-outer-row page-pin leak. *)
-       with_subquery_txn store (fun mode ->
-         let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
-         let* first = Lwt_stream.get stream in
-         Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L)))))
+       (match unwrap_for_existence op with
+        | Plan.Op_index_lookup { idx_tree; keys; range; _ } ->
+          (* #674 (item 3 of 3): the single remaining waste in the
+             already-#493-safe EXISTS path was the one [rh_get] its one
+             pulled row still paid.  Existence needs only the seek. *)
+          with_subquery_txn store (fun mode ->
+            let* found =
+              index_lookup_exists clock params store mode idx_tree keys range
+            in
+            Lwt.return (Plan.P_lit (Ast.L_int (if found then 1L else 0L))))
+        | _ ->
+          (* #262 / #493, as in [eval_scalar_subquery]. EXISTS pulls exactly
+             one row and abandons the stream; the owned snapshot is what
+             makes that safe rather than a per-outer-row page-pin leak. *)
+          with_subquery_txn store (fun mode ->
+            let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+            let* first = Lwt_stream.get stream in
+            Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L))))))
 
 (* IN (subquery): materialize [inner_ast]'s first column into the IN value list. *)
 and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
@@ -11437,7 +11528,352 @@ and aggregate_fast_path
     | Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta; _ } }
       when not (plan_expr_has_subquery pred) ->
       run_aggregate_fast_path clock params store mode cat table_meta (Some pred) aggs proj
+    (* #674 (item 1 of 3): COUNT-star/COUNT(col)/MIN/MAX directly over an
+       [Op_index_lookup] (optionally [Op_filter]-wrapped), reading the
+       aggregated value(s) straight off the decoded index key instead of
+       paying an [rh_get] per matching entry.  See
+       [index_cover_eligible]/[run_index_cover_walk] for the gate and the
+       walk. *)
+    | Plan.Op_index_lookup { idx_tree; keys; range; table_meta; _ } ->
+      run_aggregate_fast_path_index
+        clock
+        params
+        store
+        mode
+        cat
+        table_meta
+        idx_tree
+        keys
+        range
+        None
+        aggs
+        proj
+    | Plan.Op_filter
+        { pred; child = Plan.Op_index_lookup { idx_tree; keys; range; table_meta; _ } }
+      when not (plan_expr_has_subquery pred) ->
+      run_aggregate_fast_path_index
+        clock
+        params
+        store
+        mode
+        cat
+        table_meta
+        idx_tree
+        keys
+        range
+        (Some pred)
+        aggs
+        proj
     | _ -> Lwt.return None)
+
+(* #674 (item 1 of 3): decode one column read off an index entry into a
+   [Row.value].  [col_ty] is the DECLARED type of the table column at that
+   ordinal.  [Index_key.decode]'s [IK_null] is ambiguous between "the value is
+   NULL" and "the value is NaN" (#536: both encode to the same [0x00] byte);
+   every caller of this function has already gated the column to NOT NULL
+   (see [index_cover_eligible]), so an actual NULL cannot occur here and
+   [IK_null] can only mean NaN on a REAL column.  On any other declared type a
+   NOT NULL column can never legally encode [IK_null] at all — [V_null] is
+   returned defensively rather than raising, matching the general engine's
+   preference (per CLAUDE.md's #638 section) for surfacing rather than
+   crashing on an invariant that "cannot" be violated. *)
+and index_value_to_row_value (col_ty : Row.ty) (iv : Index_key.value) : Row.value =
+  match iv with
+  | Index_key.IK_null ->
+    (match col_ty with
+     | Row.Real -> Row.V_real Float.nan
+     | _ -> Row.V_null)
+  | Index_key.IK_int n -> Row.V_int n
+  | Index_key.IK_real f -> Row.V_real f
+  | Index_key.IK_text s -> Row.V_text s
+  | Index_key.IK_blob b -> Row.V_blob b
+
+(* #674 (item 1 of 3): is [table_meta]'s [idx_tree] index, [keys]/[range]
+   equality+range shape, [pred_opt] residual predicate and [aggs] aggregate
+   list eligible for the covering (no [rh_get]) walk?  Returns
+   [Some (idx_ords, min_early_stop)] when it is:
+
+   - [idx_ords]: the table column ordinal at each position of the index's own
+     column list, i.e. what [Index_key.decode]'s i-th value corresponds to.
+   - [min_early_stop]: whether the single-aggregate shape [MIN(col)] with no
+     predicate, where [col] is exactly the index column right after the
+     equality prefix and there is no #517 range, can stop after the FIRST
+     matching entry (ascending index order already yields the minimum) — see
+     the design doc's discussion of why MAX cannot do the same without a
+     reverse B-tree walk primitive this design does not add.
+
+   Gates, matching the design doc's stated scope exactly:
+   - every column [pred_opt] or any [agg]'s argument reads must be part of
+     the index AND declared NOT NULL (#536: otherwise [IK_null] is ambiguous
+     between NULL and NaN);
+   - only [Agg_count], [Agg_min], [Agg_max] are covered — SUM/AVG/GROUP_CONCAT
+     are out of this item's scope;
+   - MIN/MAX additionally require: no #517 [range], and the aggregated column
+     is exactly the next unconstrained key column of the index (position
+     [List.length keys]) — not merely SOME index column.  The index itself is
+     already guaranteed non-expression and non-partial by
+     [Planner.index_is_seekable], which is what [access_path_for_eqs] must
+     pass to ever produce an [Op_index_lookup] in the first place — see
+     CLAUDE.md's #674 design-doc section on GENERATED/partial-index scoping. *)
+and index_cover_eligible
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      (idx_tree : int)
+      (keys : (int * Row.ty * Plan.expr) list)
+      (range : Plan.range option)
+      (pred_opt : Plan.expr option)
+      (aggs : Plan.agg_spec list)
+  : (int array * bool) option
+  =
+  let idx_infos = Cat.indexes_for_table cat ~table:table_meta.Cat.name in
+  match
+    List.find_opt (fun (i : Cat.index_info) -> i.Cat.idx_tree_id = idx_tree) idx_infos
+  with
+  | None -> None
+  | Some idx_info ->
+    let col_ordinal name =
+      let rec go n = function
+        | [] -> None
+        | (c : Row.column) :: rest ->
+          if String.equal c.Row.name name then Some n else go (n + 1) rest
+      in
+      go 0 table_meta.Cat.columns
+    in
+    let idx_ords_opt = List.map col_ordinal idx_info.Cat.idx_columns in
+    if List.exists Option.is_none idx_ords_opt
+    then None
+    else (
+      let idx_ords = Array.of_list (List.map Option.get idx_ords_opt) in
+      let n_eq = List.length keys in
+      let is_idx_ord ord = Array.exists (fun o -> o = ord) idx_ords in
+      let col_not_null ord =
+        match List.nth_opt table_meta.Cat.columns ord with
+        | Some (c : Row.column) -> c.Row.not_null
+        | None -> false
+      in
+      let ok_col ord = is_idx_ord ord && col_not_null ord in
+      let agg_ok (s : Plan.agg_spec) =
+        match s.Plan.func, s.Plan.arg_expr, s.Plan.col_ord with
+        | Ast.Agg_count, None, None -> true (* COUNT-star *)
+        | (Ast.Agg_count | Ast.Agg_min | Ast.Agg_max), Some e, None ->
+          plan_expr_reads_only_cols ok_col e
+        | (Ast.Agg_count | Ast.Agg_min | Ast.Agg_max), None, Some i -> ok_col i
+        | _ -> false
+      in
+      if not (List.for_all agg_ok aggs)
+      then None
+      else (
+        let pred_ok =
+          match pred_opt with
+          | None -> true
+          | Some p -> plan_expr_reads_only_cols ok_col p
+        in
+        if not pred_ok
+        then None
+        else (
+          let minmax_ok (s : Plan.agg_spec) =
+            match s.Plan.func with
+            | Ast.Agg_min | Ast.Agg_max ->
+              range = None
+              && n_eq < Array.length idx_ords
+              &&
+                (match s.Plan.col_ord with
+                | Some i -> idx_ords.(n_eq) = i
+                | None -> false)
+            | _ -> true
+          in
+          if not (List.for_all minmax_ok aggs)
+          then None
+          else (
+            let min_early_stop =
+              pred_opt = None
+              &&
+              match aggs with
+              | [ { Plan.func = Ast.Agg_min
+                  ; col_ord = Some _
+                  ; distinct = false
+                  ; arg_expr = None
+                  }
+                ] -> true
+              | _ -> false
+            in
+            Some (idx_ords, min_early_stop)))))
+
+(* #674 (item 1 of 3): entry point for the covering-index aggregate fast
+   path — checks eligibility, then folds the accumulators over [idx_tree]
+   directly, never touching the table tree. *)
+and run_aggregate_fast_path_index
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      (table_meta : Cat.table_meta)
+      (idx_tree : int)
+      (keys : (int * Row.ty * Plan.expr) list)
+      (range : Plan.range option)
+      (pred_opt : Plan.expr option)
+      (aggs : Plan.agg_spec list)
+      proj
+  : Row.t Lwt_stream.t option Lwt.t
+  =
+  match cat with
+  | None -> Lwt.return None
+  | Some c ->
+    (match index_cover_eligible c table_meta idx_tree keys range pred_opt aggs with
+     | None -> Lwt.return None
+     | Some (idx_ords, min_early_stop) ->
+       run_index_cover_walk
+         clock
+         params
+         store
+         mode
+         cat
+         table_meta
+         idx_tree
+         idx_ords
+         keys
+         range
+         pred_opt
+         aggs
+         proj
+         ~min_early_stop)
+
+(* #674 (item 1 of 3): the covering walk itself.  Structurally the same shape
+   as [run_aggregate_fast_path]'s loop — fold accumulators over a cursor, emit
+   exactly one output row — but seeking [idx_tree] and decoding
+   [Index_key.decode]'d columns instead of [rh_get]-ing and decoding a table
+   row.  MUST stay byte-identical to [aggregate_one]/[make_agg_acc_over_values]
+   for the values it does read, which is why it reuses [make_agg_acc]
+   unchanged rather than re-deriving MIN/MAX/COUNT comparison logic. *)
+and run_index_cover_walk
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      (table_meta : Cat.table_meta)
+      (idx_tree : int)
+      (idx_ords : int array)
+      (keys : (int * Row.ty * Plan.expr) list)
+      (range : Plan.range option)
+      (pred_opt : Plan.expr option)
+      (aggs : Plan.agg_spec list)
+      proj
+      ~min_early_stop
+  : Row.t Lwt_stream.t option Lwt.t
+  =
+  match
+    let accs = List.map (make_agg_acc clock params) aggs in
+    if List.exists Option.is_none accs
+    then None
+    else Some (Array.of_list (List.map Option.get accs))
+  with
+  | None -> Lwt.return None
+  | Some accs ->
+    let* pred' =
+      match pred_opt with
+      | None -> Lwt.return None
+      | Some p ->
+        let* p' = pre_eval_subquery clock store params cat p in
+        Lwt.return (Some p')
+    in
+    let finalize_stream () =
+      let agg_vals = Array.map (fun (_, fin) -> fin ()) accs in
+      let out =
+        Array.of_list
+          (List.map
+             (function
+               | Plan.PI_agg_slot k -> agg_vals.(k)
+               | Plan.PI_expr e -> eval_expr clock params agg_vals e
+               | Plan.PI_group_col _ | Plan.PI_window_slot _ ->
+                 assert false (* excluded by [aggregate_fast_path] above *))
+             proj)
+      in
+      Lwt.return (Some (Lwt_stream.of_list [ out ]))
+    in
+    let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
+    (* Same NULL/type-mismatch gate the general index path uses
+       ([stream_index_lookup]/[index_lookup_values]): a NULL or type-mismatched
+       equality-bound value matches no rows at all. *)
+    (match index_lookup_values vs with
+     | None -> finalize_stream ()
+     | Some lookup_vs ->
+       let prefix, plen = encode_index_key_prefix lookup_vs in
+       let seek_key, past_end = range_seek_bounds clock params ~prefix ~plen range in
+       let col_tys =
+         Array.of_list
+           (List.map (fun (c : Row.column) -> c.Row.ty) table_meta.Cat.columns)
+       in
+       let n_table_cols = Array.length col_tys in
+       let decode_ikey ikey =
+         match Index_key.decode ikey with
+         | Error _ -> None
+         | Ok (col_vals, _rowid) ->
+           let row = Array.make n_table_cols Row.V_null in
+           List.iteri
+             (fun pos iv ->
+                if pos < Array.length idx_ords
+                then (
+                  let ord = idx_ords.(pos) in
+                  row.(ord) <- index_value_to_row_value col_tys.(ord) iv))
+             col_vals;
+           Some row
+       in
+       (* #262: read through the active txn so the covering walk sees rows
+          written earlier in the same open transaction, exactly like
+          [stream_index_lookup] and [run_aggregate_fast_path]. *)
+       let* rh = rh_begin store mode in
+       let* cur = rh_seek_ge rh idx_tree seek_key in
+       let s_opt = Lwt.get query_stats_key in
+       let ended = ref false in
+       let finish () =
+         if !ended
+         then Lwt.return_unit
+         else (
+           ended := true;
+           S.seek_close cur;
+           rh_finish rh)
+       in
+       Lwt.catch
+         (fun () ->
+            let rec loop () =
+              let* kv = S.seek_next cur in
+              match kv with
+              | None ->
+                let* () = finish () in
+                finalize_stream ()
+              | Some (ikey, _ivalue) ->
+                if index_key_in_range ~prefix ~plen ~past_end ikey
+                then (
+                  (* #546-style: counted before any decode, same discipline as
+                     [stream_index_lookup] — an entry walked is an entry
+                     walked whether or not it survives the residual predicate.
+                     [rows_examined] (table fetches) is never incremented at
+                     all on this path — that is the whole point of #674. *)
+                  incr_index_entries s_opt;
+                  match decode_ikey ikey with
+                  | None -> loop () (* malformed entry: skip rather than crash *)
+                  | Some row ->
+                    let keep =
+                      match pred' with
+                      | None -> true
+                      | Some p -> value_truthy (eval_expr clock params row p)
+                    in
+                    if keep then Array.iter (fun (upd, _) -> upd row) accs;
+                    if keep && min_early_stop
+                    then
+                      let* () = finish () in
+                      finalize_stream ()
+                    else loop ())
+                else
+                  let* () = finish () in
+                  finalize_stream ()
+            in
+            loop ())
+         (fun exn ->
+            let* () = finish () in
+            Lwt.fail exn))
 
 and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs proj =
   match
