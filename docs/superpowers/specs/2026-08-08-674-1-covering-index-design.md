@@ -292,6 +292,85 @@ Two distinct "doesn't fully cover" cases, both already have a clean fallback:
   partial index unless the query's WHERE subsumes it, this hazard is already
   closed by the existing access-path selection and needs no new gate here —
   confirm during implementation rather than assuming either way).
+- **GENERATED columns.** The "plain column" gate above (`idx_expr_flags`
+  false) is not the same test as "not a GENERATED column". `Sema.bind_create_index`
+  (`lib/sql/sema.ml:3742-3792`, "Phase 35 Task 2") accepts `CREATE INDEX` on a
+  VIRTUAL generated column, and a plain reference to one binds through the
+  same `Ast.E_col`/`E_tbl_col` case as an ordinary column
+  (`sema.ml:3788-3790`), which is exactly what sets `col_expr_flags = false`.
+  So a NOT NULL VIRTUAL generated column indexed by name passes this design's
+  plain-column gate even though, per #567/#629, a VIRTUAL cell's *row-store*
+  cell is `V_null` by construction — its real value only exists via
+  `Exec.decode_with_virtual`/`with_computed_virtuals` recomputation. This
+  design's whole mechanism is to read `Index_key.decode`'d bytes and skip
+  `rh_get`+decode entirely, so it needs its own answer for where a VIRTUAL
+  column's *index-stored* value comes from and whether it agrees with what
+  the general (row-decoding) path would return — #629 is precisely a bug
+  where a check ran against the wrong copy of a VIRTUAL column's value, so
+  this is not a hypothetical concern to wave off.
+
+  **STORED generated columns need no special handling.** `compute_stored_generated_cols`
+  materializes the computed value into the row's own cell before the row (and
+  its index entries) are written, at every row-store write site (`execute_insert`,
+  `execute_upsert_update`, `update_col_in_tx`, `apply_update_row` — see
+  `CLAUDE.md`'s #629 section). By the time index-key extraction runs, a STORED
+  column's cell holds a real value exactly like any other column's; the
+  covering fast path needs no STORED-specific gate.
+
+  **VIRTUAL generated columns are included in v1, on an explicit equivalence
+  argument, not excluded.** Read the write paths directly rather than
+  inferring from the expression-index gate:
+  - `execute_create_index`'s backfill (`exec.ml:4589`) computes the row for
+    key extraction via `decode_with_virtual_cols`, which is *the same function*
+    `decode_with_virtual` uses to serve an ordinary row read — not merely an
+    analogous one.
+  - The ongoing INSERT/UPDATE index-maintenance sites (`exec.ml:3889-3890`,
+    `4380`, `4662`, `4801`, `6067`) compute the row for key extraction via
+    `with_computed_virtuals`/`with_computed_virtuals_cols`, which call the
+    identical underlying `compute_virtual_generated_cols[_cols]` that
+    `decode_with_virtual` calls.
+
+  So the value written into a VIRTUAL column's index entry and the value
+  `decode_with_virtual` would recompute for that same row are produced by
+  *the same function evaluated against the same base-column values* — not
+  independently-derived numbers that happen to agree today. They can diverge
+  only if the base-column values feeding the expression change on disk
+  without the index being re-keyed at the same time, and the engine's write
+  path never does that: `write_row_rekeyed`'s index loop deletes the old key
+  and inserts the new one in the same transaction as the row-store write, for
+  every write path that can touch a base column a VIRTUAL expression reads.
+  That is the same "index and row store move together" invariant the rest of
+  this design already leans on (e.g. the #262 visibility hazard above), not a
+  new one. The one caveat worth stating rather than silently assuming: this
+  equivalence requires the generated expression to be a *pure* function of
+  the row's own columns. Granary does not currently reject a non-deterministic
+  expression (e.g. one calling `random()`) in a GENERATED column definition;
+  such a column is already unstable under the general path (`decode_with_virtual`
+  recomputes it fresh on every read, so two ordinary `SELECT`s can already
+  disagree), and the covering fast path would freeze it to its write-time
+  value instead — a different kind of wrong answer, but not a new hazard this
+  design introduces, since the column was already non-deterministic before
+  this design existed. Treat "GENERATED expressions are deterministic" as an
+  existing, implicit assumption of the whole generated-column feature, not a
+  new one this design is signing up for.
+
+  **Decision: both STORED and VIRTUAL generated columns are eligible for the
+  covering fast path in v1**, gated the same way as any other column (plain
+  reference, `idx_expr_flags` false, `not_null`, all-in-index-prefix). No
+  `table_meta.columns` stored/generated exclusion is needed. Pin the VIRTUAL
+  case explicitly in the test plan below rather than relying on the general
+  column tests to exercise it incidentally.
+- **Columnstore scoping.** This design is implicitly row-store-only
+  throughout (`table_meta`, `rh_get`, `idx_tree` as a B-tree index), and that
+  is correct by construction, not by omission: `Sema.bind_create_index`
+  refuses `CREATE INDEX` outright on a columnar table
+  (`Cat.is_columnar meta` check, `sema.ml:3750-3755`), so no secondary index
+  tree — and therefore no `Op_index_lookup` — can ever exist over a
+  `USING COLUMNSTORE` table. `planner.ml`'s columnstore access paths
+  (`Op_col_seq_scan` etc.) never produce `Op_index_lookup`, and there is no
+  path by which one could reach a columnar table's tree id. This design's
+  scope needs no explicit columnstore exclusion because the shape it targets
+  is unreachable there.
 
 ## Suggested test plan
 
@@ -315,6 +394,17 @@ Correctness (mirroring `test_limit_early_stop_677.ml`'s structure):
 - `EXISTS` over an index lookup, with 0 and >0 matching entries.
 - Expression-index and partial-index tables: confirm fallback (once the
   partial-index question above is resolved one way or the other).
+- A NOT NULL VIRTUAL generated column, indexed by name (`CREATE INDEX ON t(v)`
+  where `v` is `... GENERATED ALWAYS AS (expr) VIRTUAL NOT NULL`), exercised
+  through `MIN`, `MAX`, `COUNT(*)`, `COUNT(v)` and `EXISTS` — assert the fast
+  path is taken (it passes the plain-column gate per the GENERATED-columns
+  hazard above) and that results are identical with the fast path enabled
+  vs. `GRANARY_AGG_FASTPATH=0`, the same differential technique already used
+  for the NOT-NULL/NaN case. Include a case where a prior `UPDATE` changed a
+  base column the VIRTUAL expression reads, to exercise the "index and
+  row-store move together" claim rather than only testing freshly-inserted
+  rows. Also cover a STORED generated column indexed by name, for symmetry,
+  though no divergence is expected there.
 
 Perf regression, `Db.query_with_stats`-based, same shape as
 `index_lookup_stops_early` in `test_limit_early_stop_677.ml` and the
