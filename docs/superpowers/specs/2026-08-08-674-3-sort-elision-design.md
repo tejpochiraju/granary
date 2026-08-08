@@ -142,14 +142,25 @@ let natural_order cat (op : Plan.op) : [ `All | `Cols of int list ] option =
 (* Does [order]'s key sequence match a prefix of [natural_order]'s guarantee?
    Every key must be a bare column reference (no expression), ASC, and
    NULLS FIRST (explicit or defaulted) — see Correctness hazards for why
-   both restrictions are load-bearing. *)
-let order_satisfied_by_natural_order natural (order : Sema.bound_order_key list) =
+   both restrictions are load-bearing. [table_meta] is the same value the
+   Op_index_lookup carries (and that [natural_order] resolved ordinals
+   against); key_ok consults it to refuse a NaN/NULL-colliding suffix column
+   — see the "NULL and NaN collide in the index key" hazard below. *)
+let order_satisfied_by_natural_order table_meta natural (order : Sema.bound_order_key list) =
   let key_ok (bkey : Sema.bound_order_key) ord =
     match bkey.Sema.key with
     | Sema.BE_col c ->
       c = ord
       && bkey.Sema.dir = Ast.Asc
       && (bkey.Sema.nulls = None || bkey.Sema.nulls = Some `Nulls_first)
+      && (let col = List.nth table_meta.Cat.columns ord in
+          (* Only a nullable REAL column can hold both NULL and NaN, the one
+             pair whose index-key byte order (both -> 0x00) disagrees with
+             compare_with_nulls. A NOT NULL REAL column has no NULL to
+             collide with; a non-REAL column has no NaN at all
+             (Index_key.encode_value only folds NaN to 0x00 in the IK_real
+             case, ints/text/blob each keep their own tag byte). *)
+          not (col.Row.ty = Row.Real && not col.Row.not_null))
     | _ -> false
   in
   match natural with
@@ -170,9 +181,11 @@ let make_sort child =
   else if
     (not has_joins)
     && windows = []
-    && (match cat with
-        | Some c -> order_satisfied_by_natural_order (natural_order c base) order
-        | None -> false)
+    && (match cat, base with
+        | ( Some c
+          , (Plan.Op_index_lookup { table_meta; _ } | Plan.Op_rowid_lookup { table_meta; _ }) ) ->
+          order_satisfied_by_natural_order table_meta (natural_order c base) order
+        | _ -> false)
   then child (* elided: access path already produces this order *)
   else Plan.Op_sort { keys; child }
 ```
@@ -203,6 +216,59 @@ all.
   walk actually produces and must not be elided. `key_ok` checks this
   explicitly (`nulls = None || nulls = Some \`Nulls_first`) rather than
   assuming the default always applies.
+
+- **NULL and NaN collide in the index key, and `key_ok` must refuse elision
+  on a nullable REAL suffix column (review gap, added post-review).**
+  Direction and NULLS-placement agreement (the hazard above) are not
+  sufficient on their own. `Index_key.encode_value` (`lib/encoding/index_key.ml:109`,
+  `:119`) encodes both `IK_null` and a NaN `IK_real` to the identical
+  single `0x00` byte — the index treats NULL and NaN as *equal* keys, so a
+  B-tree walk over a district containing both ties on that column and falls
+  through to the trailing-rowid tie-break. The query-level comparator does
+  not agree: `Exec.compare_with_nulls` (`exec.ml:233`) routes NULL through
+  its `nulls` flag and NaN through `compare_values` (`exec.ml:220`), whose
+  `Row.V_null, _ -> -1` arm makes NULL strictly less than NaN. CLAUDE.md
+  documents this exact divergence as deliberate and sound for the *value*
+  comparators (#536) and separately flags it as a live index-keyed bug
+  (#578) — this is a third instance of the same #578 class: code that
+  assumes byte-equal implies value-equal for an index-keyed operation. Here
+  that assumption would make `order_satisfied_by_natural_order` return
+  `true` for a nullable REAL suffix column, and the elided walk would then
+  present NULL/NaN rows in undefined tie-break order instead of the NULL-
+  before-NaN order `ORDER BY col ASC` (the default `NULLS FIRST`) requires
+  — a silent wrong row order, not a crash, exactly the class of bug this
+  document is otherwise careful about.
+
+  **Decided: restrict, not accept as an edge case (option (a) from the
+  review).** This project's stated bar (#536/#578/#579) is to never let a
+  byte-level shortcut silently disagree with the value-level comparator, and
+  the restriction here is cheap and precise rather than broad: the collision
+  is possible if and only if a suffix column consulted by `key_ok` is typed
+  `Row.Real` *and* nullable. A `NOT NULL REAL` column has no NULL value to
+  collide with, so `#536`'s NaN-below-every-number agreement alone already
+  makes its index order and comparator order agree — no restriction needed.
+  A non-REAL nullable column (`Integer`/`Text`/`Blob`) has no NaN at all —
+  `encode_value`'s `IK_null` case is the *only* producer of the bare `0x00`
+  byte for those types, since `IK_int`/`IK_text`/`IK_blob` each carry their
+  own non-zero tag byte (`0x01` for `IK_int`, and disjoint tags for the
+  others) — so it cannot collide with anything either. Excluding every
+  nullable column, or every REAL column regardless of nullability, would
+  both forfeit cases that are actually safe (a `NOT NULL REAL o_total`
+  suffix column, extremely common in TPC-C-shaped schemas, must still be
+  eligible). `key_ok` therefore gains one more conjunct: given the
+  suffix ordinal's `Row.column` (looked up from the same `table_meta` the
+  `Op_index_lookup`/`Op_rowid_lookup` already carries), refuse when
+  `col.Row.ty = Row.Real && not col.Row.not_null`. See the updated
+  `key_ok`/`order_satisfied_by_natural_order` in Mechanism above — the
+  function now takes `table_meta` so it can look the column up.
+
+  This check runs on *every* order key `key_ok` inspects, not only the
+  first — a tie on an earlier eligible suffix column falls through to a
+  later one exactly the way the B-tree's own lexicographic comparison does,
+  so a NaN/NULL hazard two columns into the suffix is exactly as unsound as
+  one in the leading suffix column, and both are (correctly) caught because
+  `List.for_all2`/`key_ok` already evaluates every key up to `List.length
+  order`, not just the first.
 
 - **A `range` on the first suffix column does not disqualify elision, and a
   test should say so explicitly** — it's tempting to assume "the seek isn't
@@ -324,6 +390,12 @@ either is caught by the same run):
     this, but it's cheap to pin explicitly since #579's mixed-type
     comparator bugs show expression-vs-column confusion is a recurring class
     of mistake in this codebase).
+  - A **nullable REAL suffix column containing both NULL and NaN** — must
+    not elide, and (unelided, via `Op_sort`) must still return NULL rows
+    before NaN rows. Pair it with a **`NOT NULL REAL`** suffix column
+    variant that *does* elide, to pin that the restriction is scoped to
+    nullable REAL specifically and not a blanket "no REAL suffix column"
+    rule — see the "NULL and NaN collide in the index key" hazard.
 
 - **The perf claim — `Db.query_with_stats`, not wall-clock**, exactly
   #677's approach and for the same reason (CLAUDE.md's scaling-gate
