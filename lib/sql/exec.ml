@@ -6929,6 +6929,34 @@ let make_query_stats () =
    safe across interleaved fibres because each query has its own record. *)
 let query_stats_key : query_stats Lwt.key = Lwt.new_key ()
 
+(* #677: a registry of cleanup thunks for the lazy base scanners
+   (stream_seq_scan / stream_index_lookup / stream_fts_seq_scan) that hold a
+   live Store reader handle and cursor across pulls, releasing it only via
+   their own idempotent [finish] closure when the stream is drained to
+   exhaustion or raises.  [Op_limit] needs to stop pulling before
+   exhaustion — that's the whole point of early-stop — without leaking that
+   handle, which is exactly the #164/#493/#546 class of bug.
+
+   [Op_limit] opens a scope with [Lwt.with_value] around its child's
+   construction; the 3 lazy scanners push their [finish] into this key if a
+   scope is active, and [Op_limit] flushes every registered thunk once it
+   has enough rows.  Flushing is safe even when nothing is left to do:
+   every [finish] is idempotent (guarded by its own [ended] ref), so a
+   thunk that already ran because the child was fully drained naturally is
+   just a no-op the second time.
+
+   Nesting is handled by [Lwt.with_value]'s ordinary dynamic scoping: a
+   nested [Op_limit] (e.g. inside a correlated subquery) opens its own inner
+   scope for its own child construction, so its scanners register into its
+   own registry, not this one's. *)
+let stream_cleanup_key : (unit -> unit Lwt.t) list ref Lwt.key = Lwt.new_key ()
+
+let register_stream_cleanup (finish : unit -> unit Lwt.t) : unit =
+  match Lwt.get stream_cleanup_key with
+  | Some reg -> reg := finish :: !reg
+  | None -> ()
+;;
+
 (* #262: the active transaction mode for the query currently executing, carried
    in Lwt sequence-associated storage.  Subquery evaluation ([pre_eval_subquery]
    and the correlated re-eval at pull time) reads it to run inner reads under the
@@ -10249,6 +10277,7 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
       S.seek_close cur;
       rh_finish rh)
   in
+  register_stream_cleanup finish;
   let stream =
     Lwt_stream.from (fun () ->
       Lwt.catch
@@ -10565,6 +10594,7 @@ and stream_index_lookup
         S.seek_close cur;
         rh_finish rh)
     in
+    register_stream_cleanup finish;
     let stream =
       Lwt_stream.from (fun () ->
         if !exhausted
@@ -11730,6 +11760,7 @@ and stream_fts_seq_scan clock params store mode (fts_meta : Cat.fts_table_meta) 
       S.cursor_close cur;
       rh_finish rh)
   in
+  register_stream_cleanup finish;
   let rec read_next () =
     if !exhausted
     then Lwt.return_none
@@ -12701,9 +12732,33 @@ and to_stream
     stream_expr_project clock params store mode cat exprs child
   | Plan.Op_sort { keys; child } -> stream_sort clock params store mode cat keys child
   | Plan.Op_limit { limit; offset; child } ->
-    let* inner = to_stream clock params store ~mode ~cat child in
-    let* rows = Lwt_stream.to_list inner in
-    let rows' = List.filteri (fun i _ -> i >= offset && i < offset + limit) rows in
+    (* #677 (item 2 of 3): pull only [offset + limit] rows from the child
+       instead of draining it fully — [Sema.validate_limit_offset] already
+       rejects a negative [limit]/[offset] before an [Op_limit] node can
+       exist, so [want] is always >= 0 and [pull] terminates.  The cleanup
+       registry (see [stream_cleanup_key]) is what makes stopping early safe:
+       any of the 3 lazy scanners constructed while building [inner] register
+       their [finish] into [cleanups], and flushing it here after the pull —
+       whether or not the child was actually exhausted — releases whatever
+       reader handle/cursor they still hold. *)
+    let cleanups = ref [] in
+    let* inner =
+      Lwt.with_value stream_cleanup_key (Some cleanups) (fun () ->
+        to_stream clock params store ~mode ~cat child)
+    in
+    let want = offset + limit in
+    let rec pull n acc =
+      if n <= 0
+      then Lwt.return (List.rev acc)
+      else
+        let* v = Lwt_stream.get inner in
+        match v with
+        | None -> Lwt.return (List.rev acc)
+        | Some row -> pull (n - 1) (row :: acc)
+    in
+    let* rows = pull want [] in
+    let* () = Lwt_list.iter_s (fun f -> f ()) !cleanups in
+    let rows' = List.filteri (fun i _ -> i >= offset) rows in
     Lwt.return (Lwt_stream.of_list rows')
   | Plan.Op_distinct { child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
