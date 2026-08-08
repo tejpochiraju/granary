@@ -1482,6 +1482,21 @@
   lwt.unix
   unix))
 
+; #677 (item 2 of 3): Op_limit must stop pulling its child at offset+limit
+; rows instead of draining it fully via Lwt_stream.to_list.
+
+(test
+ (name test_limit_early_stop_677)
+ (modules test_limit_early_stop_677)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
 ; #491: DISTINCT inside an aggregate's argument list — COUNT(DISTINCT x) and
 ; friends. Unblocks TPC-C StockLevel and TPC-H Q16.
 
