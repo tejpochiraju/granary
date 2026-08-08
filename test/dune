@@ -1497,6 +1497,21 @@
   lwt.unix
   unix))
 
+; #674 (item 3 of 3) / #677: sort elision when an access path already
+; satisfies ORDER BY.
+
+(test
+ (name test_sort_elision_674)
+ (modules test_sort_elision_674)
+ (libraries
+  granary
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #491: DISTINCT inside an aggregate's argument list — COUNT(DISTINCT x) and
 ; friends. Unblocks TPC-C StockLevel and TPC-H Q16.
 

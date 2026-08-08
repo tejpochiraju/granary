@@ -601,6 +601,76 @@ let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts 
           Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed)))
 ;;
 
+(* #674 (3 of 3): the column-ordinal sequence a chosen access path is
+   guaranteed to produce in ascending order, or [None] if it makes no such
+   guarantee. [`All] means "every row is guaranteed sorted, trivially" (a
+   single-row lookup); [`Cols ords] means "ascending on this ordinal
+   sequence, in order."
+
+   Only [Op_index_lookup] and [Op_rowid_lookup] are handled — those are the
+   only two ops [seek_op] ever produces, and both are already guaranteed
+   plain-column, non-partial by {!index_is_seekable} (see the comment above
+   {!access_path_for_eqs}). *)
+let natural_order cat (op : Plan.op) : [ `All | `Cols of int list ] option =
+  match op with
+  | Plan.Op_rowid_lookup _ -> Some `All
+  | Plan.Op_index_lookup { idx_tree; keys; table_meta; _ } ->
+    (match
+       Cat.indexes_for_table cat ~table:table_meta.Cat.name
+       |> List.find_opt (fun (i : Cat.index_info) -> i.Cat.idx_tree_id = idx_tree)
+     with
+     | None -> None (* defensive; every Op_index_lookup came from a real index *)
+     | Some idx ->
+       let prefix_len = List.length keys in
+       let suffix_names = List.filteri (fun i _ -> i >= prefix_len) idx.Cat.idx_columns in
+       (* [index_is_seekable] already guarantees every name resolves to a
+          plain table column, so [Option.get] here is safe rather than a
+          silent degrade. *)
+       Some
+         (`Cols (List.map (fun n -> Option.get (col_ordinal table_meta n)) suffix_names)))
+  | _ -> None
+;;
+
+(* #674 (3 of 3): does [order]'s key sequence match a prefix of [natural]'s
+   guarantee?  Every key must be a bare column reference (no expression), ASC
+   and NULLS FIRST (explicit or defaulted) — see the design doc
+   (docs/superpowers/specs/2026-08-08-674-3-sort-elision-design.md) for why
+   both restrictions are load-bearing: DESC has no reverse index walk to
+   elide onto, and NULLS LAST disagrees with the index's own NULL-sorts-first
+   encoding.
+
+   [table_meta] is the same value the chosen access path carries (and that
+   [natural_order] resolved ordinals against); [key_ok] consults it to refuse
+   a nullable REAL suffix column, where NULL and NaN collide to the same
+   index-key byte (see CLAUDE.md's #536/#578/#579 sections) — a NOT NULL REAL
+   column has no NULL to collide with, and a non-REAL column has no NaN at
+   all, so both remain eligible. *)
+let order_satisfied_by_natural_order
+      (table_meta : Cat.table_meta)
+      natural
+      (order : Sema.bound_order_key list)
+  =
+  let key_ok (bkey : Sema.bound_order_key) ord =
+    match bkey.Sema.key with
+    | Sema.BE_col c ->
+      c = ord
+      && bkey.Sema.dir = Ast.Asc
+      && (bkey.Sema.nulls = None || bkey.Sema.nulls = Some `Nulls_first)
+      &&
+      let col = List.nth table_meta.Cat.columns ord in
+      not (col.Row.ty = Row.Real && not col.Row.not_null)
+    | _ -> false
+  in
+  match natural with
+  | Some `All -> true
+  | Some (`Cols ords) ->
+    let n = List.length order in
+    if n > List.length ords
+    then false
+    else List.for_all2 key_ok order (List.filteri (fun i _ -> i < n) ords)
+  | None -> false
+;;
+
 (* ------------------------------------------------------------------ *)
 (* #520: a crude static cardinality estimate for the join's driving side *)
 (* ------------------------------------------------------------------ *)
@@ -2174,7 +2244,41 @@ let plan_select
      to the aggregated output row layout. *)
   let make_sort child =
     let keys = plan_sort_keys ~order ~windows ~n_input_cols in
-    if keys = [] then child else Plan.Op_sort { keys; child }
+    if keys = []
+    then child
+    else if
+      (not has_joins)
+      && windows = []
+      &&
+      (* [plan_base] wraps its chosen seek in a residual [Op_filter] whenever
+         some conjunct — e.g. a #517 range bound, which narrows the seek's
+         span but is never marked "consumed" — is left for the caller to
+         re-check.  [Op_filter] only drops rows; it never reorders survivors,
+         so unwrapping one layer of it here to reach the seek underneath is
+         sound, and is exactly what lets the range-bounded case elide too. *)
+      match base with
+      | Plan.Op_index_lookup { table_meta; _ }
+      | Plan.Op_rowid_lookup { table_meta; _ }
+      | Plan.Op_filter
+          { child =
+              ( Plan.Op_index_lookup { table_meta; _ }
+              | Plan.Op_rowid_lookup { table_meta; _ } )
+          ; _
+          } ->
+        let seek =
+          match base with
+          | Plan.Op_filter { child; _ } -> child
+          | b -> b
+        in
+        order_satisfied_by_natural_order table_meta (natural_order cat seek) order
+      | _ -> false
+    then
+      (* #674 (3 of 3): the chosen access path already produces this order —
+         eliding a redundant Op_sort is what lets #677's Op_limit early-stop
+         reach the scanner directly, instead of draining it into a sort
+         buffer first. *)
+      child
+    else Plan.Op_sort { keys; child }
   in
   let after_sort = if is_aggregated then after_window else make_sort after_window in
   let projected =
