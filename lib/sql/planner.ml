@@ -2745,10 +2745,13 @@ let rec plan ?cat = function
       }
   | Sema.BS_fts_delete { fts_meta; where } ->
     Plan.Op_fts_delete { fts_meta; where = Option.map plan_expr where }
-  | Sema.BS_fts_seq_scan { fts_meta; where } ->
-    Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where }
-  | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
-    Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets }
+  | Sema.BS_fts_seq_scan { fts_meta; where; limit; offset } ->
+    let base = Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where } in
+    finalize_select ~distinct:false ~limit ~offset base
+  | Sema.BS_fts_match_scan
+      { fts_meta; query; proj; include_rank; snippets; limit; offset } ->
+    let base = Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } in
+    finalize_select ~distinct:false ~limit ~offset base
   | Sema.BS_compound { op; left; right; order; limit; offset } ->
     plan_compound ?cat ~op ~left ~right ~order ~limit ~offset ()
   | Sema.BS_const_select { exprs } ->
