@@ -5023,6 +5023,27 @@ let update_col_in_tx
   let new_row = Array.copy row in
   new_row.(col_idx) <- new_val;
   compute_stored_generated_cols None [||] meta new_row;
+  let indexes = Cat.indexes_for_table cat ~table:meta.Cat.name in
+  (* #693: this is the third and last [write_row_rekeyed] caller (ON UPDATE
+     CASCADE / SET NULL / SET DEFAULT) — plain UPDATE has
+     [validate_update_unique] and UPSERT DO UPDATE has [execute_upsert_update]'s
+     own pass (#667), but this write path had no uniqueness probe at all, so a
+     cascade could silently write a duplicate into a UNIQUE child column.  Run
+     the same shared [check_indexes_unique_on_update] helper before the row
+     moves, and hand its already-computed [new_row_for_idx] through to
+     [write_row_rekeyed] so the VIRTUAL-column evaluation isn't paid twice. *)
+  let new_row_for_idx = with_computed_virtuals None [||] meta new_row in
+  let* () =
+    check_indexes_unique_on_update
+      tx
+      indexes
+      ~clock:None
+      ~params:[||]
+      ~schema:meta.Cat.columns
+      ~old_row:row
+      ~new_row_for_idx
+      ~rowid
+  in
   (* #249: a cascade that lands on the child's own INTEGER PRIMARY KEY column
      must MOVE the child row (re-key + reindex), like any other alias-column
      UPDATE — funnel through the shared helper. *)
@@ -5035,7 +5056,8 @@ let update_col_in_tx
       ~old_row:row
       ~new_row
       ~old_rowid:rowid
-      ~indexes:(Cat.indexes_for_table cat ~table:meta.Cat.name)
+      ~indexes
+      ~new_row_for_idx
       ()
   in
   (* #417: record the FK-cascade child column update (ON UPDATE CASCADE / SET

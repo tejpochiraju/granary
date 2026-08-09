@@ -1515,6 +1515,24 @@
   lwt.unix
   unix))
 
+; #693: ON UPDATE CASCADE / SET NULL / SET DEFAULT writes through
+; update_col_in_tx -> write_row_rekeyed with no uniqueness probe at all,
+; unlike plain UPDATE and UPSERT DO UPDATE (#667/PR #692), so a cascade could
+; silently write a duplicate into a UNIQUE child column.
+
+(test
+ (name test_cascade_unique_693)
+ (modules test_cascade_unique_693)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #668: an ON CONFLICT target naming no PRIMARY KEY or UNIQUE constraint is a
 ; bind-time error now, instead of being silently treated as a plain INSERT.
 

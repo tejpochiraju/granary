@@ -636,6 +636,20 @@ EOF
   partial-index WHERE-transition case for both the UPSERT and plain-UPDATE
   paths.
 
+  **#693 (fixed): `ON UPDATE CASCADE` / `SET NULL` / `SET DEFAULT` — the third
+  `write_row_rekeyed` caller named above — had no uniqueness probe at all, not
+  even the imprecise one #667 fixed for upserts.** `update_col_in_tx` now
+  calls the same shared `check_indexes_unique_on_update` before
+  `write_row_rekeyed`, with `~clock:None ~params:[||]` (its existing constants
+  — a cascade runs outside any statement's clock/params scope) and hands the
+  already-computed `new_row_for_idx` through via `write_row_rekeyed`'s
+  `?new_row_for_idx`, exactly as `execute_upsert_update` and
+  `validate_update_unique` do. All three `write_row_rekeyed` callers now run
+  the identical pre-write probe. `SET NULL` can never trip it — #290 exempts
+  any NULL-containing key — but `SET DEFAULT` can, when the column's default
+  collides with a value another live row already holds; pinned alongside the
+  issue's own CASCADE repro in `test/test_cascade_unique_693.ml`.
+
   One consequence of the target pass is a change for the *raising* modifiers:
   bare / `OR ABORT` / `OR FAIL` / `OR ROLLBACK` used to report
   `UNIQUE constraint failed` for a second index the discarded insert row
