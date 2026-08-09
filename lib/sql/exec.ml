@@ -2005,23 +2005,6 @@ let with_computed_virtuals
     row')
 ;;
 
-(** Like [with_computed_virtuals] but takes a [(table_name, columns)] pair. *)
-let with_computed_virtuals_cols
-      (clock : (unit -> float) option)
-      (params : Row.value array)
-      ~(table_name : string)
-      (columns : Row.column list)
-      (row : Row.t)
-  : Row.t
-  =
-  if not (has_virtual_cols columns)
-  then row
-  else (
-    let row' = Array.copy row in
-    compute_virtual_generated_cols_cols clock params ~table_name columns row';
-    row')
-;;
-
 (** [decode_with_virtual]: like [Row.decode], but also recomputes any VIRTUAL
     generated columns in the schema. Skips the recompute when the table has
     no virtual cols (the common case). *)
@@ -3825,30 +3808,36 @@ let delete_replace_conflicts
   Lwt.return (List.rev !displaced_rows)
 ;;
 
-(** Check whether inserting a new index entry for [new_row] with
-    [rowid] into [idx] would violate a UNIQUE constraint.  Returns
-    [true] if a different row already has the same indexed value. *)
+(** Check whether inserting a new index entry with [key_vals] and [rowid]
+    into [idx] would violate a UNIQUE constraint.  Returns [true] if a
+    different row already has the same indexed value.
+
+    [key_vals] must already be the caller's fully-evaluated index-key
+    values (virtuals/expressions computed, in the ambient statement's real
+    [~clock]/[~params]) — this function does no evaluation of its own.  It
+    used to: it independently recomputed the row's index values via
+    [with_computed_virtuals_cols None [||]], hardcoding a fresh clock and
+    no bound params instead of reusing the ones its only caller,
+    [check_index_unique_on_update], had already evaluated [new_vs] with a
+    few lines above. For a UNIQUE index over a clock-dependent VIRTUAL
+    column (e.g. one referencing CURRENT_TIMESTAMP), that let the probe's
+    seek key diverge from the value just validated — a different instant
+    than the one the caller reasoned about, which could miss a real
+    duplicate or seek on a value nothing else holds. Taking the
+    already-computed [key_vals] removes the second evaluation entirely
+    rather than just aligning its inputs. *)
 let unique_violation_on_update
       (tx : S.rw S.txn)
       (idx : Cat.index_info)
-      (_new_values : Row.value list)
-        (* kept for call-site compat but unused for expr indexes *)
+      (key_vals : Row.value list)
       ~(rowid : int64)
-      ~(new_row : Row.t)
-      ~(schema : Row.column list)
   : bool Lwt.t
   =
-  (* For UNIQUE check we use the first value as the seek prefix.
-     This is a conservative approach: we seek to the first key with the
-     matching first-column value, then compare the entire encoded key.
-     Phase 35 Task 2: populate VIRTUAL gen cols on the new row so the
-     UNIQUE comparison keys reflect their computed value. *)
-  let new_row_for_idx =
-    with_computed_virtuals_cols None [||] ~table_name:idx.Cat.idx_table schema new_row
-  in
-  let key_vals = get_index_key_values None [||] idx schema new_row_for_idx in
   (* #290: a key with ANY NULL column is exempt — NULLs are distinct in a SQLite
-     UNIQUE index, so it can never collide.  Short-circuit before probing. *)
+     UNIQUE index, so it can never collide.  Short-circuit before probing.
+     (Already true of [key_vals] by the time [check_index_unique_on_update]
+     calls this — kept here too since this is the one place the seek logic
+     lives, in case a future caller doesn't pre-filter.) *)
   if any_null_val key_vals
   then Lwt.return false
   else (
@@ -3899,7 +3888,6 @@ let check_index_unique_on_update
       ~params
       ~schema
       ~old_row
-      ~new_row
       ~new_row_for_idx
       ~rowid
   : unit Lwt.t
@@ -3938,7 +3926,7 @@ let check_index_unique_on_update
       if unchanged
       then Lwt.return_unit
       else
-        let* dup = unique_violation_on_update tx idx new_vs ~rowid ~new_row ~schema in
+        let* dup = unique_violation_on_update tx idx new_vs ~rowid in
         if dup
         then
           Lwt.fail_with
@@ -3946,6 +3934,37 @@ let check_index_unique_on_update
                ~table:idx.Cat.idx_table
                ~columns:idx.idx_columns)
         else Lwt.return_unit))
+;;
+
+(* #667/#692 review: both call sites that need a pre-write uniqueness probe
+   over every index — [validate_update_unique] for plain UPDATE,
+   [execute_upsert_update] for UPSERT DO UPDATE — ran the identical loop over
+   [check_index_unique_on_update] by hand. Sharing it here is what keeps a
+   future change to the loop (a new exemption, an early exit, batching) from
+   being applied at one call site and forgotten at the other. *)
+let check_indexes_unique_on_update
+      tx
+      (indexes : Cat.index_info list)
+      ~clock
+      ~params
+      ~schema
+      ~old_row
+      ~new_row_for_idx
+      ~rowid
+  : unit Lwt.t
+  =
+  Lwt_list.iter_s
+    (fun (idx : Cat.index_info) ->
+       check_index_unique_on_update
+         tx
+         idx
+         ~clock
+         ~params
+         ~schema
+         ~old_row
+         ~new_row_for_idx
+         ~rowid)
+    indexes
 ;;
 
 (* #243/#249: write [new_row] for the row currently stored at [old_rowid],
@@ -4110,19 +4129,15 @@ let execute_upsert_update
        the conflict target, if the assignment moved that column too. *)
     let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
     let* () =
-      Lwt_list.iter_s
-        (fun (idx : Cat.index_info) ->
-           check_index_unique_on_update
-             tx
-             idx
-             ~clock
-             ~params
-             ~schema:table_meta.Cat.columns
-             ~old_row
-             ~new_row
-             ~new_row_for_idx
-             ~rowid:old_rowid)
+      check_indexes_unique_on_update
+        tx
         indexes
+        ~clock
+        ~params
+        ~schema:table_meta.Cat.columns
+        ~old_row
+        ~new_row_for_idx
+        ~rowid:old_rowid
     in
     (* #249: SET id = N in a DO UPDATE must move the row (and check uniqueness),
        same as a plain UPDATE — funnel through the shared re-key helper.
@@ -6112,19 +6127,15 @@ let validate_update_unique
        compute_stored_generated_cols clock params table_meta new_row;
        eval_check_constraints clock params table_meta new_row;
        let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-       Lwt_list.iter_s
-         (fun (idx : Cat.index_info) ->
-            check_index_unique_on_update
-              tx
-              idx
-              ~clock
-              ~params
-              ~schema
-              ~old_row
-              ~new_row
-              ~new_row_for_idx
-              ~rowid)
-         indexes)
+       check_indexes_unique_on_update
+         tx
+         indexes
+         ~clock
+         ~params
+         ~schema
+         ~old_row
+         ~new_row_for_idx
+         ~rowid)
     matches
 ;;
 

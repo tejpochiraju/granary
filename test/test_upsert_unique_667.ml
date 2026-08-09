@@ -234,6 +234,43 @@ let partial_index_membership_transition_plain_update () =
       "UPDATE p SET active = 1 WHERE id = 2")
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Property                                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* Over a random sequence of UPSERT DO UPDATEs that reassign a UNIQUE column
+   to a small pool of values (so real collisions are common, not a corner
+   case), the invariant #667 exists to protect never breaks: no two live
+   rows ever share a value in a UNIQUE index. A colliding statement is free
+   to raise — that's the correct outcome — the property only checks the
+   table's state after every attempt, whether it succeeded or not. *)
+let prop_do_update_never_leaves_a_duplicate_unique_key =
+  QCheck2.Test.make
+    ~name:"UPSERT DO UPDATE never leaves two live rows under one UNIQUE key"
+    ~count:200
+    QCheck2.Gen.(list_size (int_range 1 20) (pair (int_range 1 5) (int_range 1 5)))
+    (fun ops ->
+       with_db (fun db ->
+         exec db "CREATE TABLE q (id INTEGER PRIMARY KEY, a INTEGER, v INTEGER NOT NULL)";
+         exec db "CREATE UNIQUE INDEX q_a ON q (a)";
+         for id = 1 to 5 do
+           exec db (Printf.sprintf "INSERT INTO q VALUES (%d, %d, 0)" id id)
+         done;
+         List.iter
+           (fun (id, a) ->
+              let sql =
+                Printf.sprintf
+                  "INSERT INTO q VALUES (%d, %d, 1) ON CONFLICT(id) DO UPDATE SET a = %d"
+                  id
+                  a
+                  a
+              in
+              ignore (run (Db.execute db sql)))
+           ops;
+         let dup_groups = query db "SELECT a FROM q GROUP BY a HAVING COUNT(*) > 1" in
+         dup_groups = []))
+;;
+
 let () =
   Alcotest.run
     "upsert_unique_667"
@@ -273,5 +310,9 @@ let () =
             `Quick
             partial_index_membership_transition_plain_update
         ] )
+    ; ( "property"
+      , List.map
+          QCheck_alcotest.to_alcotest
+          [ prop_do_update_never_leaves_a_duplicate_unique_key ] )
     ]
 ;;

@@ -1489,7 +1489,15 @@
 (test
  (name test_upsert_unique_667)
  (modules test_upsert_unique_667)
- (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
 
 ; #677 (item 2 of 3): Op_limit must stop pulling its child at offset+limit
 ; rows instead of draining it fully via Lwt_stream.to_list.

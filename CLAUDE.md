@@ -573,10 +573,10 @@ EOF
 
   **What this pass does NOT do is hand the check downstream — `write_row_rekeyed`
   itself performs no uniqueness probe.** Its index loop is still an unconditional
-  `S.del` of the old key and `S.put` of the new one, and `check_index_unique_on_update`
-  is still reached only from `validate_update_unique`, the plain-`UPDATE`
-  pre-pass. Discarding the target pass's other-index verdicts is sound — they
-  were computed against the row being INSERTED, which is discarded, and a
+  `S.del` of the old key and `S.put` of the new one; see the `#667 (fixed)`
+  paragraph immediately below for where that check now lives instead.
+  Discarding the target pass's other-index verdicts here is sound regardless —
+  they were computed against the row being INSERTED, which is discarded, and a
   `SET v = 42` does not touch the column they were about.
 
   **#667 (fixed): a DO UPDATE that writes a duplicate into another unique index
@@ -585,21 +585,56 @@ EOF
   paths — plain `UPDATE`, `UPSERT ... DO UPDATE`, and `ON UPDATE CASCADE` — so
   pushing the probe inside it would have changed the other two as well; that is
   a separate decision (see the `enforce_not_null` bullet above, which makes the
-  same point). `execute_upsert_update` instead loops over
-  `Cat.indexes_for_table` and calls `check_index_unique_on_update` for each,
-  computing `new_row`'s virtuals once for the loop, before calling
-  `write_row_rekeyed`. `check_index_unique_on_update` already excludes the row
-  being updated from its own conflict probe (by rowid) and exempts an unchanged
-  key and a NULL-containing key (#290), so this includes the conflict-target
-  index itself — a DO UPDATE that moves the very column named in `ON
-  CONFLICT(...)` to a value a third row already holds is caught too, not just
-  a DO UPDATE touching an unrelated index. `check_index_unique_on_update` and
-  its `unique_violation_on_update` helper moved earlier in `exec.ml` (to just
-  before `write_row_rekeyed`) so `execute_upsert_update` — defined before their
-  original position — could call them; nothing about their behavior changed.
+  same point). `execute_upsert_update` calls the new shared helper
+  `check_indexes_unique_on_update` — one `Lwt_list.iter_s` over
+  `Cat.indexes_for_table` calling `check_index_unique_on_update` per index —
+  before calling `write_row_rekeyed`, passing it the already-computed
+  `new_row_for_idx` again via `write_row_rekeyed`'s new `?new_row_for_idx` so
+  the VIRTUAL-column evaluation isn't paid twice. `check_index_unique_on_update`
+  already excludes the row being updated from its own conflict probe (by
+  rowid) and exempts an unchanged key and a NULL-containing key (#290), so
+  this includes the conflict-target index itself — a DO UPDATE that moves the
+  very column named in `ON CONFLICT(...)` to a value a third row already
+  holds is caught too, not just a DO UPDATE touching an unrelated index.
+  `validate_update_unique`, the plain-UPDATE pre-pass, now calls the same
+  `check_indexes_unique_on_update` helper instead of hand-rolling an identical
+  loop — the two call sites cannot drift apart on a future change (a new
+  exemption, an early exit, batching) the way the first revision of this fix
+  would have let them.
+
+  Two things about `check_index_unique_on_update` moved as part of this fix
+  are correctness-bearing, not just relocation:
+
+  - It (and `check_indexes_unique_on_update`) moved earlier in `exec.ml`, to
+    just before `write_row_rekeyed`, so `execute_upsert_update` — defined
+    before their original position — could call them.
+  - `unique_violation_on_update`'s `unchanged` fast path used to compare only
+    the indexed COLUMN values (`old_vs` vs `new_vs`), never whether `old_row`
+    had matched the index's `idx_where_sql` at all. A row flipping into a
+    PARTIAL unique index's domain without touching the indexed column — e.g.
+    `active` going 0 → 1 under `UNIQUE INDEX ... WHERE active = 1` while `a`
+    stays the same — read as "nothing moved" and skipped the probe, so
+    `write_row_rekeyed` inserted a second live entry for a key another row
+    already held under that index. `unchanged` now also requires `old_row` to
+    have matched the WHERE clause. Pre-existing in `validate_update_unique`'s
+    path too (same shared primitive) — fixed there for free by fixing the one
+    function both now call.
+  - `unique_violation_on_update` also used to recompute the row's index
+    values independently, via `with_computed_virtuals_cols None [||]` —
+    hardcoding a fresh clock and no bound params instead of reusing the ones
+    its only caller, `check_index_unique_on_update`, had already evaluated
+    `new_vs` with a few lines above. For a UNIQUE index over a
+    clock-dependent VIRTUAL column that let the probe's seek key diverge from
+    the value just validated. It now takes the already-computed `key_vals`
+    directly and does no evaluation of its own, which removes the second
+    computation entirely (a `#667` review finding on top of the `unchanged`
+    one) rather than just aligning its inputs.
+
   Pinned by `test/test_upsert_unique_667.ml`, covering both conflict shapes
   (secondary UNIQUE index and rowid-alias PRIMARY KEY, since both funnel
-  through `execute_upsert_update`) and a plain-UPDATE regression check.
+  through `execute_upsert_update`), a plain-UPDATE regression check, and the
+  partial-index WHERE-transition case for both the UPSERT and plain-UPDATE
+  paths.
 
   One consequence of the target pass is a change for the *raising* modifiers:
   bare / `OR ABORT` / `OR FAIL` / `OR ROLLBACK` used to report
