@@ -2124,9 +2124,39 @@ let bind_insert_row
          Ok (ordinals, full_vals)))
 ;;
 
+(* #668: does [conflict_cols] name a constraint an ON CONFLICT target can
+   legally point at?  Mirrors [Exec.index_is_conflict_target]'s column-set
+   test (unique index, column set equality, [idx_where_sql] not consulted) so
+   the bind-time rejection and the runtime target-matching pass cannot
+   disagree about what counts as a target. The PRIMARY KEY arm covers both a
+   composite [WITHOUT ROWID] key and the rowid-alias `INTEGER PRIMARY KEY`
+   column, since #530 marks every PK column [primary_key = true] regardless of
+   how the key is spelled — neither carries a [Cat.index_info] of its own. *)
+let conflict_target_matches_constraint
+      (cat : Cat.t)
+      (meta : Cat.table_meta)
+      (conflict_cols : string list)
+  : bool
+  =
+  let cols_set = List.sort String.compare conflict_cols in
+  let pk_cols =
+    List.filter_map
+      (fun (c : Row.column) -> if c.Row.primary_key then Some c.Row.name else None)
+      meta.columns
+  in
+  (pk_cols <> [] && List.sort String.compare pk_cols = cols_set)
+  ||
+  let idxs = Cat.indexes_for_table cat ~table:meta.name in
+  List.exists
+    (fun (idx : Cat.index_info) ->
+       idx.Cat.idx_unique && List.sort String.compare idx.Cat.idx_columns = cols_set)
+    idxs
+;;
+
 (* Assemble a bound INSERT from already-bound rows: bind RETURNING and any
    UPSERT assignments, then build BS_insert. *)
 let finalize_insert
+      cat
       ~param_counter
       ~named_params
       ~(meta : Cat.table_meta)
@@ -2143,9 +2173,15 @@ let finalize_insert
       match upsert_update with
       | None -> Ok None
       | Some Ast.{ conflict_cols; assignments } ->
-        (match bind_upsert_assignments ~param_counter ~named_params meta assignments with
-         | Error e -> Error e
-         | Ok bound_assigns -> Ok (Some (conflict_cols, bound_assigns)))
+        if not (conflict_target_matches_constraint cat meta conflict_cols)
+        then
+          Error
+            (Unsupported
+               "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint")
+        else (
+          match bind_upsert_assignments ~param_counter ~named_params meta assignments with
+          | Error e -> Error e
+          | Ok bound_assigns -> Ok (Some (conflict_cols, bound_assigns)))
     in
     (match upsert_result with
      | Error e -> Lwt.return (Error e)
@@ -2234,6 +2270,7 @@ let bind_insert
      | Ok ((ordinals, _) :: _ as bound_rows) ->
        let all_vals = List.map snd bound_rows in
        finalize_insert
+         cat
          ~param_counter
          ~named_params
          ~meta

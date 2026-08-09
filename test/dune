@@ -1515,6 +1515,14 @@
   lwt.unix
   unix))
 
+; #668: an ON CONFLICT target naming no PRIMARY KEY or UNIQUE constraint is a
+; bind-time error now, instead of being silently treated as a plain INSERT.
+
+(test
+ (name test_onconflict_target_668)
+ (modules test_onconflict_target_668)
+ (libraries granary granary.unix granary.encoding alcotest lwt.unix))
+
 ; #677 (item 2 of 3): Op_limit must stop pulling its child at offset+limit
 ; rows instead of draining it fully via Lwt_stream.to_list.
 

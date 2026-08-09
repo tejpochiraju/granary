@@ -531,32 +531,41 @@ let an_alias_pk_target_beats_a_secondary_conflict () =
    because [index_is_conflict_target] tests [idx_unique] and dropping that test
    would silently turn any same-column index into one.
 
-   {b This pins a divergence from SQLite, which is recorded in CLAUDE.md rather
-   than assumed.} SQLite REJECTS the statement outright — "ON CONFLICT clause
-   does not match any PRIMARY KEY or UNIQUE constraint" — where granary treats
-   it as a plain INSERT and silently ignores the clause. The divergence is
-   pre-existing (nothing has ever validated a conflict target against the
-   schema) and #639 does not fix it; it is tracked as #668. What #639 does fix
-   is the part that mattered here: whatever the clause names, it cannot promote
-   a non-unique index into a target. *)
+   {b #668 fixed the divergence this test used to pin.} SQLite REJECTS the
+   statement outright — "ON CONFLICT clause does not match any PRIMARY KEY or
+   UNIQUE constraint" — and granary used to treat it as a plain INSERT and
+   silently ignore the clause instead. [Sema.conflict_target_matches_constraint]
+   now performs that same rejection at bind time, so this test now asserts the
+   [Error], not the old silent fallback. *)
 let a_non_unique_index_is_not_a_conflict_target () =
   with_db (fun db ->
     exec db "CREATE TABLE n (id INTEGER PRIMARY KEY, a INTEGER, v INTEGER NOT NULL)";
     exec db "CREATE INDEX n_a ON n (a)";
     exec db "INSERT INTO n VALUES (1, 10, 5)";
-    (* No uniqueness on a, so nothing conflicts: this is a plain insert. *)
+    (* No uniqueness on a, so the target is invalid and the statement is
+       refused at bind time — [Db.prepare] itself fails, before there is
+       anything to run. *)
     (match
-       run_stmt
-         db
-         "INSERT OR IGNORE INTO n VALUES (2, 10, 9) ON CONFLICT(a) DO UPDATE SET v = 42"
-         []
+       run
+         (Db.prepare
+            db
+            "INSERT OR IGNORE INTO n VALUES (2, 10, 9) ON CONFLICT(a) DO UPDATE SET v = \
+             42")
      with
-     | Ok n -> Alcotest.(check int) "inserted, not upserted" 1 n
-     | Error e -> Alcotest.failf "raised: %a" Db.pp_error e);
+     | Ok _ -> Alcotest.fail "expected a bind-time rejection"
+     | Error e ->
+       let msg = Format.asprintf "%a" Db.pp_error e in
+       Alcotest.(check bool)
+         (Printf.sprintf "bind-time rejection (got %S)" msg)
+         true
+         (contains
+            ~needle:
+              "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+            msg));
     expect_rows
       db
-      ~msg:"both rows present; no DO UPDATE ran"
-      [ "1|10|5"; "2|10|9" ]
+      ~msg:"nothing ran; the second row was never inserted"
+      [ "1|10|5" ]
       "SELECT * FROM n ORDER BY id")
 ;;
 
