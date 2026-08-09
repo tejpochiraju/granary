@@ -33,6 +33,30 @@ let mk_col name ty : Row.column =
 let int_col name = mk_col name Row.Integer
 let txt_col name = mk_col name Row.Text
 
+(* Field-by-field [Row.column] equality (no stdlib equality exists for it). *)
+let col_equal (a : Row.column) (b : Row.column) =
+  String.equal a.name b.name
+  && a.ty = b.ty
+  && Bool.equal a.not_null b.not_null
+  && Bool.equal a.primary_key b.primary_key
+  && Bool.equal a.pk_desc b.pk_desc
+  && a.default = b.default
+  && Option.equal String.equal a.check_sql b.check_sql
+  && Option.equal
+       (fun (sa, ba) (sb, bb) -> String.equal sa sb && Bool.equal ba bb)
+       a.generated_as
+       b.generated_as
+;;
+
+let fk_equal (a : C.fk_constraint) (b : C.fk_constraint) =
+  a.fk_local_cols = b.fk_local_cols
+  && String.equal a.fk_parent_table b.fk_parent_table
+  && a.fk_parent_cols = b.fk_parent_cols
+  && a.fk_on_delete = b.fk_on_delete
+  && a.fk_on_update = b.fk_on_update
+  && Bool.equal a.fk_deferrable b.fk_deferrable
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group 1: Basic create and find                                       *)
 (* ------------------------------------------------------------------ *)
@@ -2272,6 +2296,156 @@ let test_mirror_recovers_empty_next_rowid () =
      Lwt.return_unit)
 ;;
 
+(* #484: round-trip a schema with a variety of column forms (not_null, PK DESC,
+   defaults of several kinds, CHECK SQL, generated columns) plus FK constraints
+   and a multi-column index through encode -> disk -> decode.  Deleting the
+   primary _sys_tables row forces mirror reconstruction, so reopen exercises
+   decode_mirror_entry's column loop (each column via decode_column) and its FK
+   blob (decode_fks), and load_all_indexes exercises decode_index_value's
+   column-name loop. *)
+let test_mirror_roundtrips_columns_fks_and_index () =
+  run
+    (let store = S.create () in
+     let* cat1 = C.open_ store in
+     let cols : Row.column list =
+       [ { Row.name = "a"
+         ; ty = Row.Integer
+         ; not_null = true
+         ; primary_key = true
+         ; pk_desc = true
+         ; default = None
+         ; check_sql = None
+         ; generated_as = None
+         }
+       ; { Row.name = "b"
+         ; ty = Row.Text
+         ; not_null = false
+         ; primary_key = false
+         ; pk_desc = false
+         ; default = Some (Row.DV_text "hi")
+         ; check_sql = Some "b <> ''"
+         ; generated_as = None
+         }
+       ; { Row.name = "c"
+         ; ty = Row.Integer
+         ; not_null = false
+         ; primary_key = false
+         ; pk_desc = false
+         ; default = Some (Row.DV_int 42L)
+         ; check_sql = None
+         ; generated_as = Some ("a * 2", true)
+         }
+       ; { Row.name = "d"
+         ; ty = Row.Real
+         ; not_null = false
+         ; primary_key = false
+         ; pk_desc = false
+         ; default = Some (Row.DV_real 3.25)
+         ; check_sql = None
+         ; generated_as = None
+         }
+       ; { Row.name = "e"
+         ; ty = Row.Blob
+         ; not_null = false
+         ; primary_key = false
+         ; pk_desc = false
+         ; default = Some (Row.DV_blob (Bytes.of_string "\x00\xff"))
+         ; check_sql = None
+         ; generated_as = None
+         }
+       ]
+     in
+     let* tid =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let fks : C.fk_constraint list =
+       [ { fk_local_cols = [ "b" ]
+         ; fk_parent_table = "parent"
+         ; fk_parent_cols = [ "id" ]
+         ; fk_on_delete = C.FA_cascade
+         ; fk_on_update = C.FA_set_null
+         ; fk_deferrable = true
+         }
+       ; { fk_local_cols = [ "c"; "d" ]
+         ; fk_parent_table = "parent"
+         ; fk_parent_cols = [ "x"; "y" ]
+         ; fk_on_delete = C.FA_restrict
+         ; fk_on_update = C.FA_no_action
+         ; fk_deferrable = false
+         }
+       ]
+     in
+     let* () = C.save_fk_constraints cat1 ~table_name:"t" ~fks in
+     let* r =
+       C.create_index
+         cat1
+         ~name:"idx_t_ab"
+         ~table:"t"
+         ~columns:[ "a"; "b" ]
+         ~unique:true
+         ~expr_flags:[ false; false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     (match r with
+      | Ok _ -> ()
+      | Error e -> Alcotest.failf "create_index: %s" e);
+     (* Force mirror reconstruction: lose the primary _sys_tables row. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     (* Reopen — "t" is reconstructed from the mirror, decoding the columns
+        (decode_column), the FKs (decode_fks) and, on the index load, the
+        multi-column index (decode_index_value). *)
+     let* cat2 = C.open_ store in
+     let* result = C.find_table cat2 ~name:"t" in
+     (match result with
+      | None -> Alcotest.fail "table not reconstructed from the mirror"
+      | Some m ->
+        let tid_rec, _, _, _ = C.row_storage m in
+        Alcotest.(check int) "tree_id preserved" tid tid_rec;
+        Alcotest.(check int)
+          "column count preserved"
+          (List.length cols)
+          (List.length m.C.columns);
+        List.iter2
+          (fun orig got ->
+             Alcotest.(check bool)
+               (Printf.sprintf "column %s preserved" orig.Row.name)
+               true
+               (col_equal orig got))
+          cols
+          m.C.columns;
+        Alcotest.(check int)
+          "fk count preserved"
+          (List.length fks)
+          (List.length m.C.fk_constraints);
+        List.iter2
+          (fun orig got -> Alcotest.(check bool) "fk preserved" true (fk_equal orig got))
+          fks
+          m.C.fk_constraints);
+     (* The implicit PK index on "a" also survives; pick the user index out by
+        name to assert the multi-column decode. *)
+     let idxs = C.indexes_for_table cat2 ~table:"t" in
+     let user_idx =
+       match List.find_opt (fun (i : C.index_info) -> i.C.idx_name = "idx_t_ab") idxs with
+       | Some i -> i
+       | None -> Alcotest.fail "user index idx_t_ab missing after reopen"
+     in
+     Alcotest.(check (list string))
+       "index columns preserved"
+       [ "a"; "b" ]
+       user_idx.C.idx_columns;
+     Alcotest.(check bool) "index unique preserved" true user_idx.C.idx_unique;
+     Alcotest.(check bool) "index origin preserved" true (user_idx.C.idx_origin = `User);
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group: schema-drift detection (#174)                                 *)
 (* ------------------------------------------------------------------ *)
@@ -2506,6 +2680,10 @@ let () =
             "recovers_empty_next_rowid (#250)"
             `Quick
             test_mirror_recovers_empty_next_rowid
+        ; Alcotest.test_case
+            "mirror_roundtrips_columns_fks_and_index (#484)"
+            `Quick
+            test_mirror_roundtrips_columns_fks_and_index
         ] )
     ; ( "drift"
       , [ Alcotest.test_case
