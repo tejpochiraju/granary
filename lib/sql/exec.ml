@@ -12263,6 +12263,8 @@ and stream_fts_match_scan
       proj
       include_rank
       snippets
+      limit
+      offset
   =
   (* #257: each matched FTS index row counts as one examined row — the index
      seek (and the content fetch it drives) is the work this scan does.  The
@@ -12281,6 +12283,21 @@ and stream_fts_match_scan
       if include_rank
       then List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
       else scored_matches
+    in
+    (* #687: slice to the [offset, offset+limit) window BEFORE the content
+       fetch loop below — sorting needs every score, but the content fetch
+       and snippet computation that follow are per-row work that only the
+       returned rows need to pay for. Mirrors [finalize_select]'s semantics:
+       an OFFSET with no LIMIT is a no-op (matches the plain-table / FTS seq
+       scan path), and LIMIT/OFFSET never change which rows are picked, only
+       how many of the sorted list are fetched. *)
+    let sorted =
+      match limit with
+      | None -> sorted
+      | Some n ->
+        let off = Option.value ~default:0 offset in
+        let stop = off + n in
+        List.filteri (fun i _ -> i >= off && i < stop) sorted
     in
     let snippet_terms = fts_query_terms_with_kind query in
     let* rows =
@@ -13304,7 +13321,8 @@ and to_stream
       agg_windows
   | Plan.Op_fts_seq_scan { fts_meta; where } ->
     stream_fts_seq_scan clock params store mode fts_meta where
-  | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
+  | Plan.Op_fts_match_scan
+      { fts_meta; query; proj; include_rank; snippets; limit; offset } ->
     stream_fts_match_scan
       clock
       params
@@ -13315,6 +13333,8 @@ and to_stream
       proj
       include_rank
       snippets
+      limit
+      offset
   | Plan.Op_pragma_rows { rows } -> Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_get_user_version ->
     S.with_ro store

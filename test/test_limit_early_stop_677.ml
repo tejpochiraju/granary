@@ -12,6 +12,11 @@
       ({!index_lookup_stops_early}), and — since #679 wired LIMIT/OFFSET
       through the FTS sema/planner path — an FTS sequential scan
       ({!fts_seq_scan_stops_early}, {!fts_seq_scan_offset_stops_early}).
+      #687 adds the FTS MATCH scan's content-fetch pass to this list —
+      it cannot stop the score-sorting pass early (sorting needs every
+      score), but the content fetch that follows is now bounded to the
+      sliced window ({!fts_match_scan_stops_early},
+      {!fts_match_scan_offset_stops_early}).
     - No leak: after a [LIMIT]-bounded query returns, on disk,
       {!Store.active_reader_count} / {!Store.live_read_locks} /
       {!Store.pinned_page_count} must be back at their pre-query baseline —
@@ -260,6 +265,44 @@ let fts_seq_scan_offset_stops_early () =
     (stats.Db.rows_examined <= 15)
 ;;
 
+(* #687: [stream_fts_match_scan] used to sort by score (score only, no
+   content) and then fetch content + compute snippets for EVERY matched row
+   via [Lwt_list.filter_map_s] over the full sorted list, before [Op_limit]
+   ever sliced the stream. So [LIMIT 3] against 200 matches did 200
+   content-tree fetches to return 3 rows. #687 threads [limit]/[offset] into
+   [Op_fts_match_scan] itself and slices the sorted-by-score list to the
+   [offset..offset+limit) window BEFORE the content-fetch loop, so
+   [rows_examined] (incremented once per fetch attempt, ahead of the
+   [S.get]) is now bounded near [offset + limit], not the full match
+   count. *)
+let fts_match_scan_stops_early () =
+  with_mem_db
+  @@ fun db ->
+  seed_fts db;
+  let n, stats = stats_of db "SELECT body FROM doc WHERE doc MATCH 'widget' LIMIT 3" in
+  Alcotest.(check int) "rows returned" 3 n;
+  Alcotest.(check bool)
+    "rows_examined bounded near the limit, not the full match count"
+    true
+    (stats.Db.rows_examined <= 10)
+;;
+
+(* #687: OFFSET must also be respected before the content fetch, not just
+   LIMIT. *)
+let fts_match_scan_offset_stops_early () =
+  with_mem_db
+  @@ fun db ->
+  seed_fts db;
+  let n, stats =
+    stats_of db "SELECT body FROM doc WHERE doc MATCH 'widget' LIMIT 3 OFFSET 5"
+  in
+  Alcotest.(check int) "rows returned" 3 n;
+  Alcotest.(check bool)
+    "rows_examined bounded near offset+limit, not the full match count"
+    true
+    (stats.Db.rows_examined <= 15)
+;;
+
 (* #679 correctness: LIMIT/OFFSET on a plain (no MATCH) FTS scan must slice
    the same way the plain-table path does — pin against the unlimited
    result, same run so no scan-order assumption is needed. *)
@@ -282,9 +325,12 @@ let fts_seq_scan_limit_offset_correctness () =
 ;;
 
 (* #679 correctness: LIMIT/OFFSET on a MATCH query. [stream_fts_match_scan]
-   sorts and materializes its whole result set up front (score sorting needs
-   the full set), so there is no early-stop claim here — only that
-   [Op_limit]'s slicing matches the unlimited MATCH result, same run. *)
+   sorts and materializes its whole match set up front (score sorting needs
+   the full set) — there is still no early-stop claim for the SCORING pass —
+   but #687 bounds the CONTENT-FETCH pass that follows to the sliced window,
+   so this pins that the answer is still exactly [Op_limit]'s slice of the
+   unlimited MATCH result, same run. See [fts_match_scan_stops_early] below
+   for the fetch-count bound itself. *)
 let fts_match_scan_limit_offset_correctness () =
   with_mem_db
   @@ fun db ->
@@ -358,6 +404,14 @@ let () =
             "fts seq scan offset stops early"
             `Quick
             fts_seq_scan_offset_stops_early
+        ; Alcotest.test_case
+            "fts match scan stops early"
+            `Quick
+            fts_match_scan_stops_early
+        ; Alcotest.test_case
+            "fts match scan offset stops early"
+            `Quick
+            fts_match_scan_offset_stops_early
         ] )
     ; ( "no_leak"
       , [ Alcotest.test_case

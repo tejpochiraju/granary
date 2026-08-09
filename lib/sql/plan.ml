@@ -299,6 +299,11 @@ type op =
       ; proj : int list
       ; include_rank : bool (** if true, append BM25 score as last projected column *)
       ; snippets : snippet_spec list
+      ; limit : int option
+        (** #687: applied to the score-sorted match list BEFORE the
+          content-tree fetch, so a bounded [LIMIT] does not pay a fetch per
+          unreturned match. *)
+      ; offset : int option (** #687: sliced together with [limit], same window. *)
       }
   | Op_pragma_rows of { rows : Granary_encoding.Row.t list }
   | Op_pragma_get_user_version
