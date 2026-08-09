@@ -33,9 +33,31 @@ type t =
 (* On-disk format versions:
    - v1: original layout, no schema fingerprints / mirror / page stamps.
    - v2: #174 — schema fingerprints, redundant catalog mirror, per-page
-     fingerprint stamp in the reserved header bytes. *)
-let current_format_version = 2l
-let max_supported_format_version = 2l
+     fingerprint stamp in the reserved header bytes.
+   - v3: #578 (PR #690) — [Index_key.encode_value]'s type-tag bytes were
+     renumbered so NaN gets its own tag [0x01], distinct from NULL's [0x00]
+     (previously byte-identical, which spuriously conflicted a NaN insert
+     against a pre-existing NULL under a UNIQUE index).  INTEGER/REAL/TEXT/BLOB
+     shifted from [0x01]-[0x04] to [0x02]-[0x05].  Every index key ever written
+     by a v2-or-older binary is therefore misread by a v3 decoder: the old
+     INTEGER tag byte [0x01] is now read as the NaN arm, which (unlike every
+     other arm) advances the decode offset past only the 1-byte tag rather than
+     the 8 payload bytes the old encoding actually wrote there, desyncing every
+     later field in that key.  There is no migration path, so v3 refuses to
+     open anything older (see [min_supported_format_version]) rather than risk
+     silently misdecoding an index. *)
+let current_format_version = 3l
+let max_supported_format_version = 3l
+
+(* Lowest on-disk format version this build can open.  Set equal to
+   [current_format_version]: v3's index-key tag renumbering (see above) is a
+   silent, garbage-producing incompatibility for any pre-existing index over
+   an INTEGER/REAL/TEXT/BLOB column, and there is no reindex-on-open mechanism
+   in this codebase to fall back to (verified: nothing between v1 and v2 ever
+   migrated in place either — a v1 file just kept being read/written as v1).
+   Refusing outright is the "loud, not silent" pattern this project already
+   uses for #634 (VACUUM staleness) and #598 (ATTACH routing). *)
+let min_supported_format_version = 3l
 
 type error =
   | Io of string
@@ -169,8 +191,14 @@ let read_live pager =
      | (Error _ : (t, error) result) as e -> e
      | Ok h ->
        (* Forward-compatibility gate (#174): refuse a database written by a
-          newer binary rather than misreading its layout. *)
-       if Int32.compare h.format_version max_supported_format_version > 0
+          newer binary rather than misreading its layout.  Backward gate
+          (#578/#690): refuse a database written by an older binary whose
+          index-key tag layout this decoder no longer agrees with, rather than
+          silently desyncing every key past the first NaN/INTEGER/REAL/TEXT/BLOB
+          tag it decodes (see [min_supported_format_version]). *)
+       if
+         Int32.compare h.format_version max_supported_format_version > 0
+         || Int32.compare h.format_version min_supported_format_version < 0
        then Error (Unsupported_format h.format_version)
        else Ok h)
 ;;

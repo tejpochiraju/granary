@@ -641,10 +641,18 @@ let natural_order cat (op : Plan.op) : [ `All | `Cols of int list ] option =
 
    [table_meta] is the same value the chosen access path carries (and that
    [natural_order] resolved ordinals against); [key_ok] consults it to refuse
-   a nullable REAL suffix column, where NULL and NaN collide to the same
-   index-key byte (see CLAUDE.md's #536/#578/#579 sections) — a NOT NULL REAL
-   column has no NULL to collide with, and a non-REAL column has no NaN at
-   all, so both remain eligible. *)
+   a nullable REAL suffix column (see CLAUDE.md's #536/#578/#579 sections) — a
+   NOT NULL REAL column has no NULL to worry about, and a non-REAL column has
+   no NaN at all, so both remain eligible.
+
+   #578 gave NaN its own index-key tag (sorting between NULL's and INTEGER's),
+   so the index's natural walk now visits NULL entries, then NaN entries, then
+   ordinary reals — exactly the order [NULLS FIRST] wants. The refusal
+   predates that fix, when NULL and NaN shared one byte and so could interleave
+   in an order the walk did not control. Left conservative deliberately: this
+   function guards sort ELISION (dropping a real sort step outright), a higher
+   bar than #578's own fix, and re-admitting nullable REAL here is an
+   unverified optimisation, not part of #578's scope. *)
 let order_satisfied_by_natural_order
       (table_meta : Cat.table_meta)
       natural
@@ -1274,9 +1282,10 @@ let estimate_rows cat (op : Plan.op) =
         more than it saves.
 
         {b With this conjunct the bound stops being an assumption and becomes a
-        theorem.}  [Index_key.encode_value] tags NULL and NaN [0x00], integers
-        [0x01] and reals [0x02], so NULL/NaN entries sort strictly below any
-        integer lower bound and cannot inflate the walk; a unique full key means
+        theorem.}  [Index_key.encode_value] tags NULL [0x00], NaN [0x01] (#578),
+        integers [0x02] and reals [0x03], so NULL and NaN entries both sort
+        strictly below any integer lower bound and cannot inflate the walk; a
+        unique full key means
         one key value is one entry; the bounded column being last means no
         further column multiplies it; and an integer column means the window's
         unit and the walk's unit are the same.  Take away any one of the four and

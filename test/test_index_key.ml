@@ -66,11 +66,46 @@ let test_neg_zero_less_than_pos_zero () =
   then Alcotest.fail "-0.0 should sort before +0.0 in encoding"
 ;;
 
-let test_nan_encodes_as_null () =
+(* #578: NaN used to encode identically to IK_null (both the single [0x00]
+   byte), which gave the UNIQUE conflict probe — which compares encoded bytes
+   — a false collision between a stored NULL and an inserted NaN, or vice
+   versa, depending on insert order. NaN now gets its own single-byte tag
+   [0x01], distinct from NULL's [0x00] but still sorting below INTEGER's
+   [0x02] and REAL's [0x03] — i.e. below every number, matching
+   [Exec.compare_values]'s [NULL < NaN < every number] exactly rather than
+   merely "both below every number". See test/test_unique_nan_null_578.ml for
+   the UNIQUE-index-level regression this fixes. *)
+let test_nan_encodes_distinctly_from_null () =
   let enc_nan = encode_value (IK_real Float.nan) in
   let enc_null = encode_value IK_null in
-  if not (Bytes.equal enc_nan enc_null)
-  then Alcotest.fail "NaN should encode identically to IK_null"
+  Alcotest.(check int) "nan encoded length" 1 (Bytes.length enc_nan);
+  Alcotest.(check int) "nan tag byte" 0x01 (Bytes.get_uint8 enc_nan 0);
+  if Bytes.equal enc_nan enc_null
+  then Alcotest.fail "NaN should no longer encode identically to IK_null (#578)"
+;;
+
+let test_null_less_than_nan_less_than_int () =
+  let enc_null = encode_value IK_null in
+  let enc_nan = encode_value (IK_real Float.nan) in
+  let enc_zero_int = encode_value (IK_int 0L) in
+  let enc_zero_real = encode_value (IK_real 0.0) in
+  if not (cmp_bytes enc_null enc_nan < 0) then Alcotest.fail "NULL should sort before NaN";
+  if not (cmp_bytes enc_nan enc_zero_int < 0)
+  then Alcotest.fail "NaN should sort before IK_int 0L";
+  if not (cmp_bytes enc_nan enc_zero_real < 0)
+  then Alcotest.fail "NaN should sort before IK_real 0.0"
+;;
+
+(* A NaN key must round-trip through [decode] as [IK_real nan], not collapse
+   to [IK_null] — the #578 fix's other half (the issue calls this the
+   "dormant second defect": a stored NaN was not recoverable from a covering
+   index read before this). *)
+let test_nan_roundtrips_through_decode () =
+  match decode (encode [ IK_real Float.nan ] ~rowid:7L) with
+  | Error msg -> Alcotest.failf "decode error: %s" msg
+  | Ok ([ IK_real f ], 7L) ->
+    Alcotest.(check bool) "decoded value is NaN" true (Float.is_nan f)
+  | Ok _ -> Alcotest.fail "unexpected decode result"
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -138,11 +173,13 @@ let test_blob_ordering () =
 
 let test_cross_type_ordering () =
   let enc_null = encode_value IK_null in
+  let enc_nan = encode_value (IK_real Float.nan) in
   let enc_int = encode_value (IK_int 0L) in
   let enc_real = encode_value (IK_real 0.0) in
   let enc_text = encode_value (IK_text "") in
   let enc_blob = encode_value (IK_blob Bytes.empty) in
-  if not (cmp_bytes enc_null enc_int < 0) then Alcotest.fail "NULL < INT";
+  if not (cmp_bytes enc_null enc_nan < 0) then Alcotest.fail "NULL < NaN (#578)";
+  if not (cmp_bytes enc_nan enc_int < 0) then Alcotest.fail "NaN < INT (#578)";
   if not (cmp_bytes enc_int enc_real < 0) then Alcotest.fail "INT < REAL";
   if not (cmp_bytes enc_real enc_text < 0) then Alcotest.fail "REAL < TEXT";
   if not (cmp_bytes enc_text enc_blob < 0) then Alcotest.fail "TEXT < BLOB"
@@ -204,10 +241,10 @@ let test_decode_buffer_too_short () =
 ;;
 
 let test_decode_truncated_integer () =
-  (* Tag 0x01 (INTEGER) followed by only 4 bytes (need 8) + 8 rowid bytes *)
+  (* Tag 0x02 (INTEGER) followed by only 4 bytes (need 8) + 8 rowid bytes *)
   let buf = Bytes.create 13 in
   (* 1 tag + 4 partial + 8 would-be rowid *)
-  Bytes.set_uint8 buf 0 0x01;
+  Bytes.set_uint8 buf 0 0x02;
   (* INTEGER tag *)
   (* only 4 bytes follow before the would-be rowid region: too short for 8-byte int *)
   match decode buf with
@@ -216,20 +253,20 @@ let test_decode_truncated_integer () =
 ;;
 
 let test_decode_truncated_real () =
-  (* Tag 0x02 (REAL) followed by only 4 bytes (need 8) + 8 rowid bytes *)
+  (* Tag 0x03 (REAL) followed by only 4 bytes (need 8) + 8 rowid bytes *)
   let buf = Bytes.create 13 in
-  Bytes.set_uint8 buf 0 0x02;
+  Bytes.set_uint8 buf 0 0x03;
   match decode buf with
   | Error _ -> () (* expected: truncated REAL *)
   | Ok _ -> Alcotest.fail "expected Error for truncated REAL field"
 ;;
 
 let test_decode_missing_escape_terminator () =
-  (* Tag 0x03 (TEXT) followed by a byte sequence with no 0x00 0x00 terminator *)
+  (* Tag 0x04 (TEXT) followed by a byte sequence with no 0x00 0x00 terminator *)
   (* Total: 1 tag + some bytes + 8 rowid = 1 + 5 + 8 = 14 bytes
      But the 5 bytes are all non-zero so no terminator before rowid region *)
   let buf = Bytes.create 14 in
-  Bytes.set_uint8 buf 0 0x03;
+  Bytes.set_uint8 buf 0 0x04;
   (* TEXT tag *)
   Bytes.set_uint8 buf 1 0x41;
   (* 'A' *)
@@ -275,7 +312,7 @@ let test_decode_text_eof_after_zero_byte () =
   (* This exercise the missing-terminator arm reliably and additionally
      uses a tighter buffer that approaches the lone-0x00 case. *)
   let buf = Bytes.create 10 in
-  Bytes.set_uint8 buf 0 0x03;
+  Bytes.set_uint8 buf 0 0x04;
   (* TEXT tag *)
   Bytes.set_uint8 buf 1 0x00;
   (* lone zero followed by 8 rowid bytes *)
@@ -288,10 +325,10 @@ let test_decode_text_eof_after_zero_byte () =
 ;;
 
 let test_decode_invalid_escape_byte () =
-  (* Tag 0x03 (TEXT) with 0x00 0x42 (invalid escape: second byte should be 0x00 or 0xFF) *)
+  (* Tag 0x04 (TEXT) with 0x00 0x42 (invalid escape: second byte should be 0x00 or 0xFF) *)
   let buf = Bytes.create 12 in
   (* 1 tag + 2 escape bytes + 1 bogus + 8 rowid *)
-  Bytes.set_uint8 buf 0 0x03;
+  Bytes.set_uint8 buf 0 0x04;
   (* TEXT tag *)
   Bytes.set_uint8 buf 1 0x00;
   (* start of escape *)
@@ -303,10 +340,11 @@ let test_decode_invalid_escape_byte () =
 ;;
 
 let test_decode_unknown_tag () =
-  (* Tag 0x05 is not a valid type tag *)
+  (* Tag 0x06 is not a valid type tag (0x00-0x05 are all taken since #578 gave
+     NaN its own tag). *)
   let buf = Bytes.create 9 in
   (* 1 unknown tag + 8 rowid bytes *)
-  Bytes.set_uint8 buf 0 0x05;
+  Bytes.set_uint8 buf 0 0x06;
   match decode buf with
   | Error _ -> () (* expected: unknown tag *)
   | Ok _ -> Alcotest.fail "expected Error for unknown tag byte"
@@ -316,7 +354,7 @@ let test_decode_rowid_tail_wrong_length () =
   (* A valid INTEGER value (9 bytes) + 4 leftover bytes (not 8) — wrong rowid tail *)
   let buf = Bytes.create 13 in
   (* 1 tag + 8 int + 4 partial rowid *)
-  Bytes.set_uint8 buf 0 0x01;
+  Bytes.set_uint8 buf 0 0x02;
   (* INTEGER tag *)
   (* buf[1..8] = int data (zeros = 0L encoded with sign-bit flip) *)
   (* 4 remaining bytes after the 9-byte integer — not exactly 8 *)
@@ -357,7 +395,10 @@ let prop_text_order_preserving =
        cmp_str = cmp_bytes)
 ;;
 
-(* Generator for a single index key value (non-NaN reals) *)
+(* Generator for a single index key value.  NaN reals are included since
+   #578 — they now round-trip through [decode] as [IK_real nan], rather than
+   collapsing to [IK_null] — but non-NaN infinities are still excluded for
+   clean round-trip testing (unrelated to #578). *)
 let gen_value =
   let open QCheck.Gen in
   oneof_weighted
@@ -366,8 +407,9 @@ let gen_value =
     ; ( 3
       , map
           (fun f ->
-             (* Avoid NaN and infinity for clean round-trip testing *)
-             let f = if Float.is_nan f || Float.is_infinite f then 0.0 else f in
+             (* Avoid infinity for clean round-trip testing (unrelated to #578);
+                NaN is left as-is and handled specially by the comparison below. *)
+             let f = if (not (Float.is_nan f)) && Float.is_infinite f then 0.0 else f in
              IK_real f)
           float )
     ; 3, map (fun s -> IK_text s) string
@@ -386,37 +428,35 @@ let gen_key =
 
 let arb_key = QCheck.make gen_key
 
-(* QCheck: encode/decode round-trip *)
+(* QCheck: encode/decode round-trip.  Since #578 a NaN real round-trips as
+   [IK_real nan] rather than collapsing to [IK_null], so it needs no
+   filtering — but [encode_value] only preserves "is this a NaN", not the
+   generator's arbitrary NaN bit pattern (the encoding is a single fixed tag
+   byte with no payload), so the comparison below treats any two NaNs as
+   equal rather than requiring identical bits. *)
 let prop_encode_decode_roundtrip =
   QCheck.Test.make
     ~count:10000
     ~name:"encode/decode roundtrip"
     arb_key
     (fun (cols, rowid) ->
-       (* Filter out NaN reals — they encode as IK_null so can't round-trip *)
-       let cols_clean =
-         List.map
-           (function
-             | IK_real f when Float.is_nan f -> IK_null
-             | v -> v)
-           cols
-       in
-       match decode (encode cols_clean ~rowid) with
+       match decode (encode cols ~rowid) with
        | Error _ -> false
        | Ok (cols', rowid') ->
          rowid = rowid'
-         && List.length cols_clean = List.length cols'
+         && List.length cols = List.length cols'
          && List.for_all2
               (fun a b ->
                  match a, b with
                  | IK_null, IK_null -> true
                  | IK_int x, IK_int y -> Int64.equal x y
                  | IK_real x, IK_real y ->
-                   Int64.equal (Int64.bits_of_float x) (Int64.bits_of_float y)
+                   (Float.is_nan x && Float.is_nan y)
+                   || Int64.equal (Int64.bits_of_float x) (Int64.bits_of_float y)
                  | IK_text x, IK_text y -> String.equal x y
                  | IK_blob x, IK_blob y -> Bytes.equal x y
                  | _, _ -> false)
-              cols_clean
+              cols
               cols')
 ;;
 
@@ -460,7 +500,18 @@ let () =
     ; ( "real"
       , [ Alcotest.test_case "-1.0 < 0.0 < 1.0" `Quick test_real_ordering_neg_zero_pos
         ; Alcotest.test_case "-0.0 < +0.0" `Quick test_neg_zero_less_than_pos_zero
-        ; Alcotest.test_case "NaN encodes as IK_null" `Quick test_nan_encodes_as_null
+        ; Alcotest.test_case
+            "NaN encodes distinctly from NULL (#578)"
+            `Quick
+            test_nan_encodes_distinctly_from_null
+        ; Alcotest.test_case
+            "NULL < NaN < INT/REAL (#578)"
+            `Quick
+            test_null_less_than_nan_less_than_int
+        ; Alcotest.test_case
+            "NaN round-trips through decode (#578)"
+            `Quick
+            test_nan_roundtrips_through_decode
         ] )
     ; ( "text"
       , [ Alcotest.test_case "\"a\" < \"aa\" < \"b\"" `Quick test_text_ordering

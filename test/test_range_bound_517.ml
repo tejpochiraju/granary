@@ -367,9 +367,10 @@ let text_range_is_correct_without_a_bound () =
 (* NULLs IN the ranged column — the entries for which the stop test's comparison
    window runs past the column boundary, because a NULL encodes to one byte
    rather than the bounded types' nine.  What keeps that sound is the ordering
-   of the encoding's type tags: [0x00] for NULL sorts below [0x01] for integer,
-   so a misaligned window always compares low, the walk is never cut short, and
-   the NULL entries sort to the front of the group anyway.
+   of the encoding's type tags: [0x00] for NULL sorts below [0x02] for integer
+   (and, since #578, [0x01] for NaN sorts between the two), so a misaligned
+   window always compares low, the walk is never cut short, and the NULL
+   entries sort to the front of the group anyway.
 
    This case exists because that is the input the justification turns on.  It
    pins both halves — the rows still match the unoptimizable foil, AND the
@@ -982,11 +983,14 @@ let integer_bound_narrows_a_real_column () =
 (* NaN and the infinities cannot be spelled as literals, so they arrive as bound
    parameters. None of them may produce a wrong key.
 
-   NaN gets exactly the treatment a same-type NaN bound already gets: it encodes
-   to the single [0x00] NULL/NaN byte, which sorts below every other key. That
-   agrees with the residual predicate, whose [Float.compare] also orders NaN
-   below every number — so a NaN LOWER bound admits every row and a NaN UPPER
-   bound stops the walk on the first key.
+   NaN gets exactly the treatment a same-type NaN bound already gets: since
+   #578 it encodes to its own single [0x01] tag byte (distinct from NULL's
+   [0x00]), which still sorts below every INTEGER/REAL key. That agrees with
+   the residual predicate, whose [Float.compare] also orders NaN below every
+   number — so a NaN LOWER bound admits every row and a NaN UPPER bound stops
+   the walk on the first key. (Before #578, NaN shared NULL's [0x00] byte
+   outright; the tag changed, the "sorts below every number" property it is
+   tested for here did not.)
 
    The expectations below are the foil's, not SQLite's. SQLite has no NaN at
    all: [sqlite3_bind_double(NaN)] binds NULL and a NaN expression result is
@@ -1000,17 +1004,20 @@ let integer_bound_narrows_a_real_column () =
    is reopening #536, not fixing a bug.
 
    What they are really guarding is the AGREEMENT between the two mechanisms:
-   [Exec.cmp_result]'s [Float.compare] and [Index_key.encode_value]'s [0x00]
-   byte both put NaN below everything, so a seek and its residual predicate can
+   [Exec.cmp_result]'s [Float.compare] and [Index_key.encode_value]'s NaN tag
+   both put NaN below every number, so a seek and its residual predicate can
    never disagree. Move one without the other and this becomes a rows-lost bug.
    That is why each case is checked against the unoptimizable foil as well as
    against a row count. See CLAUDE.md's "inspired by, not a port" section.
 
-   That agreement holds for NaN vs NUMBERS only. NaN vs NULL is where the two
-   levels part company — [compare_values] says NULL < NaN, the index encoding
-   says NaN = NULL — and index-keyed UNIQUE enforcement reads those bytes as an
-   equality, so it answers order-dependently. That is #578, a bug, and it is
-   deliberately out of scope here: nothing below involves a UNIQUE index. *)
+   Before #578 that agreement held for NaN vs NUMBERS only, and NaN vs NULL was
+   where the two levels parted company — [compare_values] said NULL < NaN, the
+   index encoding said NaN = NULL — so index-keyed UNIQUE enforcement, which
+   reads those bytes as an equality, answered order-dependently. #578 gave NaN
+   its own tag, so the two levels now agree about NaN vs NULL too:
+   `test/test_index_key.ml` and `test/test_unique_nan_null_578.ml` pin the
+   encoding and the UNIQUE behaviour respectively; nothing below involves a
+   UNIQUE index. *)
 let nan_and_infinite_bounds_are_sound () =
   with_db (fun db ->
     seed db;
