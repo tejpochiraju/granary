@@ -76,6 +76,16 @@ let expect_ok db sql params ~msg =
   | Error e -> Alcotest.failf "%s : expected success, got: %a" msg Db.pp_error e
 ;;
 
+(* Like [expect_ok] but against an already-{!prepare}d statement, for callers
+   that seed several rows through one reusable statement rather than
+   re-preparing the same SQL per row. Doesn't assert a row count — some
+   callers only care that the write didn't raise. *)
+let expect_ok_stmt st params ~msg =
+  match run (Db.run st ~params) with
+  | Ok _ -> ()
+  | Error e -> Alcotest.failf "%s : expected success, got: %a" msg Db.pp_error e
+;;
+
 let expect_unique_violation db sql params ~table ~col ~msg =
   let want = Printf.sprintf "UNIQUE constraint failed: %s.%s" table col in
   match run_stmt db sql params with
@@ -190,12 +200,8 @@ let create_unique_index_over_existing_null_and_nan () =
   with_db (fun db ->
     exec db "CREATE TABLE t (k INTEGER PRIMARY KEY, r REAL)";
     let st = prepare db "INSERT INTO t (k, r) VALUES (?, ?)" in
-    (match run (Db.run st ~params:[ Db.V_int 1L; Db.V_null ]) with
-     | Ok _ -> ()
-     | Error e -> Alcotest.failf "seed NULL row: %a" Db.pp_error e);
-    (match run (Db.run st ~params:[ Db.V_int 2L; Db.V_real nan ]) with
-     | Ok _ -> ()
-     | Error e -> Alcotest.failf "seed NaN row: %a" Db.pp_error e);
+    expect_ok_stmt st [ Db.V_int 1L; Db.V_null ] ~msg:"seed NULL row";
+    expect_ok_stmt st [ Db.V_int 2L; Db.V_real nan ] ~msg:"seed NaN row";
     exec db "CREATE UNIQUE INDEX u ON t (r)")
 ;;
 
@@ -208,15 +214,9 @@ let update_to_nan_does_not_collide_with_existing_null () =
   with_db (fun db ->
     seed_unique_real db;
     let st = prepare db "INSERT INTO t (k, r) VALUES (?, ?)" in
-    (match run (Db.run st ~params:[ Db.V_int 1L; Db.V_null ]) with
-     | Ok _ -> ()
-     | Error e -> Alcotest.failf "seed NULL row: %a" Db.pp_error e);
-    (match run (Db.run st ~params:[ Db.V_int 2L; Db.V_real 5.0 ]) with
-     | Ok _ -> ()
-     | Error e -> Alcotest.failf "seed real row: %a" Db.pp_error e);
-    (match run (Db.run st ~params:[ Db.V_int 3L; Db.V_real 6.0 ]) with
-     | Ok _ -> ()
-     | Error e -> Alcotest.failf "seed second real row: %a" Db.pp_error e);
+    expect_ok_stmt st [ Db.V_int 1L; Db.V_null ] ~msg:"seed NULL row";
+    expect_ok_stmt st [ Db.V_int 2L; Db.V_real 5.0 ] ~msg:"seed real row";
+    expect_ok_stmt st [ Db.V_int 3L; Db.V_real 6.0 ] ~msg:"seed second real row";
     expect_ok
       db
       "UPDATE t SET r = ? WHERE k = 2"
@@ -241,9 +241,7 @@ let composite_index_leading_nan_column () =
     exec db "CREATE TABLE c (k INTEGER PRIMARY KEY, r REAL, s TEXT)";
     exec db "CREATE UNIQUE INDEX cu ON c (r, s)";
     let st = prepare db "INSERT INTO c (k, r, s) VALUES (?, ?, ?)" in
-    (match run (Db.run st ~params:[ Db.V_int 1L; Db.V_null; Db.V_text "a" ]) with
-     | Ok _ -> ()
-     | Error e -> Alcotest.failf "seed NULL row: %a" Db.pp_error e);
+    expect_ok_stmt st [ Db.V_int 1L; Db.V_null; Db.V_text "a" ] ~msg:"seed NULL row";
     (* A leading NaN with any trailing value must insert, not collide with
        the leading-NULL row above. *)
     match run (Db.run st ~params:[ Db.V_int 2L; Db.V_real nan; Db.V_text "b" ]) with
@@ -266,9 +264,7 @@ let nan_still_sorts_below_every_number_in_a_range_scan () =
     done;
     exec db "COMMIT";
     let st = prepare db "INSERT INTO r (k, v) VALUES (100, ?)" in
-    (match run (Db.run st ~params:[ Db.V_real nan ]) with
-     | Ok _ -> ()
-     | Error e -> Alcotest.failf "seed NaN row: %a" Db.pp_error e);
+    expect_ok_stmt st [ Db.V_real nan ] ~msg:"seed NaN row";
     (* A NaN lower bound admits every row (NaN sorts below every number, so
        [v >= NaN] is trivially satisfied by every real too, matching #536's
        decided divergence from SQLite). *)

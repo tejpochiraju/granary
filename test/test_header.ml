@@ -352,6 +352,50 @@ let test_unsupported_format_rejected () =
   | Error e -> Alcotest.failf "wrong error: %a" Header.pp_error e
 ;;
 
+(* #578/#690: a header stamped with an older-than-supported format_version is
+   rejected on open with the same [Unsupported_format] error, rather than
+   silently misdecoded.  v3 renumbered [Index_key.encode_value]'s type tags
+   (NaN got its own tag, INTEGER/REAL/TEXT/BLOB shifted up), so a v2-or-older
+   file's index keys are no longer decodable under the current tag layout —
+   this pins that the engine refuses to open one rather than desyncing every
+   key past the first tag byte it misreads. *)
+let test_obsolete_format_rejected () =
+  let _pager, mb = make_pager () in
+  let bad_version = Int32.sub Header.min_supported_format_version 1l in
+  let build_bad () =
+    let buf = Cstruct.create Page.page_size in
+    Page.write_common
+      buf
+      { Page.kind = Page.Header; flags = 0; n_keys = 0; right_page = 0l; crc32 = 0l };
+    Page.write_header_fields
+      buf
+      { Page.txn_id = 1L
+      ; root_page = 0L
+      ; freelist_page = 0L
+      ; n_pages_total = 0L
+      ; schema_version = 0L
+      ; page_size = Int32.of_int Page.page_size
+      ; format_version = bad_version
+      ; reserved_bytes_per_page = 0l
+      ; enc_magic = 0l
+      ; canary_nonce = String.make 16 '\000'
+      ; canary_tag = String.make 16 '\000'
+      };
+    Page.seal buf;
+    let bytes = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes buf 0 bytes 0 Page.page_size;
+    bytes
+  in
+  Hashtbl.replace mb.store 0L (build_bad ());
+  Hashtbl.replace mb.store 1L (build_bad ());
+  let pager2 = fresh_pager_over mb () in
+  match run (Header.read_live pager2) with
+  | Error (Header.Unsupported_format v) ->
+    Alcotest.(check int32) "reports the offending version" bad_version v
+  | Ok _ -> Alcotest.fail "expected Unsupported_format"
+  | Error e -> Alcotest.failf "wrong error: %a" Header.pp_error e
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Error-path coverage                                                 *)
 (* ------------------------------------------------------------------ *)
@@ -618,6 +662,10 @@ let () =
             "unsupported format_version rejected"
             `Quick
             test_unsupported_format_rejected
+        ; Alcotest.test_case
+            "obsolete format_version rejected"
+            `Quick
+            test_obsolete_format_rejected
         ] )
     ; ( "encryption"
       , [ Alcotest.test_case

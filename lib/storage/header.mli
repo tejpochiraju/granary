@@ -27,17 +27,27 @@ type t =
 
 (** On-disk format version this build writes for freshly-initialised
     databases.  v1 = pre-#174 (no fingerprints); v2 = #174 (schema
-    fingerprints, redundant catalog mirror, per-page fingerprint stamp). *)
+    fingerprints, redundant catalog mirror, per-page fingerprint stamp); v3 =
+    #578/#690 (renumbered {!Granary_encoding.Index_key} type tags, giving NaN
+    its own tag distinct from NULL). *)
 val current_format_version : int32
 
 (** Highest on-disk format version this build can open.  [read_live] fails
     with [Unsupported_format] for any database stamped above this. *)
 val max_supported_format_version : int32
 
+(** Lowest on-disk format version this build can open.  [read_live] fails with
+    [Unsupported_format] for any database stamped below this — v3's index-key
+    tag renumbering (#578/#690) has no migration path, so an older file is
+    refused rather than silently misdecoded. *)
+val min_supported_format_version : int32
+
 type error =
   | Io of string
   | Both_headers_corrupt
-  | Unsupported_format of int32 (** on-disk format_version exceeds support *)
+  | Unsupported_format of int32
+  (** on-disk format_version is outside [min_supported_format_version,
+        max_supported_format_version] *)
 
 (** Pretty-print all header fields. *)
 val pp : Format.formatter -> t -> unit
