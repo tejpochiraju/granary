@@ -3002,7 +3002,7 @@ let two_pow_63 = 9.2233720368547758e18
 
     The result must be an [IK_int] on an integer column, not the real as given:
     {!Granary_encoding.Index_key.encode_value} emits a distinct leading type tag
-    per type ([0x01] integer, [0x02] real), so an [IK_real] bound sorts into the
+    per type ([0x02] integer, [0x03] real), so an [IK_real] bound sorts into the
     reals' region and never meets the stored integer keys at all — encoding it
     as-is would be worse than declining.
 
@@ -3017,10 +3017,11 @@ let two_pow_63 = 9.2233720368547758e18
       {!index_lookup_values} decides.
 
     A NaN is deliberately {i not} declined: it goes through as [IK_real nan],
-    which {!Granary_encoding.Index_key.encode_value} writes as the single [0x00]
-    NULL/NaN byte sorting below every other key.  That matches the residual
-    predicate, whose [Float.compare] also orders NaN below every number, and is
-    the existing behaviour for a same-type NaN bound — see [range_seek_bounds]. *)
+    which {!Granary_encoding.Index_key.encode_value} writes as its own
+    single-byte [0x01] tag (#578), sorting below every INTEGER/REAL key but
+    above NULL's [0x00].  That matches the residual predicate, whose
+    [Float.compare] also orders NaN below every number, and is the existing
+    behaviour for a same-type NaN bound — see [range_seek_bounds]. *)
 let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
   : Index_key.value option
   =
@@ -3077,21 +3078,23 @@ let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
     The stop test compares a fixed-width window at offset [plen], which needs
     care: {b the bounded column is NOT always that width}.  [Plan.range] admits
     only [Integer] and [Real], whose encodings are 9 bytes — but
-    {!Granary_encoding.Index_key.encode_value} emits a {i single} [0x00] byte
-    for a NULL, and for a NaN real, which it encodes as NULL.  On such an entry
-    the window runs past the column boundary into the bytes that follow.
+    {!Granary_encoding.Index_key.encode_value} emits a {i single} byte for a
+    NULL ([0x00]) and, since #578, a {i different} single byte for a NaN real
+    ([0x01]).  On such an entry the window runs past the column boundary into
+    the bytes that follow.
 
     That is still sound, and this is the load-bearing reason — not the width.
-    The NULL/NaN tag [0x00] sorts below both the integer tag [0x01] and the real
-    tag [0x02], so a misaligned window always compares {i low}: [past_end] never
-    fires early on one, and those entries sort to the front of the prefix group
-    anyway, ahead of anything the bound could exclude.  A future change to the
-    tag ordering, not to the widths, is what would break this.
+    Both the NULL tag [0x00] and the NaN tag [0x01] sort below the integer tag
+    [0x02] and the real tag [0x03], so a misaligned window always compares
+    {i low}: [past_end] never fires early on one, and those entries sort to
+    the front of the prefix group anyway, ahead of anything the bound could
+    exclude.  A future change to the tag ordering, not to the widths, is what
+    would break this.
 
-    The mirror case is a NaN {i bound}, which encodes to that same one byte and
-    so makes [past_end] fire on the very first key: the seek returns nothing,
-    which agrees with the residual predicate, whose [Float.compare] also orders
-    NaN below every number.
+    The mirror case is a NaN {i bound}, which encodes to its own one byte and
+    so makes [past_end] fire on the very first key whose tag is [0x02] or
+    above — the seek returns nothing, which agrees with the residual
+    predicate, whose [Float.compare] also orders NaN below every number.
 
     #527: an end whose type is not the column's is not simply dropped — a
     numeric one is promoted across the int/real boundary by {!range_bound_key},
@@ -11576,15 +11579,18 @@ and aggregate_fast_path
 
 (* #674 (item 1 of 3): decode one column read off an index entry into a
    [Row.value].  [col_ty] is the DECLARED type of the table column at that
-   ordinal.  [Index_key.decode]'s [IK_null] is ambiguous between "the value is
-   NULL" and "the value is NaN" (#536: both encode to the same [0x00] byte);
-   every caller of this function has already gated the column to NOT NULL
-   (see [index_cover_eligible]), so an actual NULL cannot occur here and
-   [IK_null] can only mean NaN on a REAL column.  On any other declared type a
-   NOT NULL column can never legally encode [IK_null] at all — [V_null] is
-   returned defensively rather than raising, matching the general engine's
-   preference (per CLAUDE.md's #638 section) for surfacing rather than
-   crashing on an invariant that "cannot" be violated. *)
+   ordinal.  Before #578, [Index_key.decode]'s [IK_null] was ambiguous between
+   "the value is NULL" and "the value is NaN" (#536: both encoded to the same
+   [0x00] byte); every caller of this function has already gated the column to
+   NOT NULL (see [index_cover_eligible]), so an actual NULL cannot occur here.
+   Since #578 a NaN decodes to its own [Index_key.IK_real nan], never
+   [IK_null], so the [Row.Real -> V_real nan] arm below is unreachable through
+   any live caller today — it is kept as the defensive fallback rather than
+   deleted: on any declared type a NOT NULL column can never legally encode
+   [IK_null] at all, and [V_null] (or, for REAL, [V_real nan]) is returned
+   rather than raising, matching the general engine's preference (per
+   CLAUDE.md's #638 section) for surfacing rather than crashing on an
+   invariant that "cannot" be violated. *)
 and index_value_to_row_value (col_ty : Row.ty) (iv : Index_key.value) : Row.value =
   match iv with
   | Index_key.IK_null ->
@@ -11612,8 +11618,12 @@ and index_value_to_row_value (col_ty : Row.ty) (iv : Index_key.value) : Row.valu
 
    Gates, matching the design doc's stated scope exactly:
    - every column [pred_opt] or any [agg]'s argument reads must be part of
-     the index AND declared NOT NULL (#536: otherwise [IK_null] is ambiguous
-     between NULL and NaN);
+     the index AND declared NOT NULL (#536: at the time this was written,
+     [IK_null] was ambiguous between NULL and NaN, so a nullable column could
+     not be read back safely.  #578 gave NaN its own tag and resolved that
+     specific ambiguity, but the NOT NULL requirement here predates and is
+     not re-derived from it — relaxing this gate for nullable REAL columns is
+     a separate, unverified optimisation and out of #578's scope);
    - only [Agg_count], [Agg_min], [Agg_max] are covered — SUM/AVG/GROUP_CONCAT
      are out of this item's scope;
    - MIN/MAX additionally require: no #517 [range], and the aggregated column
@@ -11646,7 +11656,11 @@ and index_cover_idx_ords (table_meta : Cat.table_meta) (idx_info : Cat.index_inf
 
 (* #536: a column is safe to read off the index only if it is part of the
    index (so it is actually present in the encoded key) AND declared NOT
-   NULL (so [IK_null] can never mean an ambiguous NULL/NaN). *)
+   NULL.  See the #578 note on [index_cover_eligible] above: the NULL/NaN
+   ambiguity this originally guarded against was fixed at the encoding level
+   by #578, so this NOT NULL requirement is now conservative rather than
+   strictly necessary — kept as-is because relaxing it is a separate,
+   unverified change. *)
 and index_cover_ok_col (table_meta : Cat.table_meta) (idx_ords : int array) ord : bool =
   let is_idx_ord = Array.exists (fun o -> o = ord) idx_ords in
   let col_not_null =

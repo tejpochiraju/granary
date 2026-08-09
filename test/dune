@@ -1243,6 +1243,22 @@
   lwt.unix
   unix))
 
+; #578: NaN and NULL used to share the index-key byte 0x00, so UNIQUE
+; enforcement over a nullable REAL column gave order-dependent answers.
+
+(test
+ (name test_unique_nan_null_578)
+ (modules test_unique_nan_null_578)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #629: NOT NULL on a GENERATED column is enforced on the COMPUTED value, not
 ; on the placeholder the binder fills an omitted column with — before the fix
 ; such a table was uninsertable.

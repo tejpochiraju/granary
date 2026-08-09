@@ -108,19 +108,26 @@ let encode_value v =
   match v with
   | IK_null -> Bytes.make 1 '\x00'
   | IK_int n ->
-    (* tag 0x01 + 8 bytes big-endian with sign bit flipped *)
+    (* tag 0x02 + 8 bytes big-endian with sign bit flipped *)
     let buf = Bytes.create 9 in
-    Bytes.set_uint8 buf 0 0x01;
+    Bytes.set_uint8 buf 0 0x02;
     let flipped = Int64.logxor n 0x8000_0000_0000_0000L in
     write_be64 buf 1 flipped;
     buf
   | IK_real f ->
-    (* NaN → treat as NULL *)
+    (* #578: NaN gets its OWN single-byte tag [0x01], distinct from NULL's
+       [0x00] but still sorting below every INTEGER/REAL key (tags [0x02] and
+       [0x03]).  It used to collapse onto NULL's [0x00] byte, which made a
+       NaN and a NULL byte-identical and gave `check_insert_unique`'s
+       encoded-byte probe a false UNIQUE conflict between them (#578) — while
+       `compare_values`, at the value level, has always ordered
+       `NULL < NaN < every number`.  Giving NaN [0x01] makes the two levels
+       agree exactly, everywhere, not just "both below every number". *)
     if Float.is_nan f
-    then Bytes.make 1 '\x00'
+    then Bytes.make 1 '\x01'
     else (
       let buf = Bytes.create 9 in
-      Bytes.set_uint8 buf 0 0x02;
+      Bytes.set_uint8 buf 0 0x03;
       let bits = Int64.bits_of_float f in
       (* Order-preserving encoding for IEEE 754 doubles:
          - Negative float (sign bit = 1): flip ALL bits.
@@ -148,14 +155,14 @@ let encode_value v =
     let escaped = encode_escaped_bytes src in
     let elen = Bytes.length escaped in
     let buf = Bytes.create (1 + elen) in
-    Bytes.set_uint8 buf 0 0x03;
+    Bytes.set_uint8 buf 0 0x04;
     Bytes.blit escaped 0 buf 1 elen;
     buf
   | IK_blob b ->
     let escaped = encode_escaped_bytes b in
     let elen = Bytes.length escaped in
     let buf = Bytes.create (1 + elen) in
-    Bytes.set_uint8 buf 0 0x04;
+    Bytes.set_uint8 buf 0 0x05;
     Bytes.blit escaped 0 buf 1 elen;
     buf
 ;;
@@ -198,6 +205,9 @@ let decode_index_col buf ~off ~cols ~err =
   match tag with
   | 0x00 -> cols := IK_null :: !cols
   | 0x01 ->
+    (* #578: NaN's own single-byte tag — see [encode_value]. *)
+    cols := IK_real Float.nan :: !cols
+  | 0x02 ->
     (* 8 bytes big-endian, sign bit flipped *)
     if !off + 8 > len
     then err := Some "buffer too short for INTEGER"
@@ -206,7 +216,7 @@ let decode_index_col buf ~off ~cols ~err =
       let n = Int64.logxor stored 0x8000_0000_0000_0000L in
       cols := IK_int n :: !cols;
       off := !off + 8)
-  | 0x02 ->
+  | 0x03 ->
     (* 8 bytes; MSB=0 means was negative (flip all bits back),
        MSB=1 means was positive (flip only sign bit back) *)
     if !off + 8 > len
@@ -224,14 +234,14 @@ let decode_index_col buf ~off ~cols ~err =
           Int64.logxor stored Int64.min_int
       in
       cols := IK_real (Int64.float_of_bits bits) :: !cols)
-  | 0x03 ->
+  | 0x04 ->
     (* TEXT: escaped bytes + 0x00 0x00 terminator *)
     (match decode_escaped_bytes buf !off with
      | Error msg -> err := Some msg
      | Ok (raw, next_off) ->
        cols := IK_text (Bytes.to_string raw) :: !cols;
        off := next_off)
-  | 0x04 ->
+  | 0x05 ->
     (* BLOB: escaped bytes + 0x00 0x00 terminator *)
     (match decode_escaped_bytes buf !off with
      | Error msg -> err := Some msg
