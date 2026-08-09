@@ -1534,3 +1534,20 @@
  (name test_view_columns_491)
  (modules test_view_columns_491)
  (libraries granary granary.unix granary.encoding alcotest lwt.unix unix))
+
+; #674 (item 1 of 3): covering-index reads for MIN/MAX/COUNT/EXISTS over an
+; Op_index_lookup — rows_examined must be 0, and the fast path must agree
+; exactly with the general path with GRANARY_AGG_FASTPATH=0.
+
+(test
+ (name test_covering_index_674)
+ (modules test_covering_index_674)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
