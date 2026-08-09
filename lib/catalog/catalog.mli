@@ -141,7 +141,21 @@ type fts_table_meta =
   ; fts_content_tree : Granary_store.Store.tree_id
   ; fts_index_tree : Granary_store.Store.tree_id
   ; fts_columns : string list
+  ; fts_format_version : int
+    (** #689 scaffolding: 0 for every table whose posting-list entries were
+            written before this field existed (no trailing version varint in
+            the encoded meta value), [fts_current_format_version] for a table
+            created or rewritten since.  Read-only for now — the posting-list
+            encoding itself ([decode_positions]) does not yet branch on it;
+            this only makes the tag observable so a future doc_length-inlining
+            change (#689) can dual-decode by table instead of guessing. *)
   }
+
+(** The format version stamped on every newly created FTS table.  Bump this
+    and add a decode branch in [decode_fts_value] callers' consumers when the
+    posting-list value format actually changes (#689); a table already on
+    disk keeps its stamped version until rewritten. *)
+val fts_current_format_version : int
 
 (** Open (or initialise) a catalog on the given store.
     Loads all existing table metadata and index metadata from the store.

@@ -1852,6 +1852,70 @@ let make_table_value tree_id =
 
 let sys_tables_tid = 0
 let sys_columns_tid = 1
+let sys_fts_tid = 4
+
+(* #689 scaffolding: [fts_table_meta] gained a trailing [fts_format_version]
+   varint. A table created (or rewritten) after that change stamps
+   [C.fts_current_format_version]; a table whose stored bytes predate the
+   field decode as version 0, since there is nothing after the columns to
+   read. *)
+let test_fts_format_version_new_table () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* meta = C.create_fts_table cat ~name:"docs" ~columns:[ "body" ] in
+     Alcotest.(check int)
+       "newly created fts table stamps the current format version"
+       C.fts_current_format_version
+       meta.C.fts_format_version;
+     let found = C.find_fts cat "docs" in
+     match found with
+     | None -> Alcotest.fail "expected fts meta for docs"
+     | Some m ->
+       Alcotest.(check int)
+         "find_fts agrees with the value create_fts_table returned"
+         C.fts_current_format_version
+         m.C.fts_format_version;
+       Lwt.return_unit)
+;;
+
+let test_fts_format_version_legacy_bytes () =
+  run
+    (let store = S.create () in
+     (* Hand-build a pre-#689 value: content_tree, index_tree, n_cols, then
+        (col_len ++ col_bytes)* with NO trailing version varint — exactly what
+        every FTS table created before this field existed has on disk. *)
+     let legacy_bytes =
+       let buf = Buffer.create 32 in
+       let v = Varint.encode_uint64 in
+       v buf 5L;
+       (* content_tree *)
+       v buf 6L;
+       (* index_tree *)
+       v buf 1L;
+       (* n_cols *)
+       v buf 4L;
+       (* col len *)
+       Buffer.add_string buf "body";
+       Buffer.to_bytes buf
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.put tx sys_fts_tid (Bytes.of_string "legacy_docs") legacy_bytes in
+     let* () = S.commit tx in
+     let* cat = C.open_ store in
+     let found = C.find_fts cat "legacy_docs" in
+     match found with
+     | None -> Alcotest.fail "expected legacy fts meta for legacy_docs to load"
+     | Some m ->
+       Alcotest.(check int)
+         "legacy bytes decode as format version 0"
+         0
+         m.C.fts_format_version;
+       Alcotest.(check int) "content tree" 5 m.C.fts_content_tree;
+       Alcotest.(check int) "index tree" 6 m.C.fts_index_tree;
+       Alcotest.(check (list string)) "columns" [ "body" ] m.C.fts_columns;
+       Lwt.return_unit)
+;;
 
 (** Test that a catalog stored with old-format column bytes (no not_null/pk/default)
     is read correctly with backward-compat code (bytes_left = 0 path). *)
@@ -2694,6 +2758,16 @@ let () =
             "detects_primary_mirror_mismatch"
             `Quick
             test_drift_detects_primary_mirror_mismatch
+        ] )
+    ; ( "fts_format_version (#689)"
+      , [ Alcotest.test_case
+            "new_table_stamps_current_version"
+            `Quick
+            test_fts_format_version_new_table
+        ; Alcotest.test_case
+            "legacy_bytes_decode_as_version_0"
+            `Quick
+            test_fts_format_version_legacy_bytes
         ] )
     ]
 ;;
