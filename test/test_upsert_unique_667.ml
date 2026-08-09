@@ -190,6 +190,50 @@ let plain_update_still_raises_on_unique () =
       "UPDATE m SET b = 21 WHERE id = 1")
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Review finding: check_index_unique_on_update's "unchanged" fast     *)
+(* path compares only the indexed column values, never whether the     *)
+(* row's membership in a PARTIAL unique index's WHERE predicate         *)
+(* changed. A row that moves into a partial index's domain WITHOUT      *)
+(* touching the indexed column skips the probe entirely — the "old_vs   *)
+(* = new_vs" comparison says nothing moved, but the row is now a live   *)
+(* member of an index it was previously exempt from.                    *)
+(* ------------------------------------------------------------------ *)
+
+let partial_index_membership_transition_upsert_do_update () =
+  with_db (fun db ->
+    exec db "CREATE TABLE p (id INTEGER PRIMARY KEY, a INTEGER, active INTEGER NOT NULL)";
+    exec db "CREATE UNIQUE INDEX p_a ON p (a) WHERE active = 1";
+    (* row 1: active, occupies key a=5 in the partial index. *)
+    exec db "INSERT INTO p VALUES (1, 5, 1)";
+    (* row 2: same a=5, but inactive -> exempt from the partial index. *)
+    exec db "INSERT INTO p VALUES (2, 5, 0)";
+    (* Upsert on row 2's own PK: DO UPDATE flips active 0 -> 1 without
+       touching [a]. old_vs = new_vs = [5], so the "unchanged" fast path
+       must not skip this — row 2 becomes a second live a=5 member. *)
+    expect_error
+      db
+      ~needle:"UNIQUE constraint failed: p.a"
+      "INSERT INTO p VALUES (2, 5, 1) ON CONFLICT(id) DO UPDATE SET active = 1";
+    expect_rows
+      db
+      ~msg:"the conflicting DO UPDATE wrote nothing"
+      [ "1|5|1"; "2|5|0" ]
+      "SELECT * FROM p ORDER BY id")
+;;
+
+let partial_index_membership_transition_plain_update () =
+  with_db (fun db ->
+    exec db "CREATE TABLE p (id INTEGER PRIMARY KEY, a INTEGER, active INTEGER NOT NULL)";
+    exec db "CREATE UNIQUE INDEX p_a ON p (a) WHERE active = 1";
+    exec db "INSERT INTO p VALUES (1, 5, 1)";
+    exec db "INSERT INTO p VALUES (2, 5, 0)";
+    expect_error
+      db
+      ~needle:"UNIQUE constraint failed: p.a"
+      "UPDATE p SET active = 1 WHERE id = 2")
+;;
+
 let () =
   Alcotest.run
     "upsert_unique_667"
@@ -218,6 +262,16 @@ let () =
             "a plain UPDATE still raises on UNIQUE"
             `Quick
             plain_update_still_raises_on_unique
+        ] )
+    ; ( "partial-index membership transition"
+      , [ Alcotest.test_case
+            "UPSERT DO UPDATE flipping a row into a partial index's WHERE raises"
+            `Quick
+            partial_index_membership_transition_upsert_do_update
+        ; Alcotest.test_case
+            "plain UPDATE flipping a row into a partial index's WHERE raises"
+            `Quick
+            partial_index_membership_transition_plain_update
         ] )
     ]
 ;;

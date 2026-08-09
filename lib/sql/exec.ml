@@ -3649,7 +3649,7 @@ let index_is_conflict_target
    index loop is an unconditional [S.del] of the old key and [S.put] of the
    new one — but #667 added that check at [execute_upsert_update]'s call site,
    which every producer of [upsert_rowid] here (this function's target-hit
-   reset above, and the alias-PK probe in [execute_insert_write]) eventually
+   reset above, and the alias-PK probe in [execute_insert]) eventually
    reaches. So discarding the other indexes' verdicts in THIS pass is sound
    without loss: they were computed against the row being INSERTED, which is
    discarded, the DO UPDATE may not touch those columns at all, and if it does
@@ -3926,7 +3926,15 @@ let check_index_unique_on_update
         | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
         | _ -> false
       in
-      let unchanged = List.for_all2 values_equal old_vs new_vs in
+      (* A partial index's WHERE membership can flip true without the indexed
+         COLUMNS changing at all — [old_row] not matching [idx_where_sql] is
+         itself a change, because the row was never a live entry in this index
+         to compare against. Gating [unchanged] on that too (not just on
+         [old_vs]/[new_vs]) is what makes a WHERE-only transition fall through
+         to the real probe below instead of being waved through as "nothing
+         moved". *)
+      let old_matched = row_matches_index_where clock params idx schema old_row in
+      let unchanged = old_matched && List.for_all2 values_equal old_vs new_vs in
       if unchanged
       then Lwt.return_unit
       else
@@ -3959,6 +3967,8 @@ let write_row_rekeyed
       ~(new_row : Row.t)
       ~old_rowid
       ~indexes
+      ?(new_row_for_idx : Row.t option)
+      ()
   : int64 Lwt.t
   =
   let alias_col = Cat.rowid_alias_col table_meta in
@@ -3999,7 +4009,15 @@ let write_row_rekeyed
      computed value — an UPDATE to a base column can make one NULL. *)
   enforce_not_null ~clock ~params table_meta new_row;
   let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
-  let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
+  (* Callers that have already computed [new_row]'s virtuals for their own
+     uniqueness probe (#667: [execute_upsert_update]) pass it through here
+     instead of paying for a second evaluation of every VIRTUAL generated
+     column's expression. *)
+  let new_row_for_idx =
+    match new_row_for_idx with
+    | Some v -> v
+    | None -> with_computed_virtuals clock params table_meta new_row
+  in
   let* () =
     Lwt_list.iter_s
       (fun (idx : Cat.index_info) ->
@@ -4107,9 +4125,21 @@ let execute_upsert_update
         indexes
     in
     (* #249: SET id = N in a DO UPDATE must move the row (and check uniqueness),
-       same as a plain UPDATE — funnel through the shared re-key helper. *)
+       same as a plain UPDATE — funnel through the shared re-key helper.
+       [new_row_for_idx] was already computed for the loop above; hand it
+       through instead of paying for a second VIRTUAL-column evaluation. *)
     let* (_ : int64) =
-      write_row_rekeyed tx table_meta ~clock ~params ~old_row ~new_row ~old_rowid ~indexes
+      write_row_rekeyed
+        tx
+        table_meta
+        ~clock
+        ~params
+        ~old_row
+        ~new_row
+        ~old_rowid
+        ~indexes
+        ~new_row_for_idx
+        ()
     in
     let* () =
       match on_upsert_update with
@@ -4915,6 +4945,7 @@ let update_col_in_tx
       ~new_row
       ~old_rowid:rowid
       ~indexes:(Cat.indexes_for_table cat ~table:meta.Cat.name)
+      ()
   in
   (* #417: record the FK-cascade child column update (ON UPDATE CASCADE / SET
      NULL / SET DEFAULT); a cascade that re-keyed the child's own INTEGER PK is
@@ -6259,6 +6290,7 @@ let apply_update_row
       ~new_row
       ~old_rowid:rowid
       ~indexes
+      ()
   in
   (* Return the row as actually stored (generated columns included) so callers
      such as UPDATE ... RETURNING can project committed values, not a pre-lock
