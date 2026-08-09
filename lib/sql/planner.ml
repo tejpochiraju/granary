@@ -2750,8 +2750,13 @@ let rec plan ?cat = function
     finalize_select ~distinct:false ~limit ~offset base
   | Sema.BS_fts_match_scan
       { fts_meta; query; proj; include_rank; snippets; limit; offset } ->
-    let base = Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } in
-    finalize_select ~distinct:false ~limit ~offset base
+    (* #687: limit/offset are threaded into the op itself rather than
+       wrapped on with [finalize_select]'s [Op_limit] — [stream_fts_match_scan]
+       slices the score-sorted match list to the [offset, offset+limit) window
+       BEFORE fetching content for each match, so an outer [Op_limit] would
+       only slice a stream whose expensive work was already fully paid for. *)
+    Plan.Op_fts_match_scan
+      { fts_meta; query; proj; include_rank; snippets; limit; offset }
   | Sema.BS_compound { op; left; right; order; limit; offset } ->
     plan_compound ?cat ~op ~left ~right ~order ~limit ~offset ()
   | Sema.BS_const_select { exprs } ->
