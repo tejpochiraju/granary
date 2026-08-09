@@ -349,6 +349,50 @@ let fts_match_scan_limit_offset_correctness () =
     mid
 ;;
 
+(* #687 review finding 2: [limit]/[offset] are now fields on
+   [Op_fts_match_scan] itself rather than an outer [Op_limit] node (see
+   [stream_fts_match_scan]'s own slicing) — so without a rendering fix,
+   EXPLAIN would show no LIMIT anywhere in the plan for a MATCH query, while
+   the sibling [Op_fts_seq_scan] path still gets a visible [Op_limit] node
+   (finalize_select still wraps it). [op_name]'s [Op_fts_match_scan] case
+   appends the same "Limit(n offset o)" suffix [Op_limit] itself renders. *)
+let contains_pat pat s =
+  let pn = String.length pat
+  and n = String.length s in
+  let rec f i =
+    if i > n - pn then false else if String.sub s i pn = pat then true else f (i + 1)
+  in
+  f 0
+;;
+
+let fts_match_scan_explain_shows_limit () =
+  with_mem_db
+  @@ fun db ->
+  seed_fts db;
+  let stream =
+    match
+      run (Db.query db "EXPLAIN SELECT body FROM doc WHERE doc MATCH 'widget' LIMIT 3")
+    with
+    | Ok s -> s
+    | Error e -> Alcotest.failf "explain query: %a" Db.pp_error e
+  in
+  let rows = run (Lwt_stream.to_list stream) in
+  Alcotest.(check bool) "non-empty plan" true (rows <> []);
+  let has_fts_match_limit =
+    List.exists
+      (fun row ->
+         match row.(2) with
+         | Db.V_text s ->
+           contains_pat "FtsMatchScan" s && contains_pat "Limit(3 offset 0)" s
+         | _ -> false)
+      rows
+  in
+  Alcotest.(check bool)
+    "FtsMatchScan node shows Limit(3 offset 0)"
+    true
+    has_fts_match_limit
+;;
+
 (* ------------------------------------------------------------------ *)
 (* No leak: readers/pins/locks return to baseline after a LIMIT query   *)
 (* ------------------------------------------------------------------ *)
@@ -395,6 +439,10 @@ let () =
             "fts match scan limit/offset correctness"
             `Quick
             fts_match_scan_limit_offset_correctness
+        ; Alcotest.test_case
+            "fts match scan explain shows limit"
+            `Quick
+            fts_match_scan_explain_shows_limit
         ] )
     ; ( "rows_examined_bound"
       , [ Alcotest.test_case "seq scan stops early" `Quick seq_scan_stops_early

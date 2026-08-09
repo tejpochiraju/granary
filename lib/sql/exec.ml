@@ -6844,8 +6844,18 @@ let op_name = function
   | Plan.Op_fts_insert { fts_meta; _ } -> "FtsInsert(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_fts_delete { fts_meta; _ } -> "FtsDelete(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_fts_seq_scan { fts_meta; _ } -> "FtsSeqScan(" ^ fts_meta.Cat.fts_name ^ ")"
-  | Plan.Op_fts_match_scan { fts_meta; _ } ->
-    "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")"
+  | Plan.Op_fts_match_scan { fts_meta; limit; offset; _ } ->
+    (* #687: limit/offset are fields on this op rather than a wrapping
+       [Op_limit] (see [stream_fts_match_scan]), so without this suffix a
+       MATCH query's LIMIT/OFFSET would vanish from EXPLAIN entirely — the
+       sibling [Op_fts_seq_scan] path still gets a visible [Op_limit] node.
+       Same rendering as [Op_limit] itself, so the two read the same way. *)
+    let limit_suffix =
+      match limit with
+      | None -> ""
+      | Some n -> Printf.sprintf " Limit(%d offset %d)" n (Option.value ~default:0 offset)
+    in
+    "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")" ^ limit_suffix
   | Plan.Op_sqlite_master -> "SqliteMaster"
   | Plan.Op_sqlite_sequence -> "SqliteSequence"
   | Plan.Op_seq_set { table; _ } -> "SeqSet(" ^ table ^ ")"
@@ -9488,6 +9498,20 @@ let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_r
            Lwt.return (List.length pl, pl))
         query_terms
     in
+    (* #687 review finding 1: this is a per-match [S.get] against
+       [fts_index_tree], paid for every match in [matches] before LIMIT/OFFSET
+       can slice anything — structurally different from the content-tree
+       fetch #687 fixed. That fetch was avoidable because content isn't
+       needed to compute a score; [doc_length] IS needed here (BM25 uses it
+       to normalize term frequency), and this branch only runs when
+       [include_rank] is true, i.e. exactly when the caller wants results
+       sorted by rank — which needs every score before any window can be
+       chosen. So this loop cannot be truncated to [offset, offset+limit)
+       without changing what the sort itself is fed. The one thing that
+       *would* remove the per-match round trip — storing [doc_length] inline
+       with each posting-list entry instead of behind a second [S.get] per
+       match — is an index-format change, out of scope for a LIMIT/OFFSET
+       fix; tracked as a follow-up (#689). *)
     let* doc_lengths =
       Lwt_list.map_s
         (fun (rowid, positions) ->
@@ -12290,14 +12314,15 @@ and stream_fts_match_scan
        returned rows need to pay for. Mirrors [finalize_select]'s semantics:
        an OFFSET with no LIMIT is a no-op (matches the plain-table / FTS seq
        scan path), and LIMIT/OFFSET never change which rows are picked, only
-       how many of the sorted list are fetched. *)
+       how many of the sorted list are fetched. [list_drop]/[list_take]
+       (review finding 3) touch only [offset + limit] cons cells rather than
+       walking the full match list with a [List.filteri] predicate. *)
     let sorted =
       match limit with
       | None -> sorted
       | Some n ->
         let off = Option.value ~default:0 offset in
-        let stop = off + n in
-        List.filteri (fun i _ -> i >= off && i < stop) sorted
+        list_take n (list_drop off sorted)
     in
     let snippet_terms = fts_query_terms_with_kind query in
     let* rows =
