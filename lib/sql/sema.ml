@@ -326,6 +326,8 @@ type bound_stmt =
   | BS_fts_seq_scan of
       { fts_meta : Cat.fts_table_meta
       ; where : bound_expr option
+      ; limit : int option
+      ; offset : int option
       }
   | BS_fts_match_scan of
       { fts_meta : Cat.fts_table_meta
@@ -333,6 +335,8 @@ type bound_stmt =
       ; proj : int list
       ; include_rank : bool
       ; snippets : Plan.snippet_spec list
+      ; limit : int option
+      ; offset : int option
       }
   | BS_pragma of { kind : Ast.pragma_kind }
   | BS_vacuum
@@ -2295,13 +2299,20 @@ let fts_proj_fold (fts_meta : Cat.fts_table_meta) exprs =
 ;;
 
 (* Build a BS_fts_match_scan from a parsed query and a SELECT projection. *)
-let bind_fts_match_scan (fts_meta : Cat.fts_table_meta) ~query proj =
+let bind_fts_match_scan (fts_meta : Cat.fts_table_meta) ~query ~limit ~offset proj =
   match proj with
   | `All ->
     let all_real_ords = List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns in
     Ok
       (BS_fts_match_scan
-         { fts_meta; query; proj = all_real_ords; include_rank = false; snippets = [] })
+         { fts_meta
+         ; query
+         ; proj = all_real_ords
+         ; include_rank = false
+         ; snippets = []
+         ; limit
+         ; offset
+         })
   | `Cols names ->
     let has_rank = List.exists (String.equal "rank") names in
     let real_ords =
@@ -2312,15 +2323,24 @@ let bind_fts_match_scan (fts_meta : Cat.fts_table_meta) ~query proj =
     in
     Ok
       (BS_fts_match_scan
-         { fts_meta; query; proj = real_ords; include_rank = has_rank; snippets = [] })
+         { fts_meta
+         ; query
+         ; proj = real_ords
+         ; include_rank = has_rank
+         ; snippets = []
+         ; limit
+         ; offset
+         })
   | `Exprs exprs ->
     (match fts_proj_fold fts_meta exprs with
      | Error e -> Error e
      | Ok (col_ords, include_rank, snippets) ->
-       Ok (BS_fts_match_scan { fts_meta; query; proj = col_ords; include_rank; snippets }))
+       Ok
+         (BS_fts_match_scan
+            { fts_meta; query; proj = col_ords; include_rank; snippets; limit; offset }))
 ;;
 
-let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
+let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj ~limit ~offset =
   match Cat.find_fts cat table with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some fts_meta ->
@@ -2332,7 +2352,7 @@ let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
        else (
          match Fts_query.parse query_str with
          | Error msg -> Lwt.return (Error (Unsupported ("FTS query parse error: " ^ msg)))
-         | Ok q -> Lwt.return (bind_fts_match_scan fts_meta ~query:q proj))
+         | Ok q -> Lwt.return (bind_fts_match_scan fts_meta ~query:q ~limit ~offset proj))
      | _ ->
        let synth_meta = fts_as_table_meta fts_meta in
        let where_result =
@@ -2346,7 +2366,8 @@ let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
        (match where_result with
         | Error e -> Lwt.return (Error e)
         | Ok bound_where ->
-          Lwt.return (Ok (BS_fts_seq_scan { fts_meta; where = bound_where }))))
+          Lwt.return
+            (Ok (BS_fts_seq_scan { fts_meta; where = bound_where; limit; offset }))))
 ;;
 
 (* Result-bind that short-circuits to an Lwt-wrapped error.  Flattens the
@@ -3633,10 +3654,22 @@ let bind_select
   in
   match meta_opt with
   | None ->
-    (* Not a regular table — check if it's an FTS table (only plain SELECT). *)
-    (match joins, group_by, having, order, limit, offset with
-     | [], [], None, [], None, None ->
-       bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj
+    (* Not a regular table — check if it's an FTS table (only plain SELECT,
+       optionally with LIMIT/OFFSET — #679 lifted the ban on those two). *)
+    (match joins, group_by, having, order with
+     | [], [], None, [] ->
+       (match validate_limit_offset ~limit ~offset with
+        | Error e -> Lwt.return (Error e)
+        | Ok (limit, offset) ->
+          bind_fts_seq_scan
+            cat
+            ~param_counter
+            ~named_params
+            ~table
+            ~where
+            ~proj
+            ~limit
+            ~offset)
      | _ ->
        (match Cat.find_fts cat table with
         | None -> Lwt.return (Error (Unknown_table table))

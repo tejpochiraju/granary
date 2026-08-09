@@ -284,6 +284,8 @@ type bound_stmt =
   | BS_fts_seq_scan of
       { fts_meta : Granary_catalog.Catalog.fts_table_meta
       ; where : bound_expr option
+      ; limit : int option (** #679: LIMIT, matching the plain-table path *)
+      ; offset : int option (** #679: OFFSET, matching the plain-table path *)
       }
   | BS_fts_match_scan of
       { fts_meta : Granary_catalog.Catalog.fts_table_meta
@@ -291,6 +293,8 @@ type bound_stmt =
       ; proj : int list
       ; include_rank : bool
       ; snippets : Plan.snippet_spec list
+      ; limit : int option (** #679: LIMIT, matching the plain-table path *)
+      ; offset : int option (** #679: OFFSET, matching the plain-table path *)
       }
   | BS_pragma of { kind : Ast.pragma_kind }
   | BS_vacuum

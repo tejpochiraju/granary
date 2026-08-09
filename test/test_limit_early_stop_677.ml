@@ -7,14 +7,11 @@
     - The actual perf claim: {!Db.query_with_stats}'s [rows_examined] /
       [index_entries] for a [LIMIT n] query must be bounded near
       [offset + n], not the size of the table or index range it draws from.
-      Asserted for 2 of the 3 lazy scanners #677 names: a plain table scan
-      ({!seq_scan_stops_early}) and an index lookup
-      ({!index_lookup_stops_early}). The third, an FTS sequential scan
-      ({!fts_seq_scan_stops_early}), turned out to be unreachable via SQL at
-      all — see that test's own comment — so it instead pins today's actual
-      "unsupported" behavior; [stream_fts_seq_scan] is still wired into the
-      #677 cleanup registry so early-stop is safe for it whenever FTS
-      LIMIT/OFFSET support lands.
+      Asserted for all 3 lazy scanners #677 names: a plain table scan
+      ({!seq_scan_stops_early}), an index lookup
+      ({!index_lookup_stops_early}), and — since #679 wired LIMIT/OFFSET
+      through the FTS sema/planner path — an FTS sequential scan
+      ({!fts_seq_scan_stops_early}, {!fts_seq_scan_offset_stops_early}).
     - No leak: after a [LIMIT]-bounded query returns, on disk,
       {!Store.active_reader_count} / {!Store.live_read_locks} /
       {!Store.pinned_page_count} must be back at their pre-query baseline —
@@ -227,46 +224,83 @@ let seed_fts db =
 
 (* [stream_fts_seq_scan] was wired into the #677 cleanup registry (it
    registers its [finish] via [register_stream_cleanup], same as the other
-   two lazy scanners) so that IF an FTS SELECT ever reaches [Op_limit], early
-   stop is safe for it too. But discovered while making this test file green:
-   FTS SELECT has never supported LIMIT/OFFSET at the sema level at all —
-   [Sema.bind_select]'s FTS branch (`lib/sql/sema.ml` around line 3637,
-   present since 2026-05-16, well before #677) requires
+   two lazy scanners) so that once an FTS SELECT could reach [Op_limit],
+   early stop would already be safe for it. #679 closed the remaining gap —
+   [Sema.bind_select]'s FTS branch used to require
    [joins, group_by, having, order, limit, offset] to ALL be empty/None to
-   reach [bind_fts_seq_scan]; any LIMIT makes it fall through to a hard
-   "FTS tables do not support this query form" error. So today there is no
-   SQL spelling that can put an [Op_limit] above an [Op_fts_seq_scan] node,
-   and this test cannot exercise the early-stop *behavior* for FTS the way
-   {!seq_scan_stops_early} and {!index_lookup_stops_early} do for their
-   scanners. That gap is pre-existing and orthogonal to #677 item 2 — adding
-   FTS LIMIT/OFFSET support is a real feature decision (new BS_fts_seq_scan /
-   BS_fts_match_scan fields, a planner wrap, its own tests) and out of scope
-   here. This test instead pins *today's* actual behavior — the Unsupported
-   error — so a future FTS-LIMIT feature must consciously replace it with a
-   real early-stop assertion rather than silently leaving this stale. *)
+   bind at all, so no SQL spelling could ever put an [Op_limit] above an
+   [Op_fts_seq_scan]/[Op_fts_match_scan] node. [BS_fts_seq_scan] and
+   [BS_fts_match_scan] now carry their own [limit]/[offset], and the planner
+   wraps their base op with [Op_limit] via [finalize_select], exactly like
+   the plain-table path. This test now exercises the real early-stop
+   behavior [seq_scan_stops_early] and [index_lookup_stops_early] already
+   pin for their scanners. *)
 let fts_seq_scan_stops_early () =
   with_mem_db
   @@ fun db ->
   seed_fts db;
-  match run (Db.query db "SELECT body FROM doc LIMIT 4") with
-  | Ok _ ->
-    Alcotest.fail
-      "FTS SELECT ... LIMIT unexpectedly succeeded — #677's early-stop for \
-       stream_fts_seq_scan is now reachable via SQL and this test must be rewritten to \
-       assert the rows_examined bound instead of the Unsupported error"
-  | Error e ->
-    let msg = String.lowercase_ascii (Format.asprintf "%a" Db.pp_error e) in
-    let contains ~needle haystack =
-      let nl = String.length needle
-      and hl = String.length haystack in
-      let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
-      go 0
-    in
-    Alcotest.(check bool)
-      "FTS SELECT with LIMIT is rejected as unsupported (pre-existing, not #677)"
-      true
-      (contains ~needle:"do not support this query form" msg
-       || contains ~needle:"unsupported" msg)
+  let n, stats = stats_of db "SELECT body FROM doc LIMIT 4" in
+  Alcotest.(check int) "rows returned" 4 n;
+  Alcotest.(check bool)
+    "rows_examined bounded near the limit, not the table size"
+    true
+    (stats.Db.rows_examined <= 10)
+;;
+
+(* #679: OFFSET must also stop early, not drain the cursor to exhaustion. *)
+let fts_seq_scan_offset_stops_early () =
+  with_mem_db
+  @@ fun db ->
+  seed_fts db;
+  let n, stats = stats_of db "SELECT body FROM doc LIMIT 3 OFFSET 5" in
+  Alcotest.(check int) "rows returned" 3 n;
+  Alcotest.(check bool)
+    "rows_examined bounded near offset+limit, not the table size"
+    true
+    (stats.Db.rows_examined <= 15)
+;;
+
+(* #679 correctness: LIMIT/OFFSET on a plain (no MATCH) FTS scan must slice
+   the same way the plain-table path does — pin against the unlimited
+   result, same run so no scan-order assumption is needed. *)
+let fts_seq_scan_limit_offset_correctness () =
+  with_mem_db
+  @@ fun db ->
+  seed_fts db;
+  let full = rows_of db "SELECT body FROM doc" in
+  Alcotest.(check int) "full count" n_rows (List.length full);
+  let first4 = rows_of db "SELECT body FROM doc LIMIT 4" in
+  Alcotest.(check (list (list string)))
+    "limit 4"
+    (List.filteri (fun i _ -> i < 4) full)
+    first4;
+  let middle = rows_of db "SELECT body FROM doc LIMIT 3 OFFSET 5" in
+  Alcotest.(check (list (list string)))
+    "offset 5 limit 3"
+    (List.filteri (fun i _ -> i >= 5 && i < 8) full)
+    middle
+;;
+
+(* #679 correctness: LIMIT/OFFSET on a MATCH query. [stream_fts_match_scan]
+   sorts and materializes its whole result set up front (score sorting needs
+   the full set), so there is no early-stop claim here — only that
+   [Op_limit]'s slicing matches the unlimited MATCH result, same run. *)
+let fts_match_scan_limit_offset_correctness () =
+  with_mem_db
+  @@ fun db ->
+  seed_fts db;
+  let full = rows_of db "SELECT body FROM doc WHERE doc MATCH 'widget'" in
+  Alcotest.(check int) "full match count" n_rows (List.length full);
+  let first3 = rows_of db "SELECT body FROM doc WHERE doc MATCH 'widget' LIMIT 3" in
+  Alcotest.(check (list (list string)))
+    "limit 3"
+    (List.filteri (fun i _ -> i < 3) full)
+    first3;
+  let mid = rows_of db "SELECT body FROM doc WHERE doc MATCH 'widget' LIMIT 4 OFFSET 5" in
+  Alcotest.(check (list (list string)))
+    "offset 5 limit 4"
+    (List.filteri (fun i _ -> i >= 5 && i < 9) full)
+    mid
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -307,11 +341,23 @@ let () =
             `Quick
             limit_past_end_returns_remainder
         ; Alcotest.test_case "limit 0 returns nothing" `Quick limit_zero_returns_nothing
+        ; Alcotest.test_case
+            "fts seq scan limit/offset correctness"
+            `Quick
+            fts_seq_scan_limit_offset_correctness
+        ; Alcotest.test_case
+            "fts match scan limit/offset correctness"
+            `Quick
+            fts_match_scan_limit_offset_correctness
         ] )
     ; ( "rows_examined_bound"
       , [ Alcotest.test_case "seq scan stops early" `Quick seq_scan_stops_early
         ; Alcotest.test_case "index lookup stops early" `Quick index_lookup_stops_early
         ; Alcotest.test_case "fts seq scan stops early" `Quick fts_seq_scan_stops_early
+        ; Alcotest.test_case
+            "fts seq scan offset stops early"
+            `Quick
+            fts_seq_scan_offset_stops_early
         ] )
     ; ( "no_leak"
       , [ Alcotest.test_case
