@@ -147,6 +147,7 @@ type fts_table_meta =
   ; fts_content_tree : S.tree_id
   ; fts_index_tree : S.tree_id
   ; fts_columns : string list
+  ; fts_format_version : int
   }
 
 (* #283: the in-memory schema cache and its rollback ledger, sealed behind a
@@ -1219,9 +1220,21 @@ let decode_index_value bytes =
   }
 ;;
 
+(* #689 scaffolding: the format version every newly created (or rewritten) FTS
+   table is stamped with.  Bump this only alongside an actual posting-list
+   value format change, and add the corresponding decode branch wherever
+   [decode_positions] is consumed at the same time. *)
+let fts_current_format_version = 1
+
 (* FTS value encoding:
    varint(content_tree) ++ varint(index_tree) ++ varint(n_cols)
-   ++ (varint(col_len) ++ col_bytes)* *)
+   ++ (varint(col_len) ++ col_bytes)*
+   ++ varint(format_version)
+
+   The trailing version varint did not exist before #689: every table created
+   prior to it has no such tag in its stored bytes, and [decode_fts_value]
+   below reads that absence as version 0.  Do not treat "no trailing bytes" as
+   a decode error — it is the expected shape for every table on disk today. *)
 let encode_fts_value (m : fts_table_meta) =
   let buf = Buffer.create 32 in
   Varint.encode_uint64 buf (Int64.of_int m.fts_content_tree);
@@ -1233,6 +1246,7 @@ let encode_fts_value (m : fts_table_meta) =
        Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
        Buffer.add_bytes buf b)
     m.fts_columns;
+  Varint.encode_uint64 buf (Int64.of_int m.fts_format_version);
   Buffer.to_bytes buf
 ;;
 
@@ -1249,10 +1263,20 @@ let decode_fts_value fts_name bytes =
     cols := col :: !cols;
     pos := off + Int64.to_int len
   done;
+  (* #689: a table written before the version tag existed has nothing left to
+     read here — that is version 0, not a truncated value. *)
+  let format_version =
+    if !pos >= Bytes.length bytes
+    then 0
+    else (
+      let v, _ = Varint.decode_uint64 bytes !pos in
+      Int64.to_int v)
+  in
   { fts_name
   ; fts_content_tree = Int64.to_int ct
   ; fts_index_tree = Int64.to_int it
   ; fts_columns = List.rev !cols
+  ; fts_format_version = format_version
   }
 ;;
 
@@ -4020,6 +4044,7 @@ let create_fts_table ?txn (t : t) ~name ~columns : fts_table_meta Lwt.t =
       ; fts_content_tree = content_tree
       ; fts_index_tree = index_tree
       ; fts_columns = columns
+      ; fts_format_version = fts_current_format_version
       }
     in
     let%lwt () = S.put tx sys_fts_tid (Bytes.of_string name) (encode_fts_value meta) in
@@ -4034,6 +4059,7 @@ let create_fts_table ?txn (t : t) ~name ~columns : fts_table_meta Lwt.t =
       ; fts_content_tree = content_tree
       ; fts_index_tree = index_tree
       ; fts_columns = columns
+      ; fts_format_version = fts_current_format_version
       }
     in
     (* Write to sys_fts_tid *)
