@@ -1452,36 +1452,44 @@ let frame_child (f : cursor_frame) : int64 =
 
 (* Descend to the leftmost leaf starting from [page_id], returning the new
    frames in DEEPEST-FIRST order (i.e. the frame whose child is the leaf is
-   at the head). *)
+   at the head).
+
+   #676: also returns the LEAF's own buffer (and its decoded [n_keys]), which
+   this function has already fetched and decoded to tell it apart from a
+   branch page.  Every caller used to throw that away and immediately have
+   [read_cur_leaf] fetch-and-decode the SAME page again — a redundant Lwt
+   round trip and [Page.read_common] allocation on every single leaf entered
+   (via [cursor_open], [cursor_seek] and every [advance_to_next_leaf]), not
+   just on a cache miss.  #481's borrow contract already made the underlying
+   WAL/pager cache hit free of any page copy; this removes the SECOND fetch
+   and decode of that same, already-in-hand page.  For a leaf holding few
+   (wide) rows this per-leaf-touch cost does not amortize away — see #676. *)
 let leftmost_leaf_with_path ?snapshot_frames ?pin_set pager page_id
-  : (cursor_frame list * int64, error) result Lwt.t
+  : (cursor_frame list * int64 * Cstruct.t * int, error) result Lwt.t
   =
   let rec loop pid acc =
-    let* r =
-      Pager.read_borrow ?snapshot_frames ?pin_set pager pid (fun buf ->
-        let common = Page.read_common buf in
-        match common.kind with
-        | Page.Leaf -> Lwt.return (Ok `Leaf)
-        | Page.Branch ->
-          let entries, _ = decode_branch_entries buf common in
-          let right_page = page_id_of_int32 common.right_page in
-          let child =
-            match entries with
-            | [] -> right_page
-            | (e : Page.branch_entry) :: _ -> page_id_of_int32 e.left_child
-          in
-          let frame =
-            { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = 0 }
-          in
-          Lwt.return (Ok (`Branch (frame, child)))
-        | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
-    in
-    bind_pager r (function
-      | Error e -> return_error e
-      | Ok `Leaf -> return_ok (acc, pid)
-      (* New frame goes on TOP of acc (acc is deepest-first; we're going deeper,
-         so this new one becomes the new head). *)
-      | Ok (`Branch (frame, child)) -> loop child (frame :: acc))
+    let* r = Pager.read_shared ?snapshot_frames ?pin_set pager pid in
+    match r with
+    | Error e -> return_error (Pager_error e)
+    | Ok buf ->
+      let common = Page.read_common buf in
+      (match common.kind with
+       | Page.Leaf -> return_ok (acc, pid, buf, common.Page.n_keys)
+       | Page.Branch ->
+         let entries, _ = decode_branch_entries buf common in
+         let right_page = page_id_of_int32 common.right_page in
+         let child =
+           match entries with
+           | [] -> right_page
+           | (e : Page.branch_entry) :: _ -> page_id_of_int32 e.left_child
+         in
+         let frame =
+           { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = 0 }
+         in
+         (* New frame goes on TOP of acc (acc is deepest-first; we're going
+            deeper, so this new one becomes the new head). *)
+         loop child (frame :: acc)
+       | _ -> return_error (Tree_corrupt "non-tree page in tree"))
   in
   loop page_id []
 ;;
@@ -1513,7 +1521,7 @@ let cursor_open t : (cursor, error) result Lwt.t =
     in
     match r with
     | Error e -> return_error e
-    | Ok (path, leaf_pid) ->
+    | Ok (path, leaf_pid, leaf_buf, leaf_n_keys) ->
       return_ok
         { c_pager = t.pager
         ; c_root = t.root_page
@@ -1523,8 +1531,8 @@ let cursor_open t : (cursor, error) result Lwt.t =
         ; leaf_page = leaf_pid
         ; offset = Page.data_offset
         ; leaf_idx = 0
-        ; leaf_buf = None
-        ; leaf_n_keys = 0
+        ; leaf_buf = Some leaf_buf
+        ; leaf_n_keys
         ; c_span = Page.leaf_span_create ()
         ; finished = false
         }
@@ -1596,14 +1604,19 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
       in
       match r with
       | Error e -> return_error e
-      | Ok (sub_path, leaf_pid) ->
+      | Ok (sub_path, leaf_pid, leaf_buf, leaf_n_keys) ->
         (* sub_path is deepest-first relative to its subtree.  The deepest
            frame of the whole new path is the head of sub_path (or [top] if
            sub_path is empty, meaning next_child was already a leaf).
            Splice: new_path = sub_path @ [top; rest...] *)
         c.path <- sub_path @ c.path;
         c.leaf_page <- leaf_pid;
-        c.leaf_buf <- None (* #238: new leaf — drop the cached buffer. *);
+        (* #676: [leftmost_leaf_with_path] already fetched and decoded this
+           leaf to tell it apart from a branch page — seed the cursor's
+           retained buffer from that result instead of dropping it and making
+           [read_cur_leaf] fetch-and-decode the identical page again. *)
+        c.leaf_buf <- Some leaf_buf;
+        c.leaf_n_keys <- leaf_n_keys;
         c.offset <- Page.data_offset;
         c.leaf_idx <- 0;
         return_ok true)
@@ -1734,33 +1747,29 @@ let cursor_next_value c : (bytes option, error) result Lwt.t =
 ;;
 
 (* Descend from [page_id] toward [key], recording the path deepest-first.
-   Returns (path, leaf_pid). *)
+   Returns (path, leaf_pid, leaf_buf, leaf_n_keys) — see #676's comment on
+   [leftmost_leaf_with_path] for why the leaf buffer and its decoded [n_keys]
+   ride along instead of being dropped and re-fetched by [read_cur_leaf]. *)
 let descend_with_path_for_key ?snapshot_frames ?pin_set pager page_id key
-  : (cursor_frame list * int64, error) result Lwt.t
+  : (cursor_frame list * int64 * Cstruct.t * int, error) result Lwt.t
   =
   let rec loop pid acc =
-    let* r =
-      Pager.read_borrow ?snapshot_frames ?pin_set pager pid (fun buf ->
-        let common = Page.read_common buf in
-        match common.kind with
-        | Page.Leaf -> Lwt.return (Ok `Leaf)
-        | Page.Branch ->
-          let entries, _ = decode_branch_entries buf common in
-          let right_page = page_id_of_int32 common.right_page in
-          let idx, child = pick_branch_child_with_idx entries common key in
-          let frame =
-            { cf_branch_entries = entries
-            ; cf_right_page = right_page
-            ; cf_child_idx = idx
-            }
-          in
-          Lwt.return (Ok (`Branch (frame, child)))
-        | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
-    in
-    bind_pager r (function
-      | Error e -> return_error e
-      | Ok `Leaf -> return_ok (acc, pid)
-      | Ok (`Branch (frame, child)) -> loop child (frame :: acc))
+    let* r = Pager.read_shared ?snapshot_frames ?pin_set pager pid in
+    match r with
+    | Error e -> return_error (Pager_error e)
+    | Ok buf ->
+      let common = Page.read_common buf in
+      (match common.kind with
+       | Page.Leaf -> return_ok (acc, pid, buf, common.Page.n_keys)
+       | Page.Branch ->
+         let entries, _ = decode_branch_entries buf common in
+         let right_page = page_id_of_int32 common.right_page in
+         let idx, child = pick_branch_child_with_idx entries common key in
+         let frame =
+           { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = idx }
+         in
+         loop child (frame :: acc)
+       | _ -> return_error (Tree_corrupt "non-tree page in tree"))
   in
   loop page_id []
 ;;
@@ -1826,10 +1835,13 @@ let cursor_seek c key : ([ `Found | `Not_found_after of bytes ], error) result L
     in
     match r with
     | Error e -> return_error e
-    | Ok (path, leaf_pid) ->
+    | Ok (path, leaf_pid, leaf_buf, leaf_n_keys) ->
       c.path <- path;
       c.leaf_page <- leaf_pid;
-      c.leaf_buf <- None (* #238: seeked to a new leaf — drop the cache. *);
+      (* #676: seed the cursor's retained buffer from what the descent already
+         fetched and decoded, instead of dropping it and re-fetching. *)
+      c.leaf_buf <- Some leaf_buf;
+      c.leaf_n_keys <- leaf_n_keys;
       c.offset <- Page.data_offset;
       c.leaf_idx <- 0;
       c.finished <- false;
