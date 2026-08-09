@@ -1137,13 +1137,18 @@ let decode_index_value bytes =
   let off = off + tbl_len in
   let n_cols, off = Varint.decode_uint64 bytes off in
   let n_cols = Int64.to_int n_cols in
+  if n_cols < 0 then invalid_arg "decode_index_value: negative column count";
   let off = ref off in
   (* #484: explicit recursion rather than [List.init].  Each element consumes
      bytes from [off], so the decoded list's contents depend on the order the
      elements are built in.  [List.init] is documented "evaluated left to
      right" on the toolchain this project pins, but stating the order here
      keeps the decode structural rather than inherited from a stdlib
-     guarantee. *)
+     guarantee.  The negative-count guard above restores the
+     [Invalid_argument] that [List.init] used to raise on a corrupt count;
+     [decode_index_value] has no caller that catches a decode failure, so
+     losing it would turn a corrupt blob into a silently-wrong [index_info]
+     instead of a loud failure at [open_]. *)
   let rec decode_cols remaining acc =
     if remaining <= 0
     then List.rev acc
@@ -1656,13 +1661,20 @@ let decode_mirror_entry bytes : table_meta * int64 =
   let fp = Bytes.get_int64_be bytes off in
   let off = ref (off + 8) in
   let ncols, o = Varint.decode_uint64 bytes !off in
+  let ncols = Int64.to_int ncols in
+  if ncols < 0 then invalid_arg "decode_mirror_entry: negative column count";
   off := o;
   (* #484: explicit recursion rather than [List.init].  Each element consumes
      bytes from [off], so the decoded list's contents depend on the order the
      elements are built in.  [List.init] is documented "evaluated left to
      right" on the toolchain this project pins, but stating the order here
      keeps the decode structural rather than inherited from a stdlib
-     guarantee. *)
+     guarantee.  The negative-count guard above restores the
+     [Invalid_argument] that [List.init] used to raise on a corrupt count:
+     both [load_mirror_entries] and [mirror_fingerprints] catch it under
+     "skip corrupt entries", and without it a corrupt count would decode into
+     a [table_meta] with zero columns and be admitted to the catalog instead
+     of being skipped. *)
   let rec decode_columns remaining acc =
     if remaining <= 0
     then List.rev acc
@@ -1673,7 +1685,7 @@ let decode_mirror_entry bytes : table_meta * int64 =
       off := o + clen;
       decode_columns (remaining - 1) (col :: acc))
   in
-  let columns = decode_columns (Int64.to_int ncols) [] in
+  let columns = decode_columns ncols [] in
   let fklen, o = Varint.decode_uint64 bytes !off in
   let fkb = Bytes.sub bytes o (Int64.to_int fklen) in
   let fk_constraints = decode_fks fkb in
