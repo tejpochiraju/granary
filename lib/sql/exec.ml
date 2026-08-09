@@ -9763,17 +9763,25 @@ and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
          Lwt.return (Plan.P_lit v)))
 
 (* #674 (item 3 of 3): unwrap the layout-only nodes a trivial subquery like
-   [SELECT 1 FROM t WHERE ...] plans through — projection, distinct, sort,
-   limit — none of which change whether the subquery yields at least one row.
-   Stops at anything that could (a filter, join, aggregate, ...), so the
-   caller only takes the covering-existence shortcut for the exact shape it
-   knows how to answer without a table fetch. *)
+   [SELECT 1 FROM t WHERE ...] plans through — projection, distinct, sort —
+   none of which change whether the subquery yields at least one row. Stops
+   at anything that could (a filter, join, aggregate, ...), so the caller
+   only takes the covering-existence shortcut for the exact shape it knows
+   how to answer without a table fetch.
+
+   [Op_limit] is deliberately NOT unwrapped here (#684 review): "the index
+   has a matching entry" is only equivalent to EXISTS's answer when the
+   LIMIT is >= 1 rows and no OFFSET is skipping past the match — a LIMIT 0
+   must always answer false, and a nonzero OFFSET can turn an existing match
+   into a false answer too. Rather than special-case offset=0/limit>=1, we
+   simply stop here: a LIMIT over the existence subquery falls through to
+   the general (always-correct) streaming path below instead of taking the
+   fast path. *)
 and unwrap_for_existence : Plan.op -> Plan.op = function
   | Plan.Op_project { child; _ }
   | Plan.Op_expr_project { child; _ }
   | Plan.Op_distinct { child }
-  | Plan.Op_sort { child; _ }
-  | Plan.Op_limit { child; _ } -> unwrap_for_existence child
+  | Plan.Op_sort { child; _ } -> unwrap_for_existence child
   | op -> op
 
 (* #674 (item 3 of 3): does the equality-bound (+ optional #517 range) prefix
@@ -11615,6 +11623,82 @@ and index_value_to_row_value (col_ty : Row.ty) (iv : Index_key.value) : Row.valu
      [Planner.index_is_seekable], which is what [access_path_for_eqs] must
      pass to ever produce an [Op_index_lookup] in the first place — see
      CLAUDE.md's #674 design-doc section on GENERATED/partial-index scoping. *)
+and index_cover_col_ordinal (table_meta : Cat.table_meta) name : int option =
+  let rec go n = function
+    | [] -> None
+    | (c : Row.column) :: rest ->
+      if String.equal c.Row.name name then Some n else go (n + 1) rest
+  in
+  go 0 table_meta.Cat.columns
+
+(* The index's own column list, translated to table column ordinals — [None]
+   if the catalog and the index somehow disagree on a column name (defensive;
+   should not happen for a live index). *)
+and index_cover_idx_ords (table_meta : Cat.table_meta) (idx_info : Cat.index_info)
+  : int array option
+  =
+  let idx_ords_opt =
+    List.map (index_cover_col_ordinal table_meta) idx_info.Cat.idx_columns
+  in
+  if List.exists Option.is_none idx_ords_opt
+  then None
+  else Some (Array.of_list (List.map Option.get idx_ords_opt))
+
+(* #536: a column is safe to read off the index only if it is part of the
+   index (so it is actually present in the encoded key) AND declared NOT
+   NULL (so [IK_null] can never mean an ambiguous NULL/NaN). *)
+and index_cover_ok_col (table_meta : Cat.table_meta) (idx_ords : int array) ord : bool =
+  let is_idx_ord = Array.exists (fun o -> o = ord) idx_ords in
+  let col_not_null =
+    match List.nth_opt table_meta.Cat.columns ord with
+    | Some (c : Row.column) -> c.Row.not_null
+    | None -> false
+  in
+  is_idx_ord && col_not_null
+
+and index_cover_agg_ok ok_col (s : Plan.agg_spec) : bool =
+  match s.Plan.func, s.Plan.arg_expr, s.Plan.col_ord with
+  | Ast.Agg_count, None, None -> true (* COUNT-star *)
+  | (Ast.Agg_count | Ast.Agg_min | Ast.Agg_max), Some e, None ->
+    plan_expr_reads_only_cols ok_col e
+  | (Ast.Agg_count | Ast.Agg_min | Ast.Agg_max), None, Some i -> ok_col i
+  | _ -> false
+
+and index_cover_pred_ok ok_col (pred_opt : Plan.expr option) : bool =
+  match pred_opt with
+  | None -> true
+  | Some p -> plan_expr_reads_only_cols ok_col p
+
+(* MIN/MAX additionally require: no #517 [range], and the aggregated column is
+   exactly the next unconstrained key column of the index (position
+   [n_eq]) — not merely SOME index column. *)
+and index_cover_minmax_ok
+      (idx_ords : int array)
+      (n_eq : int)
+      (range : Plan.range option)
+      (s : Plan.agg_spec)
+  : bool
+  =
+  match s.Plan.func with
+  | Ast.Agg_min | Ast.Agg_max ->
+    range = None
+    && n_eq < Array.length idx_ords
+    &&
+      (match s.Plan.col_ord with
+      | Some i -> idx_ords.(n_eq) = i
+      | None -> false)
+  | _ -> true
+
+and index_cover_min_early_stop (pred_opt : Plan.expr option) (aggs : Plan.agg_spec list)
+  : bool
+  =
+  pred_opt = None
+  &&
+  match aggs with
+  | [ { Plan.func = Ast.Agg_min; col_ord = Some _; distinct = false; arg_expr = None } ]
+    -> true
+  | _ -> false
+
 and index_cover_eligible
       (cat : Cat.t)
       (table_meta : Cat.table_meta)
@@ -11631,73 +11715,18 @@ and index_cover_eligible
   with
   | None -> None
   | Some idx_info ->
-    let col_ordinal name =
-      let rec go n = function
-        | [] -> None
-        | (c : Row.column) :: rest ->
-          if String.equal c.Row.name name then Some n else go (n + 1) rest
-      in
-      go 0 table_meta.Cat.columns
-    in
-    let idx_ords_opt = List.map col_ordinal idx_info.Cat.idx_columns in
-    if List.exists Option.is_none idx_ords_opt
-    then None
-    else (
-      let idx_ords = Array.of_list (List.map Option.get idx_ords_opt) in
-      let n_eq = List.length keys in
-      let is_idx_ord ord = Array.exists (fun o -> o = ord) idx_ords in
-      let col_not_null ord =
-        match List.nth_opt table_meta.Cat.columns ord with
-        | Some (c : Row.column) -> c.Row.not_null
-        | None -> false
-      in
-      let ok_col ord = is_idx_ord ord && col_not_null ord in
-      let agg_ok (s : Plan.agg_spec) =
-        match s.Plan.func, s.Plan.arg_expr, s.Plan.col_ord with
-        | Ast.Agg_count, None, None -> true (* COUNT-star *)
-        | (Ast.Agg_count | Ast.Agg_min | Ast.Agg_max), Some e, None ->
-          plan_expr_reads_only_cols ok_col e
-        | (Ast.Agg_count | Ast.Agg_min | Ast.Agg_max), None, Some i -> ok_col i
-        | _ -> false
-      in
-      if not (List.for_all agg_ok aggs)
-      then None
-      else (
-        let pred_ok =
-          match pred_opt with
-          | None -> true
-          | Some p -> plan_expr_reads_only_cols ok_col p
-        in
-        if not pred_ok
-        then None
-        else (
-          let minmax_ok (s : Plan.agg_spec) =
-            match s.Plan.func with
-            | Ast.Agg_min | Ast.Agg_max ->
-              range = None
-              && n_eq < Array.length idx_ords
-              &&
-                (match s.Plan.col_ord with
-                | Some i -> idx_ords.(n_eq) = i
-                | None -> false)
-            | _ -> true
-          in
-          if not (List.for_all minmax_ok aggs)
-          then None
-          else (
-            let min_early_stop =
-              pred_opt = None
-              &&
-              match aggs with
-              | [ { Plan.func = Ast.Agg_min
-                  ; col_ord = Some _
-                  ; distinct = false
-                  ; arg_expr = None
-                  }
-                ] -> true
-              | _ -> false
-            in
-            Some (idx_ords, min_early_stop)))))
+    (match index_cover_idx_ords table_meta idx_info with
+     | None -> None
+     | Some idx_ords ->
+       let n_eq = List.length keys in
+       let ok_col = index_cover_ok_col table_meta idx_ords in
+       if not (List.for_all (index_cover_agg_ok ok_col) aggs)
+       then None
+       else if not (index_cover_pred_ok ok_col pred_opt)
+       then None
+       else if not (List.for_all (index_cover_minmax_ok idx_ords n_eq range) aggs)
+       then None
+       else Some (idx_ords, index_cover_min_early_stop pred_opt aggs))
 
 (* #674 (item 1 of 3): entry point for the covering-index aggregate fast
    path — checks eligibility, then folds the accumulators over [idx_tree]

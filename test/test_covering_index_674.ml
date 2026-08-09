@@ -348,6 +348,52 @@ let agrees_exists () =
     [ "i:1" ]
 ;;
 
+(* PR #684 review, blocker 1: [unwrap_for_existence] used to strip
+   [Op_limit] unconditionally on the way to the covering-existence shortcut,
+   so a LIMIT/OFFSET on the inner subquery was silently discarded and the
+   fast path answered "does the index have ANY matching entry" instead of
+   "does the subquery, limit and all, yield a row". Both cases below have a
+   matching index entry, so the fast path (if it fired through the LIMIT)
+   would wrongly answer true / true; the correct answer, honouring LIMIT, is
+   false in both. *)
+let exists_limit_zero_is_false () =
+  with_db
+  @@ fun db ->
+  seed db;
+  set_fastpath true;
+  let check sql expected = Alcotest.(check (list string)) sql expected (rows_of db sql) in
+  check
+    "SELECT EXISTS (SELECT 1 FROM new_order WHERE no_w_id = 1 AND no_d_id = 2 LIMIT 0)"
+    [ "i:0" ]
+;;
+
+let exists_limit_offset_beyond_matches_is_false () =
+  with_db
+  @@ fun db ->
+  seed db;
+  set_fastpath true;
+  let check sql expected = Alcotest.(check (list string)) sql expected (rows_of db sql) in
+  (* no_w_id = 1 AND no_d_id = 2 matches exactly [n_per_district] rows (see
+     [seed]), so an OFFSET of that many skips past every match. *)
+  check
+    (Printf.sprintf
+       "SELECT EXISTS (SELECT 1 FROM new_order WHERE no_w_id = 1 AND no_d_id = 2 LIMIT 1 \
+        OFFSET %d)"
+       n_per_district)
+    [ "i:0" ]
+;;
+
+let exists_limit_one_still_true () =
+  with_db
+  @@ fun db ->
+  seed db;
+  set_fastpath true;
+  let check sql expected = Alcotest.(check (list string)) sql expected (rows_of db sql) in
+  check
+    "SELECT EXISTS (SELECT 1 FROM new_order WHERE no_w_id = 1 AND no_d_id = 2 LIMIT 1)"
+    [ "i:1" ]
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Perf: rows_examined must be 0 for the covering shapes                *)
 (* ------------------------------------------------------------------ *)
@@ -538,6 +584,18 @@ let () =
             agrees_group_by_not_taken
         ; Alcotest.test_case "generated columns agree" `Quick agrees_generated_columns
         ; Alcotest.test_case "EXISTS over index lookup" `Quick agrees_exists
+        ; Alcotest.test_case
+            "EXISTS (... LIMIT 0) is false, not fast-pathed to true"
+            `Quick
+            exists_limit_zero_is_false
+        ; Alcotest.test_case
+            "EXISTS (... LIMIT 1 OFFSET past all matches) is false"
+            `Quick
+            exists_limit_offset_beyond_matches_is_false
+        ; Alcotest.test_case
+            "EXISTS (... LIMIT 1) is still true"
+            `Quick
+            exists_limit_one_still_true
         ] )
     ; ( "rows_examined_bound"
       , [ Alcotest.test_case "MIN touches no table rows" `Quick min_touches_no_table_rows
