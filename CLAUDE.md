@@ -571,17 +571,35 @@ EOF
   `delete_replace_conflicts` — a non-empty `dels` there is a queued delete that
   never happens.
 
-  **What this pass does NOT do — and an earlier revision of this bullet claimed
-  it did — is hand the check downstream.** `write_row_rekeyed` performs *no*
-  uniqueness probe: its index loop is an unconditional `S.del` of the old key
-  and `S.put` of the new one. `check_index_unique_on_update` is defined after it
-  in `exec.ml` and is reached only from `validate_update_unique`, the
-  plain-`UPDATE` pre-pass. Discarding the other indexes' verdicts is still
-  sound — they were computed against the row being INSERTED, which is discarded,
-  and a `SET v = 42` does not touch the column they were about — but **a DO
-  UPDATE that writes a duplicate into another unique index is accepted
-  silently**. That is pre-existing (true on `main` for the secondary-index
-  shape) and is tracked as **#667**. Do not read the target pass as covering it.
+  **What this pass does NOT do is hand the check downstream — `write_row_rekeyed`
+  itself performs no uniqueness probe.** Its index loop is still an unconditional
+  `S.del` of the old key and `S.put` of the new one, and `check_index_unique_on_update`
+  is still reached only from `validate_update_unique`, the plain-`UPDATE`
+  pre-pass. Discarding the target pass's other-index verdicts is sound — they
+  were computed against the row being INSERTED, which is discarded, and a
+  `SET v = 42` does not touch the column they were about.
+
+  **#667 (fixed): a DO UPDATE that writes a duplicate into another unique index
+  now raises, via a check at the `execute_upsert_update` call site rather than
+  inside `write_row_rekeyed`.** `write_row_rekeyed` is shared by three write
+  paths — plain `UPDATE`, `UPSERT ... DO UPDATE`, and `ON UPDATE CASCADE` — so
+  pushing the probe inside it would have changed the other two as well; that is
+  a separate decision (see the `enforce_not_null` bullet above, which makes the
+  same point). `execute_upsert_update` instead loops over
+  `Cat.indexes_for_table` and calls `check_index_unique_on_update` for each,
+  computing `new_row`'s virtuals once for the loop, before calling
+  `write_row_rekeyed`. `check_index_unique_on_update` already excludes the row
+  being updated from its own conflict probe (by rowid) and exempts an unchanged
+  key and a NULL-containing key (#290), so this includes the conflict-target
+  index itself — a DO UPDATE that moves the very column named in `ON
+  CONFLICT(...)` to a value a third row already holds is caught too, not just
+  a DO UPDATE touching an unrelated index. `check_index_unique_on_update` and
+  its `unique_violation_on_update` helper moved earlier in `exec.ml` (to just
+  before `write_row_rekeyed`) so `execute_upsert_update` — defined before their
+  original position — could call them; nothing about their behavior changed.
+  Pinned by `test/test_upsert_unique_667.ml`, covering both conflict shapes
+  (secondary UNIQUE index and rowid-alias PRIMARY KEY, since both funnel
+  through `execute_upsert_update`) and a plain-UPDATE regression check.
 
   One consequence of the target pass is a change for the *raising* modifiers:
   bare / `OR ABORT` / `OR FAIL` / `OR ROLLBACK` used to report
