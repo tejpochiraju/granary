@@ -3,8 +3,11 @@ open Granary
 type t =
   { db : Db.t
   ; path : string
-  ; stmt_cache : (string, Db.stmt) Hashtbl.t
-    (** One compiled {!Db.stmt} per distinct SQL shape (#697). The shapes are
+  ; stmt_cache : (string, Db.stmt * int) Hashtbl.t
+    (** One compiled {!Db.stmt} per distinct SQL shape (#697), paired with
+        that shape's placeholder count so {!check_arity} can validate every
+        call against a count computed once per shape rather than rescanning
+        the SQL text on every call (#697/#698 review). The shapes are
         static — see {!Tpcc_txn}'s [stmt]/[*_insert_sql] helpers — so caching
         for the lifetime of the connection amortizes the parse+plan cost
         across every call site that reruns the same shape with different
@@ -61,24 +64,62 @@ let is_control_stmt (s : Tpcc_txn.stmt) =
   | _ :: _ -> false
 ;;
 
+(* Mirrors {!Tpc_value.literal}'s own guard: a non-finite REAL has no SQL
+   literal, and {!render}'s literal-substitution path already raises on one
+   via [Tpc_value.literal]. This path binds a value directly through
+   {!Db.run}/{!Db.iter} instead of rendering it into SQL text, so it must
+   reject nan/infinity itself or it would silently bind a value {!render}
+   would have refused to produce — the same value quietly becoming a
+   different, still-runnable statement that #697's arity check was restored
+   to prevent for a missing/extra parameter (#697/#698 review). Unreachable
+   today: every {!Tpc_value.VReal} call site in {!Tpcc_txn} is bounded finite
+   arithmetic (money and quantities), so this is a safety net, not a path any
+   current input exercises. *)
 let to_db_value = function
   | Tpc_value.VInt i -> Db.V_int (Int64.of_int i)
-  | Tpc_value.VReal f -> Db.V_real f
+  | Tpc_value.VReal f ->
+    if not (Float.is_finite f)
+    then
+      invalid_arg
+        (Printf.sprintf
+           "Tpcc_conn.to_db_value: %s has no SQL literal"
+           (Float.to_string f));
+    Db.V_real f
   | Tpc_value.VText s -> Db.V_text s
   | Tpc_value.VNull -> Db.V_null
 ;;
 
 (* [Db.prepare] compiles [sql] once (parse + plan); every later call with the
    same [sql] reuses the cached {!Db.stmt} and only pays [Db.run]/[Db.iter]'s
-   per-call binding and execution cost. *)
+   per-call binding and execution cost. The placeholder count is cached
+   alongside it for the same reason — computed once per shape rather than
+   rescanned from the SQL text on every call (#697/#698 review).
+
+   Cache-miss check-then-add is not atomic across the [Db.prepare] await: two
+   fibers racing to prepare the same not-yet-cached shape would both prepare,
+   and the second [Hashtbl.add] would shadow rather than replace the first,
+   leaking it. Not reachable today — the benchmark drives a single-fiber
+   one-deep worker pool (see {!Tpcc_driver}'s header) — but nothing in this
+   module enforces that, so the miss branch re-checks the cache after the
+   await and discards its own redundant prepare in favour of whichever fiber
+   won, rather than assuming it cannot happen. *)
 let get_stmt t sql =
   match Hashtbl.find_opt t.stmt_cache sql with
-  | Some st -> Lwt.return st
+  | Some entry -> Lwt.return entry
   | None ->
     let open Lwt.Syntax in
-    let+ st = Lwt.map unwrap (Db.prepare t.db sql) in
-    Hashtbl.add t.stmt_cache sql st;
-    st
+    let* st = Lwt.map unwrap (Db.prepare t.db sql) in
+    (match Hashtbl.find_opt t.stmt_cache sql with
+     | Some entry ->
+       (* Another fiber won the race while this one awaited [Db.prepare];
+          finalize the redundant copy rather than shadow the winner's entry
+          in the cache. *)
+       let+ () = Db.finalize st in
+       entry
+     | None ->
+       let entry = st, Tpcc_txn.count_placeholders sql in
+       Hashtbl.add t.stmt_cache sql entry;
+       Lwt.return entry)
 ;;
 
 (* [Tpcc_txn.render]'s arity check never runs on this path — [Db.run]/[Db.iter]
@@ -86,31 +127,29 @@ let get_stmt t sql =
    own, so a params list shorter than the SQL's placeholder count would
    silently bind NULL for the missing tail, and a longer one would be silently
    truncated. Restoring the check here keeps a SQL/params drift a loud
-   [invalid_arg] instead of quietly corrupted benchmark data (#697 review). *)
-let check_arity (s : Tpcc_txn.stmt) =
-  let n_placeholders = Tpcc_txn.count_placeholders s.Tpcc_txn.sql in
-  let n_params = List.length s.Tpcc_txn.params in
-  if n_placeholders <> n_params
-  then
-    invalid_arg
-      (Printf.sprintf
-         "Tpcc_conn: %d placeholders but %d parameter(s)"
-         n_placeholders
-         n_params)
+   [invalid_arg] instead of quietly corrupted benchmark data (#697 review).
+   Shares its comparison and message with {!Tpcc_txn.render} via
+   {!Tpcc_txn.check_arity}, differing only in the error-message prefix
+   (#697/#698 review, finding #3). *)
+let check_arity ~n_placeholders (s : Tpcc_txn.stmt) =
+  Tpcc_txn.check_arity
+    ~prefix:"Tpcc_conn"
+    ~n_placeholders
+    ~n_params:(List.length s.Tpcc_txn.params)
 ;;
 
 let prepared_exec_lwt t (s : Tpcc_txn.stmt) =
   let open Lwt.Syntax in
-  check_arity s;
-  let* stmt = get_stmt t s.Tpcc_txn.sql in
+  let* stmt, n_placeholders = get_stmt t s.Tpcc_txn.sql in
+  check_arity ~n_placeholders s;
   let params = List.map to_db_value s.Tpcc_txn.params in
   Lwt.map (fun r -> ignore (unwrap r)) (Db.run stmt ~params)
 ;;
 
 let prepared_query_rows_lwt t (s : Tpcc_txn.stmt) =
   let open Lwt.Syntax in
-  check_arity s;
-  let* stmt = get_stmt t s.Tpcc_txn.sql in
+  let* stmt, n_placeholders = get_stmt t s.Tpcc_txn.sql in
+  check_arity ~n_placeholders s;
   let params = List.map to_db_value s.Tpcc_txn.params in
   let* stream = Lwt.map unwrap (Db.iter stmt ~params) in
   let+ rows = Lwt_stream.to_list stream in
@@ -156,8 +195,11 @@ let exec t sql = run (exec_lwt t sql)
 let query_rows t sql = run (query_rows_lwt t sql)
 
 let close t =
-  let finalizes = Hashtbl.fold (fun _ st acc -> Db.finalize st :: acc) t.stmt_cache [] in
-  run (Lwt.join finalizes);
+  (* [Db.finalize] is a documented no-op in this implementation ("should be
+     called for forward compatibility"), so a plain iteration is all the
+     effect needs — no fold-into-a-list-then-[Lwt.join] to run them
+     concurrently (#697/#698 review, finding #5). *)
+  Hashtbl.iter (fun _ (st, _) -> run (Db.finalize st)) t.stmt_cache;
   Hashtbl.reset t.stmt_cache;
   run (Db.close t.db)
 ;;

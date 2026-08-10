@@ -388,16 +388,21 @@ and subst_param buf sql i params =
     substitute buf sql (i + 1) rest
 ;;
 
-let render { sql; params } =
-  let n_placeholders = count_placeholders sql in
-  let n_params = List.length params in
+let check_arity ~prefix ~n_placeholders ~n_params =
   if n_placeholders <> n_params
   then
     invalid_arg
       (Printf.sprintf
-         "Tpcc_txn.render: %d placeholders but %d parameter(s)"
+         "%s: %d placeholders but %d parameter(s)"
+         prefix
          n_placeholders
-         n_params);
+         n_params)
+;;
+
+let render { sql; params } =
+  let n_placeholders = count_placeholders sql in
+  let n_params = List.length params in
+  check_arity ~prefix:"Tpcc_txn.render" ~n_placeholders ~n_params;
   let buf = Buffer.create (String.length sql + (16 * n_params)) in
   substitute buf sql 0 params;
   Buffer.contents buf
