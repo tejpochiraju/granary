@@ -22,7 +22,20 @@
     match count (the #514 shape); a seek that bailed out reports
     [dss_fetched = dss_peak_buffered = 0] — the fetch phase never started —
     while [dss_candidates] stops exactly at the budget, since the entry that
-    crosses it is never emitted. *)
+    crosses it is never emitted.
+
+    [staleness] below (the "guard tracks a growing table across a prepared
+    statement's life" group) is a review finding on this same issue, not a
+    duplicate of the groups above: [Db.prepare]'s plan is computed once and
+    reused for [stmt]'s whole life, and an earlier revision computed the
+    budget once, at THAT prepare, from the table's row count at that instant.
+    A statement prepared while the table was small (or below the floor above,
+    giving no guard at all) then reproduced #550's own O(n) pessimization for
+    every later execution, however large the table grew — the fix
+    ([Planner.dml_seek_bail_out_at] is now called by [Exec.seek_index_candidates]
+    itself, once per execution, against a table_meta freshly re-read from the
+    catalog) is pinned by running the SAME prepared [stmt] once before and once
+    after the table crosses the floor. *)
 
 module Db = Granary.Db
 module Exec = Granary_sql.Exec
@@ -248,6 +261,97 @@ let small_table_is_exempt () =
     Alcotest.(check int) "table emptied" 0 (one_int db "SELECT COUNT(*) FROM s"))
 ;;
 
+(* Run a prepared [stmt] with no parameters, under [Exec.dml_seek_stats].
+   [Db.run] rather than [Db.execute] is the whole point of this group: it
+   reuses the SAME compiled [Plan.op] the staleness bug baked a budget into. *)
+let run_prepared_stats pr =
+  let st = Exec.make_dml_seek_stats () in
+  (match run (Exec.with_dml_seek_stats st (fun () -> Db.run pr ~params:[])) with
+   | Ok _ -> ()
+   | Error e -> Alcotest.failf "prepared run: %a" Db.pp_error e);
+  st
+;;
+
+(* #550 review: the bail-out budget must be recomputed on every execution of a
+   prepared statement, not baked in once at [Db.prepare] time from whatever
+   the table's row count was then.
+
+   [w] carries [n_floor] rows, all [g = 0] — comfortably below
+   {!Granary_sql.Planner.build_side_seek_break_even_ratio} (200), so the guard
+   is exempt and the FIRST run of the prepared [UPDATE ... WHERE g = 0] seeks
+   and updates every row unconditionally, exactly like [small_table_is_exempt]
+   above. [n_grow] more rows are then inserted, all [g = 1] — the [g = 0]
+   match count never changes, but the TABLE does, past the floor and past the
+   point where [n_floor] rows is itself more than [1/200] of it.
+
+   Running the SAME prepared [stmt] again must now see the guard apply: with a
+   STALE, prepare-time budget (bugged behaviour) it would still answer [None]
+   and seek unconditionally a second time, exactly as the first run did, for
+   the life of the statement. With a LIVE budget it answers
+   [Some ((n_floor + n_grow) / 200)], strictly below [n_floor], and the second
+   run must bail to a scan instead — the same observable shape
+   [non_selective_bails_to_scan] pins for a single execution, here pinned
+   across two executions of one [Db.stmt]. *)
+let guard_recomputes_across_prepared_executions () =
+  with_db (fun db ->
+    let n_floor = 60 in
+    let n_grow = 3000 in
+    exec db "CREATE TABLE w (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)";
+    exec db "CREATE INDEX idx_wg ON w (g)";
+    exec db "BEGIN";
+    for i = 1 to n_floor do
+      exec db (Printf.sprintf "INSERT INTO w VALUES (%d, 0, %d)" i i)
+    done;
+    exec db "COMMIT";
+    let pr =
+      match run (Db.prepare db "UPDATE w SET v = v + 1 WHERE g = 0") with
+      | Ok pr -> pr
+      | Error e -> Alcotest.failf "prepare: %a" Db.pp_error e
+    in
+    let st_before = run_prepared_stats pr in
+    Alcotest.(check int)
+      "below the floor: seeks every g = 0 row unconditionally"
+      n_floor
+      st_before.Exec.dss_candidates;
+    Alcotest.(check int)
+      "below the floor: fetch phase ran"
+      n_floor
+      st_before.Exec.dss_fetched;
+    exec db "BEGIN";
+    for i = 1 to n_grow do
+      exec db (Printf.sprintf "INSERT INTO w VALUES (%d, 1, %d)" (n_floor + i) i)
+    done;
+    exec db "COMMIT";
+    let total = n_floor + n_grow in
+    let expected_budget = total / 200 in
+    assert (expected_budget < n_floor);
+    let st_after = run_prepared_stats pr in
+    Alcotest.(check int)
+      "same prepared statement, grown table: walk now stops at the live budget"
+      expected_budget
+      st_after.Exec.dss_candidates;
+    Alcotest.(check int)
+      "same prepared statement, grown table: fetch phase never ran"
+      0
+      st_after.Exec.dss_fetched;
+    (* Correctness backstop: whichever path each run took (unconditional seek
+       the first time, a bailed-to-scan seek the second), every g = 0 row's
+       [v] was incremented by exactly 2 (once per run: [v = i] seeded, so
+       [v = i + 2] after both), and every g = 1 row is untouched ([v = i]
+       still, where [id = n_floor + i]). *)
+    Alcotest.(check int)
+      "every g = 0 row updated by both runs"
+      n_floor
+      (one_int db "SELECT COUNT(*) FROM w WHERE g = 0 AND v = id + 2");
+    Alcotest.(check int)
+      "no g = 1 row touched"
+      n_grow
+      (one_int
+         db
+         (Printf.sprintf "SELECT COUNT(*) FROM w WHERE g = 1 AND v = id - %d" n_floor));
+    run (Db.finalize pr))
+;;
+
 (* QCheck: whatever the split between the non-selective and selective values,
    and whatever the guard decides, the affected row set never diverges from
    the unoptimizable foil's. This is the correctness backstop for the whole
@@ -306,6 +410,12 @@ let () =
             "a table below the floor is exempt"
             `Quick
             small_table_is_exempt
+        ] )
+    ; ( "staleness"
+      , [ Alcotest.test_case
+            "the guard tracks a growing table across a prepared statement's life"
+            `Quick
+            guard_recomputes_across_prepared_executions
         ] )
     ; "property", List.map QCheck_alcotest.to_alcotest [ prop_bail_out_matches_foil ]
     ]
