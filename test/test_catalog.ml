@@ -1852,6 +1852,7 @@ let make_table_value tree_id =
 
 let sys_tables_tid = 0
 let sys_columns_tid = 1
+let sys_indexes_tid = 2
 let sys_fts_tid = 4
 
 (* #689 scaffolding: [fts_table_meta] gained a trailing [fts_format_version]
@@ -2604,6 +2605,86 @@ let test_set_index_stats_is_index_scoped_576 () =
      Lwt.return_unit)
 ;;
 
+(* #576 final review: the design doc's Testing section asks for "a fixed
+   version-3 byte string decoded to confirm idx_stats = None for pre-existing
+   data" -- the backward-compatibility guarantee #576 tier 1's version-4
+   encoding leans on. Every round-trip test above writes with the CURRENT
+   (version-4) encoder, so none of them can catch a regression in the v1/v2/v3
+   DECODE arms of [decode_index_ext_fields]. This hand-encodes a version-3
+   blob (matching [encode_index_value]'s pre-#576 shape: name, table, columns,
+   unique byte, tree_id varint, then version=3, origin byte, one expr-flag
+   varint per column, WHERE-presence + optional length + string) and writes it
+   straight into the _sys_indexes tree, so [C.open_] -> [load_all_indexes] ->
+   [decode_index_value] is the REAL production decoder under test, not a
+   reimplementation of it. *)
+let make_v3_index_bytes
+      ~name
+      ~table
+      ~columns
+      ~unique
+      ~tree_id
+      ~origin_byte
+      ~expr_flags
+      ~where_sql
+  =
+  let buf = Buffer.create 32 in
+  let v = Varint.encode_uint64 in
+  v buf (Int64.of_int (String.length name));
+  Buffer.add_string buf name;
+  v buf (Int64.of_int (String.length table));
+  Buffer.add_string buf table;
+  v buf (Int64.of_int (List.length columns));
+  List.iter
+    (fun col ->
+       v buf (Int64.of_int (String.length col));
+       Buffer.add_string buf col)
+    columns;
+  Buffer.add_char buf (if unique then '\x01' else '\x00');
+  v buf (Int64.of_int tree_id);
+  v buf 3L;
+  (* version 3 (#273): origin byte, then expr flags, then WHERE clause *)
+  Buffer.add_char buf (Char.chr origin_byte);
+  List.iter (fun is_expr -> v buf (if is_expr then 1L else 0L)) expr_flags;
+  (match where_sql with
+   | None -> v buf 0L
+   | Some sql ->
+     v buf 1L;
+     v buf (Int64.of_int (String.length sql));
+     Buffer.add_string buf sql);
+  Buffer.to_bytes buf
+;;
+
+let test_decode_index_v3_backward_compat_576 () =
+  run
+    (let store = S.create () in
+     let v3_bytes =
+       make_v3_index_bytes
+         ~name:"idx_v3_legacy"
+         ~table:"legacy_t"
+         ~columns:[ "a"; "b" ]
+         ~unique:false
+         ~tree_id:9
+         ~origin_byte:2 (* `User -- see idx_origin_of_byte *)
+         ~expr_flags:[ false; true ]
+         ~where_sql:(Some "a > 0")
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.put tx sys_indexes_tid (Bytes.of_string "v3_key") v3_bytes in
+     let* () = S.commit tx in
+     let* cat = C.open_ store in
+     (match C.find_index cat ~name:"idx_v3_legacy" with
+      | None -> Alcotest.fail "expected the hand-encoded v3 index to decode and load"
+      | Some i ->
+        Alcotest.(check bool) "idx_stats is None for v3 bytes" true (i.C.idx_stats = None);
+        Alcotest.(check (list string)) "idx_columns" [ "a"; "b" ] i.C.idx_columns;
+        Alcotest.(check bool) "idx_unique" false i.C.idx_unique;
+        Alcotest.(check int) "idx_tree_id" 9 i.C.idx_tree_id;
+        Alcotest.(check (list bool)) "idx_expr_flags" [ false; true ] i.C.idx_expr_flags;
+        Alcotest.(check (option string)) "idx_where_sql" (Some "a > 0") i.C.idx_where_sql;
+        Alcotest.(check bool) "idx_origin is `User" true (i.C.idx_origin = `User));
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group: schema-drift detection (#174)                                 *)
 (* ------------------------------------------------------------------ *)
@@ -2755,6 +2836,10 @@ let () =
             "decode_column_no_check_sql"
             `Quick
             test_decode_column_no_check_sql
+        ; Alcotest.test_case
+            "decode_index_v3_backward_compat (#576)"
+            `Quick
+            test_decode_index_v3_backward_compat_576
         ] )
     ; ( "indexes"
       , [ Alcotest.test_case "create_index_basic" `Quick test_create_index_basic

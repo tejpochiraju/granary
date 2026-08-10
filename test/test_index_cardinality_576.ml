@@ -85,6 +85,41 @@ let expr_leading_column_is_exempt () =
     | Some _ -> Alcotest.fail "expression-column index must not carry idx_stats")
 ;;
 
+(* #576 final review: [execute_create_index]'s [Hashtbl] is capped at
+   [Exec.index_stats_cardinality_cap] (100,000, kept private to exec.ml --
+   this test hardcodes the same number rather than exposing a test-only
+   parameter, per the review's own instruction not to add one) to bound the
+   walk's peak retained memory. A near-unique column -- more distinct values
+   than the cap -- must persist [idx_stats = None] rather than a stat
+   computed from a partial, under-reported count: an under-reported
+   [distinct_count] makes [estimate_rows_from_stats]'s estimate too SMALL,
+   which is the ADMITTING direction (the unsafe one this cap exists to keep
+   out of), so the safe fallback is no stat at all -- identical to an
+   unanalyzed index. *)
+let n_over_cap_rows = 100_005
+
+let seed_over_cap db =
+  exec db "CREATE TABLE big (v INTEGER)";
+  exec db "BEGIN";
+  for i = 1 to n_over_cap_rows do
+    exec db (Printf.sprintf "INSERT INTO big VALUES (%d)" i)
+  done;
+  exec db "COMMIT"
+;;
+
+let cardinality_above_the_cap_falls_back_to_no_stat () =
+  with_db (fun db ->
+    seed_over_cap db;
+    exec db "CREATE INDEX idx_big_v ON big(v)";
+    match idx_stats db "idx_big_v" with
+    | None -> ()
+    | Some s ->
+      Alcotest.failf
+        "expected idx_stats = None once distinct values exceed the cardinality cap, got \
+         distinct_count=%d"
+        s.Cat.distinct_count)
+;;
+
 let a_row_excluded_by_a_partial_index_where_is_not_counted () =
   with_db (fun db ->
     exec db "CREATE TABLE p (tenant_id INTEGER, active INTEGER)";
@@ -262,6 +297,9 @@ let () =
         ; ( "partial index respects WHERE"
           , `Quick
           , a_row_excluded_by_a_partial_index_where_is_not_counted )
+        ; ( "cardinality above the cap falls back to no stat"
+          , `Quick
+          , cardinality_above_the_cap_falls_back_to_no_stat )
         ] )
     ; ( "estimate_rows"
       , [ ( "selective driving seek wins the probe"

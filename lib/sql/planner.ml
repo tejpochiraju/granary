@@ -1071,11 +1071,16 @@ let table_rows_estimate (meta : Cat.table_meta) =
     changes sign in the other direction.
 
     {b This is not the statistic #576 is about and does not close it.}  It is a
-    per-row cost ratio measured on one engine, not a selectivity estimate: it
-    can only be consulted where the window is {i literally} readable off the
-    query and the index is unique, which is why {!build_side_seek_is_unambiguous}
-    still asks {!index_is_unique} and {!range_literal_window_rows} first.  A
-    parameterised bound still has no window to compare and is still declined.
+    per-row cost ratio measured on one engine, not a selectivity estimate: for
+    the range arm it can only be consulted where the window is {i literally}
+    readable off the query and the index is unique, which is why
+    {!build_side_seek_is_unambiguous} still asks {!index_is_unique} and
+    {!range_literal_window_rows} first there.  A parameterised bound still has
+    no window to compare and is still declined.  Since #576 tier 1 this ratio
+    (via {!table_seek_budget}) is {i also} consulted in a fourth place —
+    {!build_side_seek_is_unambiguous}'s bare-equality-prefix arm, where the
+    index is explicitly {b non-unique} but carries an analyzed leading-column
+    stat instead of a literal window.
 
     {b Correction to #546's published figure.}  That issue derived break-even
     "near 1/390" from a scanned-row cost of 0.008 reads — an estimate of one page
@@ -1518,9 +1523,13 @@ let estimate_rows cat (op : Plan.op) =
       That distinction is the whole reason this is not the fudge #576 forbids: a
       constant standing in for a distribution the engine cannot see is a fudge; a
       constant measured directly, twice, over the quantity it actually names is a
-      calibration.  Everything that still needs a {i distribution} — a
-      parameterised bound, a non-integer literal, any prefix of a non-unique
-      index — is still declined, unchanged.
+      calibration.  A parameterised bound and a non-integer literal still have no
+      distribution to consult and are still declined, unchanged.  A non-unique
+      index's prefix is {b no longer} declined unconditionally: since #576
+      tier 1 (see {!build_side_seek_is_unambiguous}) it is admitted when the
+      leading column carries an analyzed distinct-value count whose resulting
+      estimate fits within {!table_seek_budget}, and declined only when the
+      index is unanalyzed or the estimate exceeds budget.
 
       Two edges the ratio brings with it:
 
@@ -1555,7 +1564,25 @@ let estimate_rows cat (op : Plan.op) =
       {!index_is_unique}'s own doc states the invariant the fourth broke — and in
       both cases the fix for one premise read as a fix for the class.  {b Reading
       a warning is not testing for the thing it warns about, and closing one
-      instance of a class is not closing the class.} *)
+      instance of a class is not closing the class.}
+
+      {b #576 tier 1 adds a fifth admission below (the [Seek_index] arm with
+      [range = None] on a non-unique index), and it rests on a premise of its
+      own that must be named here rather than left to be found the same way the
+      other five were.}  {!estimate_rows_from_stats} computes
+      [table_rows_estimate / distinct_count] — the {i mean} rows per leading-
+      column value — which assumes the column's values are roughly uniformly
+      distributed under the pinned prefix.  A skewed column breaks that
+      silently and in the {i admitting} direction: 500 distinct values across
+      100,000 rows estimates 200 (well inside a 500-row budget) whether the
+      values are even or whether one value alone holds 40,000 of them, and the
+      seek that admission takes then reads 40,000 entries — 80x over budget,
+      exactly the #575/#546 regression class this whole function exists to
+      keep out.  This is accepted as tier-1 scope, not fixed here: a per-column
+      histogram (tier 2) is what would size a skewed column correctly, and
+      {!Cat.idx_stats}'s [rows_at_analysis] does not help in the meantime — it
+      records headcount at analysis time, not shape, so it cannot distinguish a
+      uniform column from a skewed one. *)
 let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
   | Plan.Seek_rowid _ -> true
   | Plan.Seek_index { idx_tree; keys; range = None } ->
@@ -1564,7 +1591,18 @@ let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
     (* #576 tier 1: a non-unique equality prefix used to be declined
        unconditionally here. Admit it when the leading column's analyzed
        distinct-value count puts the estimated row count within
-       table_seek_budget -- the same budget dml_seek_bail_out_at consults. *)
+       table_seek_budget -- the same budget dml_seek_bail_out_at consults.
+
+       Premise this arm rests on, named per this function's own doc-block
+       convention (see its "wrong that way five times" paragraph above):
+       estimate_rows_from_stats assumes the leading column's values are
+       roughly UNIFORMLY distributed, since it divides the table's row count
+       by the distinct-value count to get a mean. A skewed column can make
+       this estimate arbitrarily wrong in the ADMITTING direction -- few
+       distinct values with one value holding most of the rows still looks
+       small on average. Tier 2 (per-column histograms) is what would fix
+       this; rows_at_analysis does not help, since it records headcount at
+       analysis time, not shape. *)
     (match estimate_rows_from_stats cat meta ~idx_tree with
       | None -> false
       | Some est ->
@@ -1686,28 +1724,34 @@ let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
     take the seek only where it is unambiguously right and decline the
     unmeasurable middle, which is what {!build_side_seek_is_unambiguous} tests.
 
-    Three access paths qualify.  The first two reach {b at most one row}:
+    Four access paths qualify.  The first two reach {b at most one row}:
 
     - [Seek_rowid] — the rowid alias IS the table key, so the seek addresses one
       row and cannot lose to a scan.
     - [Seek_index] on a {b unique} index whose {b every} key column is pinned by
       an equality.  One entry, one [rh_get].
 
-    The third is bounded rather than a point:
+    The other two are bounded rather than a point:
 
     - [Seek_index] carrying a #532 range bound.  Not a point, but not part of
       what #546 measured either: the table above is the {i open-ended} prefix
       walk, and a range stops it at a bound.  It is also the one case with a
       selectivity estimate to consult ({!range_rows_estimate}), so #575's premise
       — "no selectivity estimate" — does not hold for it.
+    - [Seek_index] on a bare equality prefix of a {b non-unique} index, admitted
+      since #576 tier 1 when the leading column was analyzed at [CREATE INDEX]
+      time: {!estimate_rows_from_stats} turns that column's stored
+      distinct-value count into a row-count estimate, and the seek is taken
+      only when that estimate fits {!table_seek_budget}.  This is the case
+      #575 originally declined outright — see the history above — because at
+      the time there was no selectivity estimate for a non-unique prefix at
+      all; #576 tier 1 is what supplies one.
 
-    Everything else — a strict prefix of a unique index, any prefix of a
-    non-unique one — is declined and scans.  That is every row of the table
-    above, so it deliberately gives up the 6% and 1% wins to avoid the 2.6-3.5x
-    regression at 100%: the engine targets MirageOS on disk, the penalty is
-    measured and the wins are the ones the planner cannot currently identify.
-    It is a trade, not a strict improvement, and #576 is what would let the
-    middle band be judged rather than declined.
+    Everything else — a strict prefix of a unique index, or a non-unique
+    prefix that is unanalyzed or whose stats-based estimate exceeds budget —
+    is still declined and scans.  Before #576 tier 1 that was every row of the
+    table above, so the trade below was unconditional; now it is the residual
+    left after the fourth arm above has had its chance to admit the seek.
 
     {b What this does NOT cost: TPC-C StockLevel.}  That query is the one #528
     and the table above are written around, so the natural reading is that #575
@@ -1891,11 +1935,15 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
      Be precise about how much that moves.  {!estimate_rows} answers
      [table_rows_estimate] for the [Op_seq_scan] case, and for an
      [Op_index_lookup] it answers [unbounded_rows] — hence [table_rows_estimate]
-     after the [min] — unless {!seek_is_unique_point} holds or the seek carries a
-     range.  So R collapses to 1 for a full-unique-key or rowid-alias pin, to
-     [range_seek_rows] once #532 gives the seek a range bound, and is otherwise
-     unchanged for a partial prefix pin.  [range_seek_rows] is a made-up
-     constant, not a selectivity estimate; do not read this as one.
+     after the [min] — unless {!seek_is_unique_point} holds, the seek carries a
+     range, or (#576 tier 1) the seek is a bare equality prefix on a non-unique
+     index with an analyzed leading-column stat.  So R collapses to 1 for a
+     full-unique-key or rowid-alias pin, to [range_seek_rows] once #532 gives the
+     seek a range bound, to {!estimate_rows_from_stats}'s estimate for a
+     stats-backed non-unique prefix, and is otherwise unchanged (still
+     [table_rows_estimate]) for a partial prefix pin with no usable stat.
+     [range_seek_rows] is a made-up constant, not a selectivity estimate; do not
+     read this as one.
 
      {b Which way a smaller R pushes the choice is the opposite of what it looks
      like.}  {!probe_is_worth_it} takes the probe iff

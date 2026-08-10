@@ -145,9 +145,14 @@ type index_info =
   ; idx_origin : idx_origin
   ; idx_stats : index_stats option
     (** #576 tier 1: [None] for every index created before this shipped,
-        every UNIQUE index (cardinality is definitionally 1 per key), and
-        every WITHOUT ROWID / columnar / expression-column index — see
-        [Exec.execute_create_index]. *)
+        every UNIQUE index (cardinality is definitionally 1 per key), every
+        WITHOUT ROWID table's index, and every expression-column index — see
+        [Exec.execute_create_index] for the WITHOUT ROWID and
+        expression-column exemptions.  A columnar table's index is exempt
+        too, but not via a check in [Exec.execute_create_index]: [CREATE
+        INDEX] on a columnar table is refused outright by the binder before
+        that function ever runs, so no columnar [index_info] is ever
+        constructed at all. *)
   }
 
 type fts_table_meta =
