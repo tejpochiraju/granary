@@ -1126,6 +1126,39 @@ let index_by_tree cat (meta : Cat.table_meta) ~idx_tree =
   |> List.find_opt (fun (i : Cat.index_info) -> i.Cat.idx_tree_id = idx_tree)
 ;;
 
+(** #576 tier 1: [idx_tree]'s leading-column distinct-value count, if the
+    index was analyzed at [CREATE INDEX] time and the count is positive.
+    [None] covers "never analyzed" (every index created before this shipped,
+    every UNIQUE index, WITHOUT ROWID/columnar/expression indexes — see
+    [Exec.execute_create_index]) uniformly with "analyzed but somehow zero" --
+    the latter cannot happen for a table with at least one row, but a zero
+    denominator must never reach the division in {!estimate_rows_from_stats}. *)
+let index_leading_distinct_count cat (meta : Cat.table_meta) ~idx_tree =
+  match index_by_tree cat meta ~idx_tree with
+  | None -> None
+  | Some i ->
+    (match i.Cat.idx_stats with
+     | Some stats when stats.Cat.distinct_count > 0 -> Some stats.Cat.distinct_count
+     | _ -> None)
+;;
+
+(** #576 tier 1: estimate a non-unique equality-prefix seek's row count from
+    [idx_tree]'s analyzed leading-column cardinality, or [None] when no usable
+    stat exists (today's exact behavior applies unchanged in that case).
+    [table_rows_estimate meta] uses the CURRENT row count; [distinct_count] is
+    from analysis time -- see the design doc's "Consumption" section for why
+    mixing the two is the right call. Shared by {!estimate_rows} and
+    {!build_side_seek_is_unambiguous} (Task 5) so the two questions -- "how
+    many rows" and "is that seek worth taking" -- never answer from different
+    numbers. *)
+let estimate_rows_from_stats cat (meta : Cat.table_meta) ~idx_tree =
+  match index_leading_distinct_count cat meta ~idx_tree with
+  | None -> None
+  | Some distinct_count ->
+    let total = table_rows_estimate meta in
+    Some (min (total / distinct_count) total)
+;;
+
 (** #575: is the index [idx_tree] holds a UNIQUE one?
 
     Weaker than {!seek_is_unique_point} on purpose, and the two are not
@@ -1296,7 +1329,13 @@ let estimate_rows cat (op : Plan.op) =
       else (
         match range with
         | Some r -> range_rows_estimate r
-        | None -> unbounded_rows)
+        | None ->
+          (* #576 tier 1: a non-unique equality prefix with no range used to
+             be pure unbounded_rows; now it consults the leading column's
+             analyzed distinct-value count when one exists. *)
+          (match estimate_rows_from_stats cat table_meta ~idx_tree with
+           | Some est -> est
+           | None -> unbounded_rows))
     in
     min seek (table_rows_estimate table_meta)
   | Plan.Op_seq_scan { table_meta; _ } -> table_rows_estimate table_meta
