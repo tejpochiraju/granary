@@ -1560,6 +1560,17 @@ let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
   | Plan.Seek_rowid _ -> true
   | Plan.Seek_index { idx_tree; keys; range = None } ->
     index_full_unique_pin cat meta ~idx_tree ~keys
+    ||
+    (* #576 tier 1: a non-unique equality prefix used to be declined
+       unconditionally here. Admit it when the leading column's analyzed
+       distinct-value count puts the estimated row count within
+       table_seek_budget -- the same budget dml_seek_bail_out_at consults. *)
+    (match estimate_rows_from_stats cat meta ~idx_tree with
+      | None -> false
+      | Some est ->
+        (match table_seek_budget meta with
+         | None -> false
+         | Some budget -> est <= budget))
   | Plan.Seek_index { idx_tree; keys; range = Some r } ->
     index_is_unique cat meta ~idx_tree
     && (match index_by_tree cat meta ~idx_tree with

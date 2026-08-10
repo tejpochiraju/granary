@@ -188,6 +188,67 @@ let selective_driving_seek_wins_the_probe () =
       (contains ~needle:"NestedLoopJoin" plan))
 ;;
 
+(* #576 tier 1: build_side_seek_is_unambiguous should ADMIT a non-unique
+   equality-prefix seek when idx_stats says it is selective enough, and still
+   DECLINE it when the stat says it is not.
+
+   t: 100,000 rows. table_seek_budget = table_rows_estimate /
+   build_side_seek_break_even_ratio(200) = 500 (private constant, stated here
+   rather than referenced). driver: enough rows to sit comfortably above
+   nlj_min_driving_rows so the strategy is decided by the cost comparison, not
+   the floor -- mirroring test_join_cost_model_576.ml's own setup. The join
+   key (driver.x = t.v) carries no selectivity information itself; only the
+   WHERE-pinned prefix on t does. *)
+let n_t_rows = 100_000
+let n_driver_rows = 1_200
+
+let seed_build_side ~n_distinct db =
+  (* CREATE INDEX analyzes the table as of its own walk, so the table must be
+     populated FIRST -- an index created over an empty table records no
+     usable stats, same ordering requirement as seed_driving_seek above. *)
+  exec db "CREATE TABLE t (tenant_id INTEGER, v INTEGER)";
+  exec db "CREATE TABLE driver (x INTEGER)";
+  exec db "BEGIN";
+  for i = 1 to n_t_rows do
+    exec db (Printf.sprintf "INSERT INTO t VALUES (%d, %d)" (i mod n_distinct) i)
+  done;
+  for i = 1 to n_driver_rows do
+    exec db (Printf.sprintf "INSERT INTO driver VALUES (%d)" i)
+  done;
+  exec db "COMMIT";
+  exec db "CREATE INDEX idx_t_tenant ON t(tenant_id)"
+;;
+
+(* 500 distinct tenant_id -> estimate = 100_000/500 = 200 <= budget (500): ADMIT. *)
+let selective_prefix_is_admitted () =
+  with_db (fun db ->
+    seed_build_side ~n_distinct:500 db;
+    let plan =
+      plan_text
+        db
+        "EXPLAIN SELECT * FROM driver JOIN t ON driver.x = t.v WHERE t.tenant_id = 5"
+    in
+    Alcotest.(check bool)
+      ("selective prefix should seek t via IndexLookup, got:\n" ^ plan)
+      true
+      (contains ~needle:"IndexLookup(t)" plan))
+;;
+
+(* 2 distinct tenant_id -> estimate = 100_000/2 = 50_000 > budget (500): DECLINE. *)
+let non_selective_prefix_still_declines () =
+  with_db (fun db ->
+    seed_build_side ~n_distinct:2 db;
+    let plan =
+      plan_text
+        db
+        "EXPLAIN SELECT * FROM driver JOIN t ON driver.x = t.v WHERE t.tenant_id = 1"
+    in
+    Alcotest.(check bool)
+      ("non-selective prefix should still scan t via SeqScan, got:\n" ^ plan)
+      true
+      (contains ~needle:"SeqScan(t)" plan))
+;;
+
 let () =
   Alcotest.run
     "index_cardinality_576"
@@ -206,6 +267,12 @@ let () =
       , [ ( "selective driving seek wins the probe"
           , `Quick
           , selective_driving_seek_wins_the_probe )
+        ] )
+    ; ( "build_side_seek_is_unambiguous"
+      , [ "selective prefix is admitted", `Quick, selective_prefix_is_admitted
+        ; ( "non-selective prefix still declines"
+          , `Quick
+          , non_selective_prefix_still_declines )
         ] )
     ]
 ;;
