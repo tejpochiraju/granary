@@ -639,6 +639,52 @@ let branch_pick_with_info buf ~n_keys ~right_page ~key : int32 * int * int =
   branch_pick_with_info_loop buf (Cstruct.length buf) n_keys right_page key data_offset 0
 ;;
 
+(* #709: the leftmost child of a branch page is always entry 0's [left_child]
+   (or [right_page] if the page has no entries) — no walk needed at all.  Used
+   by the cursor's path-building descent ([leftmost_leaf_with_path]), which
+   always wants the leftmost child and previously paid for a full
+   [decode_branch_entries] (every key on the page copied out) just to read the
+   first one. Allocates nothing. *)
+let branch_leftmost_child buf ~n_keys ~right_page : int32 =
+  if n_keys = 0
+  then right_page
+  else (
+    let key_len = Cstruct.BE.get_uint16 buf data_offset in
+    Cstruct.BE.get_uint32 buf (data_offset + 2 + key_len))
+;;
+
+(* #709: re-derive the child pointer at ordinal [idx] on a branch page without
+   decoding the entry list.  Used by the cursor's [frame_child] to walk the
+   SAME page again after [descend_with_path_for_key] / [leftmost_leaf_with_path]
+   already picked an initial [idx] — the cursor's path frame retains only the
+   page buffer and [n_keys], not a decoded entry list, so advancing to a
+   sibling re-reads the child pointer in place.  [idx >= n_keys] returns
+   [right_page], matching [branch_pick_with_info]'s convention.  Allocates
+   nothing. *)
+let rec branch_child_at_loop buf page_size n_keys right_page idx offset i =
+  if i >= n_keys || offset + 6 > page_size
+  then right_page
+  else (
+    let key_len = Cstruct.BE.get_uint16 buf offset in
+    if i = idx
+    then Cstruct.BE.get_uint32 buf (offset + 2 + key_len)
+    else
+      branch_child_at_loop
+        buf
+        page_size
+        n_keys
+        right_page
+        idx
+        (offset + 2 + key_len + 4)
+        (i + 1))
+;;
+
+let branch_child_at buf ~n_keys ~right_page ~idx : int32 =
+  if idx >= n_keys
+  then right_page
+  else branch_child_at_loop buf (Cstruct.length buf) n_keys right_page idx data_offset 0
+;;
+
 (* Build a new branch page identical to [buf] except the child pointer at
    [child_ptr_offset] is replaced with [new_child].  If [child_ptr_offset < 0]
    the [right_page] header field is updated instead.  Returns a fresh,
