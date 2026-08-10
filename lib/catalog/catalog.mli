@@ -125,6 +125,15 @@ type idx_origin =
   | `User
   ]
 
+(** #576 tier 1: the leading indexed column's distinct-value count, as
+    measured the one time the index was populated ([CREATE INDEX]).  Never
+    incrementally maintained — see the design doc's "Population" section for
+    why staleness is accepted rather than tracked. *)
+type index_stats =
+  { distinct_count : int
+  ; rows_at_analysis : int
+  }
+
 type index_info =
   { idx_name : string
   ; idx_table : string
@@ -134,6 +143,11 @@ type index_info =
   ; idx_expr_flags : bool list (* true = expression index column, false = plain column *)
   ; idx_where_sql : string option
   ; idx_origin : idx_origin
+  ; idx_stats : index_stats option
+    (** #576 tier 1: [None] for every index created before this shipped,
+        every UNIQUE index (cardinality is definitionally 1 per key), and
+        every WITHOUT ROWID / columnar / expression-column index — see
+        [Exec.execute_create_index]. *)
   }
 
 type fts_table_meta =

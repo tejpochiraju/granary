@@ -131,6 +131,11 @@ type idx_origin =
   | `User
   ]
 
+type index_stats =
+  { distinct_count : int
+  ; rows_at_analysis : int
+  }
+
 type index_info =
   { idx_name : string
   ; idx_table : string
@@ -140,6 +145,7 @@ type index_info =
   ; idx_expr_flags : bool list (* true = expression index column, false = plain column *)
   ; idx_where_sql : string option
   ; idx_origin : idx_origin
+  ; idx_stats : index_stats option
   }
 
 type fts_table_meta =
@@ -1134,8 +1140,10 @@ let encode_index_value (idx : index_info) =
     idx.idx_columns;
   Buffer.add_char buf (if idx.idx_unique then '\x01' else '\x00');
   Varint.encode_uint64 buf (Int64.of_int idx.idx_tree_id);
-  (* Extended fields version 3: origin byte + expr flags + optional WHERE *)
-  Varint.encode_uint64 buf 3L;
+  (* Extended fields version 4 (#576 tier 1): origin byte + expr flags +
+     optional WHERE + optional idx_stats. Versions 1-3 (pre-existing data)
+     decode with [idx_stats = None] — see [decode_index_ext_fields]. *)
+  Varint.encode_uint64 buf 4L;
   Buffer.add_char buf (byte_of_idx_origin idx.idx_origin);
   (* One varint per column: 0 = plain column, 1 = expression column *)
   List.iter
@@ -1148,13 +1156,22 @@ let encode_index_value (idx : index_info) =
      Varint.encode_uint64 buf 1L;
      Varint.encode_uint64 buf (Int64.of_int (String.length sql));
      Buffer.add_string buf sql);
+  (* #576 tier 1: leading-column cardinality, added in version 4 *)
+  (match idx.idx_stats with
+   | None -> Buffer.add_char buf '\x00'
+   | Some { distinct_count; rows_at_analysis } ->
+     Buffer.add_char buf '\x01';
+     Varint.encode_uint64 buf (Int64.of_int distinct_count);
+     Varint.encode_uint64 buf (Int64.of_int rows_at_analysis));
   Buffer.to_bytes buf
 ;;
 
-(* Returns [(expr_flags, where_sql, origin)].  The current encoder always writes
-   version 3 (with an explicit origin); the pre-v3 branches default [origin] to
-   [`User] — the dump-safe "emit it" choice — since the format is pre-release and
-   no v<3 data exists.  Decode of expr flags + WHERE is shared by versions 2/3. *)
+(* Returns [(expr_flags, where_sql, origin, idx_stats)].  The current encoder
+   always writes version 4 (with idx_stats); the pre-v4 branches default
+   [idx_stats] to [None] — every index on disk before #576 tier 1 shipped is,
+   correctly, "never analyzed". Decode of expr flags + WHERE is shared by
+   versions 2/3/4; [decode_flags_and_where] now also returns the offset just
+   past the WHERE clause, so version 4 knows where its stats bytes start. *)
 let decode_index_ext_fields bytes off2 cols =
   let decode_flags_and_where off_start =
     let off_ref = ref off_start in
@@ -1167,17 +1184,19 @@ let decode_index_ext_fields bytes off2 cols =
         cols
     in
     let has_where, off4 = Varint.decode_uint64 bytes !off_ref in
-    let where_sql =
+    let where_sql, off_final =
       if Int64.to_int has_where = 0
-      then None
+      then None, off4
       else (
         let sql_len, off5 = Varint.decode_uint64 bytes off4 in
-        Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len)))
+        let len = Int64.to_int sql_len in
+        Some (Bytes.sub_string bytes off5 len), off5 + len)
     in
-    expr_flags, where_sql
+    expr_flags, where_sql, off_final
   in
   if off2 >= Bytes.length bytes
-  then List.map (fun _ -> false) cols, None, `User (* old format: no extended fields *)
+  then
+    List.map (fun _ -> false) cols, None, `User, None (* old format: no extended fields *)
   else (
     let version, off3 = Varint.decode_uint64 bytes off2 in
     match Int64.to_int version with
@@ -1191,17 +1210,31 @@ let decode_index_ext_fields bytes off2 cols =
           let sql_len, off5 = Varint.decode_uint64 bytes off4 in
           Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len)))
       in
-      List.map (fun _ -> false) cols, where_sql, `User
+      List.map (fun _ -> false) cols, where_sql, `User, None
     | 2 ->
       (* Version 2 (Task 2): n_cols expr flags, then WHERE clause *)
-      let expr_flags, where_sql = decode_flags_and_where off3 in
-      expr_flags, where_sql, `User
+      let expr_flags, where_sql, _ = decode_flags_and_where off3 in
+      expr_flags, where_sql, `User, None
     | 3 ->
       (* Version 3 (#273): origin byte, then expr flags, then WHERE clause *)
       let origin = idx_origin_of_byte (Bytes.get_uint8 bytes off3) in
-      let expr_flags, where_sql = decode_flags_and_where (off3 + 1) in
-      expr_flags, where_sql, origin
-    | _ -> List.map (fun _ -> false) cols, None, `User)
+      let expr_flags, where_sql, _ = decode_flags_and_where (off3 + 1) in
+      expr_flags, where_sql, origin, None
+    | 4 ->
+      (* Version 4 (#576 tier 1): version-3 fields, then optional idx_stats *)
+      let origin = idx_origin_of_byte (Bytes.get_uint8 bytes off3) in
+      let expr_flags, where_sql, off_after_where = decode_flags_and_where (off3 + 1) in
+      let has_stats = Bytes.get_uint8 bytes off_after_where in
+      let idx_stats =
+        if has_stats = 0
+        then None
+        else (
+          let dc, off_a = Varint.decode_uint64 bytes (off_after_where + 1) in
+          let ra, _ = Varint.decode_uint64 bytes off_a in
+          Some { distinct_count = Int64.to_int dc; rows_at_analysis = Int64.to_int ra })
+      in
+      expr_flags, where_sql, origin, idx_stats
+    | _ -> List.map (fun _ -> false) cols, None, `User, None)
 ;;
 
 let decode_index_value bytes =
@@ -1239,7 +1272,7 @@ let decode_index_value bytes =
   let cols = decode_cols n_cols [] in
   let unique_byte = Bytes.get_uint8 bytes !off in
   let tree_id, off2 = Varint.decode_uint64 bytes (!off + 1) in
-  let idx_expr_flags, idx_where_sql, idx_origin =
+  let idx_expr_flags, idx_where_sql, idx_origin, idx_stats =
     decode_index_ext_fields bytes off2 cols
   in
   { idx_name = name
@@ -1250,6 +1283,7 @@ let decode_index_value bytes =
   ; idx_expr_flags
   ; idx_where_sql
   ; idx_origin
+  ; idx_stats
   }
 ;;
 
@@ -2912,6 +2946,7 @@ let create_index ?txn t ~name ~table ~columns ~unique ~expr_flags ~where_sql ~or
            ; idx_expr_flags = expr_flags
            ; idx_where_sql = where_sql
            ; idx_origin = origin
+           ; idx_stats = None
            }
          in
          (match txn with
