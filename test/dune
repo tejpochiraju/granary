@@ -297,6 +297,21 @@
   lwt.unix
   unix))
 
+; #550: the DML seek's runtime selectivity guard over a NON-UNIQUE index.
+
+(test
+ (name test_dml_seek_selectivity_550)
+ (modules test_dml_seek_selectivity_550)
+ (libraries
+  granary
+  granary.sql
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 (test
  (name test_mirage_backend)
  (modules test_mirage_backend)

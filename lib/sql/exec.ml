@@ -5800,6 +5800,14 @@ let emit_candidate ~stats ~(emit : int64 -> unit Lwt.t) rowid =
   emit rowid
 ;;
 
+(* #550: raised out of [seek_index_candidates]'s walk when a seek over a
+   NON-UNIQUE index's leading columns has walked more than its [bail_out_at]
+   budget — see [Plan.seek]'s [bail_out_at] field and
+   [Planner.dml_seek_bail_out_at] for where the budget comes from.
+   [drain_matching_rows_in_tx] is the sole handler: it falls back to a full
+   table scan, the thing the seek would otherwise have replaced. *)
+exception Seek_not_selective
+
 (* Walk the index range an equality [keys] prefix (plus optional [range]) covers,
    handing each candidate rowid to [emit] as it is decoded.  Nothing is
    accumulated here; what the caller does with the rowids is its business.
@@ -5810,7 +5818,15 @@ let emit_candidate ~stats ~(emit : int64 -> unit Lwt.t) rowid =
    caller ([drain_matching_rows_in_tx]) only appends to a buffer, and every
    physical mutation of the statement happens after the drain has returned and
    this cursor is closed — table reads included, since the candidates are sorted
-   into rowid order before any row is fetched. *)
+   into rowid order before any row is fetched.
+
+   #550: [bail_out_at] is [None] for [Seek_rowid] and for any UNIQUE index —
+   see [Plan.seek] — in which case this walks to completion exactly as before.
+   When it is [Some k], an entry walked past the [k]-th raises
+   [Seek_not_selective] instead of being emitted: the caller has already seen
+   more of a non-unique index's leading columns than the measured break-even
+   for a seek, so continuing the walk (and the one table-tree descent per
+   candidate it feeds) costs more than the full scan it stands in for. *)
 let seek_index_candidates
       tx
       clock
@@ -5818,6 +5834,7 @@ let seek_index_candidates
       ~idx_tree
       ~keys
       ~range
+      ~bail_out_at
       ~(stats : dml_seek_stats option)
       ~(emit : int64 -> unit Lwt.t)
   : unit Lwt.t
@@ -5829,17 +5846,25 @@ let seek_index_candidates
     let prefix, plen = encode_index_key_prefix ivs in
     let start, past_end = range_seek_bounds clock params ~prefix ~plen range in
     let* cur = S.seek_ge tx idx_tree start in
+    let walked = ref 0 in
     let rec walk () =
       let* next = S.seek_next cur in
       match next with
       | Some (ikey, _) when index_key_in_range ~prefix ~plen ~past_end ikey ->
-        let* () = emit_candidate ~stats ~emit (decode_index_key_rowid ikey) in
-        walk ()
+        incr walked;
+        (match bail_out_at with
+         | Some k when !walked > k -> Lwt.fail Seek_not_selective
+         | Some _ | None ->
+           let* () = emit_candidate ~stats ~emit (decode_index_key_rowid ikey) in
+           walk ())
       | _ -> Lwt.return_unit
     in
     (* [S.seek_next] and [emit] can both raise; close the cursor on that path
        too.  [Store.seek_close] is a no-op for the B-tree cursor today, so this
-       leaks nothing either way — it is here so that stops being true safely. *)
+       leaks nothing either way — it is here so that stops being true safely.
+       [Seek_not_selective] takes this same path: the cursor is closed before
+       [drain_matching_rows_in_tx] opens the table cursor its fallback scan
+       needs. *)
     Lwt.finalize walk (fun () ->
       S.seek_close cur;
       Lwt.return_unit)
@@ -5861,8 +5886,8 @@ let seek_candidates tx clock params (seek : Plan.seek) ~stats ~emit : unit Lwt.t
     (match eval_expr clock params [||] e with
      | Row.V_int n -> emit_candidate ~stats ~emit n
      | _ -> Lwt.return_unit (* NULL or non-integer matches no rowid *))
-  | Plan.Seek_index { idx_tree; keys; range } ->
-    seek_index_candidates tx clock params ~idx_tree ~keys ~range ~stats ~emit
+  | Plan.Seek_index { idx_tree; keys; range; bail_out_at } ->
+    seek_index_candidates tx clock params ~idx_tree ~keys ~range ~bail_out_at ~stats ~emit
 ;;
 
 (* #514: a growable, flat buffer of candidate rowids.  THE measurement table
@@ -6005,6 +6030,29 @@ let rowid_buf_iter_s f b =
    still walks the table or an index it lives in would revisit or skip rows.
    #514 shrinks the seek's candidate buffer from an [int64 list] to a packed
    [rowid_buf]; it does not — and must not — stream the mutations. *)
+(* The no-seek drain: walk the whole table tree, keeping what [keep] accepts.
+   Shared by [drain_matching_rows_in_tx]'s own no-seek case and by its #550
+   fallback, when a non-selective index seek bails out mid-walk. *)
+let drain_full_scan_in_tx tx tree_id (table_meta : Cat.table_meta) ~clock ~params ~keep
+  : (int64 * Row.t) list Lwt.t
+  =
+  let* cur = S.cursor_open tx tree_id in
+  let _sr = S.cursor_first cur in
+  let buf = ref [] in
+  let rec drain () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (kbytes, vbytes) ->
+      let rowid = Rowid.decode kbytes in
+      let row = decode_with_virtual clock params table_meta vbytes in
+      if keep row then buf := (rowid, row) :: !buf;
+      drain ()
+  in
+  drain ();
+  S.cursor_close cur;
+  Lwt.return (List.rev !buf)
+;;
+
 let drain_matching_rows_in_tx
       ~(seek : Plan.seek option)
       tx
@@ -6041,30 +6089,26 @@ let drain_matching_rows_in_tx
         Lwt.return_unit
     in
     let cands = rowid_buf_create () in
-    let* () =
-      seek_candidates tx clock params s ~stats ~emit:(fun rowid ->
-        rowid_buf_push cands rowid;
-        Lwt.return_unit)
-    in
-    rowid_buf_sort cands;
-    let* () = rowid_buf_iter_s fetch_one cands in
-    Lwt.return (List.rev !acc)
-  | None ->
-    let* cur = S.cursor_open tx tree_id in
-    let _sr = S.cursor_first cur in
-    let buf = ref [] in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (kbytes, vbytes) ->
-        let rowid = Rowid.decode kbytes in
-        let row = decode_with_virtual clock params table_meta vbytes in
-        if keep row then buf := (rowid, row) :: !buf;
-        drain ()
-    in
-    drain ();
-    S.cursor_close cur;
-    Lwt.return (List.rev !buf)
+    Lwt.catch
+      (fun () ->
+         let* () =
+           seek_candidates tx clock params s ~stats ~emit:(fun rowid ->
+             rowid_buf_push cands rowid;
+             Lwt.return_unit)
+         in
+         rowid_buf_sort cands;
+         let* () = rowid_buf_iter_s fetch_one cands in
+         Lwt.return (List.rev !acc))
+      (function
+        | Seek_not_selective ->
+          (* #550: the seek's non-unique-index prefix walked past its budget.
+             [acc] is still empty here — the exception can only fire during
+             candidate collection, which runs entirely before the fetch phase
+             above populates it — so there is nothing to undo before falling
+             back to the scan the seek would otherwise have replaced. *)
+          drain_full_scan_in_tx tx tree_id table_meta ~clock ~params ~keep
+        | exn -> Lwt.fail exn)
+  | None -> drain_full_scan_in_tx tx tree_id table_meta ~clock ~params ~keep
 ;;
 
 (* Apply ORDER BY, then OFFSET, then LIMIT to a drained (rowid,row) list. *)

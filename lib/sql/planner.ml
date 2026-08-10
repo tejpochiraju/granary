@@ -537,7 +537,11 @@ let make_scan ~alias (meta : Cat.table_meta) : Plan.op =
 (* Realise a chosen seek as the base-table plan op it reads through. *)
 let seek_op ~alias (table_meta : Cat.table_meta) = function
   | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val; alias }
-  | Plan.Seek_index { idx_tree; keys; range } ->
+  | Plan.Seek_index { idx_tree; keys; range; bail_out_at = _ } ->
+    (* [bail_out_at] is a #550 DML-drain concern only; [Op_index_lookup] has no
+       field for it because a SELECT or a hash join's build side streams rows
+       one at a time rather than buffering every candidate before reading any
+       of them, so it has nothing to "fall back" from mid-walk. *)
     let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
     Plan.Op_index_lookup
       { table_tree = tree_id_pl; idx_tree; keys; range; table_meta; alias }
@@ -598,7 +602,10 @@ let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts 
           let range =
             range_for_index table_meta idx ~n_eq:(List.length prefix) range_conjuncts
           in
-          Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed)))
+          Some
+            ( Plan.Seek_index
+                { idx_tree = idx.Cat.idx_tree_id; keys; range; bail_out_at = None }
+            , consumed )))
 ;;
 
 (* #674 (3 of 3): the column-ordinal sequence a chosen access path is
@@ -1038,6 +1045,52 @@ let index_is_unique cat (meta : Cat.table_meta) ~idx_tree =
   | None -> false
 ;;
 
+(** #550: the [Plan.seek]'s [bail_out_at] for a DML (UPDATE/DELETE) seek over
+    [idx_tree] — how many index entries the drain may walk before abandoning
+    the seek for a full table scan, or [None] to walk unconditionally.
+
+    A UNIQUE index needs no guard: [test_bounded_drain_514.ml] already pins an
+    always-seek, buffer-then-fetch contract for a UNIQUE index's worst case (a
+    strict prefix matching half the table), and #541 measured that contract as
+    the right one there — one extra key column narrows the WORST case to "one
+    row per distinct value of the pinned prefix," which is bounded by
+    definition. A NON-UNIQUE index carries no such bound: its leading columns
+    can match an unbounded fraction of the table, which is exactly the
+    [WHERE tenant_id = 1] shape #550 is about, and the planner has no
+    per-index cardinality statistic (#576) to size that fraction ahead of
+    time. So a non-unique prefix gets a RUNTIME budget instead of a plan-time
+    answer: {!build_side_seek_break_even_ratio} is the same per-entry seek
+    cost #546/#606 measured for the hash join's build side, reused here
+    because the DML drain pays the identical cost (one B-tree descent to fetch
+    the table row behind each index entry) — only consulted at run time
+    rather than plan time, because an equality prefix has no window a literal
+    range does.
+
+    [table_rows_estimate meta] answering {!unbounded_rows} (a WITHOUT ROWID or
+    columnar table) declines the guard rather than admitting it: dividing an
+    unknown row count by the ratio would produce a budget with no basis, and
+    "decline what cannot be judged" is the same call {!build_side_seek_is_unambiguous}
+    makes for the same input.
+
+    A table under {!build_side_seek_break_even_ratio} rows also declines: below
+    it, [rows / build_side_seek_break_even_ratio] floors to 0 and would bail out
+    on the FIRST candidate regardless of how selective the prefix actually is —
+    [test_composite_seek_508.ml]'s [dml_seeks_through_a_secondary_index] is a
+    60-row table seeking a full [(a, b)] equality prefix through a genuinely
+    non-unique secondary index, and it must still seek. A table this small has
+    no meaningful "1/200 of it" greater than zero, and its absolute cost is
+    trivial either way (#546's own measurements start at 10,000 rows), so there
+    is nothing here for the guard to protect against. *)
+let dml_seek_bail_out_at cat (meta : Cat.table_meta) ~idx_tree =
+  if index_is_unique cat meta ~idx_tree
+  then None
+  else (
+    let rows = table_rows_estimate meta in
+    if rows >= unbounded_rows || rows < build_side_seek_break_even_ratio
+    then None
+    else Some (rows / build_side_seek_break_even_ratio))
+;;
+
 (** #575: is every column of [idx_tree]'s UNIQUE index pinned by [keys]?
 
     {!seek_is_unique_point} without its [all_not_null] test, which is deliberate
@@ -1357,9 +1410,9 @@ let estimate_rows cat (op : Plan.op) =
       instance of a class is not closing the class.} *)
 let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
   | Plan.Seek_rowid _ -> true
-  | Plan.Seek_index { idx_tree; keys; range = None } ->
+  | Plan.Seek_index { idx_tree; keys; range = None; bail_out_at = _ } ->
     index_full_unique_pin cat meta ~idx_tree ~keys
-  | Plan.Seek_index { idx_tree; keys; range = Some r } ->
+  | Plan.Seek_index { idx_tree; keys; range = Some r; bail_out_at = _ } ->
     index_is_unique cat meta ~idx_tree
     && (match index_by_tree cat meta ~idx_tree with
         (* [None] is unreachable: [index_is_unique] just called [index_by_tree]
@@ -1907,10 +1960,23 @@ let plan_base cat ~table_meta ~alias ~where ~has_joins =
 (* #508: the narrowing path for a DML WHERE clause.  Unlike [plan_base] this
    discards which conjuncts were consumed — the write path always re-evaluates
    the whole predicate on every candidate row, so the seek is a pure
-   restriction of what gets read. *)
+   restriction of what gets read.
+
+   #550: [access_path_for_eqs] always answers [bail_out_at = None] — it is
+   shared with [plan_base] and [build_side], neither of which buffers
+   candidates before reading them, so neither has anything to fall back from
+   mid-walk. Patching the real budget in here, at the one caller whose seek
+   feeds the buffering DML drain, keeps that a DML-only decision without
+   threading [cat] through [access_path_for_eqs]'s two other callers just to
+   compute a number they would throw away. *)
 let plan_dml_seek cat ~table_meta ~where =
   match cat, where with
-  | Some c, Some e -> Option.map fst (choose_access_path c table_meta (conjuncts e))
+  | Some c, Some e ->
+    (match Option.map fst (choose_access_path c table_meta (conjuncts e)) with
+     | Some (Plan.Seek_index { idx_tree; keys; range; bail_out_at = _ }) ->
+       let bail_out_at = dml_seek_bail_out_at c table_meta ~idx_tree in
+       Some (Plan.Seek_index { idx_tree; keys; range; bail_out_at })
+     | s -> s)
   | _ -> None
 ;;
 

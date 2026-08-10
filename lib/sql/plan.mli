@@ -116,6 +116,18 @@ type seek =
         (** leading index columns pinned by equality, in index-column order *)
       ; range : range option
         (** #517: an optional range over the index column right after [keys] *)
+      ; bail_out_at : int option
+        (** #550: for a seek over a NON-UNIQUE index, the planner has no
+            cardinality statistic to know ahead of time how many rows the
+            equality prefix matches — unlike a range bound, whose window is
+            read straight off the query, an equality prefix on a non-unique
+            index could match anywhere from one row to the whole table.
+            [Some k] tells the DML drain to abandon the index walk once it has
+            walked more than [k] entries and fall back to a full table scan
+            instead. [None] means "walk unconditionally": always true for
+            {!Seek_rowid} (at most one row) and for a UNIQUE index (this field
+            is only ever set on the [Seek_index] variant, and only when the
+            index it names is not unique). *)
       }
 
 (** #516: one component of a nested-loop join's index probe key.
