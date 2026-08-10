@@ -401,6 +401,21 @@ val create_index
   -> origin:idx_origin
   -> (index_info, string) result Lwt.t
 
+(** #576 tier 1: persist [idx_stats] on the named index's catalog row —
+    the leading-column distinct-value count and the row count observed while
+    computing it.  Must run inside [tx]: the sole caller,
+    [Exec.execute_create_index], always holds one from populating the index,
+    so stats land in the same DDL transaction as the index itself (and roll
+    back with it).  A no-op if [name] does not name a live index (defensive;
+    unreachable from the sole call site, which just created it). *)
+val set_index_stats
+  :  t
+  -> Granary_store.Store.rw Granary_store.Store.txn
+  -> name:string
+  -> distinct_count:int
+  -> rows_at_analysis:int
+  -> unit Lwt.t
+
 (** Return the list of indexes on the given table.  Order is unspecified. *)
 val indexes_for_table : t -> table:string -> index_info list
 

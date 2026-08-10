@@ -3192,6 +3192,29 @@ let indexes_of_table_tx tx ~table =
   Lwt.return (List.rev !acc)
 ;;
 
+(* #576 tier 1: [name]'s catalog row already exists (the sole caller,
+   [Exec.execute_create_index], just created it in the same [tx]) — this
+   re-locates its storage key via [indexes_of_table_tx] (read-your-own-writes
+   through [tx]) rather than threading the numeric id back from
+   [create_index], which returns only [index_info]. *)
+let set_index_stats t tx ~name ~distinct_count ~rows_at_analysis =
+  match Schema_cache.find_index t.sc name with
+  | None -> Lwt.return_unit
+  | Some info ->
+    let%lwt idxs = indexes_of_table_tx tx ~table:info.idx_table in
+    (match
+       List.find_opt (fun (_, (i : index_info)) -> String.equal i.idx_name name) idxs
+     with
+     | None -> Lwt.return_unit
+     | Some (k, _) ->
+       let new_info =
+         { info with idx_stats = Some { distinct_count; rows_at_analysis } }
+       in
+       let%lwt () = S.put tx sys_indexes_tid k (encode_index_value new_info) in
+       Schema_cache.put_index t.sc ~name new_info;
+       Lwt.return_unit)
+;;
+
 let is_ident_start c =
   (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_' || Char.code c >= 128
 ;;

@@ -2510,6 +2510,100 @@ let test_mirror_roundtrips_columns_fks_and_index () =
      Lwt.return_unit)
 ;;
 
+(* #576 tier 1: set_index_stats persists onto the catalog row and survives a
+   mirror-forced reconstruction, exercising the version-4 decode from Task 1. *)
+let test_index_stats_roundtrip_576 () =
+  run
+    (let store = S.create () in
+     let* cat1 = C.open_ store in
+     let* _tid =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "a"; int_col "b" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let* r =
+       C.create_index
+         cat1
+         ~name:"idx_t_b"
+         ~table:"t"
+         ~columns:[ "b" ]
+         ~unique:false
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     (match r with
+      | Ok _ -> ()
+      | Error e -> Alcotest.failf "create_index: %s" e);
+     let* tx0 = S.rw_begin store in
+     let* () =
+       C.set_index_stats cat1 tx0 ~name:"idx_t_b" ~distinct_count:7 ~rows_at_analysis:42
+     in
+     let* () = S.commit tx0 in
+     (* Force mirror reconstruction: lose the primary _sys_tables row. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     let idxs = C.indexes_for_table cat2 ~table:"t" in
+     let idx =
+       match List.find_opt (fun (i : C.index_info) -> i.C.idx_name = "idx_t_b") idxs with
+       | Some i -> i
+       | None -> Alcotest.fail "user index idx_t_b missing after reopen"
+     in
+     (match idx.C.idx_stats with
+      | Some s ->
+        Alcotest.(check int) "distinct_count preserved" 7 s.C.distinct_count;
+        Alcotest.(check int) "rows_at_analysis preserved" 42 s.C.rows_at_analysis
+      | None -> Alcotest.fail "idx_stats not preserved across mirror reconstruction");
+     Lwt.return_unit)
+;;
+
+(* #576 tier 1: set_index_stats only touches the named index -- a sibling
+   index on the same table keeps idx_stats = None. *)
+let test_set_index_stats_is_index_scoped_576 () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _tid =
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "a"; int_col "b" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let create name col =
+       C.create_index
+         cat
+         ~name
+         ~table:"t"
+         ~columns:[ col ]
+         ~unique:false
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     let* _ = create "idx_a" "a" in
+     let* _ = create "idx_b" "b" in
+     let* tx = S.rw_begin store in
+     let* () =
+       C.set_index_stats cat tx ~name:"idx_a" ~distinct_count:3 ~rows_at_analysis:9
+     in
+     let* () = S.commit tx in
+     (match C.find_index cat ~name:"idx_a" with
+      | Some { C.idx_stats = Some s; _ } ->
+        Alcotest.(check int) "idx_a distinct_count" 3 s.C.distinct_count
+      | _ -> Alcotest.fail "idx_a should have stats");
+     (match C.find_index cat ~name:"idx_b" with
+      | Some { C.idx_stats = None; _ } -> ()
+      | _ -> Alcotest.fail "idx_b should be untouched");
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group: schema-drift detection (#174)                                 *)
 (* ------------------------------------------------------------------ *)
@@ -2748,6 +2842,14 @@ let () =
             "mirror_roundtrips_columns_fks_and_index (#484)"
             `Quick
             test_mirror_roundtrips_columns_fks_and_index
+        ; Alcotest.test_case
+            "index_stats_roundtrip (#576)"
+            `Quick
+            test_index_stats_roundtrip_576
+        ; Alcotest.test_case
+            "set_index_stats is index-scoped (#576)"
+            `Quick
+            test_set_index_stats_is_index_scoped_576
         ] )
     ; ( "drift"
       , [ Alcotest.test_case
