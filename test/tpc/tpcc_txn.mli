@@ -241,6 +241,21 @@ type ops =
   ; exec : stmt -> unit Lwt.t (** run a statement for effect *)
   }
 
+(** [count_placeholders sql] counts the [?] characters in [sql]. Exposed so a
+    caller that binds parameters directly, rather than substituting them
+    through {!render}, can still check its own arity against the same count
+    {!render} uses. *)
+val count_placeholders : string -> int
+
+(** [check_arity ~prefix ~n_placeholders ~n_params] raises
+    [Invalid_argument "<prefix>: %d placeholders but %d parameter(s)"] when
+    [n_placeholders <> n_params], and does nothing otherwise. Factored out of
+    {!render} so a caller binding parameters directly (rather than
+    substituting through {!render}) can run the identical arity check with
+    its own error-message prefix, instead of re-implementing the comparison
+    and message (#697/#698 review). *)
+val check_arity : prefix:string -> n_placeholders:int -> n_params:int -> unit
+
 (** [render s] substitutes [s.params] into [s.sql], left to right, each
     rendered by {!Tpc_value.literal} — for engines driven by literal SQL
     rather than bound parameters.
