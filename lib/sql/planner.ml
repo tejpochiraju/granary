@@ -537,11 +537,13 @@ let make_scan ~alias (meta : Cat.table_meta) : Plan.op =
 (* Realise a chosen seek as the base-table plan op it reads through. *)
 let seek_op ~alias (table_meta : Cat.table_meta) = function
   | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val; alias }
-  | Plan.Seek_index { idx_tree; keys; range; bail_out_at = _ } ->
-    (* [bail_out_at] is a #550 DML-drain concern only; [Op_index_lookup] has no
-       field for it because a SELECT or a hash join's build side streams rows
-       one at a time rather than buffering every candidate before reading any
-       of them, so it has nothing to "fall back" from mid-walk. *)
+  | Plan.Seek_index { idx_tree; keys; range } ->
+    (* #550's non-unique-index bail-out budget is a DML-drain concern only, and
+       is recomputed at execution time from [idx_tree] rather than carried on
+       [Plan.seek] at all (see plan.mli); [Op_index_lookup] has no field for it
+       because a SELECT or a hash join's build side streams rows one at a time
+       rather than buffering every candidate before reading any of them, so it
+       has nothing to "fall back" from mid-walk. *)
     let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
     Plan.Op_index_lookup
       { table_tree = tree_id_pl; idx_tree; keys; range; table_meta; alias }
@@ -602,10 +604,7 @@ let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts 
           let range =
             range_for_index table_meta idx ~n_eq:(List.length prefix) range_conjuncts
           in
-          Some
-            ( Plan.Seek_index
-                { idx_tree = idx.Cat.idx_tree_id; keys; range; bail_out_at = None }
-            , consumed )))
+          Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed)))
 ;;
 
 (* #674 (3 of 3): the column-ordinal sequence a chosen access path is
@@ -1018,6 +1017,33 @@ let table_rows_estimate (meta : Cat.table_meta) =
     branch measures as a win. *)
 let build_side_seek_break_even_ratio = 200
 
+(** How many entries a seek over [meta]'s table may read before it stops being
+    cheaper than a full scan, or [None] when the table's row count cannot be
+    judged at all.
+
+    {!dml_seek_bail_out_at} and {!build_side_seek_is_unambiguous} both need
+    exactly this quantity — "how many rows is [1 / build_side_seek_break_even_ratio]
+    of the table" — and used to compute it separately, once as a floor test
+    written as its own negation ([rows < build_side_seek_break_even_ratio]) and
+    once inline as part of a longer boolean chain. Sharing it means a future
+    change to the ratio or to {!unbounded_rows}'s sentinel can't apply to only
+    one of the two callers.
+
+    [None] covers both the input {!table_rows_estimate} cannot size at all (a
+    WITHOUT ROWID or columnar table, which answers {!unbounded_rows}) and a
+    table too small for [1 / build_side_seek_break_even_ratio] of it to be
+    worth even one entry: [Some 0] would bail a walk out on its very first
+    candidate regardless of selectivity, which is wrong in the same direction
+    as admitting an unbounded table would be wrong in the other. *)
+let table_seek_budget (meta : Cat.table_meta) =
+  let rows = table_rows_estimate meta in
+  if rows >= unbounded_rows
+  then None
+  else (
+    let budget = rows / build_side_seek_break_even_ratio in
+    if budget = 0 then None else Some budget)
+;;
+
 (** #593: [meta]'s index living in tree [idx_tree], if it has one.
 
     The catalog is keyed by table name and answers a list, so every question
@@ -1045,9 +1071,9 @@ let index_is_unique cat (meta : Cat.table_meta) ~idx_tree =
   | None -> false
 ;;
 
-(** #550: the [Plan.seek]'s [bail_out_at] for a DML (UPDATE/DELETE) seek over
-    [idx_tree] — how many index entries the drain may walk before abandoning
-    the seek for a full table scan, or [None] to walk unconditionally.
+(** #550: how many index entries a DML (UPDATE/DELETE) seek over [idx_tree] may
+    walk before abandoning the seek for a full table scan, or [None] to walk
+    unconditionally.
 
     A UNIQUE index needs no guard: [test_bounded_drain_514.ml] already pins an
     always-seek, buffer-then-fetch contract for a UNIQUE index's worst case (a
@@ -1066,29 +1092,43 @@ let index_is_unique cat (meta : Cat.table_meta) ~idx_tree =
     rather than plan time, because an equality prefix has no window a literal
     range does.
 
-    [table_rows_estimate meta] answering {!unbounded_rows} (a WITHOUT ROWID or
-    columnar table) declines the guard rather than admitting it: dividing an
+    {!table_seek_budget} answers [None] both for a table {!table_rows_estimate}
+    cannot size at all (a WITHOUT ROWID or columnar table) — dividing an
     unknown row count by the ratio would produce a budget with no basis, and
-    "decline what cannot be judged" is the same call {!build_side_seek_is_unambiguous}
-    makes for the same input.
-
-    A table under {!build_side_seek_break_even_ratio} rows also declines: below
-    it, [rows / build_side_seek_break_even_ratio] floors to 0 and would bail out
-    on the FIRST candidate regardless of how selective the prefix actually is —
+    "decline what cannot be judged" is the same call
+    {!build_side_seek_is_unambiguous} makes for the same input — and for a
+    table under {!build_side_seek_break_even_ratio} rows, where the division
+    floors to 0 and would bail a walk out on its very first candidate
+    regardless of how selective the prefix actually is —
     [test_composite_seek_508.ml]'s [dml_seeks_through_a_secondary_index] is a
     60-row table seeking a full [(a, b)] equality prefix through a genuinely
     non-unique secondary index, and it must still seek. A table this small has
     no meaningful "1/200 of it" greater than zero, and its absolute cost is
     trivial either way (#546's own measurements start at 10,000 rows), so there
-    is nothing here for the guard to protect against. *)
+    is nothing here for the guard to protect against.
+
+    {b This is called at EXECUTION time, once per execution, and [meta] must be
+    a freshly read [table_meta], never one carried across executions of a
+    prepared statement.} The sole caller is [Exec.seek_index_candidates],
+    which re-reads [meta] from the catalog
+    ([Granary_catalog.Catalog.find_table_cached]) on every call rather than
+    reusing whatever [table_meta] the plan itself carries.  That distinction is
+    the whole fix for a staleness bug this function used to have: an earlier
+    revision called this at PLAN time ({!plan_dml_seek}) and stamped its answer
+    onto [Plan.seek] as a [bail_out_at] field, and [Plan.op] is cached and
+    reused for the life of a prepared statement ([Db.prepare]'s [stmt.plan];
+    [Db.run]/[Db.iter] never re-plan). A budget baked in once, from whatever the
+    table's row count was at PREPARE time, would then silently keep answering
+    for that same count forever, however large the table grew afterwards — a
+    statement prepared while the table was small (or below this function's own
+    floor, giving no guard at all) reproduces #550's exact O(n) pessimization
+    for the remaining life of the prepared statement. Calling this fresh on
+    every execution, from [idx_tree] (stable across a statement's life; a
+    dropped/recreated index is a separate, pre-existing DDL-visibility
+    limitation — see [Plan.seek]'s doc) and a live [table_meta], is what keeps
+    the guard tracking the table rather than a snapshot of it. *)
 let dml_seek_bail_out_at cat (meta : Cat.table_meta) ~idx_tree =
-  if index_is_unique cat meta ~idx_tree
-  then None
-  else (
-    let rows = table_rows_estimate meta in
-    if rows >= unbounded_rows || rows < build_side_seek_break_even_ratio
-    then None
-    else Some (rows / build_side_seek_break_even_ratio))
+  if index_is_unique cat meta ~idx_tree then None else table_seek_budget meta
 ;;
 
 (** #575: is every column of [idx_tree]'s UNIQUE index pinned by [keys]?
@@ -1410,9 +1450,9 @@ let estimate_rows cat (op : Plan.op) =
       instance of a class is not closing the class.} *)
 let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
   | Plan.Seek_rowid _ -> true
-  | Plan.Seek_index { idx_tree; keys; range = None; bail_out_at = _ } ->
+  | Plan.Seek_index { idx_tree; keys; range = None } ->
     index_full_unique_pin cat meta ~idx_tree ~keys
-  | Plan.Seek_index { idx_tree; keys; range = Some r; bail_out_at = _ } ->
+  | Plan.Seek_index { idx_tree; keys; range = Some r } ->
     index_is_unique cat meta ~idx_tree
     && (match index_by_tree cat meta ~idx_tree with
         (* [None] is unreachable: [index_is_unique] just called [index_by_tree]
@@ -1432,8 +1472,12 @@ let build_side_seek_is_unambiguous cat (meta : Cat.table_meta) = function
       (match range_literal_window_rows r with
       | None -> false
       | Some window ->
-        let rows = table_rows_estimate meta in
-        rows < unbounded_rows && window <= rows / build_side_seek_break_even_ratio)
+        (* #550 review: shares {!table_seek_budget} with
+           {!dml_seek_bail_out_at} rather than re-deriving "rows / ratio"
+           inline — see that function's doc. *)
+        (match table_seek_budget meta with
+         | None -> false
+         | Some budget -> window <= budget))
 ;;
 
 (** #528: the plan op a join's right table is read through when it is the {i
@@ -1962,21 +2006,17 @@ let plan_base cat ~table_meta ~alias ~where ~has_joins =
    the whole predicate on every candidate row, so the seek is a pure
    restriction of what gets read.
 
-   #550: [access_path_for_eqs] always answers [bail_out_at = None] — it is
-   shared with [plan_base] and [build_side], neither of which buffers
-   candidates before reading them, so neither has anything to fall back from
-   mid-walk. Patching the real budget in here, at the one caller whose seek
-   feeds the buffering DML drain, keeps that a DML-only decision without
-   threading [cat] through [access_path_for_eqs]'s two other callers just to
-   compute a number they would throw away. *)
+   #550's non-unique-index bail-out budget is NOT computed here any more (see
+   plan.mli's [seek] and {!dml_seek_bail_out_at}'s staleness note): a [Plan.op]
+   built by this function can be cached and reused for the life of a prepared
+   statement, so a row-count-derived budget baked in here would go stale as the
+   table grows.  [Exec.seek_index_candidates] calls {!dml_seek_bail_out_at}
+   itself, once per execution, against a freshly re-read [table_meta] — this
+   function hands it nothing but [idx_tree] to do that with, exactly what
+   [access_path_for_eqs] already produces. *)
 let plan_dml_seek cat ~table_meta ~where =
   match cat, where with
-  | Some c, Some e ->
-    (match Option.map fst (choose_access_path c table_meta (conjuncts e)) with
-     | Some (Plan.Seek_index { idx_tree; keys; range; bail_out_at = _ }) ->
-       let bail_out_at = dml_seek_bail_out_at c table_meta ~idx_tree in
-       Some (Plan.Seek_index { idx_tree; keys; range; bail_out_at })
-     | s -> s)
+  | Some c, Some e -> Option.map fst (choose_access_path c table_meta (conjuncts e))
   | _ -> None
 ;;
 

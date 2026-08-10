@@ -84,7 +84,6 @@ type seek =
       { idx_tree : int
       ; keys : (int * Granary_encoding.Row.ty * expr) list
       ; range : range option
-      ; bail_out_at : int option
       }
 
 (* #516: one component of a nested-loop join's index probe key.  See plan.mli

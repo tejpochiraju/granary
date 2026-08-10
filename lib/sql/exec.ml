@@ -5800,17 +5800,11 @@ let emit_candidate ~stats ~(emit : int64 -> unit Lwt.t) rowid =
   emit rowid
 ;;
 
-(* #550: raised out of [seek_index_candidates]'s walk when a seek over a
-   NON-UNIQUE index's leading columns has walked more than its [bail_out_at]
-   budget — see [Plan.seek]'s [bail_out_at] field and
-   [Planner.dml_seek_bail_out_at] for where the budget comes from.
-   [drain_matching_rows_in_tx] is the sole handler: it falls back to a full
-   table scan, the thing the seek would otherwise have replaced. *)
-exception Seek_not_selective
-
 (* Walk the index range an equality [keys] prefix (plus optional [range]) covers,
    handing each candidate rowid to [emit] as it is decoded.  Nothing is
    accumulated here; what the caller does with the rowids is its business.
+   Returns [true] iff the walk bailed out before exhausting the range (see
+   below) rather than running to completion.
 
    [emit] runs with this index cursor OPEN, so it must not mutate the tree being
    walked: deleting rows or moving their index keys mid-walk would revisit rows
@@ -5820,74 +5814,121 @@ exception Seek_not_selective
    this cursor is closed — table reads included, since the candidates are sorted
    into rowid order before any row is fetched.
 
-   #550: [bail_out_at] is [None] for [Seek_rowid] and for any UNIQUE index —
-   see [Plan.seek] — in which case this walks to completion exactly as before.
-   When it is [Some k], an entry walked past the [k]-th raises
-   [Seek_not_selective] instead of being emitted: the caller has already seen
-   more of a non-unique index's leading columns than the measured break-even
-   for a seek, so continuing the walk (and the one table-tree descent per
-   candidate it feeds) costs more than the full scan it stands in for. *)
+   #550: the non-unique-index bail-out budget is computed HERE, fresh, on every
+   call, via [Planner.dml_seek_bail_out_at] against [cat] and a freshly
+   re-read [table_meta] ([Cat.find_table_cached]) — never against a
+   [table_meta] carried on a cached [Plan.op], which can be stale for the
+   whole life of a prepared statement; see [Plan.seek]'s doc and
+   [Planner.dml_seek_bail_out_at]'s for the staleness bug this replaced. [None]
+   means walk unconditionally — always true for a UNIQUE index. When it is
+   [Some k], the [(k+1)]-th entry the walk sees sets [bailed] instead of being
+   emitted, and the walk stops: the caller has already seen more of a
+   non-unique index's leading columns than the measured break-even for a seek,
+   so continuing (and the one table-tree descent per candidate it feeds) costs
+   more than the full scan it stands in for.
+
+   [bailed] is a ref checked at the top of the recursive loop rather than an
+   exception, matching this file's own idiom for aborting a walk early (see
+   e.g. [validate_child_ref_exists]'s [found]/[exhausted]): the caller only
+   needs a boolean verdict once the walk finishes, not an unwind through
+   intermediate frames. *)
 let seek_index_candidates
       tx
       clock
       params
+      cat
+      (table_meta : Cat.table_meta)
       ~idx_tree
       ~keys
       ~range
-      ~bail_out_at
       ~(stats : dml_seek_stats option)
       ~(emit : int64 -> unit Lwt.t)
-  : unit Lwt.t
+  : bool Lwt.t
   =
   let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
   match index_lookup_values vs with
-  | None -> Lwt.return_unit (* NULL or type mismatch: matches nothing *)
+  | None -> Lwt.return_false (* NULL or type mismatch: matches nothing *)
   | Some ivs ->
     let prefix, plen = encode_index_key_prefix ivs in
     let start, past_end = range_seek_bounds clock params ~prefix ~plen range in
     let* cur = S.seek_ge tx idx_tree start in
+    let live_meta =
+      match Cat.find_table_cached cat ~name:table_meta.Cat.name with
+      | Some m -> m
+      | None -> table_meta
+    in
+    let bail_out_at = Planner.dml_seek_bail_out_at cat live_meta ~idx_tree in
     let walked = ref 0 in
+    let bailed = ref false in
     let rec walk () =
-      let* next = S.seek_next cur in
-      match next with
-      | Some (ikey, _) when index_key_in_range ~prefix ~plen ~past_end ikey ->
-        incr walked;
-        (match bail_out_at with
-         | Some k when !walked > k -> Lwt.fail Seek_not_selective
-         | Some _ | None ->
-           let* () = emit_candidate ~stats ~emit (decode_index_key_rowid ikey) in
-           walk ())
-      | _ -> Lwt.return_unit
+      if !bailed
+      then Lwt.return_unit
+      else (
+        match%lwt S.seek_next cur with
+        | Some (ikey, _) when index_key_in_range ~prefix ~plen ~past_end ikey ->
+          incr walked;
+          (match bail_out_at with
+           | Some k when !walked > k ->
+             bailed := true;
+             Lwt.return_unit
+           | Some _ | None ->
+             let* () = emit_candidate ~stats ~emit (decode_index_key_rowid ikey) in
+             walk ())
+        | _ -> Lwt.return_unit)
     in
     (* [S.seek_next] and [emit] can both raise; close the cursor on that path
        too.  [Store.seek_close] is a no-op for the B-tree cursor today, so this
-       leaks nothing either way — it is here so that stops being true safely.
-       [Seek_not_selective] takes this same path: the cursor is closed before
-       [drain_matching_rows_in_tx] opens the table cursor its fallback scan
-       needs. *)
-    Lwt.finalize walk (fun () ->
-      S.seek_close cur;
-      Lwt.return_unit)
+       leaks nothing either way — it is here so that stops being true safely. *)
+    let* () =
+      Lwt.finalize walk (fun () ->
+        S.seek_close cur;
+        Lwt.return_unit)
+    in
+    Lwt.return !bailed
 ;;
 
 (* #508: candidate rowids for a DML [seek], handed to [emit] as they are
    decoded.  The seek is only a restriction: the caller still evaluates the full
    WHERE predicate on every candidate, so a wrong-but-superset answer here can
-   cost time but cannot change results.
+   cost time but cannot change results.  Returns whether the walk bailed out —
+   see [seek_index_candidates] — always [false] for [Seek_rowid], which never
+   walks more than one entry.
 
    Candidates arrive in INDEX-KEY order, which for a prefix spanning several
    distinct full keys is not rowid order.  The caller must therefore sort its
    accumulated matches by rowid — the order a full table-tree scan drains in —
    or an [UPDATE/DELETE ... LIMIT n] without [ORDER BY] would silently hit a
    different n rows than the scan it replaced. *)
-let seek_candidates tx clock params (seek : Plan.seek) ~stats ~emit : unit Lwt.t =
+let seek_candidates
+      tx
+      clock
+      params
+      cat
+      (table_meta : Cat.table_meta)
+      (seek : Plan.seek)
+      ~stats
+      ~emit
+  : bool Lwt.t
+  =
   match seek with
   | Plan.Seek_rowid e ->
     (match eval_expr clock params [||] e with
-     | Row.V_int n -> emit_candidate ~stats ~emit n
-     | _ -> Lwt.return_unit (* NULL or non-integer matches no rowid *))
-  | Plan.Seek_index { idx_tree; keys; range; bail_out_at } ->
-    seek_index_candidates tx clock params ~idx_tree ~keys ~range ~bail_out_at ~stats ~emit
+     | Row.V_int n ->
+       let* () = emit_candidate ~stats ~emit n in
+       Lwt.return_false
+     | _ -> Lwt.return_false (* NULL or non-integer matches no rowid *))
+  | Plan.Seek_index { idx_tree; keys; range } ->
+    seek_index_candidates
+      tx
+      clock
+      params
+      cat
+      table_meta
+      ~idx_tree
+      ~keys
+      ~range
+      ~stats
+      ~emit
 ;;
 
 (* #514: a growable, flat buffer of candidate rowids.  THE measurement table
@@ -6056,6 +6097,7 @@ let drain_full_scan_in_tx tx tree_id (table_meta : Cat.table_meta) ~clock ~param
 let drain_matching_rows_in_tx
       ~(seek : Plan.seek option)
       tx
+      cat
       (table_meta : Cat.table_meta)
       ~clock
       ~params
@@ -6089,25 +6131,23 @@ let drain_matching_rows_in_tx
         Lwt.return_unit
     in
     let cands = rowid_buf_create () in
-    Lwt.catch
-      (fun () ->
-         let* () =
-           seek_candidates tx clock params s ~stats ~emit:(fun rowid ->
-             rowid_buf_push cands rowid;
-             Lwt.return_unit)
-         in
-         rowid_buf_sort cands;
-         let* () = rowid_buf_iter_s fetch_one cands in
-         Lwt.return (List.rev !acc))
-      (function
-        | Seek_not_selective ->
-          (* #550: the seek's non-unique-index prefix walked past its budget.
-             [acc] is still empty here — the exception can only fire during
-             candidate collection, which runs entirely before the fetch phase
-             above populates it — so there is nothing to undo before falling
-             back to the scan the seek would otherwise have replaced. *)
-          drain_full_scan_in_tx tx tree_id table_meta ~clock ~params ~keep
-        | exn -> Lwt.fail exn)
+    let* bailed =
+      seek_candidates tx clock params cat table_meta s ~stats ~emit:(fun rowid ->
+        rowid_buf_push cands rowid;
+        Lwt.return_unit)
+    in
+    if bailed
+    then
+      (* #550: the seek's non-unique-index prefix walked past its budget.
+         [acc] is still empty here — a bail-out can only happen during
+         candidate collection, which runs entirely before the fetch phase
+         below populates it — so there is nothing to undo before falling back
+         to the scan the seek would otherwise have replaced. *)
+      drain_full_scan_in_tx tx tree_id table_meta ~clock ~params ~keep
+    else (
+      rowid_buf_sort cands;
+      let* () = rowid_buf_iter_s fetch_one cands in
+      Lwt.return (List.rev !acc))
   | None -> drain_full_scan_in_tx tx tree_id table_meta ~clock ~params ~keep
 ;;
 
@@ -6504,7 +6544,7 @@ let execute_update
   Lwt.catch
     (fun () ->
        let* matches =
-         drain_matching_rows_in_tx ~seek tx table_meta ~clock ~params ~where
+         drain_matching_rows_in_tx ~seek tx cat table_meta ~clock ~params ~where
        in
        let matches =
          apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches
@@ -6837,7 +6877,7 @@ let execute_delete
   Lwt.catch
     (fun () ->
        let* matches =
-         drain_matching_rows_in_tx ~seek tx table_meta ~clock ~params ~where
+         drain_matching_rows_in_tx ~seek tx cat table_meta ~clock ~params ~where
        in
        let matches =
          apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches
