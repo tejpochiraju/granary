@@ -677,8 +677,22 @@ val rollback_schema_changes : t -> unit
     every table's tree.  Clears the bumped set.  Must be called by the db layer
     AFTER the store rollback (so the trees show last-committed state and the RW
     lock is free), and after [rollback_schema_changes] (which leaves the bumped
-    set intact for this call to consume). *)
+    set intact for this call to consume).  #706: the RO scans run unlocked, but
+    the publish that follows re-acquires the writer lock and only takes effect
+    as a compare-and-swap against the live shared counter — see the
+    implementation's doc comment for why a blind re-locked overwrite is not
+    enough. *)
 val recompute_rowid_counters_after_rollback : t -> unit Lwt.t
+
+(** #706 test seam ONLY — production code never assigns this.  Awaited inside
+    [recompute_rowid_counters_after_rollback], exactly between finishing every
+    bumped table's (unlocked) RO scan and re-acquiring the writer lock to
+    publish the compare-and-swap.  Default is a no-op.  Exists so a test can
+    deterministically park one fiber here, run a second, concurrent allocation
+    to completion, and only then let the recompute resume and publish —
+    reproducing the race #706 fixed without depending on real scheduling
+    timing (see [test_rollback_recompute_publish_race_706.ml]). *)
+val rollback_recompute_publish_hook : (unit -> unit Lwt.t) ref
 
 (** #280: open a schema-undo savepoint named [name].  Records the current
     undo-log position so a later [savepoint_rollback_schema]/
