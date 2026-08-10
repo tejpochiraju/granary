@@ -1297,6 +1297,130 @@ let prop_branch_pick_with_info_agrees =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* #709: branch_leftmost_child / branch_child_at tests                 *)
+(* ------------------------------------------------------------------ *)
+
+let test_branch_leftmost_child_empty () =
+  let buf = fresh_page () in
+  let rp = 42l in
+  Alcotest.(check int32)
+    "child=right_page"
+    rp
+    (P.branch_leftmost_child buf ~n_keys:0 ~right_page:rp)
+;;
+
+let test_branch_leftmost_child_nonempty () =
+  let buf = fresh_page () in
+  let lc = 5l
+  and rp = 88l in
+  let off =
+    P.branch_append_entry
+      buf
+      ~offset:P.data_offset
+      ~key:(Bytes.of_string "a")
+      ~left_child:lc
+  in
+  let _ =
+    P.branch_append_entry buf ~offset:off ~key:(Bytes.of_string "b") ~left_child:9l
+  in
+  Alcotest.(check int32)
+    "child=entry 0's left_child"
+    lc
+    (P.branch_leftmost_child buf ~n_keys:2 ~right_page:rp)
+;;
+
+let test_branch_child_at_out_of_range () =
+  let buf = fresh_page () in
+  let rp = 88l in
+  let _ =
+    P.branch_append_entry
+      buf
+      ~offset:P.data_offset
+      ~key:(Bytes.of_string "a")
+      ~left_child:5l
+  in
+  Alcotest.(check int32)
+    "idx>=n_keys => right_page"
+    rp
+    (P.branch_child_at buf ~n_keys:1 ~right_page:rp ~idx:1)
+;;
+
+(* Review finding on this PR: a corrupt/torn page whose stored [key_len]
+   pushes the entry past the page must fall back to [right_page], the way
+   [branch_pick_with_info_loop] and the old [decode_branch_entries]/
+   [branch_entry_at] path (which this PR replaces on the cursor path) both do
+   — not let [Cstruct.BE.get_uint32] raise [Invalid_argument].  [offset + 6]
+   still fits (6 < page_size - data_offset) but the full entry does not,
+   which is the specific shape the first cut of [branch_leftmost_child] /
+   [branch_child_at] missed. *)
+let test_branch_leftmost_child_corrupt_key_len_falls_back () =
+  let buf = fresh_page () in
+  let rp = 42l in
+  Cstruct.BE.set_uint16 buf P.data_offset 60000;
+  Alcotest.(check int32)
+    "corrupt key_len => right_page, no exception"
+    rp
+    (P.branch_leftmost_child buf ~n_keys:1 ~right_page:rp)
+;;
+
+let test_branch_child_at_corrupt_key_len_falls_back () =
+  let buf = fresh_page () in
+  let rp = 42l in
+  Cstruct.BE.set_uint16 buf P.data_offset 60000;
+  Alcotest.(check int32)
+    "corrupt key_len => right_page, no exception"
+    rp
+    (P.branch_child_at buf ~n_keys:1 ~right_page:rp ~idx:0)
+;;
+
+(* Reference: the OLD [decode_branch_entries]-then-[List.nth] the cursor's
+   [frame_child] used before #709. *)
+let ref_branch_child_at buf n_keys right_page idx : int32 =
+  let rec collect offset i acc =
+    if i >= n_keys
+    then List.rev acc
+    else (
+      match P.branch_entry_at buf ~offset with
+      | `End -> List.rev acc
+      | `Entry (e : P.branch_entry) -> collect e.next_offset (i + 1) (e :: acc))
+  in
+  let entries = collect P.data_offset 0 [] in
+  if idx >= List.length entries then right_page else (List.nth entries idx).left_child
+;;
+
+let prop_branch_child_at_matches =
+  let gen =
+    QCheck.Gen.(
+      let* n = int_range 0 80 in
+      let* raw = list_size (return n) (pair (bytes_size (int_range 0 20)) int32) in
+      let* rp = int32 in
+      return (raw, rp))
+  in
+  QCheck.Test.make
+    ~name:"prop_branch_child_at_matches"
+    ~count:10_000
+    (QCheck.make gen)
+    (fun (raw, rp) ->
+       let su = sort_unique_by_key raw in
+       let buf = fresh_page () in
+       let _ =
+         List.fold_left
+           (fun off (k, lc) ->
+              P.branch_append_entry buf ~offset:off ~key:k ~left_child:lc)
+           P.data_offset
+           su
+       in
+       let n = List.length su in
+       (* idx in -1 .. n (n and beyond exercise the right_page fallback) *)
+       List.init (n + 2) (fun i -> i)
+       |> List.for_all (fun idx ->
+         P.branch_child_at buf ~n_keys:n ~right_page:rp ~idx
+         = ref_branch_child_at buf n rp idx)
+       && P.branch_leftmost_child buf ~n_keys:n ~right_page:rp
+          = ref_branch_child_at buf n rp 0)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* branch_blit_update_child tests                                      *)
 (* ------------------------------------------------------------------ *)
 
@@ -1359,6 +1483,7 @@ let () =
       ; prop_leaf_blit_insert_equiv
       ; prop_leaf_insert_inplace_equiv
       ; prop_branch_pick_with_info_agrees
+      ; prop_branch_child_at_matches
       ]
   in
   Alcotest.run
@@ -1507,6 +1632,28 @@ let () =
       , [ Alcotest.test_case "empty branch" `Quick test_branch_pick_with_info_empty
         ; Alcotest.test_case "follows left_child" `Quick test_branch_pick_with_info_left
         ; Alcotest.test_case "follows right_page" `Quick test_branch_pick_with_info_right
+        ] )
+    ; ( "branch_leftmost_child / branch_child_at"
+      , [ Alcotest.test_case
+            "leftmost: empty branch"
+            `Quick
+            test_branch_leftmost_child_empty
+        ; Alcotest.test_case
+            "leftmost: entry 0"
+            `Quick
+            test_branch_leftmost_child_nonempty
+        ; Alcotest.test_case
+            "child_at: idx out of range"
+            `Quick
+            test_branch_child_at_out_of_range
+        ; Alcotest.test_case
+            "leftmost: corrupt key_len falls back to right_page"
+            `Quick
+            test_branch_leftmost_child_corrupt_key_len_falls_back
+        ; Alcotest.test_case
+            "child_at: corrupt key_len falls back to right_page"
+            `Quick
+            test_branch_child_at_corrupt_key_len_falls_back
         ] )
     ; ( "branch_blit_update_child"
       , [ Alcotest.test_case "update left_child" `Quick test_branch_blit_update_child_left

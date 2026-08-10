@@ -253,6 +253,15 @@ val branch_pick_with_info
   -> key:bytes
   -> int32 * int * int
 
+(** The leftmost child of a branch page: entry 0's [left_child], or
+    [right_page] if the page has no entries.  O(1), allocates nothing (#709). *)
+val branch_leftmost_child : Cstruct.t -> n_keys:int -> right_page:int32 -> int32
+
+(** Re-derive the child pointer at ordinal [idx] on a branch page without
+    decoding an entry list. [idx >= n_keys] returns [right_page], matching
+    {!branch_pick_with_info}'s convention. Allocates nothing (#709). *)
+val branch_child_at : Cstruct.t -> n_keys:int -> right_page:int32 -> idx:int -> int32
+
 (** Build a new branch page identical to [buf] except the child pointer at
     [child_ptr_offset] is replaced with [new_child] ([child_ptr_offset < 0]
     updates [right_page] instead).  Returns a fresh, freshly-sealed Cstruct. *)

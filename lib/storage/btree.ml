@@ -1392,9 +1392,20 @@ let del t key : (t, error) result Lwt.t =
 (* A frame: a branch page and which child pointer we descended through.
    [child_idx = i] means we followed [branch_entries.(i).left_child].
    [child_idx = List.length branch_entries] means we followed [right_page]. *)
+(* #709: the cursor's read-only path frame used to hold a fully DECODED
+   [Page.branch_entry list] — every key on the page copied out of it via
+   [decode_branch_entries] — purely so [frame_child] could re-derive a child
+   pointer by ordinal index later (on sibling advance).  That made every
+   cursor open/seek/advance pay for a full branch-page decode at every level,
+   the dominant allocation #709 attributes Stock_level's NLJ probe cost to.
+   The frame now retains the branch page's buffer itself (borrowed exactly as
+   [leaf_buf] is — see [read_cur_leaf]'s comment for why retaining a
+   [read_shared] buffer across yields is safe) and [n_keys]; [frame_child]
+   re-reads the child pointer in place via [Page.branch_child_at]. *)
 type cursor_frame =
-  { cf_branch_entries : Page.branch_entry list
-  ; cf_right_page : int64
+  { cf_buf : Cstruct.t
+  ; cf_n_keys : int
+  ; cf_right_page : int32
   ; mutable cf_child_idx : int
   }
 
@@ -1440,14 +1451,15 @@ type cursor =
   ; mutable finished : bool
   }
 
-(* Get the child page-id of frame at its current cf_child_idx. *)
+(* Get the child page-id of frame at its current cf_child_idx.  #709:
+   allocates nothing — see the [cursor_frame] comment. *)
 let frame_child (f : cursor_frame) : int64 =
-  let n = List.length f.cf_branch_entries in
-  if f.cf_child_idx >= n
-  then f.cf_right_page
-  else (
-    let e = List.nth f.cf_branch_entries f.cf_child_idx in
-    page_id_of_int32 e.left_child)
+  page_id_of_int32
+    (Page.branch_child_at
+       f.cf_buf
+       ~n_keys:f.cf_n_keys
+       ~right_page:f.cf_right_page
+       ~idx:f.cf_child_idx)
 ;;
 
 (* Descend to the leftmost leaf starting from [page_id], returning the new
@@ -1476,19 +1488,22 @@ let leftmost_leaf_with_path ?snapshot_frames ?pin_set pager page_id
       (match common.kind with
        | Page.Leaf -> return_ok (acc, pid, buf, common.Page.n_keys)
        | Page.Branch ->
-         let entries, _ = decode_branch_entries buf common in
-         let right_page = page_id_of_int32 common.right_page in
-         let child =
-           match entries with
-           | [] -> right_page
-           | (e : Page.branch_entry) :: _ -> page_id_of_int32 e.left_child
+         let child32 =
+           Page.branch_leftmost_child
+             buf
+             ~n_keys:common.n_keys
+             ~right_page:common.right_page
          in
          let frame =
-           { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = 0 }
+           { cf_buf = buf
+           ; cf_n_keys = common.n_keys
+           ; cf_right_page = common.right_page
+           ; cf_child_idx = 0
+           }
          in
          (* New frame goes on TOP of acc (acc is deepest-first; we're going
             deeper, so this new one becomes the new head). *)
-         loop child (frame :: acc)
+         loop (page_id_of_int32 child32) (frame :: acc)
        | _ -> return_error (Tree_corrupt "non-tree page in tree"))
   in
   loop page_id []
@@ -1586,7 +1601,7 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
     c.finished <- true;
     return_ok false
   | top :: rest ->
-    let n = List.length top.cf_branch_entries in
+    let n = top.cf_n_keys in
     if top.cf_child_idx >= n
     then (
       (* Already at right_page of this frame — pop and try parent. *)
@@ -1762,13 +1777,21 @@ let descend_with_path_for_key ?snapshot_frames ?pin_set pager page_id key
       (match common.kind with
        | Page.Leaf -> return_ok (acc, pid, buf, common.Page.n_keys)
        | Page.Branch ->
-         let entries, _ = decode_branch_entries buf common in
-         let right_page = page_id_of_int32 common.right_page in
-         let idx, child = pick_branch_child_with_idx entries common key in
-         let frame =
-           { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = idx }
+         let child32, idx, _ptr_off =
+           Page.branch_pick_with_info
+             buf
+             ~n_keys:common.n_keys
+             ~right_page:common.right_page
+             ~key
          in
-         loop child (frame :: acc)
+         let frame =
+           { cf_buf = buf
+           ; cf_n_keys = common.n_keys
+           ; cf_right_page = common.right_page
+           ; cf_child_idx = idx
+           }
+         in
+         loop (page_id_of_int32 child32) (frame :: acc)
        | _ -> return_error (Tree_corrupt "non-tree page in tree"))
   in
   loop page_id []
