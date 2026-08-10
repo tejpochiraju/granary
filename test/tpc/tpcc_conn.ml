@@ -81,8 +81,27 @@ let get_stmt t sql =
     st
 ;;
 
+(* [Tpcc_txn.render]'s arity check never runs on this path — [Db.run]/[Db.iter]
+   bind params positionally against [Plan.P_param] with no arity check of their
+   own, so a params list shorter than the SQL's placeholder count would
+   silently bind NULL for the missing tail, and a longer one would be silently
+   truncated. Restoring the check here keeps a SQL/params drift a loud
+   [invalid_arg] instead of quietly corrupted benchmark data (#697 review). *)
+let check_arity (s : Tpcc_txn.stmt) =
+  let n_placeholders = Tpcc_txn.count_placeholders s.Tpcc_txn.sql in
+  let n_params = List.length s.Tpcc_txn.params in
+  if n_placeholders <> n_params
+  then
+    invalid_arg
+      (Printf.sprintf
+         "Tpcc_conn: %d placeholders but %d parameter(s)"
+         n_placeholders
+         n_params)
+;;
+
 let prepared_exec_lwt t (s : Tpcc_txn.stmt) =
   let open Lwt.Syntax in
+  check_arity s;
   let* stmt = get_stmt t s.Tpcc_txn.sql in
   let params = List.map to_db_value s.Tpcc_txn.params in
   Lwt.map (fun r -> ignore (unwrap r)) (Db.run stmt ~params)
@@ -90,6 +109,7 @@ let prepared_exec_lwt t (s : Tpcc_txn.stmt) =
 
 let prepared_query_rows_lwt t (s : Tpcc_txn.stmt) =
   let open Lwt.Syntax in
+  check_arity s;
   let* stmt = get_stmt t s.Tpcc_txn.sql in
   let params = List.map to_db_value s.Tpcc_txn.params in
   let* stream = Lwt.map unwrap (Db.iter stmt ~params) in

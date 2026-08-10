@@ -241,6 +241,12 @@ type ops =
   ; exec : stmt -> unit Lwt.t (** run a statement for effect *)
   }
 
+(** [count_placeholders sql] counts the [?] characters in [sql]. Exposed so a
+    caller that binds parameters directly, rather than substituting them
+    through {!render}, can still check its own arity against the same count
+    {!render} uses. *)
+val count_placeholders : string -> int
+
 (** [render s] substitutes [s.params] into [s.sql], left to right, each
     rendered by {!Tpc_value.literal} — for engines driven by literal SQL
     rather than bound parameters.
