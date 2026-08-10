@@ -1090,6 +1090,56 @@ Two rules make the sharing correct and must survive any future edit:
   The unknown-table `Failure` stays *synchronous* (raised before any `Lwt.t`
   exists) — `test_rowid_unknown_table` in `test_catalog.ml` pins the contract.
 
+  **The ROLLBACK side of the same shared table was not brought under this
+  discipline until #706 — same class of bug as #632, different function.**
+  `Cat.recompute_rowid_counters_after_rollback` re-derives a rolled-back
+  table's counter (`recover_next_rowid`'s RO tree scan, or
+  `read_committed_next_rowid` for AUTOINCREMENT) and publishes it via
+  `Schema_cache.set_rowid_durable`. The RO scan correctly runs *after*
+  `S.rollback` releases the writer lock (its own RO txn would otherwise
+  self-deadlock against it), but the **publish** used to run right after with
+  no lock at all — an unlocked write into the one counters table every
+  catalog over the store shares, exactly what #632 eliminated for the
+  allocate path. A second worker handle could `rw_begin` in that window, read
+  the still-stale (too-high, not-yet-recomputed) counter, allocate from it,
+  and commit — and the recompute's blind publish would then clobber the
+  counter back down past that commit's id, so the next allocation reissued it
+  and silently overwrote the row. Reliably reproducible with
+  `GRANARY_TPCC_TERMINALS >= 2` once `Tpcc_driver`'s terminals got genuine
+  concurrency (#703): NewOrder's ~1% rollback rate raced a sibling terminal's
+  concurrent allocation on `new_order`/`order_line` on nearly every run.
+
+  Unlike #632, re-acquiring the lock around a **blind** overwrite is not
+  enough, and would break the common (no-race) case: the value already
+  sitting in the shared table when the recompute is ready to publish is
+  usually this *same* rollback's own stale bump — the value the recompute
+  exists to correct — so "the live value differs from what I'm about to
+  write" cannot tell that apart from "a concurrent commit already moved
+  it". The fix is a compare-and-swap, `Schema_cache.cas_rowid_durable`:
+  capture `expected`, the live counter as of the *start* of the recompute
+  (before either RO scan runs); after the scan, re-acquire the writer lock
+  and publish the recomputed value only if the live value still equals
+  `expected`. A match means nothing else touched it — safe to lower, same as
+  before #706. A mismatch means a concurrent commit already advanced it past
+  what this recompute saw, and the recompute leaves it alone; the "wasted"
+  ids between the recomputed value and the live one are the same accepted
+  "too HIGH" residual #632's own writeup names, never a reissued one. All of
+  a rollback's bumped tables are scanned first (unlocked), then published
+  together under a *single* `rw_begin`/`rollback` bracket (not `commit` —
+  nothing is written to any tree, only the in-memory counters table is
+  republished, and `rollback` is the cheaper release: no header bump, no WAL
+  frame).
+
+  `test/test_rollback_recompute_publish_race_706.ml` pins it via
+  `Cat.rollback_recompute_publish_hook`, a test-only seam (production code
+  never assigns it) awaited at exactly the point between the RO scans
+  finishing and the lock being re-acquired to publish — deterministic
+  interleaving of a second handle's competing allocation, rather than relying
+  on real scheduling timing the way the TPC-C repro does. Must run **WAL-mode
+  and on disk**, for the same reason as #632's own tests: the in-memory
+  backend's RO scan does no real (yielding) I/O, so nothing would interleave
+  with it even without the hook.
+
 What it used to do, and what the tests now assert the opposite of — two counters
 over one data tree, neither invalidating the other, so an `INSERT` with an
 engine-assigned rowid reused a rowid the other handle had already committed and

@@ -1406,6 +1406,15 @@
   lwt.unix
   unix))
 
+; #706: a rollback's rowid-counter recompute publishes under a
+; compare-and-swap, not a blind overwrite, so a concurrent worker handle's
+; allocation can never be clobbered.
+
+(test
+ (name test_rollback_recompute_publish_race_706)
+ (modules test_rollback_recompute_publish_race_706)
+ (libraries granary granary.unix granary.catalog alcotest lwt.unix unix))
+
 ; #634: VACUUM invalidates every other handle over the store, loudly.
 
 (test

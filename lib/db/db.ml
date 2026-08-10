@@ -870,7 +870,11 @@ let force_rollback_txn t tx =
      row reverted with [S.rollback] above but the cache did not.  Re-derive each
      rowid table's counter from the rolled-back data tree so the next allocation
      reuses a rolled-back rowid (SQLite parity for plain rowid tables).  Done
-     after [S.rollback] released the RW lock so the recompute's RO txn is safe. *)
+     after [S.rollback] released the RW lock so the recompute's RO scan is safe
+     — #706: the scan runs unlocked, but the recompute re-acquires the writer
+     lock around its publish and only takes effect there if nothing else has
+     published to the shared counter in the meantime (see the doc comment on
+     [Cat.recompute_rowid_counters_after_rollback]). *)
   let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
   (* Reload all columnar stores from the rolled-back B-tree.  The RO snapshot
      opened by [load_columnar_stores] sees the last committed state, which is

@@ -221,6 +221,20 @@ module Schema_cache : sig
      durable set; [take_rowid_bumped] returns the dirty names and clears the set. *)
   val bump_rowid : t -> name:string -> table_meta -> unit
   val set_rowid_durable : t -> name:string -> table_meta -> unit
+
+  (** #706: publish [meta]'s recomputed rowid counter iff the shared table's
+      LIVE value for its tree still equals [expected] — i.e. nobody has
+      allocated from (or otherwise republished) this tree since [expected] was
+      read.  Must be called with the store's writer lock held (an [S.rw_begin]
+      /.../[S.commit] or [S.rollback] bracket with no [Lwt] yield in between),
+      so the compare and the swap are atomic against every allocator (#632)
+      and against a concurrent rollback recompute.  A mismatch means a
+      concurrent COMMITTED allocation already advanced the counter past what
+      this recompute saw; publishing [meta]'s value over it would silently
+      hand out an already-used rowid, so the call is a deliberate no-op in
+      that case — see [recompute_rowid_counters_after_rollback]. *)
+  val cas_rowid_durable : t -> name:string -> expected:int64 -> table_meta -> unit
+
   val take_rowid_bumped : t -> string list
 
   (** Append an arbitrary reversal to the undo log.  The ONLY way an external
@@ -585,6 +599,25 @@ end = struct
   ;;
 
   let set_rowid_durable t ~name meta = set_meta t name meta
+
+  (* #706: the local [tables] entry is always refreshed — its own [next_rowid]
+     field is inert (every read goes through [patch], which overlays the
+     shared counter), so overwriting it unconditionally can't leak a stale
+     value.  Only the SHARED [counters] publish is gated: it fires only when
+     the live value under the lock still matches [expected], the value this
+     recompute saw before it ran its (unlocked) RO scan.  A mismatch means a
+     concurrent commit already published a higher, correct value between that
+     scan and this call, and must be left alone. *)
+  let cas_rowid_durable t ~name ~expected (m : table_meta) =
+    Hashtbl.replace t.tables name m;
+    match m.storage with
+    | Row { tree_id; next_rowid; _ } when tree_id >= 0 ->
+      (match Hashtbl.find_opt t.counters tree_id with
+       | Some cur when Int64.equal cur expected ->
+         Hashtbl.replace t.counters tree_id next_rowid
+       | _ -> ())
+    | Row _ | Columnar _ -> ()
+  ;;
 
   let take_rowid_bumped t =
     let names = Hashtbl.fold (fun k _ acc -> k :: acc) t.rowid_bumped [] in
@@ -2176,34 +2209,93 @@ let rollback_schema_changes t = Schema_cache.rollback t.sc
    in [_sys_tables] (which [S.rollback] has already reverted to), via
    [read_committed_next_rowid].  That still reverts a rolled-back allocation to
    the committed mark (matching SQLite, whose [sqlite_sequence] is itself
-   transactional) while preserving stickiness across committed deletes. *)
+   transactional) while preserving stickiness across committed deletes.
+
+   #706: the RO scans above run WITHOUT the writer lock — [S.rollback] already
+   released it and re-taking it for the whole scan would just reintroduce the
+   deadlock the comment above describes.  But the PUBLISH this function ends
+   with is exactly the shape #632 already fixed once for [next_rowid]: an
+   unlocked write into [Store.rowid_counters], the ONE allocator table every
+   catalog over this store shares (#633).  Between "[S.rollback] releases the
+   lock" and "this function publishes", another worker handle can [rw_begin],
+   read the still-stale (too-high, pre-recompute) shared counter, allocate
+   from it, and commit — legitimately, since nothing else had touched the
+   counter yet.  A blind publish of the recomputed (lower) value after that
+   would clobber a rowid that commit already used, reproducing #589 by a new
+   route (the TPC-C repro in #706).
+
+   Blindly re-acquiring the lock around the publish and overwriting is NOT
+   enough on its own, and would in fact break the common (no-race) case: the
+   value already sitting in the shared table at that point is exactly this
+   same rollback's own stale bump (that is the value the recompute exists to
+   correct), so an unconditional overwrite-if-changed can't tell "nobody
+   touched this since" from "our own rollback is what made it stale" — both
+   look like "the live value differs from the value I'm about to write".  The
+   fix is a compare-and-swap: capture [expected], the LIVE counter as
+   patch-overlaid at the top of this loop (before either RO scan runs) — that
+   is this rollback's own stale bump if nothing else has happened, or a
+   racing commit's fresher value if something has.  Then, with the writer
+   lock held, publish the recomputed value ONLY if the live value still
+   equals [expected]:
+   - matches -> nothing else touched it since; safe to lower it to the
+     recomputed value, same as before.
+   - differs -> a concurrent commit already advanced it past what this
+     recompute saw; leave it alone.  The "wasted" ids between the recomputed
+     value and the live one are the accepted "too HIGH" residual #632's own
+     writeup names — it only skips ids, never reissues one.
+
+   All the scans run first (unlocked); the CAS publishes are batched under a
+   SINGLE [rw_begin]/[rollback] bracket with no [Lwt] yield inside it, so one
+   lock cycle covers every table this rollback touched rather than one per
+   table.  [rollback], not [commit], because nothing is written to any tree —
+   this only republishes the in-memory shared counter table, and [rollback]
+   is the cheaper of the two releases (no header bump, no WAL frame; see
+   [next_rowid]'s own note on why publishing must happen strictly BEFORE
+   whichever release call is used). *)
+
+(* #706 test seam ONLY — see the .mli doc comment.  Never assigned outside a
+   test. *)
+let rollback_recompute_publish_hook : (unit -> unit Lwt.t) ref =
+  ref (fun () -> Lwt.return_unit)
+;;
+
 let recompute_rowid_counters_after_rollback t =
   let names = Schema_cache.take_rowid_bumped t.sc in
-  Lwt_list.iter_s
-    (fun name ->
-       match Schema_cache.find_table t.sc name with
-       | None -> Lwt.return_unit
-       | Some m when is_columnar m -> Lwt.return_unit
-       | Some m ->
-         let tree_id, _next_rowid, without_rowid, autoincrement = row_storage m in
-         if without_rowid
-         then Lwt.return_unit
-         else if autoincrement
-         then (
-           let%lwt committed = read_committed_next_rowid t.store ~name in
-           Schema_cache.set_rowid_durable
-             t.sc
-             ~name
-             { m with
-               storage =
-                 Row { tree_id; next_rowid = committed; without_rowid; autoincrement }
-             };
-           Lwt.return_unit)
-         else (
-           let%lwt recovered = recover_next_rowid t.store m in
-           Schema_cache.set_rowid_durable t.sc ~name recovered;
-           Lwt.return_unit))
-    names
+  let%lwt updates =
+    Lwt_list.filter_map_s
+      (fun name ->
+         match Schema_cache.find_table t.sc name with
+         | None -> Lwt.return_none
+         | Some m when is_columnar m -> Lwt.return_none
+         | Some m ->
+           let tree_id, expected, without_rowid, autoincrement = row_storage m in
+           if without_rowid
+           then Lwt.return_none
+           else if autoincrement
+           then (
+             let%lwt committed = read_committed_next_rowid t.store ~name in
+             Lwt.return_some
+               ( name
+               , expected
+               , { m with
+                   storage =
+                     Row { tree_id; next_rowid = committed; without_rowid; autoincrement }
+                 } ))
+           else (
+             let%lwt recovered = recover_next_rowid t.store m in
+             Lwt.return_some (name, expected, recovered)))
+      names
+  in
+  let%lwt () = !rollback_recompute_publish_hook () in
+  match updates with
+  | [] -> Lwt.return_unit
+  | _ ->
+    let%lwt tx = S.rw_begin t.store in
+    List.iter
+      (fun (name, expected, recomputed) ->
+         Schema_cache.cas_rowid_durable t.sc ~name ~expected recomputed)
+      updates;
+    S.rollback tx
 ;;
 
 (* #280/#295: open a savepoint over the schema-undo log.  Records the current
