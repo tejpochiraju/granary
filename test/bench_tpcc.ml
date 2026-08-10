@@ -11,16 +11,25 @@
    the SQL is rewritten for granary's dialect, there are no keying or think
    times, and there is no audit or pricing disclosure.
 
-   Both engines are driven through a ONE-worker pool.  For granary that is a
-   hard constraint (#555) — a Db.t holds one explicit-transaction slot, so two
-   terminals sharing it would let one COMMIT the other's half-done work (see
-   Tpcc_driver's module header).  For reference SQLite it is a deliberate
-   choice: these bindings are blocking calls from a single-domain Lwt
-   program, so a second handle could not overlap anything either, and giving
-   one engine a deeper pool than the other would make the comparison a
-   comparison of pool depths.  What varies across a run is the TERMINAL
-   count, and on a one-deep pool the honest result is that it moves wait(ms)
-   and not throughput.
+   The two engines are driven through pools of DIFFERENT depths, deliberately.
+
+   Granary gets one {!Tpcc_conn.t} per terminal (#703): the load phase runs on
+   a single connection, then one {!Tpcc_conn.worker_handle} is minted per
+   remaining terminal, all sharing one on-disk {!Store.t} and its
+   single-writer [Rwlock] (see CLAUDE.md's "Running explicit transactions from
+   more than one fiber", #555/#589/#632/#633). That removes the pool itself as
+   a source of queueing — {!Tpcc_driver}'s pool now has exactly as many workers
+   as there are terminals — so what remains in wait(ms) is real writer-lock
+   contention, not an artifact of sharing a single [Db.t].
+
+   Reference SQLite stays a ONE-worker pool: these bindings are blocking calls
+   from a single-domain Lwt program, so a second handle could not overlap
+   anything either, and there is no equivalent of [create_worker_handle] to
+   reach for. Giving sqlite a deeper pool than its bindings can actually use
+   would not make it faster, only add unused connections, so the comparison
+   stays a comparison of what each engine's terminal count can do to
+   throughput — not a comparison of pool depths, which was the failure mode
+   the old one-worker-both-engines setup avoided by being uniformly flat.
 
    Not audited TPC results — see docs/benchmarks/BENCHMARKS-TPCC.md. *)
 
@@ -225,12 +234,17 @@ let load_failures r =
   List.fold_left (fun acc (s : D.profile_stats) -> acc + s.D.failed) 0 r.D.per_profile
 ;;
 
-let run_engine ~engine ~config ~gen ~load ~ops ~exec ~query_rows ~self_test =
+(* [mk_workers] is a thunk, not a plain list, so it can be evaluated AFTER
+   [load] completes — a worker handle minted before the load phase's DDL runs
+   would carry a catalog that cannot see the freshly created tables (see
+   {!Tpcc_conn.worker_handle}'s doc). *)
+let run_engine ~engine ~config ~gen ~load ~mk_workers ~exec ~query_rows ~self_test =
   Printf.eprintf "[%s] loading W=%d…%!" engine (G.warehouses gen);
   let (), load_wall, _ = BR.time_it load in
   Printf.eprintf " %.2fs\n%!" load_wall;
+  let workers = mk_workers () in
   let before = print_check (check_conditions query_rows ~engine ~where:"before") in
-  let result = Lwt_main.run (D.run config ~workers:[ T.run ops ]) in
+  let result = Lwt_main.run (D.run config ~workers:(List.map T.run workers)) in
   let after = print_check (check_conditions query_rows ~engine ~where:"after") in
   let self = if self_test then prove_the_oracle_can_fail exec query_rows ~engine else 0 in
   prerr_string (D.summary result);
@@ -238,6 +252,13 @@ let run_engine ~engine ~config ~gen ~load ~ops ~exec ~query_rows ~self_test =
   { result; failures = before + after + self + load_failures result }
 ;;
 
+(* One worker-handle connection per terminal (#703): [c] itself serves the
+   first terminal (and is what pre/post consistency checks and the oracle
+   self-test run against — all of them run outside the timed interval, so
+   there is no overlap with a terminal using it), and [config.terminals - 1]
+   further connections are minted via [Conn.worker_handle c], each sharing
+   [c]'s store. Only [c] is ever closed — see [Conn.worker_handle]'s doc on
+   why closing a sibling would tear down every other handle's store. *)
 let run_granary ~dir ~config ~gen ~self_test =
   let module Load = Granary_tpc.Tpcc_schema.Load (Conn) in
   let c = Conn.open_db ~dir in
@@ -247,7 +268,11 @@ let run_granary ~dir ~config ~gen ~self_test =
       ~config
       ~gen
       ~load:(fun () -> Load.run c gen)
-      ~ops:(Conn.ops c)
+      ~mk_workers:(fun () ->
+        c
+        :: List.init (config.D.terminals - 1) (fun _ ->
+          Lwt_main.run (Conn.worker_handle c))
+        |> List.map Conn.ops)
       ~exec:(Conn.exec c)
       ~query_rows:(Conn.query_rows c)
       ~self_test
@@ -265,7 +290,7 @@ let run_sqlite ~dir ~config ~gen ~self_test =
       ~config
       ~gen
       ~load:(fun () -> Load.run s gen)
-      ~ops:(Ref_sqlite.ops s)
+      ~mk_workers:(fun () -> [ Ref_sqlite.ops s ])
       ~exec:(Ref_sqlite.exec s)
       ~query_rows:(Ref_sqlite.query_rows s)
       ~self_test

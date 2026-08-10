@@ -1115,8 +1115,39 @@ handles/five inserts, a rollback, and a close/reopen is pinned by
 `worker_handle_stale_rowid_counter` in `test_txn.ml` keep the issue's own two
 sequences.
 
-**What is still unsafe about a worker handle** — none of it corrupts anything:
+**What is still unsafe about a worker handle** — the DDL/scoping items below do
+not corrupt anything, but the first one, found while implementing #703, does:
 
+- **#706 (open, found via #703): `ROLLBACK`'s rowid-counter recompute publishes
+  outside the writer lock and can race a concurrent worker handle's allocation
+  on the same tree, reproducing #589's exact symptom (a reused engine rowid,
+  second `S.put` silently overwriting the first row).** `force_rollback_txn`
+  calls `S.rollback` — which releases the writer lock as its last synchronous
+  step — and only THEN calls `Cat.recompute_rowid_counters_after_rollback`,
+  deliberately outside the lock (its RO scan would deadlock inside `rw_begin`
+  otherwise). That recompute's publish
+  (`Schema_cache.set_rowid_durable` → `Catalog.publish`) is an unconditional
+  `Hashtbl.replace` on `Store.rowid_counters` — no compare-and-swap, no
+  re-acquisition of the lock. If a sibling worker handle begins, allocates from
+  the same tree, and commits in the window between the rollback's unlock and
+  this recompute's publish, the publish clobbers that legitimate allocation
+  back down to a stale, lower value, and the next `INSERT` reissues an
+  already-used rowid. This is the *same* mechanism the "#632" bullet above
+  documents as fixed for `Catalog.next_rowid` — "every allocator allocates
+  *and* publishes with the writer lock held" — except the rollback-recompute
+  path was never brought under that discipline, because nothing before #703
+  drove genuinely concurrent worker handles through a multi-statement,
+  sometimes-rolling-back transaction on the same table under load. TPC-C's
+  NewOrder profile's spec-mandated ~1% invalid-item `ROLLBACK` (after already
+  bumping `orders`/`new_order`/`order_line`'s counters earlier in the same
+  transaction) is exactly the shape that exposes it, and it reproduces
+  reliably — not a flake — at `GRANARY_TPCC_TERMINALS` 2, 4, 8 and 16 (never at
+  1, where there is no second handle to race). See #706 for the full
+  repro/analysis. **Until #706 is fixed, do not treat a multi-terminal
+  `Tpcc_driver`/`bench_tpcc` run — or any other workload that rolls back a
+  bumped rowid table concurrently with a sibling worker handle's writes — as
+  producing a consistent database; always check its own consistency oracle
+  before trusting output from such a run.**
 - **DDL on one handle is invisible to the other's schema cache.** This one is
   inherent to the per-handle catalog and was *not* fixed: create a table on the
   parent and the worker cannot see it until reopened. Pinned by
@@ -1170,9 +1201,15 @@ Two consequences worth knowing before editing this:
   stale" case is unreachable today; forwarding `file_path` to workers would make
   it reachable, and the cohort already handles it.
 
-`Tpcc_driver`'s one-deep worker pool predates this and serializes whole
-transactions on a single handle; that is why its terminal-count sweep flatlines
-by construction.
+**Since #703, `Tpcc_driver` no longer runs a one-deep pool.** `test/bench_tpcc.ml`
+mints one worker handle per terminal (after the load phase, per the DDL
+limitation above) instead of serializing every terminal through a single
+`Db.t`. The terminal-count sweep is no longer flat-by-construction — see
+`docs/benchmarks/BENCHMARKS-TPCC.md`'s `#703` section for the measured shape —
+but see the #706 bullet above: a multi-terminal run currently trips its own
+consistency oracle, because #703 is the first thing in the tree to drive real
+concurrent worker-handle writers through a workload that rolls back a bumped
+rowid table under load.
 
 ## Repository structure
 
