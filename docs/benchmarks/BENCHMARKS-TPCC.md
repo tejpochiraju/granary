@@ -44,7 +44,11 @@ headline figure is **NewOrder transactions per second** and is **never tpmC**.
 Treat the numbers as a measurement tool for our own regressions and for a rough
 sense of distance from SQLite — not as a competitive claim.
 
-## The one-worker pool, and why the terminal sweep flatlines
+## The one-worker pool, and why the terminal sweep used to flatline
+
+**This section describes the driver as it was before #703, and still
+describes reference SQLite today.** For granary's current behaviour see the
+`#703` section further down.
 
 `Tpcc_driver.run` takes a **list of workers** and guarantees that no worker runs
 two transactions at once. That is not a stylistic choice:
@@ -56,24 +60,28 @@ two transactions at once. That is not a stylistic choice:
 > work. Filed as **#555**.
 
 A TPC-C transaction is inherently multi-statement and explicit, so one granary
-connection can carry exactly one transaction at a time, and the benchmark
-therefore runs a **one-deep pool**. Reference SQLite is run one-deep too, for a
+connection used to carry exactly one transaction at a time, and the benchmark
+ran a **one-deep pool**. Reference SQLite is still run one-deep, for a
 different reason: the `sqlite3` bindings are blocking calls inside a
 single-domain Lwt program, so a second handle could not overlap anything either,
-and giving one engine a deeper pool would turn the comparison into a comparison
-of pool depths.
+there is no SQLite equivalent of `Db.create_worker_handle` to reach for, and
+giving one engine a deeper pool than the other would turn the comparison into a
+comparison of pool depths rather than of engines.
 
-The consequence is deliberate and visible in the output rather than hidden by
-it: **raising `GRANARY_TPCC_TERMINALS` cannot raise throughput.** It raises
-queueing delay, and the driver reports that delay as its own column. Each
-profile's latency is split into
+The consequence used to be deliberate and visible in the output rather than
+hidden by it: **raising `GRANARY_TPCC_TERMINALS` could not raise throughput.**
+It raised queueing delay, and the driver reports that delay as its own column.
+Each profile's latency is split into
 
-- `service_ms` — time inside the worker, the engine's own cost, and
-- `wait_ms` — time the terminal spent queued for a free worker,
+- `service_ms` — time inside the worker, the engine's own cost (which, since
+  #703, includes any time granary's own writer-lock wait takes — see below),
+  and
+- `wait_ms` — time the terminal spent queued for a free worker in
+  `Tpcc_driver`'s own pool,
 
-so a flat throughput curve against a rising `wait_ms` is the *expected* reading
-of a terminal sweep, not a defect in the run. Do not tune the terminal count
-until the number looks better; report the flat curve.
+and for SQLite (still one-deep) a flat throughput curve against a rising
+`wait_ms` remains the *expected* reading of a terminal sweep. Since #703 that
+reading no longer applies to granary — read on.
 
 ## Determinism
 
@@ -319,3 +327,128 @@ table records as the pre-batch **1-terminal** ceiling. So the whole curve has
 moved up by roughly the queueing penalty this table was measuring, and the
 sentence above understates today's ceiling. Re-run the sweep before quoting any
 row of it.
+
+**This whole section is now superseded for granary by the `#703` section
+below** — the pool referred to throughout is no longer one deep for granary.
+It remains accurate for reference SQLite, which is unaffected by #703.
+
+## #703: one worker handle per terminal, and the correctness bug it found
+
+`Db.create_worker_handle` (#589/#632/#633, see the top-level `CLAUDE.md`) gives
+a fiber its own `explicit_txn` slot over the *same* `Store.t` and writer
+`Rwlock` as the handle it was minted from — two worker handles' write
+transactions block on that shared lock instead of colliding/poisoning. #632 and
+#633 removed the prerequisite blocker (#589: two worker handles used to hold
+independent rowid counters over one tree, silently losing rows), so #703 gave
+`Tpcc_driver` one worker-handle connection per terminal — minted from
+`Tpcc_conn.worker_handle` after the load phase completes, since a handle's
+catalog cannot see DDL run on another handle — instead of the one-deep pool
+described above. `Tpcc_driver.run` itself needed **no change**: it already
+accepted an arbitrary list of workers and enforced "no worker runs two
+transactions at once" per worker, not per process: what changed is how many
+distinct `Db.t`-backed connections `test/bench_tpcc.ml` hands it, and that they
+now share one on-disk database rather than being the same handle wrapped
+`terminals` times.
+
+### A correctness bug surfaced immediately, before any throughput conclusion is safe to draw
+
+Every existing worker-handle test drives straight-line INSERT/UPDATE traffic,
+never a `ROLLBACK` racing a concurrent sibling handle's allocation on the same
+table. TPC-C's NewOrder profile is the first workload in the tree to do
+exactly that under load: it intentionally `ROLLBACK`s ~1% of transactions
+(spec 2.4.2.3's invalid-item case) *after* already bumping
+`orders`/`new_order`/`order_line`'s rowid counters earlier in the same
+transaction. At `GRANARY_TPCC_TERMINALS >= 2`, `bench_tpcc.exe`'s own
+before/after consistency oracle reliably — not occasionally — reports rows
+missing from `new_order`/`order_line`:
+
+```
+[granary] after: condition 3 (max(no_o_id) - min(no_o_id) + 1 equals the new_order row count per district): VIOLATED — 1 offending district(s)/row(s), first = district (1,8): max=3047 min=2142 count=905 (max-min+1=906)
+[granary] after: condition 4 (the sum of o_ol_cnt equals the order_line row count per district): VIOLATED — 6 offending district(s)/row(s), first = district (1,10): sum(o_ol_cnt)=30553 <> order_line count=30541
+```
+
+The root cause (filed as **#706**, with full analysis): `Db.force_rollback_txn`
+calls `S.rollback` — which releases the writer lock as its last synchronous
+step — and only *then* calls `Cat.recompute_rowid_counters_after_rollback` to
+re-derive the rolled-back table's counter, deliberately outside the lock (its
+RO scan would deadlock inside `rw_begin` otherwise). That recompute's publish
+is an unconditional `Hashtbl.replace` on the shared `Store.rowid_counters`
+table, with no re-acquisition of the lock. A sibling worker handle that begins,
+allocates from the same tree, and commits inside the window between the
+rollback's unlock and this recompute's publish has its legitimate allocation
+silently clobbered back down to a stale, lower value — and the next `INSERT`
+reissues an already-used rowid, exactly reproducing #589's original symptom
+(a reused engine rowid, the second `S.put` silently overwriting the first row).
+This is the same class of bug CLAUDE.md's `#632` bullet documents as already
+fixed for the *allocate* path ("every allocator allocates *and* publishes with
+the writer lock held") — the rollback-recompute path was simply never brought
+under that same discipline, because nothing before #703 exercised it under
+real concurrency.
+
+**Consequence for this section: every terminals >= 2 number below comes from a
+run whose database was not left consistent.** The run still completes and
+prints throughput/latency figures, and the shape is real and worth recording —
+but until #706 is fixed, do not read a multi-terminal `bench_tpcc` run as a
+validated result, and re-run the sweep clean once it is.
+
+### Terminal sweep, W=1, granary, worker-handle driver (#703)
+
+`bench/results/2026-08-10-tpcc-w1-worker-handle-sweep.csv`, 10 s measured, 2 s
+warm-up, one run per terminal count (not averaged), on a loaded container host
+(loadavg ~3-5 on 8 cores — treat absolute numbers as noisy, the shape as the
+signal), `GRANARY_TPCC_ENGINES=granary` only:
+
+| terminals | NewOrder/sec | new_order mean | service | wait | oracle |
+|---|---|---|---|---|---|
+| 1 | 31.60 | 17.5 ms | 17.5 ms | 0.0 ms | clean |
+| 2 | 32.47 | 28.7 ms | 28.7 ms | 0.0 ms | **violated** (#706) |
+| 4 | 33.95 | 54.7 ms | 54.7 ms | 0.0 ms | **violated** (#706) |
+| 8 | 28.24 | 140.0 ms | 140.0 ms | 0.0 ms | **violated** (#706) |
+| 16 | 27.45 | 299.5 ms | 299.5 ms | 0.0 ms | **violated** (#706) |
+
+For reference, the pre-#703 one-deep-pool shape (from the `2026-08-02` table
+above, a different host and a different post-#671 baseline, so compare shapes,
+not absolute values): NewOrder/sec fell monotonically from 25.70 (1 terminal)
+to 9.88 (16 terminals) — a 62% collapse — with essentially all of the latency
+rise landing in `wait_ms` and `service_ms` staying roughly flat.
+
+**What moved, and why:**
+
+- **`wait_ms` is now 0.000 at every terminal count.** `Tpcc_driver`'s pool has
+  exactly as many workers as there are terminals, so no terminal ever queues
+  for a worker — the queueing-for-a-connection artifact the old table measured
+  is gone by construction.
+- **All of the latency that used to show up as `wait_ms` now shows up as
+  `service_ms` instead — it has not disappeared, only been relabeled.** A
+  worker's call to `Db.begin_txn` blocks inside the worker (on the shared
+  `Rwlock`) until the previous writer commits, and `Tpcc_driver.attempt_once`
+  times the whole worker call as `service_ms`. So `service_ms` here is *not*
+  purely "the engine's own per-transaction cost" the way it was for a one-deep
+  pool — it now also carries genuine writer-lock contention. This is expected
+  and is the same underlying serialization #555 always implied for concurrent
+  writers; #703 only changed which column reports the wait.
+- **Throughput is no longer a monotonic collapse — it is roughly flat (27-34
+  NewOrder/sec) from 1 to 16 terminals**, dipping at 8 and 16 rather than
+  cratering. 16-terminal throughput retains ~87% of the 1-terminal figure here,
+  versus ~38% in the old one-deep-pool table. That is the real, structural
+  improvement #703 set out to measure: removing the pool as an *artificial*
+  bottleneck exposes the *actual* ceiling, which is the single-writer `Rwlock`
+  every explicit write transaction still serializes on (per #555 — worker
+  handles remove the pool-depth bottleneck, not the one-writer-at-a-time
+  invariant, and #703's own issue said as much going in). It is not an N×
+  throughput win, and it was never going to be one: TPC-C's write mix means
+  most terminals' time is spent inside a write transaction, and only one
+  writer runs at a time regardless of how many `Db.t`s exist.
+- **This is a wash-to-modest-win on throughput, entangled with a real
+  correctness regression that must be fixed before the win can be trusted.**
+  Reporting both together, as asked: the pool-queueing collapse is gone and
+  the curve is flatter and higher, which is the honest structural result: but
+  every number at terminals >= 2 was produced by a run that lost rows, so the
+  win is not yet one to build on without #706.
+
+### Recommendation until #706 lands
+
+Run `bench_tpcc.exe` with `GRANARY_TPCC_ORACLE_SELFTEST=1` and read its exit
+code, not just its throughput line, whenever `GRANARY_TPCC_TERMINALS > 1`. A
+regression benchmark that silently corrupts the database it is measuring is
+worse than no benchmark.

@@ -25,3 +25,24 @@ val pp : Format.formatter -> t -> unit
     against — no [Lwt_main.run] anywhere beneath it, so it is safe inside a
     driver terminal. *)
 val ops : t -> Tpcc_txn.ops
+
+(** [worker_handle t] mints a fresh connection sharing [t]'s underlying store,
+    via {!Granary.Db.create_worker_handle}: its own [explicit_txn] slot and its
+    own prepared-statement cache, but the same on-disk data and the same
+    single-writer [Rwlock]. Two connections returned from this function (or one
+    of them and [t]) can each drive one of {!Tpcc_driver.run}'s workers without
+    the collision/poison hazard a shared [Db.t] would have — see #555/#589/#632/
+    #633 and the "Running explicit transactions from more than one fiber"
+    section of the top-level [CLAUDE.md].
+
+    {b Must only be called after the load phase.} DDL run on [t] is invisible
+    to a handle minted before it runs (per-handle catalog), so calling this
+    before {!Tpcc_schema.Load} completes would hand a terminal a connection
+    that cannot see the freshly created tables.
+
+    {b Never call [close] on the returned handle (or on [t]) while any sibling
+    handle is still in use.} [Db.close] releases the shared [Store.t]
+    unconditionally — it is not reference-counted — so closing any one of them
+    tears down every other handle's store out from under it. Close exactly one
+    connection, once, after every worker built from it is done. *)
+val worker_handle : t -> t Lwt.t

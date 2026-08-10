@@ -1,0 +1,19 @@
+#703: Tpcc_driver terminals moved from a one-deep Db.t pool to one
+Db.create_worker_handle session per terminal (minted after the load phase).
+GRANARY_TPCC_WAREHOUSES=1, GRANARY_TPCC_SECONDS=10, GRANARY_TPCC_WARMUP_SECONDS=2,
+GRANARY_TPCC_ENGINES=granary, GRANARY_TPC_SEED=42 (default), terminals swept
+1/2/4/8/16, one bench_tpcc.exe run per terminal count (not repeated/averaged).
+Host: containerized dev image (granary-dev), loadavg ~3-5 on 8 cores during the
+runs -- treat absolute numbers as noisy, the shape as the signal.
+
+IMPORTANT: every run at terminals >= 2 tripped the post-run consistency oracle
+(conditions 3 and/or 4, condition 2 additionally at terminals=16) -- see
+Forgejo issue #706, filed from this investigation. The database was NOT
+consistent after these runs; a handful of new_order/order_line rows were
+silently lost via a rowid-counter race between a worker handle's post-ROLLBACK
+counter recompute (unlocked) and a sibling worker handle's concurrent
+allocation on the same tree. Throughput/latency numbers are still reported
+below because the run otherwise completes and the shape (removal of the pool-
+queueing collapse) is real and useful signal, but they are not from a run
+whose data is known-consistent, and must not be read as a validated benchmark
+result until #706 is fixed and the sweep is re-run clean.

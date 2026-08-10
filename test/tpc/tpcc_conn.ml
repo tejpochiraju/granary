@@ -174,6 +174,21 @@ let ops t =
   }
 ;;
 
+(* ── worker handles (#703) ────────────────────────────────────────────────
+   [Db.create_worker_handle] gives a fresh [Db.t] its own [explicit_txn] slot
+   over the SAME [Store.t] and [Rwlock] as [t.db] — see this function's [.mli]
+   doc and CLAUDE.md's "Running explicit transactions from more than one
+   fiber" section. A fresh, empty [stmt_cache] is required, not merely
+   harmless: a [Db.stmt] returned by [Db.prepare] is compiled against the
+   handle it was prepared on, and a worker handle gets its own catalog, so
+   reusing [t]'s cache would hand a new connection a statement compiled
+   somewhere else. *)
+let worker_handle t =
+  let open Lwt.Syntax in
+  let+ db = Db.create_worker_handle t.db in
+  { db; path = t.path; stmt_cache = Hashtbl.create 32 }
+;;
+
 (* ── synchronous ENGINE view, for the load phase only ─────────────────── *)
 
 let run = Lwt_main.run
