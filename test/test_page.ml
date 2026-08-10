@@ -1345,6 +1345,34 @@ let test_branch_child_at_out_of_range () =
     (P.branch_child_at buf ~n_keys:1 ~right_page:rp ~idx:1)
 ;;
 
+(* Review finding on this PR: a corrupt/torn page whose stored [key_len]
+   pushes the entry past the page must fall back to [right_page], the way
+   [branch_pick_with_info_loop] and the old [decode_branch_entries]/
+   [branch_entry_at] path (which this PR replaces on the cursor path) both do
+   — not let [Cstruct.BE.get_uint32] raise [Invalid_argument].  [offset + 6]
+   still fits (6 < page_size - data_offset) but the full entry does not,
+   which is the specific shape the first cut of [branch_leftmost_child] /
+   [branch_child_at] missed. *)
+let test_branch_leftmost_child_corrupt_key_len_falls_back () =
+  let buf = fresh_page () in
+  let rp = 42l in
+  Cstruct.BE.set_uint16 buf P.data_offset 60000;
+  Alcotest.(check int32)
+    "corrupt key_len => right_page, no exception"
+    rp
+    (P.branch_leftmost_child buf ~n_keys:1 ~right_page:rp)
+;;
+
+let test_branch_child_at_corrupt_key_len_falls_back () =
+  let buf = fresh_page () in
+  let rp = 42l in
+  Cstruct.BE.set_uint16 buf P.data_offset 60000;
+  Alcotest.(check int32)
+    "corrupt key_len => right_page, no exception"
+    rp
+    (P.branch_child_at buf ~n_keys:1 ~right_page:rp ~idx:0)
+;;
+
 (* Reference: the OLD [decode_branch_entries]-then-[List.nth] the cursor's
    [frame_child] used before #709. *)
 let ref_branch_child_at buf n_keys right_page idx : int32 =
@@ -1618,6 +1646,14 @@ let () =
             "child_at: idx out of range"
             `Quick
             test_branch_child_at_out_of_range
+        ; Alcotest.test_case
+            "leftmost: corrupt key_len falls back to right_page"
+            `Quick
+            test_branch_leftmost_child_corrupt_key_len_falls_back
+        ; Alcotest.test_case
+            "child_at: corrupt key_len falls back to right_page"
+            `Quick
+            test_branch_child_at_corrupt_key_len_falls_back
         ] )
     ; ( "branch_blit_update_child"
       , [ Alcotest.test_case "update left_child" `Quick test_branch_blit_update_child_left
