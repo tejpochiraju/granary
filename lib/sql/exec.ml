@@ -4840,7 +4840,12 @@ let execute_create_index
          [None] for a WITHOUT ROWID table's index: its rows are keyed by the
          PRIMARY KEY, not a rowid, and the leading-column cardinality stat
          has no consumer there yet (see the [idx_stats] doc comment in
-         catalog.mli). *)
+         catalog.mli). And [None] when the leading column is an expression
+         column (the same doc comment) -- [Index_key.encode_value (List.hd
+         iks)] would still run and produce a technically-correct count, but
+         there is no plan-time consumer that resolves a stat back to the
+         expression that produced it, so persisting one would be a number
+         nothing ever reads. *)
       let without_rowid_table =
         match Cat.find_table_cached cat ~name:table with
         | Some tm ->
@@ -4848,8 +4853,15 @@ let execute_create_index
           without_rowid
         | None -> false
       in
+      let leading_col_is_expr =
+        match col_expr_flags with
+        | flag :: _ -> flag
+        | [] -> false
+      in
       let seen =
-        if unique || without_rowid_table then None else Some (Hashtbl.create 64)
+        if unique || without_rowid_table || leading_col_is_expr
+        then None
+        else Some (Hashtbl.create 64)
       in
       let rows_indexed = ref 0 in
       let rec walk () =

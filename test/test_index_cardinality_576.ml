@@ -75,6 +75,16 @@ let without_rowid_index_is_exempt () =
     | Some _ -> Alcotest.fail "WITHOUT ROWID table's index must not carry idx_stats")
 ;;
 
+let expr_leading_column_is_exempt () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t2 (a INTEGER, b TEXT)";
+    exec db "INSERT INTO t2 VALUES (1, 'X'), (2, 'Y'), (3, 'x')";
+    exec db "CREATE INDEX idx_expr ON t2(lower(b))";
+    match idx_stats db "idx_expr" with
+    | None -> ()
+    | Some _ -> Alcotest.fail "expression-column index must not carry idx_stats")
+;;
+
 let a_row_excluded_by_a_partial_index_where_is_not_counted () =
   with_db (fun db ->
     exec db "CREATE TABLE p (tenant_id INTEGER, active INTEGER)";
@@ -105,6 +115,9 @@ let () =
       , [ "non-unique index is analyzed", `Quick, non_unique_index_gets_analyzed
         ; "UNIQUE index is exempt", `Quick, unique_index_is_exempt
         ; "WITHOUT ROWID index is exempt", `Quick, without_rowid_index_is_exempt
+        ; ( "expression-column leading index is exempt"
+          , `Quick
+          , expr_leading_column_is_exempt )
         ; ( "partial index respects WHERE"
           , `Quick
           , a_row_excluded_by_a_partial_index_where_is_not_counted )
