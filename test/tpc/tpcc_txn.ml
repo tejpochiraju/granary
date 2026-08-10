@@ -923,23 +923,22 @@ let delivery_order ops ~w_id ~d_id ~carrier_id ~o_id =
           ol_o_id = ?"
          order_key)
   in
-  let* () =
-    ops.exec
-      (stmt
-         "UPDATE customer SET c_balance = c_balance + ?, c_delivery_cnt = c_delivery_cnt \
-          + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
-         [ Tpc_value.VReal
-             (required_float
-                (first total)
-                0
-                ~source:"Delivery order_line SUM"
-                ~column:"SUM(ol_amount)")
-         ; Tpc_value.VInt w_id
-         ; Tpc_value.VInt d_id
-         ; Tpc_value.VInt c_id
-         ])
-  in
-  ops.exec commit_txn
+  (* No commit here: since #701 the transaction boundary belongs to
+     [run_delivery], not to this district's body — see the comment there. *)
+  ops.exec
+    (stmt
+       "UPDATE customer SET c_balance = c_balance + ?, c_delivery_cnt = c_delivery_cnt + \
+        1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
+       [ Tpc_value.VReal
+           (required_float
+              (first total)
+              0
+              ~source:"Delivery order_line SUM"
+              ~column:"SUM(ol_amount)")
+       ; Tpc_value.VInt w_id
+       ; Tpc_value.VInt d_id
+       ; Tpc_value.VInt c_id
+       ])
 ;;
 
 (* [MIN(no_o_id)] over a district always returns EXACTLY ONE row: a value
@@ -970,10 +969,10 @@ let delivery_oldest_o_id rows =
          | None -> missing_value ~source:"Delivery MIN(no_o_id)" ~column:"MIN(no_o_id)"))
 ;;
 
-(* One district, in its own transaction: the spec makes Delivery ten separate
-   transactions, not one. *)
+(* One district's business logic. No transaction boundary here since #701 —
+   see [run_delivery], which now owns one [BEGIN]/[COMMIT] pair for the whole
+   batch of ten. *)
 let delivery_district_body ops ~w_id ~d_id ~carrier_id =
-  let* () = ops.exec begin_txn in
   let* oldest =
     ops.query
       (stmt
@@ -981,23 +980,49 @@ let delivery_district_body ops ~w_id ~d_id ~carrier_id =
          [ Tpc_value.VInt w_id; Tpc_value.VInt d_id ])
   in
   match delivery_oldest_o_id oldest with
-  | None -> ops.exec commit_txn
+  | None -> Lwt.return_unit
   | Some o_id -> delivery_order ops ~w_id ~d_id ~carrier_id ~o_id
-;;
-
-let delivery_district ops ~w_id ~d_id ~carrier_id =
-  with_rollback ops (fun () -> delivery_district_body ops ~w_id ~d_id ~carrier_id)
 ;;
 
 let rec delivery_from ops ~w_id ~carrier_id ~d_id =
   if d_id > districts_per_warehouse
   then Lwt.return_unit
   else
-    let* () = delivery_district ops ~w_id ~d_id ~carrier_id in
+    let* () = delivery_district_body ops ~w_id ~d_id ~carrier_id in
     delivery_from ops ~w_id ~carrier_id ~d_id:(d_id + 1)
 ;;
 
-let run_delivery ops ~w_id ~carrier_id = delivery_from ops ~w_id ~carrier_id ~d_id:1
+(* #701: one [BEGIN]/[COMMIT] pair for all ten districts, not one pair per
+   district. Profiling on a fresh W=1 population found BEGIN+COMMIT together
+   were 77.9% of Delivery's total service time (64.4% COMMIT, i.e. the fsync,
+   13.5% BEGIN) — Delivery was paying that fixed per-commit cost 10x per
+   logical transaction where every other TPC-C profile pays it once. TPC-C
+   clause 2.7.1 explicitly permits this: "the Delivery transaction must group
+   any subset of the 10 delivery transactions... into groups of one or more,
+   at the discretion of the SUT." Batching all ten into a single group is
+   projected (from the profiled per-statement costs) to take Delivery from
+   ~92.4ms to ~27.5ms per logical transaction.
+
+   Tradeoff, decided deliberately and not an oversight (#701's own writeup
+   flags it): before this change, each district ran in its own transaction
+   via its own [with_rollback], so a failure in district N left districts
+   1..N-1 committed and only district N rolled back — [with_rollback] here
+   now wraps the WHOLE batch, so a failure anywhere in the ten aborts the
+   entire batch and every district's work in this logical Delivery
+   transaction is lost, not just the failing one. A mid-run crash therefore
+   now loses more undelivered orders' worth of partial progress than before.
+   [Tpcc_driver.attempt] redraws a fresh input on retry, so the retry
+   reprocesses all ten districts from scratch rather than resuming after the
+   ones that used to have committed. This matches ordinary SQL transaction
+   semantics — the unit of atomicity is the whole logical Delivery
+   transaction, as TPC-C 2.7.1 allows the SUT to define it — rather than a
+   silent behavior change nobody asked for. *)
+let run_delivery ops ~w_id ~carrier_id =
+  with_rollback ops (fun () ->
+    let* () = ops.exec begin_txn in
+    let* () = delivery_from ops ~w_id ~carrier_id ~d_id:1 in
+    ops.exec commit_txn)
+;;
 
 (* --- Stock_level ------------------------------------------------------ *)
 

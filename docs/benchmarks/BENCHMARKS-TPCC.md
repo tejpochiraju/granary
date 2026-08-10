@@ -248,6 +248,48 @@ longer interval is needed before anything is claimed about them; the delivery
 figure is called out above because ~181 ms against 1.66 ms survives that caveat
 by a wide margin, not because 12 samples are enough on their own.
 
+### Delivery batches its ten districts into one transaction (#701)
+
+#674 fixed three algorithmic defects in Delivery's `MIN(no_o_id)` query and
+took it from ~181 ms to ~82.7 ms/transaction, but #701's per-statement
+profiling found that `BEGIN`+`COMMIT` together still accounted for 77.9% of
+what remained (64.4% `COMMIT` — the fsync — 13.5% `BEGIN`), because
+`Tpcc_txn.delivery_district`/`delivery_district_body` ran each of Delivery's
+ten districts through its **own** `BEGIN`...`COMMIT` pair, so Delivery paid
+that fixed per-commit cost ten times per logical transaction where every
+other profile pays it once.
+
+TPC-C clause 2.7.1 explicitly allows grouping: "the Delivery transaction must
+group any subset of the 10 delivery transactions... into groups of one or
+more, at the discretion of the SUT." Since #701, `Tpcc_txn.run_delivery`
+wraps all ten districts in a single `BEGIN`...`COMMIT` pair instead of ten.
+Measured (`bench_tpcc.exe`, W=1, 4 terminals, 20 s, on a loaded host —
+loadavg ~7 on 8 cores, so treat the absolute numbers as noisy and the
+direction as the signal): delivery's `service_ms` dropped from ~94 ms
+(pre-#701, one-transaction-per-district, re-measured on the same loaded host
+for a like-for-like comparison) to ~65-74 ms across repeated runs, with
+`new_order`/`payment`/`order_status`/`stock_level` and NewOrder/sec
+unaffected, as expected since the change is scoped to Delivery's transaction
+boundary only. On a quieter host #701's own instrumented profiling projected
+a larger drop (~92.4 ms → ~27.5 ms, a ~3.4x reduction) — the batching removes
+9 of Delivery's 10 fixed per-commit costs regardless of host load, but how
+much wall-clock time that translates to depends on how expensive a single
+fsync is on the box doing the measuring.
+
+**This is a deliberate isolation-granularity tradeoff, not a free win.**
+Before #701, a failure partway through Delivery's ten districts rolled back
+only the failing district — the districts already committed earlier in the
+same call stayed committed. Since #701 the ten districts share one
+transaction, so a failure or crash partway through rolls back the *entire*
+batch, and a retry (`Tpcc_driver.attempt` redraws a fresh input) reprocesses
+all ten districts from scratch. This matches ordinary SQL transaction
+semantics — the atomic unit is now the whole logical Delivery transaction,
+which is exactly what TPC-C 2.7.1 permits the SUT to define it as — but it
+does mean a mid-run crash now loses more undelivered orders' worth of partial
+progress than before. See `Tpcc_txn.run`'s `.mli` doc comment and the comment
+on `run_delivery` in `tpcc_txn.ml` for the same tradeoff spelled out next to
+the code.
+
 ### Terminal sweep, W=1, granary
 
 `bench/results/2026-08-02-tpcc-w1-sweep.csv`, 10 s measured, 2 s warm-up:

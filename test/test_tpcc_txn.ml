@@ -474,19 +474,21 @@ let delivery_district_rows =
   ]
 ;;
 
-let test_delivery_runs_ten_transactions () =
+let test_delivery_runs_one_transaction_for_all_ten_districts () =
+  (* #701: Delivery now batches all ten districts into a single
+     BEGIN/COMMIT pair instead of one pair per district. *)
   let rows = List.concat (List.init 10 (fun _ -> delivery_district_rows)) in
   let ops, log = mock ~rows in
   Lwt_main.run (T.run ops (T.Delivery_input { w_id = 1; carrier_id = 4 }));
   let log = log () in
-  Alcotest.(check int) "ten BEGINs" 10 (count_matching (starts_with "BEGIN") log);
-  Alcotest.(check int) "ten COMMITs" 10 (count_matching (starts_with "COMMIT") log);
+  Alcotest.(check int) "one BEGIN" 1 (count_matching (starts_with "BEGIN") log);
+  Alcotest.(check int) "one COMMIT" 1 (count_matching (starts_with "COMMIT") log);
   Alcotest.(check int)
     "ten deletes from new_order"
     10
     (count_matching (contains "DELETE FROM new_order") log);
   Alcotest.(check bool)
-    "per-district sequence"
+    "the batch opens with BEGIN, then the districts in order, then COMMIT"
     true
     (in_order
        [ "BEGIN"
@@ -498,7 +500,8 @@ let test_delivery_runs_ten_transactions () =
        ; "UPDATE customer SET c_balance = c_balance + 123.45"
        ; "COMMIT"
        ]
-       log)
+       log);
+  check_transactional "delivery" log
 ;;
 
 let test_delivery_skips_a_district_with_no_new_order () =
@@ -506,8 +509,8 @@ let test_delivery_skips_a_district_with_no_new_order () =
   let ops, log = mock ~rows:(List.init 10 (fun _ -> [ [ "NULL" ] ])) in
   Lwt_main.run (T.run ops (T.Delivery_input { w_id = 2; carrier_id = 9 }));
   let log = log () in
-  Alcotest.(check int) "still ten BEGINs" 10 (count_matching (starts_with "BEGIN") log);
-  Alcotest.(check int) "still ten COMMITs" 10 (count_matching (starts_with "COMMIT") log);
+  Alcotest.(check int) "still one BEGIN" 1 (count_matching (starts_with "BEGIN") log);
+  Alcotest.(check int) "still one COMMIT" 1 (count_matching (starts_with "COMMIT") log);
   Alcotest.(check bool) "nothing delivered" false (issued "DELETE FROM new_order" log)
 ;;
 
@@ -771,9 +774,14 @@ let test_engine_failure_rolls_back_and_reraises () =
   check_transactional "new_order" log
 ;;
 
-let test_delivery_failure_rolls_back_only_its_district () =
-  (* Delivery is ten transactions; a failure in a later one must not reopen or
-     roll back the districts that already committed. *)
+let test_delivery_failure_rolls_back_the_whole_batch () =
+  (* #701: Delivery is now one transaction for all ten districts, so a
+     failure partway through rolls back the WHOLE batch — the districts
+     processed before the failing one are no longer left committed, because
+     they share the one enclosing transaction with it. This is the deliberate
+     isolation-granularity tradeoff #701 calls out: a mid-batch failure now
+     loses more undelivered orders' worth of partial progress than the old
+     per-district transactions did. *)
   let rows =
     List.concat (List.init 3 (fun _ -> delivery_district_rows))
     @ [ [ [ "2001" ] ]; [] (* the fourth district's o_c_id lookup comes back empty *) ]
@@ -789,16 +797,16 @@ let test_delivery_failure_rolls_back_only_its_district () =
   Alcotest.(check bool) "the failure propagates out of run" true raised;
   let log = log () in
   Alcotest.(check int)
-    "three districts committed"
-    3
+    "nothing commits — the batch is one transaction"
+    0
     (count_matching (starts_with "COMMIT") log);
   Alcotest.(check int)
-    "the fourth rolled back"
+    "the whole batch rolled back once"
     1
     (count_matching (starts_with "ROLLBACK") log);
   Alcotest.(check int)
-    "and no district was left open"
-    4
+    "one BEGIN for the whole batch"
+    1
     (count_matching (starts_with "BEGIN") log);
   check_transactional "delivery" log
 ;;
@@ -966,7 +974,10 @@ let () =
     ; ( "order_status"
       , [ Alcotest.test_case "read-only" `Quick test_order_status_is_read_only ] )
     ; ( "delivery"
-      , [ Alcotest.test_case "ten transactions" `Quick test_delivery_runs_ten_transactions
+      , [ Alcotest.test_case
+            "one transaction for all ten districts"
+            `Quick
+            test_delivery_runs_one_transaction_for_all_ten_districts
         ; Alcotest.test_case
             "skips an empty district"
             `Quick
@@ -1003,9 +1014,9 @@ let () =
             `Quick
             test_engine_failure_rolls_back_and_reraises
         ; Alcotest.test_case
-            "delivery rolls back only its district"
+            "delivery failure rolls back the whole batch"
             `Quick
-            test_delivery_failure_rolls_back_only_its_district
+            test_delivery_failure_rolls_back_the_whole_batch
         ; Alcotest.test_case
             "an unused-but-required warehouse read raises when empty"
             `Quick

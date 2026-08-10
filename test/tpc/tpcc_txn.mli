@@ -297,9 +297,13 @@ exception Missing_value of string
 
     The transaction boundary belongs to the profile, not to the caller: [run]
     issues its own [BEGIN] and [COMMIT] (or [ROLLBACK]) through [ops.exec].
-    {!Delivery} is the exception in shape — it processes ten districts, each
-    in its own transaction, so it issues ten [BEGIN]/[COMMIT] pairs rather
-    than one enclosing pair.
+    {!Delivery} processes all ten districts inside that single [BEGIN]/[COMMIT]
+    pair (since {b #701}; TPC-C clause 2.7.1 permits grouping any subset of
+    the ten district transactions into one or more transactions, at the SUT's
+    discretion — batching all ten into one avoids paying the fixed per-commit
+    fsync cost ten times over per logical Delivery transaction). A failure in
+    any district now rolls back the whole batch, not just that district — see
+    the paragraph below.
 
     Between a [BEGIN] and its [COMMIT] this function awaits nothing but
     [ops.query] and [ops.exec]: granary holds a non-reentrant single-writer
@@ -316,6 +320,10 @@ exception Missing_value of string
     the transaction still open would leave granary's non-reentrant writer lock
     held, which is the same permanent hang described above by another route.
     A failure of that [ROLLBACK] is swallowed, so the original exception is
-    what the caller sees. Delivery rolls back only the district's own
-    transaction; the districts already committed stay committed. *)
+    what the caller sees. Since {b #701}, a failure in any one of Delivery's
+    ten districts rolls back the WHOLE batch — districts processed earlier in
+    the same call are no longer left committed, because they now share the
+    one enclosing transaction. This is a deliberate tradeoff, not a
+    regression nobody noticed: it buys the fsync-count reduction above at the
+    cost of losing more partial progress on a mid-batch failure or crash. *)
 val run : ops -> input -> unit Lwt.t
