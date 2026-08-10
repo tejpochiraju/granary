@@ -125,6 +125,15 @@ type idx_origin =
   | `User
   ]
 
+(** #576 tier 1: the leading indexed column's distinct-value count, as
+    measured the one time the index was populated ([CREATE INDEX]).  Never
+    incrementally maintained — see the design doc's "Population" section for
+    why staleness is accepted rather than tracked. *)
+type index_stats =
+  { distinct_count : int
+  ; rows_at_analysis : int
+  }
+
 type index_info =
   { idx_name : string
   ; idx_table : string
@@ -134,6 +143,16 @@ type index_info =
   ; idx_expr_flags : bool list (* true = expression index column, false = plain column *)
   ; idx_where_sql : string option
   ; idx_origin : idx_origin
+  ; idx_stats : index_stats option
+    (** #576 tier 1: [None] for every index created before this shipped,
+        every UNIQUE index (cardinality is definitionally 1 per key), every
+        WITHOUT ROWID table's index, and every expression-column index — see
+        [Exec.execute_create_index] for the WITHOUT ROWID and
+        expression-column exemptions.  A columnar table's index is exempt
+        too, but not via a check in [Exec.execute_create_index]: [CREATE
+        INDEX] on a columnar table is refused outright by the binder before
+        that function ever runs, so no columnar [index_info] is ever
+        constructed at all. *)
   }
 
 type fts_table_meta =
@@ -386,6 +405,21 @@ val create_index
   -> where_sql:string option
   -> origin:idx_origin
   -> (index_info, string) result Lwt.t
+
+(** #576 tier 1: persist [idx_stats] on the named index's catalog row —
+    the leading-column distinct-value count and the row count observed while
+    computing it.  Must run inside [tx]: the sole caller,
+    [Exec.execute_create_index], always holds one from populating the index,
+    so stats land in the same DDL transaction as the index itself (and roll
+    back with it).  A no-op if [name] does not name a live index (defensive;
+    unreachable from the sole call site, which just created it). *)
+val set_index_stats
+  :  t
+  -> Granary_store.Store.rw Granary_store.Store.txn
+  -> name:string
+  -> distinct_count:int
+  -> rows_at_analysis:int
+  -> unit Lwt.t
 
 (** Return the list of indexes on the given table.  Order is unspecified. *)
 val indexes_for_table : t -> table:string -> index_info list

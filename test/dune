@@ -974,6 +974,11 @@
  (modules test_join_cost_model_576)
  (libraries granary granary.unix alcotest lwt.unix unix))
 
+(test
+ (name test_index_cardinality_576)
+ (modules test_index_cardinality_576)
+ (libraries granary granary.unix granary.catalog alcotest lwt.unix unix))
+
 ; #532: on-disk cost of the join-strategy flip a range-bounded build side
 ; causes. A measurement tool, not a gate.
 

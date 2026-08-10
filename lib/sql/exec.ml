@@ -4792,6 +4792,13 @@ let execute_insert
        Lwt.fail exn)
 ;;
 
+(** #576 final review: caps the [Hashtbl] {!execute_create_index} builds to
+    compute a leading-column distinct-value count during its table walk, so
+    that walk's peak retained memory cannot grow past this many entries
+    regardless of table size -- see the comment at the [Hashtbl.create] site
+    for why an unbounded version is a real regression, not a theoretical one. *)
+let index_stats_cardinality_cap = 100_000
+
 (** Run [Op_create_index]: register the index in the catalog, then scan
     the table tree and populate the index tree with one entry per row. *)
 let execute_create_index
@@ -4833,6 +4840,53 @@ let execute_create_index
     | Ok info ->
       let* cur = S.cursor_open tx tree_id in
       let _sr = S.cursor_first cur in
+      (* #576 tier 1: piggyback the leading-column distinct-value count on
+         this walk -- it already decodes every candidate row and computes its
+         index key, so this adds no I/O. [None] for a UNIQUE index: its
+         cardinality is definitionally 1 per key, so no stat is useful. Also
+         [None] for a WITHOUT ROWID table's index: its rows are keyed by the
+         PRIMARY KEY, not a rowid, and the leading-column cardinality stat
+         has no consumer there yet (see the [idx_stats] doc comment in
+         catalog.mli). And [None] when the leading column is an expression
+         column (the same doc comment) -- [Index_key.encode_value (List.hd
+         iks)] would still run and produce a technically-correct count, but
+         there is no plan-time consumer that resolves a stat back to the
+         expression that produced it, so persisting one would be a number
+         nothing ever reads. *)
+      let without_rowid_table =
+        match Cat.find_table_cached cat ~name:table with
+        | Some tm ->
+          let _, _, without_rowid, _ = Cat.row_storage tm in
+          without_rowid
+        | None -> false
+      in
+      let leading_col_is_expr =
+        match col_expr_flags with
+        | flag :: _ -> flag
+        | [] -> false
+      in
+      let seen =
+        if unique || without_rowid_table || leading_col_is_expr
+        then None
+        else Some (Hashtbl.create 64)
+      in
+      (* #576 final review: [seen] retains one encoded leading-column key per
+         DISTINCT value for the whole table walk, so on a non-unique-but-
+         near-unique column (an email column, a timestamp, an order-line id)
+         over a large table it is effectively O(table size) memory retained
+         for the duration of this one DDL statement -- a regression from the
+         O(1)-memory streaming walk every other CREATE INDEX path gets.
+         [index_stats_cardinality_cap] bounds that peak: once the table has
+         already produced this many distinct leading-column values, stop
+         adding new ones to [tbl] (an already-seen value can still be
+         re-probed at no cost) and fall back to persisting [idx_stats = None]
+         below rather than a stat computed from a partial, capped count. A
+         capped count would UNDER-report [distinct_count], which makes
+         [estimate_rows_from_stats]'s resulting estimate too SMALL -- the
+         ADMITTING direction, which is the unsafe one; [None] reproduces
+         today's exact pre-#576 behavior for that index instead. *)
+      let capped = ref false in
+      let rows_indexed = ref 0 in
       let rec walk () =
         match S.cursor_next cur with
         | None -> Lwt.return_unit
@@ -4850,6 +4904,16 @@ let execute_create_index
             let key_vals = get_index_key_values None [||] info columns row in
             let iks = List.map row_value_to_index_value key_vals in
             let ikey = Index_key.encode iks ~rowid in
+            (match seen with
+             | None -> ()
+             | Some tbl ->
+               if not !capped
+               then (
+                 let ek = Index_key.encode_value (List.hd iks) in
+                 if Hashtbl.mem tbl ek || Hashtbl.length tbl < index_stats_cardinality_cap
+                 then Hashtbl.replace tbl ek ()
+                 else capped := true));
+            incr rows_indexed;
             (* #288: for a UNIQUE index, the build must detect pre-existing
                duplicate values.  The encoded key includes the rowid suffix, so
                two rows sharing the indexed value produce DISTINCT keys and never
@@ -4889,7 +4953,24 @@ let execute_create_index
       in
       let* () = walk () in
       S.cursor_close cur;
-      Lwt.return_unit)
+      (* #576 tier 1: persist the stat in the same DDL transaction as the
+         index itself, so it rolls back with it. *)
+      (match seen with
+       | None -> Lwt.return_unit
+       | Some _ when !capped ->
+         (* #576 final review: capped mid-walk -- the count in [tbl] is a
+            partial, under-reported [distinct_count], and persisting it would
+            estimate too FEW rows for the seek it gates (the unsafe,
+            admitting direction). Fall back to no stat, same as an
+            unanalyzed index. *)
+         Lwt.return_unit
+       | Some tbl ->
+         Cat.set_index_stats
+           cat
+           tx
+           ~name
+           ~distinct_count:(Hashtbl.length tbl)
+           ~rows_at_analysis:!rows_indexed))
 ;;
 
 (** Build the list of (child_table_meta, relevant_fk_constraints) pairs

@@ -1852,6 +1852,7 @@ let make_table_value tree_id =
 
 let sys_tables_tid = 0
 let sys_columns_tid = 1
+let sys_indexes_tid = 2
 let sys_fts_tid = 4
 
 (* #689 scaffolding: [fts_table_meta] gained a trailing [fts_format_version]
@@ -2510,6 +2511,180 @@ let test_mirror_roundtrips_columns_fks_and_index () =
      Lwt.return_unit)
 ;;
 
+(* #576 tier 1: set_index_stats persists onto the catalog row and survives a
+   mirror-forced reconstruction, exercising the version-4 decode from Task 1. *)
+let test_index_stats_roundtrip_576 () =
+  run
+    (let store = S.create () in
+     let* cat1 = C.open_ store in
+     let* _tid =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "a"; int_col "b" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let* r =
+       C.create_index
+         cat1
+         ~name:"idx_t_b"
+         ~table:"t"
+         ~columns:[ "b" ]
+         ~unique:false
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     (match r with
+      | Ok _ -> ()
+      | Error e -> Alcotest.failf "create_index: %s" e);
+     let* tx0 = S.rw_begin store in
+     let* () =
+       C.set_index_stats cat1 tx0 ~name:"idx_t_b" ~distinct_count:7 ~rows_at_analysis:42
+     in
+     let* () = S.commit tx0 in
+     (* Force mirror reconstruction: lose the primary _sys_tables row. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     let idxs = C.indexes_for_table cat2 ~table:"t" in
+     let idx =
+       match List.find_opt (fun (i : C.index_info) -> i.C.idx_name = "idx_t_b") idxs with
+       | Some i -> i
+       | None -> Alcotest.fail "user index idx_t_b missing after reopen"
+     in
+     (match idx.C.idx_stats with
+      | Some s ->
+        Alcotest.(check int) "distinct_count preserved" 7 s.C.distinct_count;
+        Alcotest.(check int) "rows_at_analysis preserved" 42 s.C.rows_at_analysis
+      | None -> Alcotest.fail "idx_stats not preserved across mirror reconstruction");
+     Lwt.return_unit)
+;;
+
+(* #576 tier 1: set_index_stats only touches the named index -- a sibling
+   index on the same table keeps idx_stats = None. *)
+let test_set_index_stats_is_index_scoped_576 () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _tid =
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "a"; int_col "b" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let create name col =
+       C.create_index
+         cat
+         ~name
+         ~table:"t"
+         ~columns:[ col ]
+         ~unique:false
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     let* _ = create "idx_a" "a" in
+     let* _ = create "idx_b" "b" in
+     let* tx = S.rw_begin store in
+     let* () =
+       C.set_index_stats cat tx ~name:"idx_a" ~distinct_count:3 ~rows_at_analysis:9
+     in
+     let* () = S.commit tx in
+     (match C.find_index cat ~name:"idx_a" with
+      | Some { C.idx_stats = Some s; _ } ->
+        Alcotest.(check int) "idx_a distinct_count" 3 s.C.distinct_count
+      | _ -> Alcotest.fail "idx_a should have stats");
+     (match C.find_index cat ~name:"idx_b" with
+      | Some { C.idx_stats = None; _ } -> ()
+      | _ -> Alcotest.fail "idx_b should be untouched");
+     Lwt.return_unit)
+;;
+
+(* #576 final review: the design doc's Testing section asks for "a fixed
+   version-3 byte string decoded to confirm idx_stats = None for pre-existing
+   data" -- the backward-compatibility guarantee #576 tier 1's version-4
+   encoding leans on. Every round-trip test above writes with the CURRENT
+   (version-4) encoder, so none of them can catch a regression in the v1/v2/v3
+   DECODE arms of [decode_index_ext_fields]. This hand-encodes a version-3
+   blob (matching [encode_index_value]'s pre-#576 shape: name, table, columns,
+   unique byte, tree_id varint, then version=3, origin byte, one expr-flag
+   varint per column, WHERE-presence + optional length + string) and writes it
+   straight into the _sys_indexes tree, so [C.open_] -> [load_all_indexes] ->
+   [decode_index_value] is the REAL production decoder under test, not a
+   reimplementation of it. *)
+let make_v3_index_bytes
+      ~name
+      ~table
+      ~columns
+      ~unique
+      ~tree_id
+      ~origin_byte
+      ~expr_flags
+      ~where_sql
+  =
+  let buf = Buffer.create 32 in
+  let v = Varint.encode_uint64 in
+  v buf (Int64.of_int (String.length name));
+  Buffer.add_string buf name;
+  v buf (Int64.of_int (String.length table));
+  Buffer.add_string buf table;
+  v buf (Int64.of_int (List.length columns));
+  List.iter
+    (fun col ->
+       v buf (Int64.of_int (String.length col));
+       Buffer.add_string buf col)
+    columns;
+  Buffer.add_char buf (if unique then '\x01' else '\x00');
+  v buf (Int64.of_int tree_id);
+  v buf 3L;
+  (* version 3 (#273): origin byte, then expr flags, then WHERE clause *)
+  Buffer.add_char buf (Char.chr origin_byte);
+  List.iter (fun is_expr -> v buf (if is_expr then 1L else 0L)) expr_flags;
+  (match where_sql with
+   | None -> v buf 0L
+   | Some sql ->
+     v buf 1L;
+     v buf (Int64.of_int (String.length sql));
+     Buffer.add_string buf sql);
+  Buffer.to_bytes buf
+;;
+
+let test_decode_index_v3_backward_compat_576 () =
+  run
+    (let store = S.create () in
+     let v3_bytes =
+       make_v3_index_bytes
+         ~name:"idx_v3_legacy"
+         ~table:"legacy_t"
+         ~columns:[ "a"; "b" ]
+         ~unique:false
+         ~tree_id:9
+         ~origin_byte:2 (* `User -- see idx_origin_of_byte *)
+         ~expr_flags:[ false; true ]
+         ~where_sql:(Some "a > 0")
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.put tx sys_indexes_tid (Bytes.of_string "v3_key") v3_bytes in
+     let* () = S.commit tx in
+     let* cat = C.open_ store in
+     (match C.find_index cat ~name:"idx_v3_legacy" with
+      | None -> Alcotest.fail "expected the hand-encoded v3 index to decode and load"
+      | Some i ->
+        Alcotest.(check bool) "idx_stats is None for v3 bytes" true (i.C.idx_stats = None);
+        Alcotest.(check (list string)) "idx_columns" [ "a"; "b" ] i.C.idx_columns;
+        Alcotest.(check bool) "idx_unique" false i.C.idx_unique;
+        Alcotest.(check int) "idx_tree_id" 9 i.C.idx_tree_id;
+        Alcotest.(check (list bool)) "idx_expr_flags" [ false; true ] i.C.idx_expr_flags;
+        Alcotest.(check (option string)) "idx_where_sql" (Some "a > 0") i.C.idx_where_sql;
+        Alcotest.(check bool) "idx_origin is `User" true (i.C.idx_origin = `User));
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group: schema-drift detection (#174)                                 *)
 (* ------------------------------------------------------------------ *)
@@ -2661,6 +2836,10 @@ let () =
             "decode_column_no_check_sql"
             `Quick
             test_decode_column_no_check_sql
+        ; Alcotest.test_case
+            "decode_index_v3_backward_compat (#576)"
+            `Quick
+            test_decode_index_v3_backward_compat_576
         ] )
     ; ( "indexes"
       , [ Alcotest.test_case "create_index_basic" `Quick test_create_index_basic
@@ -2748,6 +2927,14 @@ let () =
             "mirror_roundtrips_columns_fks_and_index (#484)"
             `Quick
             test_mirror_roundtrips_columns_fks_and_index
+        ; Alcotest.test_case
+            "index_stats_roundtrip (#576)"
+            `Quick
+            test_index_stats_roundtrip_576
+        ; Alcotest.test_case
+            "set_index_stats is index-scoped (#576)"
+            `Quick
+            test_set_index_stats_is_index_scoped_576
         ] )
     ; ( "drift"
       , [ Alcotest.test_case
