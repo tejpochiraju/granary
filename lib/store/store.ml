@@ -1287,7 +1287,13 @@ let ro_begin_at t st ~snap_txn_id ~snap_meta_root =
     ; rs_snap_meta_root = snap_meta_root
     ; rs_snap_trees = Hashtbl.create 4
     ; rs_snap_frames = snap_frames
-    ; rs_pinned = Hashtbl.create 64
+    ; (* #416: a point lookup pins only a couple of pages (root/branch/leaf),
+         so a 64-slot bucket array was ~48 words wasted on every snapshot
+         open.  [Hashtbl] grows on demand (it is consulted from
+         [bt_get_tree_ro]/[Pager.read] below, never sized up front elsewhere),
+         so a wide scan pays one amortized resize instead of every snapshot
+         paying the 64-slot cost whether it needs it or not. *)
+      rs_pinned = Hashtbl.create 8
     ; rs_mem_snap = None
     }
 ;;

@@ -1610,3 +1610,12 @@
   qcheck-alcotest
   lwt.unix
   unix))
+
+; #416: a warm Op_rowid_lookup point lookup must not allocate far more than
+; the row it returns — pins the [rs_pinned] pin-set resize and the
+; [single_row_stream] constructor below the pre-fix baseline.
+
+(test
+ (name test_point_lookup_alloc_416)
+ (modules test_point_lookup_alloc_416)
+ (libraries granary granary.unix alcotest lwt.unix unix))
