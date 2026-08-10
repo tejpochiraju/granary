@@ -4833,6 +4833,25 @@ let execute_create_index
     | Ok info ->
       let* cur = S.cursor_open tx tree_id in
       let _sr = S.cursor_first cur in
+      (* #576 tier 1: piggyback the leading-column distinct-value count on
+         this walk -- it already decodes every candidate row and computes its
+         index key, so this adds no I/O. [None] for a UNIQUE index: its
+         cardinality is definitionally 1 per key, so no stat is useful. Also
+         [None] for a WITHOUT ROWID table's index: its rows are keyed by the
+         PRIMARY KEY, not a rowid, and the leading-column cardinality stat
+         has no consumer there yet (see the [idx_stats] doc comment in
+         catalog.mli). *)
+      let without_rowid_table =
+        match Cat.find_table_cached cat ~name:table with
+        | Some tm ->
+          let _, _, without_rowid, _ = Cat.row_storage tm in
+          without_rowid
+        | None -> false
+      in
+      let seen =
+        if unique || without_rowid_table then None else Some (Hashtbl.create 64)
+      in
+      let rows_indexed = ref 0 in
       let rec walk () =
         match S.cursor_next cur with
         | None -> Lwt.return_unit
@@ -4850,6 +4869,10 @@ let execute_create_index
             let key_vals = get_index_key_values None [||] info columns row in
             let iks = List.map row_value_to_index_value key_vals in
             let ikey = Index_key.encode iks ~rowid in
+            (match seen with
+             | None -> ()
+             | Some tbl -> Hashtbl.replace tbl (Index_key.encode_value (List.hd iks)) ());
+            incr rows_indexed;
             (* #288: for a UNIQUE index, the build must detect pre-existing
                duplicate values.  The encoded key includes the rowid suffix, so
                two rows sharing the indexed value produce DISTINCT keys and never
@@ -4889,7 +4912,17 @@ let execute_create_index
       in
       let* () = walk () in
       S.cursor_close cur;
-      Lwt.return_unit)
+      (* #576 tier 1: persist the stat in the same DDL transaction as the
+         index itself, so it rolls back with it. *)
+      (match seen with
+       | None -> Lwt.return_unit
+       | Some tbl ->
+         Cat.set_index_stats
+           cat
+           tx
+           ~name
+           ~distinct_count:(Hashtbl.length tbl)
+           ~rows_at_analysis:!rows_indexed))
 ;;
 
 (** Build the list of (child_table_meta, relevant_fk_constraints) pairs
