@@ -966,12 +966,28 @@
   lwt.unix
   unix))
 
+; #576 tier 3: a build-side SEEK must be charged its own per-row cost ratio,
+; not the scanned-build-side one.
+
+(test
+ (name test_join_cost_model_576)
+ (modules test_join_cost_model_576)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
 ; #532: on-disk cost of the join-strategy flip a range-bounded build side
 ; causes. A measurement tool, not a gate.
 
 (executable
  (name bench_build_side_strategy_532)
  (modules bench_build_side_strategy_532)
+ (libraries granary granary.unix lwt.unix unix))
+
+; #576 tier 3: on-disk cost of a nested-loop probe versus a hash join whose
+; build side seeks (rather than scans). A measurement tool, not a gate.
+
+(executable
+ (name bench_nlj_probe_seek_cost_576)
+ (modules bench_nlj_probe_seek_cost_576)
  (libraries granary granary.unix lwt.unix unix))
 
 ; #546: the index traversal an index lookup performs must be visible in stats.

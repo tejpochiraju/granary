@@ -764,6 +764,75 @@ let nlj_min_driving_rows = 1000
     100,000 probes, which is the regression this constant fixes. *)
 let nlj_probe_cost_ratio = 8
 
+(** #576 tier 3: {!nlj_probe_cost_ratio} for a build side that {b seeks}
+    ({!build_side} returned [Op_index_lookup] or [Op_rowid_lookup]) rather
+    than scans.
+
+    #576 opened on the suspicion that 8 is simply the wrong number here: it
+    was calibrated against a {i scanned} build side at ~9.5 µs/hashed row, and
+    #546/#606 separately measured a build-side {i seek} at ~3 pager
+    reads/row on the same 100,000-row table — described there as "the same
+    order as a probe seek", which would put break-even near 1 rather than 8.
+
+    {b That intuition is about the seek #575 declined, not the one #586
+    admits, and the two cost very differently.} #546/#606's ~3 reads/row
+    figure was measured with windows from 200 up to 9,999 keys — 2% to 100%
+    of the table — which is exactly the band {!build_side_seek_is_unambiguous}
+    now REFUSES ([window > table_rows_estimate / build_side_seek_break_even_ratio],
+    i.e. > 0.5% of a 100,000-row table declines).  The window this ratio is
+    ever consulted for is capped an order of magnitude smaller, and at that
+    size a seek's marginal reads/row is nowhere near its large-window figure —
+    small windows fit inside a handful of leaf pages, so most of a seek's
+    per-entry descent is shared with its neighbours instead of paid fresh.
+
+    Measured directly, [test/bench_nlj_probe_seek_cost_576.ml], 100,000 stock
+    rows, cold pager reads, default [GRANARY_PAGE_CACHE]:
+
+    {v
+      probe (driving rows scattered across the whole table, matching the
+      #520/#526 shape where the join column has no relation to key order):
+        D        100    300    600   1,000
+        reads     33     89    171     281      marginal 0.276 reads/row
+
+      hash, build side seeking an UNAMBIGUOUS window (#586-admitted, si
+      BETWEEN bound, D held fixed at 2,000):
+        R         50    150    300     450
+        reads     58     60     64      68      marginal 0.025 reads/row
+    v}
+
+    A probe costs {b ~11x} an admitted seek's marginal row here — the opposite
+    direction from the issue's opening hypothesis, and the reconciliation is
+    the point: #546/#606's figure describes the window #575/#586 REFUSE, not
+    the one they admit.  Within what {!build_side_seek_is_unambiguous} lets
+    through, an admitted seek is closer to a scan's ~0.02 reads/row than to a
+    probe's, because the budget that makes it unambiguous also makes it small.
+
+    {b This constant is set from that measurement, not copied from
+    {!nlj_probe_cost_ratio}, and it is deliberately conservative rather than
+    equal to the measured ~11}: {!build_side_seek_break_even_ratio} could move,
+    and a build-side change could someday feed {!probe_is_worth_it} a seek
+    outside today's tiny admitted band.  10 is the round number just below
+    11 rather than 8, on the same "just below break-even, and the bias cannot
+    matter much at break-even" reasoning {!nlj_probe_cost_ratio}'s doc gives.
+
+    {b It changes no decision reachable today.} {!build_side_seek_is_unambiguous}
+    caps an admitted [right_rows] at [table_rows_estimate / build_side_seek_break_even_ratio]
+    (500 for a 100,000-row table); {!probe_is_worth_it} only reaches either
+    ratio once [driving_rows] clears {!nlj_min_driving_rows} = 1000; and
+    500 / 10 as well as 500 / 8 are both far below 1000. So for every
+    [driving_rows] this function is consulted at, the hash join wins under
+    EITHER constant — this is why #532's "row 4" residual (D = 5,000, W =
+    20,000) is not an instance of this at all: that window is declined by
+    #586 before reaching here, R collapses to [table_rows_estimate], and it is
+    {!nlj_probe_cost_ratio} — the scanned constant — that answers it, exactly
+    as the #586-review comment on #576 found.  A dedicated seeked-build
+    constant is still worth having: it is the answer #576 asked for, it is
+    correct where {!nlj_probe_cost_ratio} would not be if the admission budget
+    ever widens, and [seeked_build_side_still_takes_the_hash_join] in
+    [test/test_join_cost_model_576.ml] pins that today's answer does not move
+    by asserting it under BOTH constants at once. *)
+let nlj_probe_cost_ratio_seeked_build = 10
+
 let range_seek_rows = 100
 
 (** #532: how many rows a range-bounded seek is estimated to reach.
@@ -1632,13 +1701,23 @@ let build_side cat (right_meta : Cat.table_meta) ~alias ~right_eqs ~right_ranges
   | Some _ | None -> make_scan ~alias right_meta
 ;;
 
-(** #520: is a nested-loop probe worth it, given [driving_rows] estimated left
-    rows and a right table of [right_rows]?
+(** #520/#576: is a nested-loop probe worth it, given [driving_rows] estimated
+    left rows and a right table of [right_rows], read through a build side
+    that either scans or seeks?
 
     A probe costs one seek per driving row; the hash join it replaces costs one
     read per right-table row, plus the same driving rows either way.  So below
     {!nlj_min_driving_rows} the probe always wins, and above it the comparison
-    is against the right table's size scaled by {!nlj_probe_cost_ratio}.
+    is against the right table's size scaled by a per-row-cost ratio —
+    {!nlj_probe_cost_ratio} when [build_side_is_seek] is [false] (the build
+    side is [Op_seq_scan] or one of {!make_scan}'s synthesized/columnar arms),
+    {!nlj_probe_cost_ratio_seeked_build} when it is [true] ([Op_index_lookup]
+    or [Op_rowid_lookup] — see {!build_side}).  #520 calibrated the first
+    against a scanned build side; #576 calibrated the second directly, rather
+    than reusing a constant measured for a different physical operation.  See
+    {!nlj_probe_cost_ratio_seeked_build}'s doc for why the two numbers turned
+    out close instead of an order of magnitude apart, and for why the choice
+    between them changes no decision reachable today.
 
     The ratio is written as a division rather than [driving_rows * ratio >
     right_rows] because [driving_rows] can be {!unbounded_rows} = [max_int],
@@ -1646,11 +1725,14 @@ let build_side cat (right_meta : Cat.table_meta) ~alias ~right_eqs ~right_ranges
     invert the test.  An unbounded estimate on {i either} side also fails the
     comparison outright, so "we have no idea how big this is" lands on the hash
     join, which is the bounded-loss choice. *)
-let probe_is_worth_it ~driving_rows ~right_rows =
+let probe_is_worth_it ~driving_rows ~right_rows ~build_side_is_seek =
+  let ratio =
+    if build_side_is_seek then nlj_probe_cost_ratio_seeked_build else nlj_probe_cost_ratio
+  in
   driving_rows <= nlj_min_driving_rows
   || (driving_rows < unbounded_rows
       && right_rows < unbounded_rows
-      && driving_rows <= right_rows / nlj_probe_cost_ratio)
+      && driving_rows <= right_rows / ratio)
 ;;
 
 (** #552: the join for an ON predicate the hash keys cannot express — anything
@@ -1776,9 +1858,17 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
      having moved.  A change that makes R more accurate will move plans; check
      which side of that comparison it lands on before assuming the direction. *)
   let right_rows = estimate_rows cat right_op in
+  (* #576: which per-row cost {!probe_is_worth_it} should charge the hash join
+     — [right_op] already says whether {!build_side} took the seek or declined
+     it, so this is read off the op it returned rather than re-deriving it. *)
+  let build_side_is_seek =
+    match right_op with
+    | Plan.Op_index_lookup _ | Plan.Op_rowid_lookup _ -> true
+    | _ -> false
+  in
   let mk_with_left_col_right_col left_col right_col : Plan.op =
     let probe =
-      if probe_is_worth_it ~driving_rows ~right_rows
+      if probe_is_worth_it ~driving_rows ~right_rows ~build_side_is_seek
       then best_probe cat bj.right_meta ~join_col:right_col ~left_col ~right_eqs
       else None
     in
