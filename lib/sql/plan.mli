@@ -107,7 +107,24 @@ type range =
 (** #508: a narrowing access path for a DML statement's WHERE clause.  It only
     restricts the candidate rows the write path considers — the full WHERE
     predicate is still evaluated on every candidate — so a seek can never change
-    which rows a statement affects, only how many are read to find them. *)
+    which rows a statement affects, only how many are read to find them.
+
+    #550's non-unique-index seek guard is NOT carried on this type. An earlier
+    revision stamped a [bail_out_at : int option] budget onto [Seek_index] at
+    PLAN time, computed from the table's row count at that instant. Because a
+    [Plan.op] is cached for the life of a prepared statement ([Db.prepare]'s
+    [stmt.plan]), a budget baked in while a table was small (or below
+    {!Granary_sql.Planner.build_side_seek_break_even_ratio}'s floor, giving no
+    guard at all) would silently keep answering for that same small table
+    forever, even after thousands of inserts — reproducing the exact O(n)
+    pessimization #550 exists to prevent, for the remaining life of the
+    prepared statement. The budget is instead recomputed on every execution,
+    in [Exec.seek_index_candidates], from the index's identity ([idx_tree],
+    which IS stable across a statement's life — see #550's issue for why a
+    dropped/recreated index is a separate, pre-existing limitation) and a
+    freshly re-read [table_meta] ([Granary_catalog.Catalog.find_table_cached],
+    the same live-row-count lookup FK checks already use). See
+    {!Granary_sql.Planner.dml_seek_bail_out_at}. *)
 type seek =
   | Seek_rowid of expr (** the INTEGER PRIMARY KEY rowid alias is pinned *)
   | Seek_index of
