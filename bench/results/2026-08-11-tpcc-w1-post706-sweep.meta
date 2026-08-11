@@ -1,0 +1,17 @@
+#706: re-run of the #703 worker-handle terminal sweep after
+5f86fb6/PR #708 ("hold the writer lock around rollback's rowid-counter
+republish") fixed the rollback/allocate race that #703 found. Same
+methodology as bench/results/2026-08-10-tpcc-w1-worker-handle-sweep.csv:
+GRANARY_TPCC_WAREHOUSES=1, GRANARY_TPCC_SECONDS=10,
+GRANARY_TPCC_WARMUP_SECONDS=2, GRANARY_TPCC_ENGINES=granary,
+GRANARY_TPC_SEED=42 (default), terminals swept 1/2/4/8/16, one
+bench_tpcc.exe run per terminal count (not repeated/averaged), each run
+against a fresh W=1 load. Host: containerized dev image (granary-dev),
+loaded (sibling workloads running concurrently) -- treat absolute numbers
+as noisy, the shape as the signal.
+
+Every run's post-run consistency oracle (conditions 1-4) reported "ok" at
+every terminal count, including 8 and 16 where the pre-fix sweep tripped
+conditions 2/3/4. All five processes exited 0. This is the "re-run the
+sweep clean" that docs/benchmarks/BENCHMARKS-TPCC.md's #703 section asked
+for once #706 landed.

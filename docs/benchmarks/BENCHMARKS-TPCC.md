@@ -391,6 +391,12 @@ prints throughput/latency figures, and the shape is real and worth recording —
 but until #706 is fixed, do not read a multi-terminal `bench_tpcc` run as a
 validated result, and re-run the sweep clean once it is.
 
+**#706 is now fixed** (`5f86fb6`, PR #708 — hold the writer lock around the
+rollback recompute's publish via a compare-and-swap, `Schema_cache.
+cas_rowid_durable`). The table immediately below is kept as-is because it is
+the record of what the bug looked like; the clean re-run is its own section
+further down ("Terminal sweep, W=1, granary, worker-handle driver, post-#706").
+
 ### Terminal sweep, W=1, granary, worker-handle driver (#703)
 
 `bench/results/2026-08-10-tpcc-w1-worker-handle-sweep.csv`, 10 s measured, 2 s
@@ -446,9 +452,40 @@ rise landing in `wait_ms` and `service_ms` staying roughly flat.
   every number at terminals >= 2 was produced by a run that lost rows, so the
   win is not yet one to build on without #706.
 
-### Recommendation until #706 lands
+### Recommendation while #706 was open
 
 Run `bench_tpcc.exe` with `GRANARY_TPCC_ORACLE_SELFTEST=1` and read its exit
 code, not just its throughput line, whenever `GRANARY_TPCC_TERMINALS > 1`. A
 regression benchmark that silently corrupts the database it is measuring is
-worse than no benchmark.
+worse than no benchmark. (Superseded by the clean re-run below — kept as the
+standing advice for any *future* multi-terminal regression, not just this one.)
+
+### Terminal sweep, W=1, granary, worker-handle driver, post-#706 (2026-08-11)
+
+`bench/results/2026-08-11-tpcc-w1-post706-sweep.csv`, same methodology as the
+table above (10 s measured, 2 s warm-up, one run per terminal count, fresh W=1
+load each run, `GRANARY_TPCC_ENGINES=granary` only), run against `main` at
+`1a3f627` plus #706's fix (`5f86fb6`/PR #708):
+
+| terminals | NewOrder/sec | new_order mean | service | wait | oracle (before/after) |
+|---|---|---|---|---|---|
+| 1 | 30.21 | 17.6 ms | 17.6 ms | 0.0 ms | ok / ok |
+| 2 | 29.79 | 30.8 ms | 30.8 ms | 0.0 ms | ok / ok |
+| 4 | 33.30 | 56.3 ms | 56.3 ms | 0.0 ms | ok / ok |
+| 8 | 28.19 | 144.6 ms | 144.6 ms | 0.0 ms | ok / ok |
+| 16 | 27.70 | 301.2 ms | 301.2 ms | 0.0 ms | ok / ok |
+
+All five runs exited 0 with every consistency condition (1-4) reporting `ok`,
+including at 8 and 16 terminals where the pre-fix sweep tripped conditions
+2/3/4 on every run. **This is now a validated result.**
+
+The shape is unchanged from the pre-fix sweep, as expected — #706's fix
+touches only the rollback-recompute publish path, not the driver, the write
+path, or the writer-lock contention the numbers are actually measuring:
+`wait_ms` is 0 at every terminal count (the worker-per-terminal pool has no
+queueing-for-a-connection to show), `service_ms` carries the real
+writer-`Rwlock` contention, and throughput is roughly flat (28-33 NewOrder/sec)
+from 1 to 16 terminals rather than collapsing the way the old one-deep-pool
+sweep did. The analysis in the bullet list above (`wait_ms` → `service_ms`
+relabeling, the #555 single-writer ceiling, "wash-to-modest-win on
+throughput") stands unchanged; only its correctness caveat is retired.
