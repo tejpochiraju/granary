@@ -131,9 +131,12 @@ type idx_origin =
   | `User
   ]
 
+type histogram = { boundaries : string array }
+
 type index_stats =
   { distinct_count : int
   ; rows_at_analysis : int
+  ; range_histograms : histogram option array
   }
 
 type index_info =
@@ -1140,10 +1143,12 @@ let encode_index_value (idx : index_info) =
     idx.idx_columns;
   Buffer.add_char buf (if idx.idx_unique then '\x01' else '\x00');
   Varint.encode_uint64 buf (Int64.of_int idx.idx_tree_id);
-  (* Extended fields version 4 (#576 tier 1): origin byte + expr flags +
-     optional WHERE + optional idx_stats. Versions 1-3 (pre-existing data)
-     decode with [idx_stats = None] — see [decode_index_ext_fields]. *)
-  Varint.encode_uint64 buf 4L;
+  (* Extended fields version 6 (#576 tier 2, corrected): origin byte + expr
+     flags + optional WHERE + optional idx_stats (now with one histogram
+     per index column position instead of one for column 0 only). Versions
+     1-5 (pre-existing data) decode with [idx_stats = None] /
+     [range_histograms = [||]] respectively — see [decode_index_ext_fields]. *)
+  Varint.encode_uint64 buf 6L;
   Buffer.add_char buf (byte_of_idx_origin idx.idx_origin);
   (* One varint per column: 0 = plain column, 1 = expression column *)
   List.iter
@@ -1156,22 +1161,44 @@ let encode_index_value (idx : index_info) =
      Varint.encode_uint64 buf 1L;
      Varint.encode_uint64 buf (Int64.of_int (String.length sql));
      Buffer.add_string buf sql);
-  (* #576 tier 1: leading-column cardinality, added in version 4 *)
+  (* #576 tier 1: leading-column cardinality, added in version 4. #576 tier 2
+     (corrected) appends one optional histogram per index column position,
+     added in version 6 (version 5's single optional histogram is gone). *)
   (match idx.idx_stats with
    | None -> Buffer.add_char buf '\x00'
-   | Some { distinct_count; rows_at_analysis } ->
+   | Some { distinct_count; rows_at_analysis; range_histograms } ->
      Buffer.add_char buf '\x01';
      Varint.encode_uint64 buf (Int64.of_int distinct_count);
-     Varint.encode_uint64 buf (Int64.of_int rows_at_analysis));
+     Varint.encode_uint64 buf (Int64.of_int rows_at_analysis);
+     Varint.encode_uint64 buf (Int64.of_int (Array.length range_histograms));
+     Array.iter
+       (fun (h : histogram option) ->
+          match h with
+          | None -> Buffer.add_char buf '\x00'
+          | Some { boundaries } ->
+            Buffer.add_char buf '\x01';
+            Varint.encode_uint64 buf (Int64.of_int (Array.length boundaries));
+            Array.iter
+              (fun b ->
+                 Varint.encode_uint64 buf (Int64.of_int (String.length b));
+                 Buffer.add_string buf b)
+              boundaries)
+       range_histograms);
   Buffer.to_bytes buf
 ;;
 
 (* Returns [(expr_flags, where_sql, origin, idx_stats)].  The current encoder
-   always writes version 4 (with idx_stats); the pre-v4 branches default
-   [idx_stats] to [None] — every index on disk before #576 tier 1 shipped is,
-   correctly, "never analyzed". Decode of expr flags + WHERE is shared by
-   versions 2/3/4; [decode_flags_and_where] now also returns the offset just
-   past the WHERE clause, so version 4 knows where its stats bytes start. *)
+   always writes version 6 (idx_stats with one optional histogram per index
+   column position); versions 1-5 are pre-existing on-disk formats and all
+   decode to some fallback -- 1-3 always give [idx_stats = None] (no stats
+   were ever encoded in those formats), 4 and 5 decode a real
+   [distinct_count]/[rows_at_analysis] but always give
+   [range_histograms = [||]] (4 predates per-column histograms entirely; 5's
+   single column-0 histogram was never valid, per the version-5 branch's own
+   comment below). Decode of expr flags + WHERE is shared by every version
+   from 2 through 6; [decode_flags_and_where] also returns the offset just
+   past the WHERE clause, so each version's branch knows where its own
+   stats bytes (if any) start. *)
 let decode_index_ext_fields bytes off2 cols =
   let decode_flags_and_where off_start =
     let off_ref = ref off_start in
@@ -1221,7 +1248,11 @@ let decode_index_ext_fields bytes off2 cols =
       let expr_flags, where_sql, _ = decode_flags_and_where (off3 + 1) in
       expr_flags, where_sql, origin, None
     | 4 ->
-      (* Version 4 (#576 tier 1): version-3 fields, then optional idx_stats *)
+      (* Version 4 (#576 tier 1): version-3 fields, then optional idx_stats.
+         No per-column histograms in this version — #576 tier 2 added a
+         single column-0 histogram in version 5, then corrected it to one
+         per column position in version 6. Data written as version 4 always
+         decodes with [range_histograms = [||]]. *)
       let origin = idx_origin_of_byte (Bytes.get_uint8 bytes off3) in
       let expr_flags, where_sql, off_after_where = decode_flags_and_where (off3 + 1) in
       let has_stats = Bytes.get_uint8 bytes off_after_where in
@@ -1231,7 +1262,105 @@ let decode_index_ext_fields bytes off2 cols =
         else (
           let dc, off_a = Varint.decode_uint64 bytes (off_after_where + 1) in
           let ra, _ = Varint.decode_uint64 bytes off_a in
-          Some { distinct_count = Int64.to_int dc; rows_at_analysis = Int64.to_int ra })
+          Some
+            { distinct_count = Int64.to_int dc
+            ; rows_at_analysis = Int64.to_int ra
+            ; range_histograms = [||]
+            })
+      in
+      expr_flags, where_sql, origin, idx_stats
+    | 5 ->
+      (* Version 5 (#576 tier 2, superseded by version 6): version-4 fields,
+         then idx_stats carried a SINGLE optional column-0 histogram (a
+         presence byte, then if present a boundary count and that many
+         length-prefixed byte strings). That histogram was never valid
+         (column 0 is never a Plan.range's target — see the design doc's
+         "The bug" section), so the loop below is a pure byte-skip: it walks
+         past the encoded histogram bytes, discarding them, purely to
+         correctly advance the offset for anything that might follow in a
+         future encoding — this version's decode has nothing else to read
+         after it. The decoded value is [range_histograms = [||]], same as
+         a version-4 record. *)
+      let origin = idx_origin_of_byte (Bytes.get_uint8 bytes off3) in
+      let expr_flags, where_sql, off_after_where = decode_flags_and_where (off3 + 1) in
+      let has_stats = Bytes.get_uint8 bytes off_after_where in
+      let idx_stats =
+        if has_stats = 0
+        then None
+        else (
+          let dc, off_a = Varint.decode_uint64 bytes (off_after_where + 1) in
+          let ra, off_b = Varint.decode_uint64 bytes off_a in
+          let has_hist = Bytes.get_uint8 bytes off_b in
+          let () =
+            if has_hist = 0
+            then ()
+            else (
+              let n_boundaries, off_c = Varint.decode_uint64 bytes (off_b + 1) in
+              let n = Int64.to_int n_boundaries in
+              let off_ref = ref off_c in
+              for _ = 1 to n do
+                let blen, off_next = Varint.decode_uint64 bytes !off_ref in
+                off_ref := off_next + Int64.to_int blen
+              done)
+          in
+          Some
+            { distinct_count = Int64.to_int dc
+            ; rows_at_analysis = Int64.to_int ra
+            ; range_histograms = [||]
+            })
+      in
+      expr_flags, where_sql, origin, idx_stats
+    | 6 ->
+      (* Version 6 (#576 tier 2, corrected): version-5 fields, but idx_stats'
+         tail is now a histogram-count varint followed by that many
+         [presence byte, then if present boundary-count + length-prefixed
+         strings] slots -- one per index column, in column order. *)
+      let origin = idx_origin_of_byte (Bytes.get_uint8 bytes off3) in
+      let expr_flags, where_sql, off_after_where = decode_flags_and_where (off3 + 1) in
+      let has_stats = Bytes.get_uint8 bytes off_after_where in
+      let idx_stats =
+        if has_stats = 0
+        then None
+        else (
+          let dc, off_a = Varint.decode_uint64 bytes (off_after_where + 1) in
+          let ra, off_b = Varint.decode_uint64 bytes off_a in
+          let n_hist, off_c = Varint.decode_uint64 bytes off_b in
+          let off_ref = ref off_c in
+          (* Explicit sequential loops, not [Array.init]: each slot's decode
+             consumes bytes from [off_ref], so the result depends on the
+             callback running in strictly ascending index order. [Array.init]
+             happens to do that on the pinned toolchain but does not
+             contractually promise it (unlike, e.g., [List.init], which
+             does) -- see [decode_index_value]'s own [#484] comment for the
+             same concern applied to a [List.init] call. A [for] loop over a
+             pre-sized [Array.make] makes the order structural instead of
+             inherited from a stdlib guarantee. *)
+          let n_hist_i = Int64.to_int n_hist in
+          let range_histograms = Array.make n_hist_i None in
+          for i = 0 to n_hist_i - 1 do
+            let has_hist = Bytes.get_uint8 bytes !off_ref in
+            off_ref := !off_ref + 1;
+            range_histograms.(i)
+            <- (if has_hist = 0
+                then None
+                else (
+                  let n_boundaries, off_next = Varint.decode_uint64 bytes !off_ref in
+                  let n = Int64.to_int n_boundaries in
+                  off_ref := off_next;
+                  let boundaries = Array.make n "" in
+                  for j = 0 to n - 1 do
+                    let blen, off_next2 = Varint.decode_uint64 bytes !off_ref in
+                    let s = Bytes.sub_string bytes off_next2 (Int64.to_int blen) in
+                    off_ref := off_next2 + Int64.to_int blen;
+                    boundaries.(j) <- s
+                  done;
+                  Some { boundaries }))
+          done;
+          Some
+            { distinct_count = Int64.to_int dc
+            ; rows_at_analysis = Int64.to_int ra
+            ; range_histograms
+            })
       in
       expr_flags, where_sql, origin, idx_stats
     | _ -> List.map (fun _ -> false) cols, None, `User, None)
@@ -3197,7 +3326,7 @@ let indexes_of_table_tx tx ~table =
    re-locates its storage key via [indexes_of_table_tx] (read-your-own-writes
    through [tx]) rather than threading the numeric id back from
    [create_index], which returns only [index_info]. *)
-let set_index_stats t tx ~name ~distinct_count ~rows_at_analysis =
+let set_index_stats t tx ~name ~distinct_count ~rows_at_analysis ~range_histograms =
   match Schema_cache.find_index t.sc name with
   | None -> Lwt.return_unit
   | Some info ->
@@ -3208,7 +3337,9 @@ let set_index_stats t tx ~name ~distinct_count ~rows_at_analysis =
      | None -> Lwt.return_unit
      | Some (k, _) ->
        let new_info =
-         { info with idx_stats = Some { distinct_count; rows_at_analysis } }
+         { info with
+           idx_stats = Some { distinct_count; rows_at_analysis; range_histograms }
+         }
        in
        let%lwt () = S.put tx sys_indexes_tid k (encode_index_value new_info) in
        Schema_cache.put_index t.sc ~name new_info;

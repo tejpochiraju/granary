@@ -2541,7 +2541,13 @@ let test_index_stats_roundtrip_576 () =
       | Error e -> Alcotest.failf "create_index: %s" e);
      let* tx0 = S.rw_begin store in
      let* () =
-       C.set_index_stats cat1 tx0 ~name:"idx_t_b" ~distinct_count:7 ~rows_at_analysis:42
+       C.set_index_stats
+         cat1
+         tx0
+         ~name:"idx_t_b"
+         ~distinct_count:7
+         ~rows_at_analysis:42
+         ~range_histograms:[||]
      in
      let* () = S.commit tx0 in
      (* Force mirror reconstruction: lose the primary _sys_tables row. *)
@@ -2592,7 +2598,13 @@ let test_set_index_stats_is_index_scoped_576 () =
      let* _ = create "idx_b" "b" in
      let* tx = S.rw_begin store in
      let* () =
-       C.set_index_stats cat tx ~name:"idx_a" ~distinct_count:3 ~rows_at_analysis:9
+       C.set_index_stats
+         cat
+         tx
+         ~name:"idx_a"
+         ~distinct_count:3
+         ~rows_at_analysis:9
+         ~range_histograms:[||]
      in
      let* () = S.commit tx in
      (match C.find_index cat ~name:"idx_a" with
@@ -2602,6 +2614,134 @@ let test_set_index_stats_is_index_scoped_576 () =
      (match C.find_index cat ~name:"idx_b" with
       | Some { C.idx_stats = None; _ } -> ()
       | _ -> Alcotest.fail "idx_b should be untouched");
+     Lwt.return_unit)
+;;
+
+(* #576 tier 2 (corrected): range_histograms round-trips through
+   encode/decode as a full array -- one slot per index column, with a mix
+   of Some and None to prove positions aren't silently collapsed. *)
+let test_index_range_histograms_roundtrip_576 () =
+  run
+    (let store = S.create () in
+     let* cat1 = C.open_ store in
+     let* _tid =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "a"; int_col "b"; int_col "c" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let* r =
+       C.create_index
+         cat1
+         ~name:"idx_t_abc"
+         ~table:"t"
+         ~columns:[ "a"; "b"; "c" ]
+         ~unique:false
+         ~expr_flags:[ false; false; false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     (match r with
+      | Ok _ -> ()
+      | Error e -> Alcotest.failf "create_index: %s" e);
+     let b_boundaries = [| "\x02\x00"; "\x02\x05"; "\x02\x0a" |] in
+     let c_boundaries = [| "\x02\x01"; "\x02\x02"; "\x02\x03"; "\x02\x04" |] in
+     let range_histograms =
+       [| None
+        ; Some { C.boundaries = b_boundaries }
+        ; Some { C.boundaries = c_boundaries }
+       |]
+     in
+     let* tx0 = S.rw_begin store in
+     let* () =
+       C.set_index_stats
+         cat1
+         tx0
+         ~name:"idx_t_abc"
+         ~distinct_count:7
+         ~rows_at_analysis:42
+         ~range_histograms
+     in
+     let* () = S.commit tx0 in
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     let idxs = C.indexes_for_table cat2 ~table:"t" in
+     let idx =
+       match
+         List.find_opt (fun (i : C.index_info) -> i.C.idx_name = "idx_t_abc") idxs
+       with
+       | Some i -> i
+       | None -> Alcotest.fail "user index idx_t_abc missing after reopen"
+     in
+     (match idx.C.idx_stats with
+      | Some { C.range_histograms = got; _ } ->
+        Alcotest.(check int) "array length" 3 (Array.length got);
+        Alcotest.(check bool) "slot 0 is None" true (got.(0) = None);
+        (match got.(1), got.(2) with
+         | Some { C.boundaries = gb }, Some { C.boundaries = gc } ->
+           Alcotest.(check (array string)) "slot 1 boundaries" b_boundaries gb;
+           Alcotest.(check (array string)) "slot 2 boundaries" c_boundaries gc
+         | _ -> Alcotest.fail "expected slots 1 and 2 to both be Some")
+      | None -> Alcotest.fail "idx_stats not preserved");
+     Lwt.return_unit)
+;;
+
+(* #576 tier 2 (corrected): an all-None range_histograms array round-trips
+   too -- the array LENGTH, not just individual Some/None slots, must
+   survive (distinguishing "3 columns, none analyzed" from "predates
+   per-position histograms" ([||])). *)
+let test_index_stats_all_none_histograms_roundtrip_576 () =
+  run
+    (let store = S.create () in
+     let* cat1 = C.open_ store in
+     let* _tid =
+       C.create_table
+         cat1
+         ~name:"t2"
+         ~columns:[ int_col "a"; int_col "b" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let* r =
+       C.create_index
+         cat1
+         ~name:"idx_t2_ab"
+         ~table:"t2"
+         ~columns:[ "a"; "b" ]
+         ~unique:false
+         ~expr_flags:[ false; false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     (match r with
+      | Ok _ -> ()
+      | Error e -> Alcotest.failf "create_index: %s" e);
+     let* tx0 = S.rw_begin store in
+     let* () =
+       C.set_index_stats
+         cat1
+         tx0
+         ~name:"idx_t2_ab"
+         ~distinct_count:3
+         ~rows_at_analysis:9
+         ~range_histograms:[| None; None |]
+     in
+     let* () = S.commit tx0 in
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t2") in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     (match C.find_index cat2 ~name:"idx_t2_ab" with
+      | Some
+          { C.idx_stats =
+              Some { C.range_histograms = [| None; None |]; distinct_count = 3; _ }
+          ; _
+          } -> ()
+      | _ -> Alcotest.fail "expected a 2-slot all-None array to round-trip exactly");
      Lwt.return_unit)
 ;;
 
@@ -2682,6 +2822,210 @@ let test_decode_index_v3_backward_compat_576 () =
         Alcotest.(check (list bool)) "idx_expr_flags" [ false; true ] i.C.idx_expr_flags;
         Alcotest.(check (option string)) "idx_where_sql" (Some "a > 0") i.C.idx_where_sql;
         Alcotest.(check bool) "idx_origin is `User" true (i.C.idx_origin = `User));
+     Lwt.return_unit)
+;;
+
+(* #576 tier 2: a fixed version-4 byte string (idx_stats present, no
+   histogram bytes at all -- version 4 never wrote them) must decode with
+   [range_histograms = [||]] under the version-6 decoder. *)
+let make_v4_index_bytes
+      ~name
+      ~table
+      ~columns
+      ~unique
+      ~tree_id
+      ~origin_byte
+      ~expr_flags
+      ~where_sql
+      ~distinct_count
+      ~rows_at_analysis
+  =
+  let buf = Buffer.create 32 in
+  let v = Varint.encode_uint64 in
+  v buf (Int64.of_int (String.length name));
+  Buffer.add_string buf name;
+  v buf (Int64.of_int (String.length table));
+  Buffer.add_string buf table;
+  v buf (Int64.of_int (List.length columns));
+  List.iter
+    (fun col ->
+       v buf (Int64.of_int (String.length col));
+       Buffer.add_string buf col)
+    columns;
+  Buffer.add_char buf (if unique then '\x01' else '\x00');
+  v buf (Int64.of_int tree_id);
+  v buf 4L;
+  Buffer.add_char buf (Char.chr origin_byte);
+  List.iter (fun is_expr -> v buf (if is_expr then 1L else 0L)) expr_flags;
+  (match where_sql with
+   | None -> v buf 0L
+   | Some sql ->
+     v buf 1L;
+     v buf (Int64.of_int (String.length sql));
+     Buffer.add_string buf sql);
+  Buffer.add_char buf '\x01';
+  v buf (Int64.of_int distinct_count);
+  v buf (Int64.of_int rows_at_analysis);
+  Buffer.to_bytes buf
+;;
+
+let test_decode_index_v4_backward_compat_576 () =
+  run
+    (let store = S.create () in
+     let v4_bytes =
+       make_v4_index_bytes
+         ~name:"idx_v4_legacy"
+         ~table:"legacy_t2"
+         ~columns:[ "a" ]
+         ~unique:false
+         ~tree_id:11
+         ~origin_byte:2
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~distinct_count:5
+         ~rows_at_analysis:50
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.put tx sys_indexes_tid (Bytes.of_string "v4_key") v4_bytes in
+     let* () = S.commit tx in
+     let* cat = C.open_ store in
+     (match C.find_index cat ~name:"idx_v4_legacy" with
+      | Some
+          { C.idx_stats =
+              Some
+                { C.distinct_count = 5; rows_at_analysis = 50; range_histograms = [||] }
+          ; _
+          } -> ()
+      | Some { C.idx_stats = None; _ } ->
+        Alcotest.fail "expected idx_stats to decode from v4 bytes"
+      | Some { C.idx_stats = Some { C.range_histograms; _ }; _ }
+        when Array.length range_histograms > 0 ->
+        Alcotest.fail "v4 bytes must decode with range_histograms = [||]"
+      | Some { C.idx_stats = Some { C.distinct_count; rows_at_analysis; _ }; _ } ->
+        Alcotest.failf
+          "expected distinct_count=5, rows_at_analysis=50, got %d, %d"
+          distinct_count
+          rows_at_analysis
+      | None -> Alcotest.fail "idx_v4_legacy not found");
+     Lwt.return_unit)
+;;
+
+(* #576 tier 2 (corrected): a hand-encoded version-5 byte string -- the OLD
+   single-histogram-for-column-0 shape -- must decode with
+   [range_histograms = [||]] regardless of whether the v5 blob's histogram
+   was present. This is the test that proves the version-5 decode arm
+   correctly SKIPS the old histogram bytes (rather than mis-parsing them)
+   now that they no longer decode into anything. *)
+let make_v5_index_bytes
+      ~name
+      ~table
+      ~columns
+      ~unique
+      ~tree_id
+      ~origin_byte
+      ~expr_flags
+      ~where_sql
+      ~distinct_count
+      ~rows_at_analysis
+      ~histogram_boundaries
+  =
+  let buf = Buffer.create 32 in
+  let v = Varint.encode_uint64 in
+  v buf (Int64.of_int (String.length name));
+  Buffer.add_string buf name;
+  v buf (Int64.of_int (String.length table));
+  Buffer.add_string buf table;
+  v buf (Int64.of_int (List.length columns));
+  List.iter
+    (fun col ->
+       v buf (Int64.of_int (String.length col));
+       Buffer.add_string buf col)
+    columns;
+  Buffer.add_char buf (if unique then '\x01' else '\x00');
+  v buf (Int64.of_int tree_id);
+  v buf 5L;
+  Buffer.add_char buf (Char.chr origin_byte);
+  List.iter (fun is_expr -> v buf (if is_expr then 1L else 0L)) expr_flags;
+  (match where_sql with
+   | None -> v buf 0L
+   | Some sql ->
+     v buf 1L;
+     v buf (Int64.of_int (String.length sql));
+     Buffer.add_string buf sql);
+  Buffer.add_char buf '\x01';
+  v buf (Int64.of_int distinct_count);
+  v buf (Int64.of_int rows_at_analysis);
+  (match histogram_boundaries with
+   | None -> Buffer.add_char buf '\x00'
+   | Some bs ->
+     Buffer.add_char buf '\x01';
+     v buf (Int64.of_int (Array.length bs));
+     Array.iter
+       (fun b ->
+          v buf (Int64.of_int (String.length b));
+          Buffer.add_string buf b)
+       bs);
+  Buffer.to_bytes buf
+;;
+
+let test_decode_index_v5_backward_compat_576 () =
+  run
+    (let store = S.create () in
+     let v5_bytes_with_hist =
+       make_v5_index_bytes
+         ~name:"idx_v5_legacy_with_hist"
+         ~table:"legacy_t3"
+         ~columns:[ "a" ]
+         ~unique:false
+         ~tree_id:13
+         ~origin_byte:2
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~distinct_count:6
+         ~rows_at_analysis:60
+         ~histogram_boundaries:(Some [| "\x02\x00"; "\x02\x05" |])
+     in
+     let v5_bytes_without_hist =
+       make_v5_index_bytes
+         ~name:"idx_v5_legacy_without_hist"
+         ~table:"legacy_t4"
+         ~columns:[ "a" ]
+         ~unique:false
+         ~tree_id:14
+         ~origin_byte:2
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~distinct_count:8
+         ~rows_at_analysis:80
+         ~histogram_boundaries:None
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.put tx sys_indexes_tid (Bytes.of_string "v5_key_1") v5_bytes_with_hist in
+     let* () =
+       S.put tx sys_indexes_tid (Bytes.of_string "v5_key_2") v5_bytes_without_hist
+     in
+     let* () = S.commit tx in
+     let* cat = C.open_ store in
+     (match C.find_index cat ~name:"idx_v5_legacy_with_hist" with
+      | Some
+          { C.idx_stats =
+              Some
+                { C.distinct_count = 6; rows_at_analysis = 60; range_histograms = [||] }
+          ; _
+          } -> ()
+      | _ ->
+        Alcotest.fail
+          "expected v5-with-histogram bytes to decode with range_histograms = [||]");
+     (match C.find_index cat ~name:"idx_v5_legacy_without_hist" with
+      | Some
+          { C.idx_stats =
+              Some
+                { C.distinct_count = 8; rows_at_analysis = 80; range_histograms = [||] }
+          ; _
+          } -> ()
+      | _ ->
+        Alcotest.fail
+          "expected v5-without-histogram bytes to decode with range_histograms = [||]");
      Lwt.return_unit)
 ;;
 
@@ -2840,6 +3184,14 @@ let () =
             "decode_index_v3_backward_compat (#576)"
             `Quick
             test_decode_index_v3_backward_compat_576
+        ; Alcotest.test_case
+            "decode_index_v4_backward_compat (#576)"
+            `Quick
+            test_decode_index_v4_backward_compat_576
+        ; Alcotest.test_case
+            "decode_index_v5_backward_compat (#576)"
+            `Quick
+            test_decode_index_v5_backward_compat_576
         ] )
     ; ( "indexes"
       , [ Alcotest.test_case "create_index_basic" `Quick test_create_index_basic
@@ -2935,6 +3287,14 @@ let () =
             "set_index_stats is index-scoped (#576)"
             `Quick
             test_set_index_stats_is_index_scoped_576
+        ; Alcotest.test_case
+            "index_range_histograms_roundtrip (#576)"
+            `Quick
+            test_index_range_histograms_roundtrip_576
+        ; Alcotest.test_case
+            "index_stats_all_none_histograms_roundtrip (#576)"
+            `Quick
+            test_index_stats_all_none_histograms_roundtrip_576
         ] )
     ; ( "drift"
       , [ Alcotest.test_case

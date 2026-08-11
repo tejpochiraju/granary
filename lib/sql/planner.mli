@@ -30,3 +30,14 @@ val dml_seek_bail_out_at
   -> Granary_catalog.Catalog.table_meta
   -> idx_tree:int
   -> int option
+
+(** #517/#576: [true] iff a column of this type can ever produce a
+    [Plan.range] bound -- only [Row.Integer] and [Row.Real] have a
+    fixed-width index-key encoding a range seek can be built from; [Row.Text]
+    and [Row.Blob] never can. {!range_histogram_estimate}
+    only ever consults a histogram for a column this returns [true] for, so
+    [Exec.execute_create_index] uses this same predicate to decide whether a
+    non-leading index column is worth building a histogram for in the first
+    place -- building one for a column this returns [false] on would be a
+    number nothing ever reads. *)
+val bounded_type : Granary_encoding.Row.ty -> bool

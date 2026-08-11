@@ -1,5 +1,6 @@
 module Cat = Granary_catalog.Catalog
 module Row = Granary_encoding.Row
+module Index_key = Granary_encoding.Index_key
 
 (* Produces uppercase SQLite PRAGMA wire-format strings ("CASCADE", "NO ACTION", etc.)
    Distinct from Cat.fk_action_to_string which uses lowercase for internal serialization. *)
@@ -901,21 +902,6 @@ let range_int_literal_span (r : Plan.range) =
   | _ -> None
 ;;
 
-let range_rows_estimate (r : Plan.range) =
-  match range_int_literal_span r with
-  | Some (lo, hi) ->
-    let span = Int64.sub hi lo in
-    (* [hi < lo] is an empty window; a [span] that came out negative for the
-       other reason — [hi - lo] overflowing int64 — is as unbounded as a range
-       gets.  Both are handled by the sign test, in the direction each wants. *)
-    if Int64.compare span 0L < 0
-    then if Int64.compare hi lo < 0 then range_seek_rows else unbounded_rows
-    else if Int64.compare span (Int64.of_int unbounded_rows) >= 0
-    then unbounded_rows
-    else max range_seek_rows (Int64.to_int span + 1)
-  | None -> range_seek_rows
-;;
-
 (** #606: the {i unfloored} key count a both-ends-integer-literal range spans,
     or [None] when the window cannot be sized at all.
 
@@ -1131,6 +1117,178 @@ let index_by_tree cat (meta : Cat.table_meta) ~idx_tree =
   |> List.find_opt (fun (i : Cat.index_info) -> i.Cat.idx_tree_id = idx_tree)
 ;;
 
+(** #576 tier 2: the smallest index [i] into [boundaries] such that
+    [boundaries.(i) >= key] (byte order) — [Array.length boundaries] if
+    [key] is greater than every boundary. A standard lower-bound binary
+    search; [boundaries] is assumed sorted ascending, which
+    [Exec.build_histogram] guarantees. *)
+let histogram_lower_bound (boundaries : string array) (key : string) =
+  let n = Array.length boundaries in
+  let rec go lo hi =
+    if lo >= hi
+    then lo
+    else (
+      let mid = lo + ((hi - lo) / 2) in
+      if String.compare boundaries.(mid) key < 0 then go (mid + 1) hi else go lo mid)
+  in
+  go 0 n
+;;
+
+(** #576 tier 2 (corrected): estimate a literal [Integer]/[Real] range's row
+    count from [idx_tree]'s histogram at column position [n_eq] -- the
+    position [Plan.range]'s doc comment guarantees a range always describes
+    (the first column after an [n_eq]-long equality-covered prefix; see
+    docs/superpowers/specs/2026-08-11-576-tier2-per-position-histograms-design.md's
+    "The bug" section for the full reachability proof). [None] when no
+    histogram is available at that position (unanalyzed index, position
+    out of range, capped, or the range has no literal bound to look up --
+    a bound parameter, or a bound of any type other than [L_int]/[L_real];
+    [Plan.range] only exists for [Integer]/[Real] columns in the first
+    place). [None] on EITHER end falls back whole to
+    {!range_int_literal_span}, same as before.
+
+    A literal is coerced to [r.Plan.r_ty] -- the bounded column's OWN
+    declared type -- before it is encoded into a probe key, because the AST
+    literal's own syntactic spelling does not always match: an ordinary
+    integer literal against a REAL column (`v BETWEEN 0 AND 199`, no decimal
+    point) is exactly as common as one with a decimal point, but the
+    histogram's boundaries were built in [r_ty], and [Index_key.encode_value]
+    tags [IK_int] and [IK_real] with different leading bytes, so comparing
+    across the mismatch silently defeats the lookup rather than raising.
+
+    Deliberately BUCKET-GRANULARITY, not linear interpolation -- see the
+    original tier-2 design doc's "Consumption" section, unchanged by this
+    fix; only WHICH histogram is looked up changed.
+
+    MARGINAL, not CONDITIONAL -- read this before wiring the result into a
+    new consumer. [range_histograms.(n_eq)] is built UNCONDITIONALLY over
+    the whole table by {!Exec.execute_create_index}'s walk: it is an
+    equi-depth histogram of that column's values across every row of the
+    table, with no knowledge of any equality prefix. The caller's actual
+    question, though, is conditional -- "how many rows match BOTH the
+    [n_eq]-long equality prefix AND this range" -- and the histogram alone
+    cannot answer it. The result is a systematic OVER-estimate, by roughly
+    the equality prefix's own selectivity factor: for `w = 1 AND v BETWEEN
+    ...` where [w] has 1000 distinct values, the histogram-based estimate
+    for [v]'s range is the row count across ALL 1000 values of [w], i.e.
+    ~1000x the true row count for [w = 1] specifically.
+
+    Three things worth being explicit about:
+    (a) this is not a new blind spot -- the pre-existing flat
+        {!range_int_literal_span} fallback this replaces had the identical
+        one: it also estimated a range's span with no knowledge of any
+        equality prefix;
+    (b) the error direction is the SAFE one -- an over-estimate biases the
+        caller toward the hash join, and {!table_rows_estimate}'s own doc
+        comment already argues that is the direction to err in when unsure;
+    (c) this is DELIBERATELY not corrected by combining with the equality
+        prefix's own {!index_leading_distinct_count} (dividing the estimate
+        by that count would assume the range's rows are spread evenly
+        across the prefix's distinct values -- an independence assumption,
+        not a fact this histogram or that stat encodes). That combination
+        is a plausible future improvement, not something silently missing
+        today -- name it as such if you touch this function, rather than
+        treating the current number as more exact than it is. This matters
+        because a future reader wiring this estimate into another consumer
+        (e.g. a build-side gate for {!range_literal_window_rows}, per #606)
+        could otherwise be misled by how "real" the number looks now that
+        it comes from stored per-value data instead of a flat constant. *)
+let range_histogram_estimate cat (meta : Cat.table_meta) ~idx_tree ~n_eq (r : Plan.range) =
+  match index_by_tree cat meta ~idx_tree with
+  | Some { Cat.idx_stats = Some { Cat.range_histograms; rows_at_analysis; _ }; _ }
+    when n_eq >= 0 && n_eq < Array.length range_histograms ->
+    (match range_histograms.(n_eq) with
+     | Some { Cat.boundaries } when Array.length boundaries >= 2 ->
+       let lit_key = function
+         | Some (Plan.P_lit (Ast.L_int n)) ->
+           (match r.Plan.r_ty with
+            | Granary_encoding.Row.Real ->
+              (* The histogram's boundaries were built in the column's OWN
+                 declared type. An ordinary integer literal against a REAL
+                 column (`v BETWEEN 0 AND 199`) must be coerced to [IK_real]
+                 before lookup -- [IK_int] and [IK_real] are different tag
+                 bytes ([0x02] vs [0x03] in {!Index_key.encode_value}), so an
+                 un-coerced [IK_int] key sorts below EVERY [IK_real] boundary
+                 regardless of its numeric value, always landing at bucket 0. *)
+              Some
+                (Bytes.to_string
+                   (Index_key.encode_value (Index_key.IK_real (Int64.to_float n))))
+            | _ -> Some (Bytes.to_string (Index_key.encode_value (Index_key.IK_int n))))
+         | Some (Plan.P_lit (Ast.L_real f)) ->
+           (match r.Plan.r_ty with
+            | Granary_encoding.Row.Integer ->
+              (* The rarer direction (`WHERE intcol BETWEEN 1.5 AND 10.5`):
+                 round to the nearest int. This feeds a bucket-granularity
+                 estimate, not a scan boundary, so a simple round is enough --
+                 unlike {!Exec.range_bound_key}'s careful ceil/floor/pred/succ
+                 handling of the same cross-type problem for an actual seek
+                 bound, which this function does not need. *)
+              Some
+                (Bytes.to_string
+                   (Index_key.encode_value
+                      (Index_key.IK_int (Int64.of_float (Float.round f)))))
+            | _ -> Some (Bytes.to_string (Index_key.encode_value (Index_key.IK_real f))))
+         | None ->
+           None (* unbounded end: use the histogram's own extreme, handled below *)
+         | Some _ ->
+           None (* a parameter, or any other expr shape: no literal to look up *)
+       in
+       let n_buckets = Array.length boundaries - 1 in
+       let lo_i =
+         match r.Plan.r_lo with
+         | None -> Some 0
+         | Some _ as e ->
+           (match lit_key e with
+            | Some k -> Some (histogram_lower_bound boundaries k)
+            | None -> None)
+       in
+       let hi_i =
+         match r.Plan.r_hi with
+         | None -> Some n_buckets
+         | Some _ as e ->
+           (match lit_key e with
+            | Some k -> Some (histogram_lower_bound boundaries k)
+            | None -> None)
+       in
+       (match lo_i, hi_i with
+        | Some lo_i, Some hi_i
+          when Option.is_some r.Plan.r_lo || Option.is_some r.Plan.r_hi ->
+          (* Clamp to [n_buckets]: [hi_i] can be [Array.length boundaries]
+             (one past the last valid bucket index) when the upper bound is
+             unbounded or past the histogram's own max, which with [lo_i = 0]
+             would otherwise give [span_buckets = n_buckets + 1] -- one more
+             bucket-width than actually exists, and enough to push the
+             product above [rows_at_analysis]. *)
+          let span_buckets = min n_buckets (max 0 (hi_i - lo_i)) in
+          Some (max range_seek_rows (rows_at_analysis * span_buckets / n_buckets))
+        | _ -> None)
+     | _ -> None)
+  | _ -> None
+;;
+
+(** #576 tier 2 (corrected): [~n_eq] is the equality-prefix length -- the
+    column position [r] describes (see {!range_histogram_estimate}'s doc
+    comment). [cat]/[meta]/[idx_tree] identify the seeked index, exactly as
+    {!estimate_rows_from_stats} already does. *)
+let range_rows_estimate cat (meta : Cat.table_meta) ~idx_tree ~n_eq (r : Plan.range) =
+  match range_histogram_estimate cat meta ~idx_tree ~n_eq r with
+  | Some est -> est
+  | None ->
+    (match range_int_literal_span r with
+     | Some (lo, hi) ->
+       let span = Int64.sub hi lo in
+       (* [hi < lo] is an empty window; a [span] that came out negative for the
+          other reason — [hi - lo] overflowing int64 — is as unbounded as a
+          range gets.  Both are handled by the sign test, in the direction each
+          wants. *)
+       if Int64.compare span 0L < 0
+       then if Int64.compare hi lo < 0 then range_seek_rows else unbounded_rows
+       else if Int64.compare span (Int64.of_int unbounded_rows) >= 0
+       then unbounded_rows
+       else max range_seek_rows (Int64.to_int span + 1)
+     | None -> range_seek_rows)
+;;
+
 (** #576 tier 1: [idx_tree]'s leading-column distinct-value count, if the
     index was analyzed at [CREATE INDEX] time and the count is positive.
     [None] covers "never analyzed" (every index created before this shipped,
@@ -1333,7 +1491,8 @@ let estimate_rows cat (op : Plan.op) =
       then 1
       else (
         match range with
-        | Some r -> range_rows_estimate r
+        | Some r ->
+          range_rows_estimate cat table_meta ~idx_tree ~n_eq:(List.length keys) r
         | None ->
           (* #576 tier 1: a non-unique equality prefix with no range used to
              be pure unbounded_rows; now it consults the leading column's

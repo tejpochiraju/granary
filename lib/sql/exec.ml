@@ -4799,6 +4799,99 @@ let execute_insert
     for why an unbounded version is a real regression, not a theoretical one. *)
 let index_stats_cardinality_cap = 100_000
 
+(** #576 tier 2: how many equi-depth (by row count) buckets
+    [execute_create_index]'s walk targets when building a leading-column
+    histogram. 20 buckets is ~5% CDF resolution -- enough to separate "this
+    range covers a small slice of the table" from "this range covers most of
+    it" (#561's row-4 residual class of mis-estimate) without a
+    variable-resolution scheme to justify a different number. A single
+    skewed value can still make the actual persisted histogram shorter than
+    [histogram_bucket_count + 1] entries -- see [histogram]'s doc comment in
+    catalog.mli -- so nothing downstream may assume the array has exactly
+    this many buckets; they must read [Array.length boundaries - 1]. *)
+let histogram_bucket_count = 20
+
+(** #576 tier 2: build an equi-depth (by row count) histogram from
+    [entries] -- the [(encoded_key, row_count)] pairs
+    [execute_create_index]'s walk collected, unsorted, for one indexed
+    column. [total_rows] is the sum of every entry's count (equivalently,
+    [rows_at_analysis]). [None] when [entries] has fewer than
+    [histogram_bucket_count] distinct keys -- see [histogram]'s doc comment
+    in catalog.mli for why that floor exists.
+
+    The boundary array is built by sorting [entries] by key (byte order --
+    the same order the index itself sorts by) and walking the sorted list
+    while accumulating a running row total; each time the running total
+    crosses a multiple of [total_rows / histogram_bucket_count], the current
+    key is emitted as an interior boundary, up to [histogram_bucket_count - 1]
+    of them.  The first and last keys are always prepended/appended, so the
+    result spans the full observed range even when a single skewed key's
+    count overshoots several bucket-widths in one step (it still only
+    contributes ONE boundary -- this is the standard equi-depth degenerate
+    case, not a bug: see [histogram]'s doc comment on why a consumer must
+    read the actual array length rather than assume
+    [histogram_bucket_count + 1]).
+
+    The first sorted key can never itself be emitted as an interior
+    boundary -- it is always the array's own unconditional first element,
+    so the loop below only walks the REMAINING (non-first) entries, with
+    [running]/[next_threshold] pre-seeded/pre-advanced past the first
+    key's own count before the loop starts. Folding the first key into
+    the loop like every other entry would let a large first-key count
+    cross the very first threshold on the first iteration and push that
+    same key onto the interior list too, duplicating it and producing a
+    zero-width phantom bucket at the start ([boundaries.(0) =
+    boundaries.(1)]). *)
+let build_histogram (entries : (string * int) list) ~total_rows : Cat.histogram option =
+  if List.length entries < histogram_bucket_count
+  then None
+  else (
+    let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) entries in
+    let step = total_rows / histogram_bucket_count in
+    let first_key, first_count = List.hd sorted in
+    let rest = List.tl sorted in
+    let last_key = fst (List.nth sorted (List.length sorted - 1)) in
+    (* [middle] excludes both the first key (via [rest]) and the last key,
+       so the loop below can never re-emit either as an interior boundary
+       — the mirror image of the pre-advance done for the first key. *)
+    let middle =
+      match List.rev rest with
+      | [] -> [] (* unreachable: [rest] always has >= 19 elements here *)
+      | _last :: rev_middle -> List.rev rev_middle
+    in
+    let running = ref first_count in
+    let next_threshold = ref step in
+    (* Pre-advance past every threshold multiple the first key's own count
+       already meets, so the loop below can never re-emit the first key
+       as an interior boundary. *)
+    while !next_threshold <= !running do
+      next_threshold := !next_threshold + step
+    done;
+    let interior = ref [] in
+    List.iter
+      (fun (key, count) ->
+         running := !running + count;
+         if
+           !running >= !next_threshold
+           && List.length !interior < histogram_bucket_count - 1
+         then (
+           interior := key :: !interior;
+           (* Advance past every threshold multiple [running] already
+              exceeds, not just one [step] past wherever it happened to
+              land. A single dominant key can jump [running] well past
+              several thresholds in one stride; incrementing by a fixed
+              [step] here would re-cross those already-passed thresholds
+              on the very next (near-empty) keys, cramming a run of
+              degenerate boundaries right after the skewed key instead of
+              spreading them across the real value range. *)
+           while !next_threshold <= !running do
+             next_threshold := !next_threshold + step
+           done))
+      middle;
+    let mids = List.rev !interior in
+    Some { Cat.boundaries = Array.of_list ((first_key :: mids) @ [ last_key ]) })
+;;
+
 (** Run [Op_create_index]: register the index in the catalog, then scan
     the table tree and populate the index tree with one entry per row. *)
 let execute_create_index
@@ -4865,10 +4958,11 @@ let execute_create_index
         | flag :: _ -> flag
         | [] -> false
       in
+      let index_eligible = not (unique || without_rowid_table) in
       let seen =
-        if unique || without_rowid_table || leading_col_is_expr
-        then None
-        else Some (Hashtbl.create 64)
+        if index_eligible && not leading_col_is_expr
+        then Some (Hashtbl.create 64)
+        else None
       in
       (* #576 final review: [seen] retains one encoded leading-column key per
          DISTINCT value for the whole table walk, so on a non-unique-but-
@@ -4885,6 +4979,55 @@ let execute_create_index
          [estimate_rows_from_stats]'s resulting estimate too SMALL -- the
          ADMITTING direction, which is the unsafe one; [None] reproduces
          today's exact pre-#576 behavior for that index instead. *)
+      (* #576 tier 2 (corrected): one per-position [Hashtbl] for every
+         column OTHER than column 0 -- column 0's own [seen] above still
+         only feeds [distinct_count], unaffected by this array. Slot 0 of
+         [pos_tables] always stays [None]: it is never built, matching
+         [range_histograms]'s own slot-0-always-[None] contract (see the
+         [index_stats] doc comment in catalog.mli). A position whose
+         column is an expression column also stays [None] -- see that same
+         doc comment for why a histogram there is never consulted.
+
+         Gated on [seen <> None], not just [index_eligible]: when the
+         LEADING column is itself an expression column, [seen] is [None]
+         (see its own construction above) and nothing from this walk is
+         ever persisted -- [Some tbl -> ... | Some _ when !capped -> ...]
+         below all key off [seen]. Building real [Hashtbl]s here in that
+         case would do up to [(n_cols-1) * index_stats_cardinality_cap]
+         wasted inserts per row, discarded unread at the end. Sized off
+         [info.idx_columns], not [col_expr_flags]: [iks] (below) is built
+         from [info.idx_columns] via [get_index_key_values], so sizing
+         [pos_tables] from the same list makes the two agree by
+         construction rather than by every current SQL code path
+         coincidentally producing equal-length lists. *)
+      (* #576 waste fix: a non-expression position also stays [None] when its
+         declared column type can never carry a [Plan.range] bound --
+         [Planner.bounded_type] is the single source of truth
+         [range_histogram_estimate] itself consults on the read side, and a
+         histogram built for a column it returns [false] on (TEXT/BLOB) would
+         never be read: real per-row CPU/memory work, and a stat persisted to
+         disk forever, for nothing. *)
+      let pos_col_bounded i =
+        match List.nth_opt info.idx_columns i with
+        | None -> false
+        | Some col_name ->
+          (match List.find_opt (fun (c : Row.column) -> c.name = col_name) columns with
+           | Some c -> Planner.bounded_type c.ty
+           | None -> false)
+      in
+      let pos_tables =
+        match seen with
+        | None -> Array.make (List.length info.idx_columns) None
+        | Some _ ->
+          Array.of_list
+            (List.mapi
+               (fun i is_expr ->
+                  if i = 0 || is_expr || not (pos_col_bounded i)
+                  then None
+                  else Some (Hashtbl.create 64))
+               col_expr_flags)
+      in
+      let pos_capped = Array.make (Array.length pos_tables) false in
       let capped = ref false in
       let rows_indexed = ref 0 in
       let rec walk () =
@@ -4909,10 +5052,28 @@ let execute_create_index
              | Some tbl ->
                if not !capped
                then (
-                 let ek = Index_key.encode_value (List.hd iks) in
-                 if Hashtbl.mem tbl ek || Hashtbl.length tbl < index_stats_cardinality_cap
-                 then Hashtbl.replace tbl ek ()
-                 else capped := true));
+                 let ek = Bytes.to_string (Index_key.encode_value (List.hd iks)) in
+                 match Hashtbl.find_opt tbl ek with
+                 | Some count -> Hashtbl.replace tbl ek (count + 1)
+                 | None ->
+                   if Hashtbl.length tbl < index_stats_cardinality_cap
+                   then Hashtbl.replace tbl ek 1
+                   else capped := true));
+            List.iteri
+              (fun i v ->
+                 match pos_tables.(i) with
+                 | None -> ()
+                 | Some tbl ->
+                   if not pos_capped.(i)
+                   then (
+                     let ek = Bytes.to_string (Index_key.encode_value v) in
+                     match Hashtbl.find_opt tbl ek with
+                     | Some count -> Hashtbl.replace tbl ek (count + 1)
+                     | None ->
+                       if Hashtbl.length tbl < index_stats_cardinality_cap
+                       then Hashtbl.replace tbl ek 1
+                       else pos_capped.(i) <- true))
+              iks;
             incr rows_indexed;
             (* #288: for a UNIQUE index, the build must detect pre-existing
                duplicate values.  The encoded key includes the rowid suffix, so
@@ -4953,24 +5114,44 @@ let execute_create_index
       in
       let* () = walk () in
       S.cursor_close cur;
-      (* #576 tier 1: persist the stat in the same DDL transaction as the
-         index itself, so it rolls back with it. *)
+      (* #576 tier 1/2 (corrected): persist the stats in the same DDL
+         transaction as the index itself, so they roll back with it.
+         [seen] (column 0) governs whether ANY stats are persisted at all,
+         exactly as tier 1 always did -- if column 0's own walk was capped
+         or the whole index is ineligible, nothing is persisted, including
+         every per-position histogram, even one that individually never
+         hit its own cap. This keeps [distinct_count]'s existing all-or-
+         nothing contract; only per-position CAPPING (below) is new and
+         granular. *)
       (match seen with
        | None -> Lwt.return_unit
-       | Some _ when !capped ->
-         (* #576 final review: capped mid-walk -- the count in [tbl] is a
-            partial, under-reported [distinct_count], and persisting it would
-            estimate too FEW rows for the seek it gates (the unsafe,
-            admitting direction). Fall back to no stat, same as an
-            unanalyzed index. *)
-         Lwt.return_unit
+       | Some _ when !capped -> Lwt.return_unit
        | Some tbl ->
+         let range_histograms =
+           Array.mapi
+             (fun i pos_tbl ->
+                match pos_tbl with
+                | None -> None
+                | Some _ when pos_capped.(i) ->
+                  (* #576 tier 2 (corrected): a per-position cap hit is
+                     LOCAL -- it degrades only this slot to [None], not the
+                     whole index's stats (unlike column 0's [capped] flag
+                     above, which is whole-index by design -- see the
+                     design doc's "Population" section for why the two
+                     scopes differ). *)
+                  None
+                | Some t ->
+                  let entries = Hashtbl.fold (fun k c acc -> (k, c) :: acc) t [] in
+                  build_histogram entries ~total_rows:!rows_indexed)
+             pos_tables
+         in
          Cat.set_index_stats
            cat
            tx
            ~name
            ~distinct_count:(Hashtbl.length tbl)
-           ~rows_at_analysis:!rows_indexed))
+           ~rows_at_analysis:!rows_indexed
+           ~range_histograms))
 ;;
 
 (** Build the list of (child_table_meta, relevant_fk_constraints) pairs

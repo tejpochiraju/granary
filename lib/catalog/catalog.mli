@@ -125,13 +125,59 @@ type idx_origin =
   | `User
   ]
 
+(** #576 tier 2: an equi-depth (by row count) histogram of ONE indexed
+    column's encoded values.  [boundaries] holds [Index_key.encode_value]-
+    encoded bytes, strictly ascending by [Bytes.compare]/[String.compare]
+    (a [bytes] value round-tripped through [Bytes.to_string]/
+    [Bytes.of_string] for storage in this array, since OCaml's structural
+    comparison/serialization is simplest over immutable strings):
+    [boundaries.(0)] is the smallest value seen at analysis time,
+    [boundaries.(Array.length boundaries - 1)] the largest, and bucket [i]
+    (for [0 <= i < Array.length boundaries - 1]) covers roughly
+    [rows_at_analysis / (Array.length boundaries - 1)] rows.  The array
+    length is NOT guaranteed to be [histogram_bucket_count + 1]: a single
+    very skewed value can absorb several bucket-widths at once and only
+    ever contributes one boundary, so a consumer must divide by
+    [Array.length boundaries - 1], never by the population-time constant —
+    see [Exec.execute_create_index]'s "Population" comment for how the
+    array is built. *)
+type histogram = { boundaries : string array }
+
 (** #576 tier 1: the leading indexed column's distinct-value count, as
     measured the one time the index was populated ([CREATE INDEX]).  Never
     incrementally maintained — see the design doc's "Population" section for
-    why staleness is accepted rather than tracked. *)
+    why staleness is accepted rather than tracked.
+
+    #576 tier 2 (corrected, see
+    docs/superpowers/specs/2026-08-11-576-tier2-per-position-histograms-design.md)
+    adds [range_histograms], one slot per column of the index
+    ([Array.length range_histograms = List.length idx_columns] for every
+    index this walk analyzed). Slot 0 is ALWAYS [None]: a [Plan.range] never
+    describes an index's column 0 (it always sits at the first column
+    {i after} an equality-covered prefix, so it is always at position
+    [n_eq >= 1] — see the design doc's "The bug" section for the proof), so
+    a column-0 histogram would be a number nothing ever reads. A slot at
+    position [i >= 1] is [None] when: the whole index has no stats at all
+    (same eligibility as [distinct_count] — UNIQUE, WITHOUT ROWID, or the
+    walk was capped mid-way — see [Exec.execute_create_index]); that
+    column is an expression column (its literal name never resolves via
+    [Planner.range_for_index]'s [col_ordinal] lookup, so a histogram there
+    is never consulted either); that column has fewer distinct values than
+    [Exec.histogram_bucket_count]; or that column's OWN per-position walk
+    hit [Exec.index_stats_cardinality_cap] (capping is per-position, not
+    whole-index — a near-unique column no longer costs its siblings their
+    histograms, see [Exec.execute_create_index]). An index this walk never
+    analyzed at all (pre-version-6 data) decodes with
+    [range_histograms = [||]] — an EMPTY array, deliberately distinct from
+    an array of all-[None] slots, so a consumer (or future debugging
+    surface) can tell "predates per-position histograms" from "has them,
+    all empty" if that distinction ever matters; [Planner.range_rows_estimate]
+    treats an out-of-bounds or empty-array lookup identically to a [None]
+    slot, so this distinction changes no plan today. *)
 type index_stats =
   { distinct_count : int
   ; rows_at_analysis : int
+  ; range_histograms : histogram option array
   }
 
 type index_info =
@@ -152,7 +198,9 @@ type index_info =
         too, but not via a check in [Exec.execute_create_index]: [CREATE
         INDEX] on a columnar table is refused outright by the binder before
         that function ever runs, so no columnar [index_info] is ever
-        constructed at all. *)
+        constructed at all.  [range_histograms] follows the same eligibility
+        as [distinct_count] per slot, with further per-column exemptions —
+        see [index_stats]'s own doc comment above. *)
   }
 
 type fts_table_meta =
@@ -406,9 +454,11 @@ val create_index
   -> origin:idx_origin
   -> (index_info, string) result Lwt.t
 
-(** #576 tier 1: persist [idx_stats] on the named index's catalog row —
-    the leading-column distinct-value count and the row count observed while
-    computing it.  Must run inside [tx]: the sole caller,
+(** #576 tier 1/2: persist [idx_stats] on the named index's catalog row —
+    the leading-column distinct-value count, the row count observed while
+    computing it, and (#576 tier 2, corrected) one equi-depth histogram per
+    index column position, slot 0 always [None] — see [index_stats]'s doc
+    comment for why.  Must run inside [tx]: the sole caller,
     [Exec.execute_create_index], always holds one from populating the index,
     so stats land in the same DDL transaction as the index itself (and roll
     back with it).  A no-op if [name] does not name a live index (defensive;
@@ -419,6 +469,7 @@ val set_index_stats
   -> name:string
   -> distinct_count:int
   -> rows_at_analysis:int
+  -> range_histograms:histogram option array
   -> unit Lwt.t
 
 (** Return the list of indexes on the given table.  Order is unspecified. *)

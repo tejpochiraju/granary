@@ -979,6 +979,22 @@
  (modules test_index_cardinality_576)
  (libraries granary granary.unix granary.catalog alcotest lwt.unix unix))
 
+; #576 tier 2: plan-shape tests proving Planner.range_rows_estimate consults
+; a per-index histogram (built by Task 3's CREATE INDEX walk) rather than
+; the pre-existing flat/int-span estimate.
+
+(test
+ (name test_range_histogram_576)
+ (modules test_range_histogram_576)
+ (libraries
+  granary
+  granary.unix
+  granary.catalog
+  granary.sql
+  alcotest
+  lwt.unix
+  unix))
+
 ; #532: on-disk cost of the join-strategy flip a range-bounded build side
 ; causes. A measurement tool, not a gate.
 
