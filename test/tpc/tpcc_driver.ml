@@ -52,6 +52,7 @@ type profile_stats =
   ; mean_ms : float
   ; wait_ms : float
   ; service_ms : float
+  ; service_total_ms : float
   }
 
 type result =
@@ -182,6 +183,7 @@ let stats_of_acc a =
   ; mean_ms = Array.fold_left ( +. ) 0.0 samples /. n
   ; wait_ms = a.a_wait_total /. n
   ; service_ms = a.a_service_total /. n
+  ; service_total_ms = a.a_service_total
   }
 ;;
 
@@ -360,6 +362,11 @@ let run config ~workers =
   let pool = make_pool workers in
   let warm = make_recorder ~record:false profiles in
   let* _ = run_interval pool warm ~config ~profiles ~duration:config.warmup_seconds in
+  (* #714: discard the warm-up window's statement observations, so cold-cache
+     first touches and the one-off [Db.prepare] per shape do not contaminate
+     the steady-state means.  Unconditional: on a non-profiling run this is
+     [Hashtbl.reset] on an empty table. *)
+  Tpcc_stmt_profile.reset ();
   let rec_ = make_recorder ~record:true profiles in
   let+ elapsed_s = run_interval pool rec_ ~config ~profiles ~duration:config.seconds in
   { config

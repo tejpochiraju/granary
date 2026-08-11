@@ -38,6 +38,7 @@ module D = Granary_tpc.Tpcc_driver
 module T = Granary_tpc.Tpcc_txn
 module C = Granary_tpc.Tpcc_check
 module G = Granary_tpc.Tpcc_gen
+module SP = Granary_tpc.Tpcc_stmt_profile
 module Conn = Granary_tpc.Tpcc_conn
 
 (* ── reference C SQLite (in-process bindings) ─────────────────────────────
@@ -247,6 +248,37 @@ let run_engine ~engine ~config ~gen ~load ~mk_workers ~exec ~query_rows ~self_te
   let result = Lwt_main.run (D.run config ~workers:(List.map T.run workers)) in
   let after = print_check (check_conditions query_rows ~engine ~where:"after") in
   let self = if self_test then prove_the_oracle_can_fail exec query_rows ~engine else 0 in
+  (* #714: [D.run] resets the profile after its own warm-up window, so what is
+     here is this engine's measured interval alone — both engines drive
+     [Tpcc_txn.run] and would otherwise share the (profile, sql) keys.
+     [service_total_ms] is the accumulator's own sum, not reconstructed from
+     [service_ms]'s mean, so this has no dependency on [committed] matching
+     the mean's denominator (see {!Tpcc_driver.profile_stats.service_total_ms}). *)
+  if SP.enabled
+  then (
+    let service_ms =
+      List.map
+        (fun (p : D.profile_stats) -> p.D.name, p.D.service_total_ms)
+        result.D.per_profile
+    in
+    Printf.eprintf "[%s]%s%!" engine (SP.report ~service_ms);
+    match BR.env_str "GRANARY_TPCC_STMT_PROFILE_CSV" "" with
+    | "" -> ()
+    | dir ->
+      let path = Filename.concat dir (Printf.sprintf "tpcc-stmt-profile-%s.csv" engine) in
+      (try
+         SP.to_csv ~path ~service_ms;
+         Printf.eprintf "[%s] statement profile CSV: %s\n%!" engine path
+       with
+       | Sys_error msg ->
+         Printf.eprintf
+           "[%s] WARNING: could not write statement profile CSV to %S (from \
+            GRANARY_TPCC_STMT_PROFILE_CSV=%S): %s — continuing without it\n\
+            %!"
+           engine
+           path
+           dir
+           msg));
   prerr_string (D.summary result);
   flush stderr;
   { result; failures = before + after + self + load_failures result }
@@ -327,7 +359,21 @@ let selected_engines () =
          other)
 ;;
 
+(* #715 review: the two variables are documented adjacent in one table in
+   BENCHMARKS-TPCC.md, and setting only the CSV path silently produces a
+   normal run with no CSV and no diagnostic — the report/CSV block below is
+   gated on [SP.enabled] entirely. Warn once, here rather than per engine. *)
+let warn_if_csv_path_set_without_profiler () =
+  if (not SP.enabled) && BR.env_str "GRANARY_TPCC_STMT_PROFILE_CSV" "" <> ""
+  then
+    Printf.eprintf
+      "WARNING: GRANARY_TPCC_STMT_PROFILE_CSV is set but GRANARY_TPCC_STMT_PROFILE is \
+       not — the statement profiler is disabled, so no CSV will be written\n\
+       %!"
+;;
+
 let () =
+  warn_if_csv_path_set_without_profiler ();
   let config = D.config_from_env () in
   let seed = config.D.seed in
   let host = BR.host_label () in

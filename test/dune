@@ -858,6 +858,24 @@
  (modules test_tpch_check)
  (libraries granary_tpc alcotest))
 
+; #714: [test_disabled_by_default] and [test_run_is_inert_when_disabled] assert
+; [Tpcc_stmt_profile.enabled = false], which is read once from the ambient
+; environment at module init — so a developer with GRANARY_TPCC_STMT_PROFILE
+; exported (exactly the state someone iterating on this profiler is in) would
+; otherwise see this test go red for a reason that has nothing to do with a
+; real regression. Clear the variable for this test's own environment so both
+; cases keep running, and keep their meaning, for everyone.
+
+(test
+ (name test_tpcc_stmt_profile)
+ (modules test_tpcc_stmt_profile)
+ (libraries granary_tpc alcotest lwt lwt.unix)
+ (action
+  (setenv
+   GRANARY_TPCC_STMT_PROFILE
+   ""
+   (run %{test}))))
+
 (test
  (name test_tpch_smoke)
  (modules test_tpch_smoke)

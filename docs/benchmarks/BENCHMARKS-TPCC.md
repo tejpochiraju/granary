@@ -124,6 +124,8 @@ driver run; it is not the oracle going quiet.
 | `GRANARY_TPCC_RETRIES` | 3 | retries before a transaction counts as failed |
 | `GRANARY_TPCC_ENGINES` | `granary,sqlite` | which engines to run |
 | `GRANARY_TPCC_ORACLE_SELFTEST` | unset | prove the oracle can fail |
+| `GRANARY_TPCC_STMT_PROFILE` | unset | per-statement attribution (#714); read only at `TERMINALS=1` |
+| `GRANARY_TPCC_STMT_PROFILE_CSV` | unset | directory for the profile CSV; engine name is appended |
 | `GRANARY_TPC_SEED` | 42 | base seed |
 | `GRANARY_TPC_HOST` | hostname | CSV `host` column |
 | `GRANARY_TPCC_BATCH` | 500 | load batch size |
@@ -489,3 +491,260 @@ from 1 to 16 terminals rather than collapsing the way the old one-deep-pool
 sweep did. The analysis in the bullet list above (`wait_ms` → `service_ms`
 relabeling, the #555 single-writer ceiling, "wash-to-modest-win on
 throughput") stands unchanged; only its correctness caveat is retired.
+
+### Per-statement service-time attribution of a NewOrder (#714)
+
+`bench/results/2026-08-11-tpcc-stmt-profile-granary.csv`, produced by the
+statement profiler added in #714 (`GRANARY_TPCC_STMT_PROFILE=1`), run against
+this branch at W=1, 10 s measured, 2 s warm-up, `GRANARY_TPCC_ENGINES=granary`:
+
+```sh
+podman run --rm --user 0 -v "$(pwd):/workspace:z" -w /workspace \
+  -e GRANARY_TPCC_WAREHOUSES=1 -e GRANARY_TPCC_TERMINALS=1 \
+  -e GRANARY_TPCC_SECONDS=10 -e GRANARY_TPCC_WARMUP_SECONDS=2 \
+  -e GRANARY_TPCC_ENGINES=granary \
+  -e GRANARY_TPCC_STMT_PROFILE=1 -e GRANARY_TPCC_STMT_PROFILE_CSV=bench/results \
+  granary-dev dune exec test/bench_tpcc.exe
+```
+
+This command writes `bench/results/tpcc-stmt-profile-granary.csv` (the undated
+name `test/bench_tpcc.ml:268` writes); the committed artifact was renamed with
+the run's date afterward, so a reproducer should not read the undated filename
+as evidence the committed file is stale.
+
+The run reported **32.957 NewOrder/sec**, mean `new_order` service 16.964 ms —
+i.e. the same operating point as the post-#706 sweep's 1-terminal row above.
+
+#### What this measures, and what it does not
+
+The profiler brackets each statement's promise from call to resolution. What it
+therefore attributes is **service time** — elapsed wall clock per statement,
+summing to the driver's own per-transaction `service_ms`. That is the quantity
+the whole section is about, and every share below is a share of it.
+
+**The in-lock / out-of-lock split is not measured, and the profiler cannot see
+it.** Two places in the engine make that split real, and both cut across the
+largest rows in the table:
+
+- `Db.begin_txn` takes the store's single writer lock at `BEGIN`, so a `BEGIN`
+  that finds the lock held is *waiting*, not working.
+- `COMMIT` **releases the writer lock before it finishes**. `commit_wal` calls
+  `unlock_once ()` (`lib/store/store.ml:2166`) and only then enters
+  `group_commit_sync` → `Pager.wal_sync` (`:2167-2177`); the non-WAL arm
+  releases with `Rwlock.release_write` inside the `Lwt.finalize` at
+  `:2274-2283`. Default `sync_mode` is `` `Full ``
+  (`store.ml:734`) and `Tpcc_conn.open_db` passes no `durability`, so every
+  commit fsyncs *after* the lock is released. An unknown but likely majority of
+  the `COMMIT` row — the largest row in the table — is therefore held **outside**
+  the critical section, and `group_commit_sync` exists precisely so that
+  concurrent committers coalesce that fsync. It is the part that does *not*
+  serialise.
+
+So do not read this table as an attribution of lock-hold time. It is an
+attribution of the transaction's elapsed time. Establishing the split needs
+instrumentation inside `Store` that does not exist.
+
+#### `TERMINALS=1` is still the methodology, in its weaker form
+
+Read these figures only at one terminal. What one terminal buys is that there is
+no queueing behind a **sibling terminal**: the sweep above shows `wait_ms` of 0
+at every terminal count while `service_ms` grows, so at higher counts the
+per-statement numbers would silently absorb inter-terminal contention and the
+profiler could not tell that apart from work.
+
+It does **not** buy "no lock wait at all", and the `BEGIN` row below is the
+evidence that it does not: one terminal is not one writer.
+`maybe_autockpt_after_commit` dispatches the autocheckpoint through `Lwt.async`
+(`lib/store/store.ml:2078`) and that fiber takes `Rwlock.acquire_write`
+(`:2083`) with nobody awaiting it, so with the default 1000-frame threshold
+(`store.ml:294`, `test/tpc/tpcc_conn.ml:203`) a background checkpoint **can be**
+a genuine second writer.
+
+#### Coverage first — how much of the transaction this table accounts for
+
+Summed per-statement time against the driver's own `service_ms` for the same
+interval, verbatim from the run:
+
+```
+coverage — summed statement time vs driver service time
+  delivery        2093.8 ms of    2096.5 ms    99.9% attributed
+  new_order       5581.1 ms of    5598.1 ms    99.7% attributed
+  order_status     116.7 ms of     116.8 ms    99.9% attributed
+  payment         1664.5 ms of    1667.9 ms    99.8% attributed
+  stock_level      528.4 ms of     528.5 ms   100.0% attributed
+```
+
+**`new_order` is 99.7% attributed**, and every other profile is 99.8% or
+better. There is no meaningful unattributed remainder: driver bookkeeping,
+random-input generation and scheduling between statements together account for
+0.3% of a NewOrder. The table below is therefore the real attribution of a
+NewOrder's service time, not a partial view of it.
+
+#### `new_order`, ranked by total time in the measured interval
+
+330 NewOrder transactions — 326 `COMMIT` and 4 `ROLLBACK` statements, the
+spec-mandated ~1% invalid-item abort — 5581.1 ms of attributed statement time.
+(The driver's own `committed` count for `new_order` is 330: `rolled_back` is a
+subset of `committed`, not a separate outcome — see `Tpcc_driver.record_success`,
+which increments `a_committed` for every completed attempt and then
+`a_rolled_back` when that attempt was an intentional abort. The 4 rollbacks are
+4 of those 330, not 4 on top of 326.)
+
+| sql | calls | rows | total_ms | mean_ms | % |
+|---|---|---|---|---|---|
+| `COMMIT` | 326 | 0 | 1699.3 | 5.213 | 30.45 |
+| `ROLLBACK` | 4 | 0 | 1435.7 | 358.916 | 25.72 |
+| `BEGIN` | 330 | 0 | 1065.2 | 3.228 | 19.09 |
+| `UPDATE stock SET s_quantity = ?, s_ytd = …` | 3264 | 0 | 404.9 | 0.124 | 7.26 |
+| `INSERT INTO order_line (…) VALUES (?,…)` | 3264 | 0 | 246.0 | 0.075 | 4.41 |
+| `SELECT i_price, i_name, i_data FROM item WHERE i_id = ?` | 3268 | 3264 | 187.0 | 0.057 | 3.35 |
+| `INSERT INTO orders (…) VALUES (?,…)` | 330 | 0 | 78.0 | 0.236 | 1.40 |
+| `SELECT c_discount, c_last, c_credit FROM customer WHERE …` | 330 | 330 | 62.4 | 0.189 | 1.12 |
+| `INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES (?,?,?)` | 330 | 0 | 44.5 | 0.135 | 0.80 |
+| `SELECT s_quantity, s_dist_09, s_data FROM stock WHERE …` | 439 | 439 | 44.1 | 0.101 | 0.79 |
+| `SELECT s_quantity, s_dist_05, s_data FROM stock WHERE …` | 394 | 394 | 43.2 | 0.110 | 0.77 |
+| `SELECT s_quantity, s_dist_01, s_data FROM stock WHERE …` | 422 | 422 | 42.4 | 0.101 | 0.76 |
+| `SELECT s_quantity, s_dist_08, s_data FROM stock WHERE …` | 345 | 345 | 34.2 | 0.099 | 0.61 |
+| `SELECT s_quantity, s_dist_10, s_data FROM stock WHERE …` | 350 | 350 | 33.3 | 0.095 | 0.60 |
+| `SELECT s_quantity, s_dist_02, s_data FROM stock WHERE …` | 307 | 307 | 28.3 | 0.092 | 0.51 |
+| `SELECT s_quantity, s_dist_06, s_data FROM stock WHERE …` | 260 | 260 | 27.5 | 0.106 | 0.49 |
+| `SELECT s_quantity, s_dist_04, s_data FROM stock WHERE …` | 248 | 248 | 26.0 | 0.105 | 0.47 |
+| `SELECT s_quantity, s_dist_07, s_data FROM stock WHERE …` | 260 | 260 | 25.8 | 0.099 | 0.46 |
+| `SELECT s_quantity, s_dist_03, s_data FROM stock WHERE …` | 239 | 239 | 21.9 | 0.092 | 0.39 |
+| `UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE …` | 330 | 0 | 11.6 | 0.035 | 0.21 |
+| `SELECT d_tax, d_next_o_id FROM district WHERE …` | 330 | 330 | 10.8 | 0.033 | 0.19 |
+| `SELECT w_tax FROM warehouse WHERE w_id = ?` | 330 | 330 | 8.9 | 0.027 | 0.16 |
+
+The ten `s_dist_NN` rows are the same TPC-C stock read, spelled ten times
+because the district number selects the column name; together they are 326.7 ms
+(5.9%) over 3264 calls at 0.100 ms/call — which would rank it **fourth**, not
+tenth-through-nineteenth. That rollup was done by hand for this run and is now
+done by the tool: `Tpcc_stmt_profile.families` groups keys within a profile that
+differ only in an embedded number and `report` prints them under
+*generated-SQL families*, so a later run read without this paragraph cannot
+silently understate a generated shape by its fan-out factor. The rollup is
+reported only — `ranked` and the CSV keep the raw per-key rows, because
+collapsing digits is a heuristic (two statements differing only in a numeric
+*literal* are distinct shapes to the planner) and an interpretation should not
+overwrite the measurement.
+
+#### What the numbers say
+
+- **Transaction control is 75.3% of a NewOrder's service time.** `BEGIN` +
+  `COMMIT` + `ROLLBACK` sum to 4200.2 ms of 5581.1 ms. Every SQL statement a
+  NewOrder issues accounts for the remaining 1380.9 ms, **24.7%** — and there
+  are more of them than the profile's shape suggests: 15040 non-control calls
+  over 330 transactions is **45.6 statements per NewOrder**, six header
+  statements plus 39.6 in the item loop, i.e. **four** statements per item
+  (`item` lookup, `stock` read, `UPDATE stock`, `INSERT order_line`).
+- **Excluding the four rollbacks it is 49.53%** — `BEGIN` + `COMMIT` = 2764.5 ms
+  of 5581.1 ms. Stated per transaction it is a slightly different statistic:
+  3.228 + 5.213 = 8.44 ms against a 16.96 ms mean NewOrder, or 49.8%, because
+  `BEGIN` has 330 calls and `COMMIT` only 326. Either way, roughly half of a
+  NewOrder is spent in two statements that do no SQL.
+- **`BEGIN` at 3.228 ms/call is waiting, not working, and its variance across
+  profiles is the proof.** After the lock is acquired, `rw_begin` does only
+  in-memory bookkeeping — `set_txn_id`, an event emit, `set_alloc_min_safe`,
+  `txn_owned_pool_set`, a freelist snapshot (`lib/store/store.ml:1505-1541`) —
+  with no I/O and no await; and an uncontended `Rwlock.acquire_write` returns an
+  already-resolved promise (`lib/store/rwlock.ml:53-62`), so it costs nothing
+  when the lock is free.
+
+  There is a second fixed-cost candidate that the `rw_begin` argument does not
+  reach, and it needs its own measurement rather than an argument, because it
+  applies to `BEGIN`/`COMMIT`/`ROLLBACK` and to *nothing else in the harness*:
+  they are the only statements `Tpcc_conn` does not prepare. `is_control_stmt`
+  routes them to the one-shot `Db.execute` path (`test/tpc/tpcc_conn.ml:48-56`,
+  because `Sql.Exec.execute_with_count` refuses `Op_begin`/`Op_commit`/
+  `Op_rollback` outright), so each pays a full parse+plan on every call while
+  every other row in the table is a cached prepared statement. Measured
+  directly — 5000 `Db.execute "BEGIN"`/`Db.execute "COMMIT"` pairs on an idle
+  in-memory handle, after a 200-pair warm-up, three runs — the pair costs
+  **0.0009-0.0016 ms**, i.e. under **0.001 ms per control statement**. That is
+  ~0.02% of `BEGIN`'s 3.228 ms and ~0.01% of `COMMIT`'s 5.213 ms. The
+  unprepared path is real but it is three orders of magnitude too small to
+  matter, so it is ruled out as well, and the per-profile minima (`BEGIN`
+  0.861 ms in `stock_level`, `COMMIT` 1.231 ms in `order_status`) are *not* a
+  front-end floor — whatever sets them, it is not SQL parsing.
+
+  The CSV then rules out a fixed cost of any origin directly: `BEGIN`'s mean
+  varies **3.7x** across profiles for identical work — 0.861 ms in
+  `stock_level`, 2.006 in `order_status`, 2.273 in `delivery`, 2.420 in
+  `payment`, 3.228 in `new_order` — and is largest after the heaviest writer.
+  Something is holding the lock, or the scheduler is draining, at the awaits the
+  profiler brackets. The **candidate** mechanism is the background
+  autocheckpoint described above (a real second writer at one terminal); this
+  run does not measure which, and no cause is attributed here.
+- **`ROLLBACK` costs 358.9 ms per call, ~70x a `COMMIT`.** Four calls — 1.2% of
+  transactions — take 25.7% of all NewOrder time, and they are visibly the
+  `new_order` p99 of 345.5 ms and max of 381.5 ms in the run's own summary
+  table. The per-call cost is two orders of magnitude off the write work being
+  discarded, which is a handful of rows. A **candidate** mechanism, not
+  measured by this run: `Cat.recompute_rowid_counters_after_rollback`
+  (`lib/catalog/catalog.ml:2425`) runs a read-only tree scan
+  (`recover_next_rowid`'s `cursor_open`/`cursor_next` walk) per bumped table,
+  and a NewOrder bumps three — `orders`, `new_order`, `order_line`. No cause
+  is attributed here.
+- **No single SQL statement is a hotspot.** The largest, the ten-item
+  `UPDATE stock`, is 7.26% and runs at 0.124 ms/call; the largest read, the
+  `item` lookup, is 3.35% at 0.057 ms/call. The per-call figures are uniform
+  across reads and writes and across tables (0.027-0.236 ms), which is what a
+  workload with no bad plan and no missing index looks like.
+
+#### What it rules out
+
+- **It rules out the per-statement execution path as the throughput bound.**
+  The measured interval is 10.013 s and the five profiles' service time sums to
+  10.008 s of it, so the terminal is never idle and wall clock is service time.
+  One terminal runs all five profiles serially, so "making the entire
+  statement-execution path infinitely fast" means removing every profile's
+  non-control statement time, not just NewOrder's — 1380.9 ms (new_order) +
+  635.1 ms (delivery) + 455.5 ms (stock_level) + 208.5 ms (payment) + 19.6 ms
+  (order_status) = 2699.5 ms of the 10.008 s. That leaves 7.309 s for the same
+  330 NewOrders — **45.2 NewOrder/sec, a 37% gain**, and that is the *ceiling*
+  of what the entire statement-execution path is worth. Removing only
+  NewOrder's own 1380.9 ms, with the rest of the mix unchanged, is a narrower
+  question — "what if just NewOrder's statements were free" — and gives 8.627 s
+  for the same 330 NewOrders, **38.3 NewOrder/sec, a 16% gain**. By contrast
+  `BEGIN` + `COMMIT` + `ROLLBACK` across all five profiles is 7285.0 ms,
+  **72.8% of the whole measured interval**. This is the strongest claim in the
+  section and neither caveat above touches it: it is arithmetic over service
+  time, which is exactly what the profiler measures, and it holds whatever the
+  in-lock split turns out to be. The time is in `BEGIN` and `COMMIT`, not in
+  what runs between them.
+
+  What does *not* follow is that all of it is *serialisation*. A likely
+  majority of the `COMMIT` row is the post-unlock fsync, which
+  `group_commit_sync` coalesces across concurrent committers — so the share of
+  that 72.8% which actually excludes other writers is unmeasured, and smaller.
+- **It rules out the ten-item loop as the thing to batch.** Its 3264-call
+  statements are individually the cheapest per call in the profile; the loop is
+  large in *count*, not in *time*.
+- **It rules out plan or index quality as an explanation *for NewOrder*, and
+  explicitly not for the run.** Within `new_order` no statement's mean deviates
+  from its neighbours in a way a bad plan would produce, and the `stock`
+  reads — the ones that touch the largest table — are among the cheapest. That
+  scope is deliberate: `stock_level`'s
+  `SELECT COUNT(DISTINCT s_i_id) FROM order_line INNER JOIN stock …` runs at
+  **13.354 ms/call**, 50-130x every other statement in the CSV, and is 454.0 ms
+  — 85.9% of `stock_level` and ~17% of the 2699.5 ms of non-control statement
+  time the ceiling above is computed from. That is exactly the signature a plan
+  or index problem produces, and it is the one statement in the run this table
+  does **not** rule out. Anything designed against the ceiling should treat it
+  as a separate, already-identified target rather than as covered by the
+  NewOrder finding.
+- **It does not rule out anything about multi-terminal behaviour.** These
+  figures are service time at one terminal; how that time interacts with a
+  queue of writers is the sweep above, not this table.
+- **It rules nothing in or out about *where the lock is held*.** That split is
+  unmeasured (see the caveat at the top), and both of the two largest rows —
+  `COMMIT`'s post-unlock fsync and `BEGIN`'s apparent waiting — sit on the wrong
+  side of it for any conclusion about lock-hold time to be drawn here.
+
+The other four profiles show the same shape and are in the CSV: `payment` is
+87.5% `BEGIN`+`COMMIT`, `delivery` 69.7%, `order_status` 83.2%. `stock_level` is
+the one exception — 85.9% of it is its single `COUNT(DISTINCT s_i_id)` join, at
+13.354 ms/call — and it is a read-only profile issued at 4% of the mix.
+
+Full data, including all five profiles and the coverage rows:
+`bench/results/2026-08-11-tpcc-stmt-profile-granary.csv`.

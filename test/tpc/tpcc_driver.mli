@@ -109,6 +109,14 @@ type profile_stats =
   ; mean_ms : float (** mean end-to-end latency *)
   ; wait_ms : float (** mean time queued for a free worker *)
   ; service_ms : float (** mean time executing inside a worker *)
+  ; service_total_ms : float
+    (** sum of every committed transaction's time executing inside a worker,
+        in milliseconds. Equal to [service_ms *. float_of_int committed] but
+        computed directly from the accumulator rather than reconstructed from
+        the mean, so a caller comparing it against
+        {!Tpcc_stmt_profile.summaries}'s per-profile statement total does not
+        depend on {!field-service_ms}'s averaging denominator matching
+        {!field-committed} exactly. *)
   }
 
 (** The result of one measurement interval. *)

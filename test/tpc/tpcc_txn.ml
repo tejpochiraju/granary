@@ -1090,9 +1090,75 @@ let run_stock_level ops ~w_id ~d_id ~threshold =
   with_rollback ops (fun () -> stock_level_body ops ~w_id ~d_id ~threshold)
 ;;
 
+(* --- #714 statement profiling ---------------------------------------- *)
+
+let kind_of_input = function
+  | New_order_input _ -> New_order
+  | Payment_input _ -> Payment
+  | Order_status_input _ -> Order_status
+  | Delivery_input _ -> Delivery
+  | Stock_level_input _ -> Stock_level
+;;
+
+(* Looked up from [all] rather than spelled out a second time.  The profiler's
+   coverage summary joins on this name against [Tpcc_driver.profile_stats.name],
+   which is also taken from [all], so a hand-written table here could drift and
+   silently produce a profile whose statements attribute to nothing. *)
+let profile_name input =
+  let k = kind_of_input input in
+  match List.find_opt (fun p -> p.kind = k) all with
+  | Some p -> p.name
+  | None -> invalid_arg "Tpcc_txn.profile_name: input's kind is not in [all]"
+;;
+
+(* Timing brackets the promise's RESOLUTION, not the call that creates it, or
+   every statement would read as free.
+
+   Both outcomes are recorded.  Recording only success would silently drop the
+   statement that ends NewOrder's spec-mandated ~1% invalid-item rollback —
+   the one statement on that path whose cost the table exists to show. *)
+let timed_query ~profile f s =
+  let t0 = Unix.gettimeofday () in
+  let stop rows =
+    Tpcc_stmt_profile.record ~profile ~sql:s.sql ~rows ~secs:(Unix.gettimeofday () -. t0)
+  in
+  Lwt.try_bind
+    (fun () -> f s)
+    (fun rows ->
+       stop (List.length rows);
+       Lwt.return rows)
+    (fun exn ->
+       stop 0;
+       Lwt.reraise exn)
+;;
+
+let timed_exec ~profile f s =
+  let t0 = Unix.gettimeofday () in
+  let stop () =
+    Tpcc_stmt_profile.record ~profile ~sql:s.sql ~rows:0 ~secs:(Unix.gettimeofday () -. t0)
+  in
+  Lwt.try_bind
+    (fun () -> f s)
+    (fun () ->
+       stop ();
+       Lwt.return_unit)
+    (fun exn ->
+       stop ();
+       Lwt.reraise exn)
+;;
+
+let instrument ~profile ops =
+  { query = timed_query ~profile ops.query; exec = timed_exec ~profile ops.exec }
+;;
+
 (* --- entry point ------------------------------------------------------ *)
 
 let run ops input =
+  let ops =
+    if Tpcc_stmt_profile.enabled
+    then instrument ~profile:(profile_name input) ops
+    else ops
+  in
   match input with
   | New_order_input { w_id; d_id; c_id; lines; rollback = _ } ->
     (* [rollback] needs no branch here: gen_input has already replaced the
