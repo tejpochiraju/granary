@@ -1348,10 +1348,40 @@ let max_key t : (bytes option, error) result Lwt.t =
                    then Ok last
                    else if Page.leaf_span_at buf ~offset:off span
                    then
-                     scan
-                       span.Page.sp_next_offset
-                       (i + 1)
-                       (Some (span.Page.sp_key_off, span.Page.sp_key_len))
+                     (* #716 finding 1: [leaf_span_at] SUCCEEDS on trailing
+                        zero bytes past the last real entry -- it reads them
+                        as a spurious empty entry ([key_len = 0][val_len = 0])
+                        rather than running off the page, so the finding-3
+                        guard above (which only fires when the walk runs off
+                        the END of the page) has a hole: a leaf whose
+                        [n_keys] is inflated by exactly the right amount to
+                        land the walk on zero padding sails through as
+                        [Ok (Some "")] -- a zero-length key, silently smaller
+                        than the tree's true maximum, exactly the "answer too
+                        low" failure this function exists to avoid.
+
+                        [val_len = 0] can never happen for a genuine entry:
+                        every stored value is wrapped by [wrap_inline_value]
+                        (>= 1 byte: the inline tag) or [encode_overflow_marker]
+                        (17 bytes), so a real entry's [sp_val_len] is always
+                        >= 1. Checking [sp_key_len = 0] too costs nothing and
+                        makes the signature exactly "an all-zero span", never
+                        a coincidence with some future value encoding that
+                        might legitimately store a 0-length payload. *)
+                     if span.Page.sp_key_len = 0 && span.Page.sp_val_len = 0
+                     then
+                       Error
+                         (Tree_corrupt
+                            (Printf.sprintf
+                               "max_key: leaf entry %d of %d is zero padding, not a real \
+                                entry (n_keys overstates the leaf)"
+                               i
+                               n))
+                     else
+                       scan
+                         span.Page.sp_next_offset
+                         (i + 1)
+                         (Some (span.Page.sp_key_off, span.Page.sp_key_len))
                    else
                      (* #716 finding 3: [n_keys] promised [n] entries but the
                         page ran out of entry bytes first. Answering with
@@ -1376,18 +1406,19 @@ let max_key t : (bytes option, error) result Lwt.t =
              | Page.Branch ->
                let n = common.Page.n_keys in
                let right_page = common.Page.right_page in
-               (* #716 finding 2: derive child pointers with [branch_child_at]
-                  instead of decoding the whole page into a [branch_entry
-                  list] (which copies every separator key) and reversing it.
-                  [branch_child_at]'s convention is [idx >= n_keys] ->
-                  [right_page]; ascending child order is [idx = 0] ->
-                  [e0.left_child] through [idx = n - 1] -> [e_{n-1}.left_child]
-                  then [idx = n] -> [right_page]. Right-to-left is therefore
-                  [idx] running from [n] down to [0]. *)
+               (* #716 finding 2: [Page.branch_children_right_to_left] gives a
+                  LAZY right-to-left child sequence instead of eagerly
+                  materialising every child pointer. The naive
+                  [List.init (n + 1) (fun k -> branch_child_at ... ~idx:(n-k))]
+                  this replaced was O(n^2) per branch page — [branch_child_at]
+                  restarts its entry walk from the page start on every call —
+                  and eager on top of that, computing and discarding [n]
+                  pointers whenever [first_child_with_key] below only needed
+                  the first (the common case: the rightmost subtree holds a
+                  key). The lazy sequence costs O(1) for that common case and
+                  O(n), never O(n^2), when every child must be tried. *)
                let children =
-                 List.init (n + 1) (fun k ->
-                   page_id_of_int32
-                     (Page.branch_child_at buf ~n_keys:n ~right_page ~idx:(n - k)))
+                 Page.branch_children_right_to_left buf ~n_keys:n ~right_page
                in
                Lwt.return (Ok (`Children children))
              | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
@@ -1396,10 +1427,11 @@ let max_key t : (bytes option, error) result Lwt.t =
         | Error e -> return_error e
         | Ok (`Key k) -> return_ok k
         | Ok (`Children cs) -> first_child_with_key cs)
-    and first_child_with_key = function
-      | [] -> return_ok None
-      | pid :: rest ->
-        let* r = descend pid in
+    and first_child_with_key (cs : int32 Seq.t) =
+      match cs () with
+      | Seq.Nil -> return_ok None
+      | Seq.Cons (pid, rest) ->
+        let* r = descend (page_id_of_int32 pid) in
         (match r with
          | Error e -> return_error e
          | Ok (Some k) -> return_ok (Some k)

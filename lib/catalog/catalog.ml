@@ -2041,7 +2041,24 @@ let load_mirror_entries store =
    Return [next_rowid = max + 1], or [empty_next_rowid] for an empty or
    unreadable tree (#250: so a subsequent NULL insert seeds at 1 and an explicit
    below-counter id seeds from its own value, exactly as in-session).  WITHOUT
-   ROWID tables are skipped — they don't use rowid keys. *)
+   ROWID tables are skipped — they don't use rowid keys.
+
+   #716 finding 3: "unreadable" above must include a tree [S.max_key] cannot
+   even READ (a truncated/corrupt leaf, [Btree.Tree_corrupt], surfaced by
+   [S.max_key] as an [Lwt.fail_with]) — not just an empty one — or this
+   function stops delivering the contract its own doc comment promises.  This
+   is the ONLY [S.max_key] caller that catches: it is reached from [open_]'s
+   mirror-reconstruction loop, which is explicitly "best-effort" and exists
+   so a database THAT IS ALREADY DAMAGED can still be opened by recovery
+   tooling ([:2205]'s "warn (but stay openable)"). Letting the exception
+   propagate would make a corrupt tree refuse to open at all — defeating the
+   very path meant to recover it. [max_rowid_in_txn] below is the deliberate
+   asymmetry: its callers are live DML ([note_rowid_deleted],
+   [set_next_rowid_in_txn]), where silently substituting a wrong counter
+   because a page came back corrupt is exactly the #589 hazard [Tree_corrupt]
+   exists to catch, so it stays loud. Best-effort recovery degrades; live DML
+   fails loud. Do not "unify" the two by adding a catch there too, or by
+   removing this one. *)
 let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
   let without_rowid, autoincrement, next_rowid, tree_id =
     match m.storage with
@@ -2060,19 +2077,23 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
        caller (which passes live-cache, non-AUTOINCREMENT metas) never trips
        this branch. *)
     Lwt.return m
-  else
-    S.with_ro store
-    @@ fun tx ->
-    let%lwt mk = S.max_key tx tree_id in
-    let recovered =
-      match mk with
-      | None -> empty_next_rowid
-      | Some k -> Int64.add (Rowid.decode k) 1L
+  else (
+    let%lwt recovered =
+      Lwt.catch
+        (fun () ->
+           S.with_ro store
+           @@ fun tx ->
+           let%lwt mk = S.max_key tx tree_id in
+           Lwt.return
+             (match mk with
+              | None -> empty_next_rowid
+              | Some k -> Int64.add (Rowid.decode k) 1L))
+        (fun _exn -> Lwt.return empty_next_rowid)
     in
     Lwt.return
       { m with
         storage = Row { tree_id; next_rowid = recovered; without_rowid; autoincrement }
-      }
+      })
 ;;
 
 (* #299: read a table's LAST-COMMITTED [next_rowid] straight from its

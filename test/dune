@@ -1710,6 +1710,7 @@
   granary.store
   granary.storage
   granary.encoding
+  granary.catalog
   alcotest
   qcheck-core
   qcheck-alcotest

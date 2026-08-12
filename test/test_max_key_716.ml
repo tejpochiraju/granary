@@ -302,6 +302,50 @@ let test_truncated_leaf_is_tree_corrupt () =
   | Ok None -> Alcotest.fail "expected Tree_corrupt, got None (silent too-low fallback)"
 ;;
 
+(* #716 FINDING 1 (second review round): the guard above only fires when the
+   walk runs off the END of the page — [n_keys + 1000] overruns it. Inflating
+   by exactly [1] instead lands the walk on the zero-filled bytes just past
+   the last real entry, which [Page.leaf_span_at] reads as a SUCCESSFUL,
+   spurious [key_len = 0][val_len = 0] entry rather than failing — so before
+   this fix, [Btree.max_key] returned [Ok (Some "")], a zero-length key
+   silently smaller than the tree's true maximum, instead of [Tree_corrupt].
+   Same construction as [test_truncated_leaf_is_tree_corrupt] (only the
+   inflation amount differs), so a regression here is a regression in the
+   zero-padding discriminator specifically, not in the page-overrun guard
+   that test already covers. *)
+let test_truncated_leaf_by_one_is_tree_corrupt () =
+  let t, pager = empty_tree_with_pager () in
+  let t = ref t in
+  let value = Bytes.make 100 'x' in
+  let n = 60 in
+  let key i = b (Printf.sprintf "k%04d" i) in
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.put !t (key i) value))
+  done;
+  let leaf_pid = rightmost_leaf_pid pager (Btree.root_page !t) in
+  let buf =
+    match run (Pager.read pager leaf_pid) with
+    | Ok buf -> buf
+    | Error e -> Alcotest.failf "reading rightmost leaf: %a" Pager.pp_error e
+  in
+  let common = Page.read_common buf in
+  Alcotest.(check bool) "rightmost leaf actually has entries" true (common.n_keys > 0);
+  let corrupt = Cstruct.create Page.page_size in
+  Cstruct.blit buf 0 corrupt 0 Page.page_size;
+  Page.write_common corrupt { common with n_keys = common.n_keys + 1 };
+  Page.seal corrupt;
+  Pager.write pager leaf_pid corrupt;
+  match run (Btree.max_key !t) with
+  | Error (Btree.Tree_corrupt _) -> ()
+  | Error e -> Alcotest.failf "expected Tree_corrupt, got: %a" Btree.pp_error e
+  | Ok (Some k) ->
+    Alcotest.failf
+      "expected Tree_corrupt, got a too-low key instead: %S (zero-length key indicates \
+       the zero-padding discriminator did not fire)"
+      (Bytes.to_string k)
+  | Ok None -> Alcotest.fail "expected Tree_corrupt, got None (silent too-low fallback)"
+;;
+
 module S = Granary_store.Store
 
 let lwt f = Lwt_main.run (f ())
@@ -680,6 +724,156 @@ let test_rollback_recompute_after_tail_delete () =
     Lwt_main.run (Db.close db))
 ;;
 
+module Cat = Granary_catalog.Catalog
+
+(* #716 FINDING 3 (second review round): [Cat.recover_next_rowid] is the
+   BEST-EFFORT mirror-reconstruction path — [catalog.ml]'s own comments call
+   it "Best-effort" and say to "warn (but stay openable so recovery tooling
+   can still run)" — reached only when a database is ALREADY damaged. Before
+   this fix it called [Store.max_key] directly and let its [Lwt.fail_with]
+   (raised on [Btree.Tree_corrupt], since #716's earlier commit) propagate,
+   which would make an already-damaged database refuse to open at all —
+   defeating the very recovery tooling this path exists for. It must instead
+   degrade to [Cat.empty_next_rowid], exactly as it already does for a
+   genuinely empty tree.
+
+   Built directly against [Cat.recover_next_rowid] (exposed in [catalog.mli]
+   for this test) rather than end-to-end through [Db]/[Cat.open_]'s
+   mirror-reconstruction loop: reaching a corrupt on-disk leaf through that
+   loop needs the primary [_sys_tables] row dropped AND the data tree's
+   rightmost leaf independently corrupted, and locating a given [tree_id]'s
+   pages on a real B+-tree-backed [Store.t] requires walking a meta-tree
+   indirection this test has no public seam into. [recover_next_rowid] itself
+   never touches the mirror or [_sys_tables] — it only takes a [table_meta]
+   and a [Store.t] — so writing rows directly to an arbitrary [tree_id] via
+   [S.put] and inflating that leaf's [n_keys] by 1 (the same corruption shape
+   as [test_truncated_leaf_by_one_is_tree_corrupt] above, this time through
+   the real [Store]/[Pager] stack instead of a bare [Btree.t]) reaches the
+   exact same [Btree.max_key] failure with a hand-built [table_meta]. *)
+let test_recover_next_rowid_falls_back_on_corrupt_tree () =
+  let mb = make_mock () in
+  let read_page, write_page, sync, resize = mock_callbacks mb in
+  let tid = 55 in
+  let key i = Granary_encoding.Rowid.encode i in
+  lwt (fun () ->
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:true
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "open_block: %a" S.pp_error e
+    in
+    let%lwt tx = S.rw_begin store in
+    let%lwt () = Lwt_list.iter_s (fun i -> S.put tx tid (key i) (b "v")) [ 1L; 2L; 3L ] in
+    let%lwt () = S.commit tx in
+    (* Locate the leaf page holding these rows by scanning the mock device
+       directly for a Leaf page whose entries include one of our known keys,
+       then inflate its [n_keys] by exactly 1. *)
+    let target_keys = List.map key [ 1L; 2L; 3L ] in
+    let holds_a_target_key buf ~n_keys =
+      let rec scan off i =
+        if i >= n_keys
+        then false
+        else (
+          match Page.leaf_entry_at buf ~offset:off with
+          | `End -> false
+          | `Entry (e : Page.leaf_entry) ->
+            if List.exists (Bytes.equal e.key) target_keys
+            then true
+            else scan e.next_offset (i + 1))
+      in
+      scan Page.data_offset 0
+    in
+    let leaf_pid =
+      Hashtbl.fold
+        (fun pid bytes acc ->
+           match acc with
+           | Some _ -> acc
+           | None ->
+             let buf = Cstruct.of_bytes bytes in
+             let common = Page.read_common buf in
+             (match common.Page.kind with
+              | Page.Leaf when holds_a_target_key buf ~n_keys:common.Page.n_keys ->
+                Some pid
+              | _ -> acc))
+        mb.store
+        None
+    in
+    let leaf_pid =
+      match leaf_pid with
+      | Some pid -> pid
+      | None -> Alcotest.fail "could not locate the leaf holding the test rows"
+    in
+    let buf = Cstruct.of_bytes (Hashtbl.find mb.store leaf_pid) in
+    let common = Page.read_common buf in
+    let corrupt = Cstruct.create Page.page_size in
+    Cstruct.blit buf 0 corrupt 0 Page.page_size;
+    Page.write_common corrupt { common with n_keys = common.n_keys + 1 };
+    Page.seal corrupt;
+    let corrupt_bytes = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes corrupt 0 corrupt_bytes 0 Page.page_size;
+    Hashtbl.replace mb.store leaf_pid corrupt_bytes;
+    let%lwt () = S.close store in
+    (* Reopen over the SAME mock device (the [Hashtbl] persists, per
+       [test_store_crypto.ml]'s round-trip pattern) so the corrupted bytes are
+       genuinely read back off "disk" rather than served from the closed
+       store's in-memory page cache. *)
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:false
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "reopen_block: %a" S.pp_error e
+    in
+    (* Sanity check first: [S.max_key] itself must now raise, confirming the
+       corruption actually reaches [Btree.max_key]'s guard rather than this
+       test vacuously passing because nothing was corrupted. *)
+    let%lwt raised =
+      Lwt.catch
+        (fun () ->
+           let%lwt (_ : bytes option) = S.with_ro store (fun tx -> S.max_key tx tid) in
+           Lwt.return false)
+        (fun _exn -> Lwt.return true)
+    in
+    Alcotest.(check bool) "S.max_key raises on the corrupted leaf" true raised;
+    let meta : Cat.table_meta =
+      { name = "corrupt_test"
+      ; storage =
+          Cat.Row
+            { tree_id = tid
+            ; next_rowid = Cat.empty_next_rowid
+            ; without_rowid = false
+            ; autoincrement = false
+            }
+      ; columns = []
+      ; fk_constraints = []
+      }
+    in
+    let%lwt recovered = Cat.recover_next_rowid store meta in
+    let _, nrid, _, _ = Cat.row_storage recovered in
+    Alcotest.(check int64)
+      "recover_next_rowid degrades to empty_next_rowid on a corrupt tree, not raise"
+      Cat.empty_next_rowid
+      nrid;
+    S.close store)
+;;
+
 let () =
   Alcotest.run
     "max_key_716"
@@ -702,6 +896,10 @@ let () =
             "truncated leaf is Tree_corrupt, not a too-low key"
             `Quick
             test_truncated_leaf_is_tree_corrupt
+        ; Alcotest.test_case
+            "truncated leaf by exactly 1 (zero padding) is Tree_corrupt"
+            `Quick
+            test_truncated_leaf_by_one_is_tree_corrupt
         ] )
     ; ( "store"
       , [ Alcotest.test_case "mem rw shadow" `Quick test_store_mem_rw
@@ -732,6 +930,10 @@ let () =
             "rollback recompute after a committed tail delete"
             `Quick
             test_rollback_recompute_after_tail_delete
+        ; Alcotest.test_case
+            "recover_next_rowid falls back to empty_next_rowid on a corrupt tree"
+            `Quick
+            test_recover_next_rowid_falls_back_on_corrupt_tree
         ] )
     ]
 ;;

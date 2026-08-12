@@ -262,6 +262,18 @@ val branch_leftmost_child : Cstruct.t -> n_keys:int -> right_page:int32 -> int32
     {!branch_pick_with_info}'s convention. Allocates nothing (#709). *)
 val branch_child_at : Cstruct.t -> n_keys:int -> right_page:int32 -> idx:int -> int32
 
+(** Right-to-left child sequence for a branch page: [right_page] first (O(1),
+    no entry decode), then [idx = n_keys - 1] downto [0] — computed via a
+    single left-to-right entry pass on first demand past [right_page], not
+    one [branch_child_at] call per child (#716; that pattern is O(n^2)).
+    Used by {!Btree.max_key}'s right-to-left descent, whose common case
+    consumes only the first element. *)
+val branch_children_right_to_left
+  :  Cstruct.t
+  -> n_keys:int
+  -> right_page:int32
+  -> int32 Seq.t
+
 (** Build a new branch page identical to [buf] except the child pointer at
     [child_ptr_offset] is replaced with [new_child] ([child_ptr_offset < 0]
     updates [right_page] instead).  Returns a fresh, freshly-sealed Cstruct. *)

@@ -92,6 +92,21 @@ val tid_of_storage : storage -> Granary_store.Store.tree_id
     [sqlite_sequence] until its first insert).  See #250/#312. *)
 val empty_next_rowid : int64
 
+(** #175: recompute [next_rowid = max(rowid) + 1] over a table's data tree
+    (via {!Granary_store.Store.max_key}, #716's O(log n) rightmost descent),
+    for a [table_meta] reconstructed from the mirror. Returns [m] unchanged
+    for a WITHOUT ROWID table or a live AUTOINCREMENT high-water. Otherwise
+    returns [empty_next_rowid] for an empty tree AND (#716 finding 3) for one
+    [Store.max_key] cannot even read — a truncated/corrupt leaf — because this
+    is [open_]'s best-effort mirror-reconstruction path, which by construction
+    only runs on an already-damaged database and must stay openable for
+    recovery tooling rather than propagate the read failure. Exposed
+    (otherwise private to [catalog.ml]) so
+    [test/test_max_key_716.ml] can pin that fallback directly against a
+    genuinely corrupted on-disk leaf, without needing a public seam into
+    [open_]'s internal mirror-reconstruction loop. *)
+val recover_next_rowid : Granary_store.Store.t -> table_meta -> table_meta Lwt.t
+
 (** #243 (T1): index of the INTEGER PRIMARY KEY column that aliases the rowid,
     if the table qualifies (rowid table, single INTEGER PRIMARY KEY column).
     For such tables the table tree is keyed by this column's value and no
