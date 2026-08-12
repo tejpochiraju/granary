@@ -2044,8 +2044,7 @@ let load_mirror_entries store =
    ROWID tables are skipped — they don't use rowid keys.
 
    #716 finding 3: "unreadable" above must include a tree [S.max_key] cannot
-   even READ (a truncated/corrupt leaf, [Btree.Tree_corrupt], surfaced by
-   [S.max_key] as an [Lwt.fail_with], i.e. an OCaml [Failure]) — not just an
+   even READ (a truncated/corrupt leaf, [Btree.Tree_corrupt]) — not just an
    empty one — but ONLY for [open_]'s best-effort mirror-reconstruction
    caller ([:~2211], "warn (but stay openable)"), which by construction only
    ever runs on an already-damaged database and must stay openable for
@@ -2069,14 +2068,30 @@ let load_mirror_entries store =
    an unconditional catch, and do not widen the default to [true] — a future
    THIRD caller must inherit the loud behaviour, not the degraded one.
 
-   The catch itself is scoped to [Failure _] — the exact shape [S.max_key]
-   raises on a [Btree.error] — rather than every exception, so
-   [Lwt.Canceled] and anything else propagates even under
-   [~tolerate_unreadable:true]. [max_rowid_in_txn] below stays unconditional
-   and loud for the same live-DML reason: its callers ([note_rowid_deleted],
-   [set_next_rowid_in_txn]) must never substitute a wrong counter for a
-   corrupt read. Best-effort recovery degrades only when explicitly asked;
-   live DML always fails loud. *)
+   #716 round-4 review finding 1: the catch used to be scoped to [Failure _],
+   the shape [S.max_key] used to raise unconditionally regardless of WHY it
+   failed — which was simultaneously too broad (a transient I/O error on an
+   otherwise healthy tree, [S.Block_error], is not corruption, and degrading
+   it to [empty_next_rowid] would reset a live table's counter and let a
+   subsequent NULL insert overwrite rowid 1) and too narrow (a damaged key
+   can surface through [Rowid.decode] below as [Invalid_argument] — e.g. a
+   key shorter than the 8 bytes it unconditionally indexes — which is not a
+   [Failure] and used to escape the catch entirely, defeating
+   [~tolerate_unreadable:true] for exactly the corrupt-tree case it exists
+   to handle). [S.max_key] now raises the typed [S.Max_key_error of S.error]
+   (store.ml's existing idiom — see [S.History_error]), so the catch below
+   can discriminate on the error's CLASS: [S.Corruption] (from
+   [Btree.Tree_corrupt] or a [Pager.Corruption]) is tolerated, along with
+   [Invalid_argument] from the [Rowid.decode] call a few lines down inside
+   [compute] (also corruption, just detected one level up rather than inside
+   the btree) — everything else, notably [S.Max_key_error (S.Block_error _)]
+   and any exception neither of those, propagates unconditionally, including
+   under [~tolerate_unreadable:true]. [max_rowid_in_txn] below stays
+   unconditional and loud for the same live-DML reason: its callers
+   ([note_rowid_deleted], [set_next_rowid_in_txn]) must never substitute a
+   wrong counter for a corrupt read. Best-effort recovery degrades only when
+   explicitly asked, and only for damage — not for an I/O error, and never
+   silently; live DML always fails loud. *)
 let recover_next_rowid ?(tolerate_unreadable = false) store (m : table_meta)
   : table_meta Lwt.t
   =
@@ -2111,7 +2126,8 @@ let recover_next_rowid ?(tolerate_unreadable = false) store (m : table_meta)
       if tolerate_unreadable
       then
         Lwt.catch compute (function
-          | Failure _ -> Lwt.return empty_next_rowid
+          | S.Max_key_error (S.Corruption _) -> Lwt.return empty_next_rowid
+          | Invalid_argument _ -> Lwt.return empty_next_rowid
           | exn -> Lwt.fail exn)
       else compute ()
     in

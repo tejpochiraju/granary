@@ -1342,32 +1342,69 @@ let max_key t : (bytes option, error) result Lwt.t =
        Latent, not firing, today: the writer lock serializes writers and
        nothing on the [max_key] read path mutates a page, but the retention
        must be sound independent of that, per [read_borrow]'s own contract. *)
+    (* #716 round-4 review finding 2: one visited-set of page ids for the
+       WHOLE call, covering both hazards a corrupt branch can create:
+       - a cycle ([right_page]/[left_child] pointing at itself or an
+         ancestor) would otherwise grow the OCaml stack without bound —
+         [Pager.read_shared] resolves synchronously on a cache hit, so Lwt
+         runs the [descend] continuation inline rather than yielding, and
+         the failure mode is [Stack_overflow], not a clean error;
+       - fan-out amplification: a truncated branch's un-filled slots all
+         default to [right_page] (mirroring [branch_child_at]'s own
+         truncation fallback), so a corrupt [n_keys] of 65535 re-descends
+         the SAME rightmost subtree up to 65535 times when that subtree
+         yields no key (the common recovery-path case, an all-empty
+         subtree) — no cycle exists, so a depth bound alone would not
+         catch this; the same handful of pages can be revisited an
+         unbounded number of times without depth ever growing.
+       A pid already in [visited] covers both: it either closes a cycle, or
+       is a redundant re-descend of a subtree that already answered "no
+       key" — in a healthy B+-tree neither can happen (sibling pointers are
+       distinct pages), so either way it is reported as [Tree_corrupt],
+       consistent with the two guards already in this function, rather than
+       silently truncated or left to overflow the stack.
+       Cost on the healthy path: this function's own doc already promises
+       "normally one page per level" for a root-to-leaf descent; the added
+       cost is one [Hashtbl.add]/[Hashtbl.mem] per page visited, which is
+       the case regardless — the guard does not change what gets read, only
+       adds an O(1) bookkeeping step per page already being read. *)
+    let visited : (int64, unit) Hashtbl.t = Hashtbl.create 16 in
     let rec descend pid =
-      let* r =
-        Pager.read_shared
-          ?snapshot_frames:t.snapshot_frames
-          ?pin_set:t.pin_set
-          t.pager
-          pid
-      in
-      bind_pager r (fun buf ->
-        let common = Page.read_common buf in
-        match common.Page.kind with
-        | Page.Leaf ->
-          let n = common.Page.n_keys in
-          if n = 0
-          then return_ok None
-          else (
-            (* #716 finding 1: walk with ONE reused span (allocates
+      if Hashtbl.mem visited pid
+      then
+        return_error
+          (Tree_corrupt
+             (Printf.sprintf
+                "max_key: page %Ld visited twice during descent (cycle, or a truncated \
+                 branch's n_keys re-descending the same subtree)"
+                pid))
+      else (
+        Hashtbl.add visited pid ();
+        let* r =
+          Pager.read_shared
+            ?snapshot_frames:t.snapshot_frames
+            ?pin_set:t.pin_set
+            t.pager
+            pid
+        in
+        bind_pager r (fun buf ->
+          let common = Page.read_common buf in
+          match common.Page.kind with
+          | Page.Leaf ->
+            let n = common.Page.n_keys in
+            if n = 0
+            then return_ok None
+            else (
+              (* #716 finding 1: walk with ONE reused span (allocates
                     nothing per entry, unlike [leaf_entry_at]) and copy only
                     the final key, once, at the very end. *)
-            let span = Page.leaf_span_create () in
-            let rec scan off i last =
-              if i >= n
-              then Ok last
-              else if Page.leaf_span_at buf ~offset:off span
-              then
-                (* #716 finding 1: [leaf_span_at] SUCCEEDS on trailing
+              let span = Page.leaf_span_create () in
+              let rec scan off i last =
+                if i >= n
+                then Ok last
+                else if Page.leaf_span_at buf ~offset:off span
+                then
+                  (* #716 finding 1: [leaf_span_at] SUCCEEDS on trailing
                         zero bytes past the last real entry -- it reads them
                         as a spurious empty entry ([key_len = 0][val_len = 0])
                         rather than running off the page, so the finding-3
@@ -1387,22 +1424,22 @@ let max_key t : (bytes option, error) result Lwt.t =
                         makes the signature exactly "an all-zero span", never
                         a coincidence with some future value encoding that
                         might legitimately store a 0-length payload. *)
-                if span.Page.sp_key_len = 0 && span.Page.sp_val_len = 0
-                then
-                  Error
-                    (Tree_corrupt
-                       (Printf.sprintf
-                          "max_key: leaf entry %d of %d is zero padding, not a real \
-                           entry (n_keys overstates the leaf)"
-                          i
-                          n))
+                  if span.Page.sp_key_len = 0 && span.Page.sp_val_len = 0
+                  then
+                    Error
+                      (Tree_corrupt
+                         (Printf.sprintf
+                            "max_key: leaf entry %d of %d is zero padding, not a real \
+                             entry (n_keys overstates the leaf)"
+                            i
+                            n))
+                  else
+                    scan
+                      span.Page.sp_next_offset
+                      (i + 1)
+                      (Some (span.Page.sp_key_off, span.Page.sp_key_len))
                 else
-                  scan
-                    span.Page.sp_next_offset
-                    (i + 1)
-                    (Some (span.Page.sp_key_off, span.Page.sp_key_len))
-              else
-                (* #716 finding 3: [n_keys] promised [n] entries but the
+                  (* #716 finding 3: [n_keys] promised [n] entries but the
                         page ran out of entry bytes first. Answering with
                         [last] (or [None]) here would silently return a key
                         SMALLER than the tree's true maximum -- exactly the
@@ -1410,21 +1447,21 @@ let max_key t : (bytes option, error) result Lwt.t =
                         avoid (it feeds [next_rowid]; a too-low answer
                         reissues a live rowid, #589's symptom). Fail loud
                         instead of guessing. *)
-                Error
-                  (Tree_corrupt
-                     (Printf.sprintf
-                        "max_key: leaf entries end before n_keys (saw %d of %d)"
-                        i
-                        n))
-            in
-            match scan Page.data_offset 0 None with
-            | Error e -> return_error e
-            | Ok None -> return_ok None
-            | Ok (Some (off, len)) -> return_ok (Some (Page.copy_span buf ~off ~len)))
-        | Page.Branch ->
-          let n = common.Page.n_keys in
-          let right_page = common.Page.right_page in
-          (* #716 finding 2: [Page.branch_children_right_to_left] gives a
+                  Error
+                    (Tree_corrupt
+                       (Printf.sprintf
+                          "max_key: leaf entries end before n_keys (saw %d of %d)"
+                          i
+                          n))
+              in
+              match scan Page.data_offset 0 None with
+              | Error e -> return_error e
+              | Ok None -> return_ok None
+              | Ok (Some (off, len)) -> return_ok (Some (Page.copy_span buf ~off ~len)))
+          | Page.Branch ->
+            let n = common.Page.n_keys in
+            let right_page = common.Page.right_page in
+            (* #716 finding 2: [Page.branch_children_right_to_left] gives a
                   LAZY right-to-left child sequence instead of eagerly
                   materialising every child pointer. The naive
                   [List.init (n + 1) (fun k -> branch_child_at ... ~idx:(n-k))]
@@ -1439,9 +1476,9 @@ let max_key t : (bytes option, error) result Lwt.t =
                   [first_child_with_key] below) past the point where [buf]
                   was read, hence [read_shared] above, not [read_borrow] —
                   see the comment on [descend] itself. *)
-          let children = Page.branch_children_right_to_left buf ~n_keys:n ~right_page in
-          first_child_with_key children
-        | _ -> return_error (Tree_corrupt "non-tree page in tree"))
+            let children = Page.branch_children_right_to_left buf ~n_keys:n ~right_page in
+            first_child_with_key children
+          | _ -> return_error (Tree_corrupt "non-tree page in tree")))
     and first_child_with_key (cs : int32 Seq.t) =
       match cs () with
       | Seq.Nil -> return_ok None

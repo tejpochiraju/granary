@@ -3025,14 +3025,14 @@ let cursor_value c =
    an RW Mem read MUST come from the shadow or it misses this txn's own writes.
    [Bytes_map] is [Map.Make (Bytes)], so [max_binding_opt] is the map's own
    rightmost descent — the Mem arms are not scans either. *)
+exception Max_key_error of error
+
 let max_key : type a. a txn -> tree_id -> bytes option Lwt.t =
   fun tx tid ->
-  let of_btree label bt =
+  let of_btree _label bt =
     let* r = Btree.max_key bt in
     match r with
-    | Error e ->
-      Lwt.fail_with
-        (Format.asprintf "Store.max_key%s: %a" label pp_error (map_btree_err e))
+    | Error e -> Lwt.fail (Max_key_error (map_btree_err e))
     | Ok k -> Lwt.return k
   in
   match tx with

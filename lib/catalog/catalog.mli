@@ -97,20 +97,25 @@ val empty_next_rowid : int64
     Returns [m] unchanged for a WITHOUT ROWID table or a live AUTOINCREMENT
     high-water; otherwise [empty_next_rowid] for an empty tree.
 
-    Two callers, and they disagree deliberately on what a READ FAILURE (a
-    truncated/corrupt leaf, [Btree.Tree_corrupt], surfaced by [Store.max_key]
-    as a [Failure]) means (#716 round-3 review finding 1):
+    Two callers, and they disagree deliberately on what a READ FAILURE means
+    (#716 round-3 review finding 1):
     - [open_]'s best-effort mirror-reconstruction path passes
       [~tolerate_unreadable:true]: by construction it only ever runs on an
       already-damaged database and must stay openable for recovery tooling,
       so a read failure there degrades to [empty_next_rowid] rather than
-      refusing to open at all.
+      refusing to open at all — but ONLY when the failure is corruption
+      ([Store.Max_key_error (Store.Corruption _)], from [Btree.Tree_corrupt]
+      or a [Pager.Corruption]; or [Invalid_argument] from [Rowid.decode]
+      choking on a too-short key). A transient I/O error
+      ([Store.Max_key_error (Store.Block_error _)]) still propagates even
+      under [~tolerate_unreadable:true] — degrading it would reset a
+      perfectly healthy table's counter (#716 round-4 review finding 1).
     - [recompute_rowid_counters_after_rollback]'s caller (live DML: a
       [ROLLBACK] recomputing a counter it bumped earlier in the same
       transaction) takes the default [~tolerate_unreadable:false] and RAISES
-      on the same failure — substituting [empty_next_rowid] there would reset
-      a live counter and let the next INSERT reissue an on-disk rowid, the
-      #589 hazard [Tree_corrupt] exists to catch.
+      on every read failure — substituting [empty_next_rowid] there would
+      reset a live counter and let the next INSERT reissue an on-disk rowid,
+      the #589 hazard [Tree_corrupt] exists to catch.
 
     [~tolerate_unreadable] defaults to [false] so a future third caller
     inherits the loud behaviour, not the degraded one; only [open_]'s loop

@@ -340,8 +340,20 @@ val cursor_value : cursor -> bytes option
     {!cursor_open} on the same transaction.
 
     Use this instead of draining a cursor to find a maximum: {!cursor_open}
-    materialises every key and value in the tree before returning. *)
+    materialises every key and value in the tree before returning.
+
+    Raises {!Max_key_error} on a B+-tree backend error (never on the
+    in-memory backend, which cannot fail here). *)
 val max_key : _ txn -> tree_id -> bytes option Lwt.t
+
+(** Raised by {!max_key} to carry the underlying B+-tree {!error} typed,
+    rather than flattened into a string (#716 round-4 review finding 1).
+    [Corruption] is the class a caller may choose to tolerate — a damaged
+    page or a [Btree.Tree_corrupt] guard firing; every other constructor,
+    in particular [Block_error] (a transient I/O failure), should propagate:
+    tolerating corruption is not the same as tolerating a device that failed
+    to answer a healthy read. *)
+exception Max_key_error of error
 
 (** A lazy, streaming forward cursor positioned by {!seek_ge}.  Unlike
     {!cursor}, it does NOT materialise the whole tree: it descends the

@@ -346,6 +346,59 @@ let test_truncated_leaf_by_one_is_tree_corrupt () =
   | Ok None -> Alcotest.fail "expected Tree_corrupt, got None (silent too-low fallback)"
 ;;
 
+(* #716 round-4 review finding 2: a corrupt branch whose [right_page] points
+   at itself (the simplest cycle: an ancestor pointing at itself, rather than
+   at a more distant ancestor) must fail loud as [Tree_corrupt], never loop.
+   Before the visited-set guard, [descend] would recurse into the same page
+   forever; because [Pager.read_shared] resolves synchronously on a cache
+   hit, Lwt runs the continuation inline rather than yielding, so the actual
+   failure mode was an unbounded stack grow ending in [Stack_overflow], not a
+   hang a test timeout would catch cleanly. Uses the same depth-3
+   construction as [test_depth_three] (fat 200-byte keys force a branch of
+   branches) so the corrupted page is a genuine BRANCH, and self-references
+   THE ROOT specifically, since the root is always visited first regardless
+   of which level a real corruption would occur at. *)
+let test_self_referential_right_page_is_tree_corrupt () =
+  let t, pager = empty_tree_with_pager () in
+  let t = ref t in
+  let n = 300 in
+  let key i = b (Printf.sprintf "k%04d%s" i (String.make 195 'q')) in
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.put !t (key i) (b "v")))
+  done;
+  let depth = depth_of pager (Btree.root_page !t) in
+  Alcotest.(check bool)
+    (Printf.sprintf "tree reaches depth >= 2 (has a branch); measured depth = %d" depth)
+    true
+    (depth >= 2);
+  let root_pid = Btree.root_page !t in
+  let buf =
+    match run (Pager.read pager root_pid) with
+    | Ok buf -> buf
+    | Error e -> Alcotest.failf "reading root page: %a" Pager.pp_error e
+  in
+  let common = Page.read_common buf in
+  Alcotest.(check bool)
+    "root is actually a branch page"
+    true
+    (match common.Page.kind with
+     | Page.Branch -> true
+     | _ -> false);
+  let corrupt = Cstruct.create Page.page_size in
+  Cstruct.blit buf 0 corrupt 0 Page.page_size;
+  Page.write_common corrupt { common with right_page = Int64.to_int32 root_pid };
+  Page.seal corrupt;
+  Pager.write pager root_pid corrupt;
+  match run (Btree.max_key !t) with
+  | Error (Btree.Tree_corrupt _) -> ()
+  | Error e ->
+    Alcotest.failf "expected Tree_corrupt (self-cycle), got: %a" Btree.pp_error e
+  | Ok _ ->
+    Alcotest.fail
+      "expected Tree_corrupt for a self-referential right_page (cycle), got Ok — the \
+       descent either looped or (worse) terminated with a silent wrong answer"
+;;
+
 module S = Granary_store.Store
 
 let lwt f = Lwt_main.run (f ())
@@ -998,6 +1051,191 @@ let test_recover_next_rowid_raises_by_default_on_corrupt_tree () =
     S.close store)
 ;;
 
+(* #716 round-4 review finding 1 ("too narrow" half): a damaged tree can
+   surface through [Rowid.decode] as [Invalid_argument], not as a page-level
+   [S.Max_key_error (S.Corruption _)]. [Rowid.decode] unconditionally indexes
+   8 bytes ([rowid.ml:11-18]), so a key shorter than that raises
+   [Invalid_argument "index out of bounds"] straight out of
+   [Bytes.get_uint8] -- and this needs no corrupted PAGE at all: [S.max_key]
+   happily returns the short key (it is a perfectly well-formed leaf entry,
+   its byte CONTENT aside), and the failure is entirely in the catalog-level
+   decode a few lines after [S.max_key] returns. Confirms
+   [~tolerate_unreadable:true] degrades this shape too, not just
+   [Btree.Tree_corrupt]. *)
+let test_recover_next_rowid_tolerates_invalid_argument_from_short_key () =
+  let mb = make_mock () in
+  let read_page, write_page, sync, resize = mock_callbacks mb in
+  let tid = 57 in
+  lwt (fun () ->
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:true
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "open_block: %a" S.pp_error e
+    in
+    let%lwt tx = S.rw_begin store in
+    (* A 3-byte key: well short of the 8 bytes [Rowid.decode] indexes
+       unconditionally, and the tree's ONLY key, so [S.max_key] returns it
+       without any page-level corruption at all. *)
+    let%lwt () = S.put tx tid (b "abc") (b "v") in
+    let%lwt () = S.commit tx in
+    let meta : Cat.table_meta =
+      { name = "short_key_test"
+      ; storage =
+          Cat.Row
+            { tree_id = tid
+            ; next_rowid = Cat.empty_next_rowid
+            ; without_rowid = false
+            ; autoincrement = false
+            }
+      ; columns = []
+      ; fk_constraints = []
+      }
+    in
+    let%lwt recovered = Cat.recover_next_rowid ~tolerate_unreadable:true store meta in
+    let _, nrid, _, _ = Cat.row_storage recovered in
+    Alcotest.(check int64)
+      "recover_next_rowid degrades to empty_next_rowid when Rowid.decode raises \
+       Invalid_argument on a too-short key, under ~tolerate_unreadable:true"
+      Cat.empty_next_rowid
+      nrid;
+    S.close store)
+;;
+
+(* #716 round-4 review finding 1 ("too broad" half): a TRANSIENT I/O error on
+   an otherwise healthy tree must NOT degrade to [empty_next_rowid] the way
+   genuine corruption does -- doing so would reset a perfectly live table's
+   counter, and the next NULL insert would overwrite a row still on disk
+   (#250). Simulates a transient failure by making [read_page] fail for
+   exactly the leaf holding the table's rows -- every OTHER page (header,
+   meta tree, ...) reads fine, so this is not a corrupt tree, just one bad
+   read. *)
+let test_recover_next_rowid_propagates_io_error_even_when_tolerating () =
+  let mb = make_mock () in
+  let read_page, write_page, sync, resize = mock_callbacks mb in
+  let tid = 58 in
+  let key i = Granary_encoding.Rowid.encode i in
+  lwt (fun () ->
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:true
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "open_block: %a" S.pp_error e
+    in
+    let%lwt tx = S.rw_begin store in
+    let%lwt () = Lwt_list.iter_s (fun i -> S.put tx tid (key i) (b "v")) [ 1L; 2L; 3L ] in
+    let%lwt () = S.commit tx in
+    let target_keys = List.map key [ 1L; 2L; 3L ] in
+    let holds_a_target_key buf ~n_keys =
+      let rec scan off i =
+        if i >= n_keys
+        then false
+        else (
+          match Page.leaf_entry_at buf ~offset:off with
+          | `End -> false
+          | `Entry (e : Page.leaf_entry) ->
+            if List.exists (Bytes.equal e.key) target_keys
+            then true
+            else scan e.next_offset (i + 1))
+      in
+      scan Page.data_offset 0
+    in
+    let leaf_pid =
+      Hashtbl.fold
+        (fun pid bytes acc ->
+           match acc with
+           | Some _ -> acc
+           | None ->
+             let buf = Cstruct.of_bytes bytes in
+             let common = Page.read_common buf in
+             (match common.Page.kind with
+              | Page.Leaf when holds_a_target_key buf ~n_keys:common.Page.n_keys ->
+                Some pid
+              | _ -> acc))
+        mb.store
+        None
+    in
+    let leaf_pid =
+      match leaf_pid with
+      | Some pid -> pid
+      | None -> Alcotest.fail "could not locate the leaf holding the test rows"
+    in
+    let%lwt () = S.close store in
+    (* Reopen with a [read_page] that fails ONLY for the target leaf --
+       simulating a transient I/O error on an otherwise healthy tree, never
+       corruption. *)
+    let flaky_read_page ~page_id buf =
+      if Int64.equal page_id leaf_pid
+      then Lwt.return_error "simulated transient I/O failure"
+      else read_page ~page_id buf
+    in
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:false
+          ~read_page:flaky_read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "reopen_block: %a" S.pp_error e
+    in
+    let meta : Cat.table_meta =
+      { name = "io_error_test"
+      ; storage =
+          Cat.Row
+            { tree_id = tid
+            ; next_rowid = Cat.empty_next_rowid
+            ; without_rowid = false
+            ; autoincrement = false
+            }
+      ; columns = []
+      ; fk_constraints = []
+      }
+    in
+    let%lwt result =
+      Lwt.catch
+        (fun () ->
+           let%lwt (_ : Cat.table_meta) =
+             Cat.recover_next_rowid ~tolerate_unreadable:true store meta
+           in
+           Lwt.return `Degraded)
+        (function
+          | S.Max_key_error (S.Block_error _) -> Lwt.return `Propagated
+          | exn -> Lwt.fail exn)
+    in
+    (match result with
+     | `Propagated -> ()
+     | `Degraded ->
+       Alcotest.fail
+         "recover_next_rowid degraded a simulated transient I/O error to \
+          empty_next_rowid instead of propagating it, even under \
+          ~tolerate_unreadable:true");
+    S.close store)
+;;
+
 let () =
   Alcotest.run
     "max_key_716"
@@ -1024,6 +1262,11 @@ let () =
             "truncated leaf by exactly 1 (zero padding) is Tree_corrupt"
             `Quick
             test_truncated_leaf_by_one_is_tree_corrupt
+        ; Alcotest.test_case
+            "self-referential right_page (cycle) is Tree_corrupt, not a loop (round-4 \
+             finding 2)"
+            `Quick
+            test_self_referential_right_page_is_tree_corrupt
         ] )
     ; ( "store"
       , [ Alcotest.test_case "mem rw shadow" `Quick test_store_mem_rw
@@ -1062,6 +1305,16 @@ let () =
             "recover_next_rowid raises by default on a corrupt tree (round-3 finding 1)"
             `Quick
             test_recover_next_rowid_raises_by_default_on_corrupt_tree
+        ; Alcotest.test_case
+            "recover_next_rowid tolerates Invalid_argument from a too-short key (round-4 \
+             finding 1, too narrow)"
+            `Quick
+            test_recover_next_rowid_tolerates_invalid_argument_from_short_key
+        ; Alcotest.test_case
+            "recover_next_rowid propagates a transient I/O error even when tolerating \
+             (round-4 finding 1, too broad)"
+            `Quick
+            test_recover_next_rowid_propagates_io_error_even_when_tolerating
         ] )
     ]
 ;;
