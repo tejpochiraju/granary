@@ -2347,26 +2347,48 @@ let rollback_schema_changes t = Schema_cache.rollback t.sc
    We recompute ONLY the [rowid_bumped_in_txn] set — usually a single table —
    rather than every cached rowid table.  This is primarily a CORRECTNESS
    restriction, not a cost one: recomputing a table this transaction never
-   touched derives its counter from the (rolled-back) data instead of trusting
-   the cached high-water, and for an untouched table [cas_rowid_durable]'s
-   [expected] IS the live value, so the CAS always succeeds and the recomputed
-   value is published unconditionally.  If a committed, earlier transaction
-   deleted that table's high-water row in a way [note_rowid_deleted] did not
-   catch, the cached counter sits ABOVE [max(rowid) + 1]; including the table
-   here would LOWER it and the next INSERT would reissue a still-live rowid —
-   #589's symptom, reached by scanning a table nobody touched.  Secondarily it
-   is also right for cost, since the recomputed value must equal the cached
-   counter in the benign case anyway and computing it is pure waste.  Since
-   #716 [recover_next_rowid] is an O(log n) rightmost descent rather than a
-   full scan, the cost side of this argument is far weaker than it used to be
-   (a full-tree drain per table would have justified the restriction on cost
-   alone) — which is exactly why the correctness reason above has to be
-   stated explicitly rather than left to ride along with it.  A bumped name
-   that is no longer cached (e.g. its CREATE TABLE rolled back in the same
-   txn) or that is WITHOUT ROWID is skipped.  The set is CLEARED here so it
-   never leaks into a later transaction; commit clears it too (via
-   [commit_schema_changes]), which is why a COMMIT keeps the bumped counter
-   yet a subsequent unrelated ROLLBACK does not wrongly recompute it.
+   touched derives its counter from data (or, for AUTOINCREMENT, from the
+   persisted mark — see #299 below) instead of trusting the value already
+   published, and for an untouched table [cas_rowid_durable]'s [expected] IS
+   the live value, so the CAS always succeeds and the recomputed value
+   publishes unconditionally.  The mechanism that makes that genuinely
+   unsafe, not merely wasteful, is #706's own race: the shared
+   [Store.rowid_counters] entry can already reflect a SIBLING worker
+   handle's allocation that has not yet reached the data tree —
+   [S.rollback] released the writer lock before this recompute's RO scan
+   runs, so a concurrent [rw_begin]/allocate/commit on an untouched table
+   can land in that exact window.  If it lands BEFORE this recompute
+   captures [expected], [expected] still equals the (about-to-go-stale)
+   live value, the CAS succeeds, and the publish lowers the counter below
+   an id the sibling has already committed — #589's symptom, reached
+   through the #706 window rather than through a missed delete.
+
+   A committed DELETE of the high-water row that [note_rowid_deleted]
+   missed is NOT such a case: recomputing an untouched table from data can
+   only land AT OR ABOVE the true [max(rowid) + 1] (every live row is still
+   visible to the scan), so the next INSERT would reissue a DEAD rowid —
+   #409's intended reuse, not an overwrite.  (A deliberate [sqlite_sequence]
+   SET — [set_next_rowid_in_txn], which raises on anything that is not
+   AUTOINCREMENT — can legitimately push a table's counter above
+   [max(rowid) + 1] too, but it is not a hazard to THIS restriction
+   specifically: [recover_next_rowid] already refuses to touch a populated
+   AUTOINCREMENT counter regardless of whether it is called on a bumped or
+   an untouched table, and the [autoincrement] branch below never calls it
+   for such a table in the first place — see #299.)
+
+   Secondarily it is also right for cost, since the recomputed value must
+   equal the cached counter in the benign case anyway and computing it is
+   pure waste.  Since #716 [recover_next_rowid] is an O(log n) rightmost
+   descent rather than a full scan, the cost side of this argument is far
+   weaker than it used to be (a full-tree drain per table would have
+   justified the restriction on cost alone) — which is exactly why the
+   correctness reason above has to be stated explicitly rather than left to
+   ride along with it.  A bumped name that is no longer cached (e.g. its
+   CREATE TABLE rolled back in the same txn) or that is WITHOUT ROWID is
+   skipped.  The set is CLEARED here so it never leaks into a later
+   transaction; commit clears it too (via [commit_schema_changes]), which
+   is why a COMMIT keeps the bumped counter yet a subsequent unrelated
+   ROLLBACK does not wrongly recompute it.
 
    #299: AUTOINCREMENT tables take a DIFFERENT branch.  Their counter is a
    sticky high-water that a committed DELETE never lowers, so recomputing
