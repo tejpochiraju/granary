@@ -237,6 +237,71 @@ let test_negative_rowid_keys () =
       (Granary_encoding.Rowid.decode k)
 ;;
 
+(* Follow the rightmost spine ([right_page]) from the root down to the
+   rightmost LEAF, reading raw pages via [pager] directly (bypassing
+   [Btree]) — the same technique as [depth_of] above, but returning the
+   page id instead of the depth. *)
+let rec rightmost_leaf_pid pager page_id =
+  match run (Pager.read pager page_id) with
+  | Error e ->
+    Alcotest.failf "pager read while locating rightmost leaf: %a" Pager.pp_error e
+  | Ok buf ->
+    let common = Page.read_common buf in
+    (match common.kind with
+     | Page.Leaf -> page_id
+     | Page.Branch -> rightmost_leaf_pid pager (Int64.of_int32 common.right_page)
+     | Page.Header | Page.Freelist | Page.Overflow ->
+       Alcotest.failf "unexpected page kind while locating rightmost leaf")
+;;
+
+(* #716 FINDING 3: a leaf whose [n_keys] header claims more entries than the
+   page actually holds entry bytes for must fail loud (Tree_corrupt), never
+   answer a plausible-but-too-low key. Build a real multi-leaf tree (same
+   60-key/100-byte-value shape as [test_empty_rightmost_leaf], guaranteeing a
+   branch over at least two leaves), then reach into the mock pager and
+   inflate the RIGHTMOST leaf's [n_keys] header far past its actual entry
+   count — [Page.write_common] touches only the 16-byte common header, so the
+   entry bytes themselves are untouched and still end where they always did.
+   [Btree.max_key]'s right-to-left descent reaches this exact leaf first, so
+   if the truncation guard is missing (or scans past the corrupted header
+   without noticing), the old behaviour would answer [Ok (Some <a smaller
+   key>)] — or, if the very first entry read failed, silently fall back past
+   this leaf to [Ok None] — either of which is precisely the "too low"
+   failure #589 already burned the project on once. *)
+let test_truncated_leaf_is_tree_corrupt () =
+  let t, pager = empty_tree_with_pager () in
+  let t = ref t in
+  let value = Bytes.make 100 'x' in
+  let n = 60 in
+  let key i = b (Printf.sprintf "k%04d" i) in
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.put !t (key i) value))
+  done;
+  let leaf_pid = rightmost_leaf_pid pager (Btree.root_page !t) in
+  let buf =
+    match run (Pager.read pager leaf_pid) with
+    | Ok buf -> buf
+    | Error e -> Alcotest.failf "reading rightmost leaf: %a" Pager.pp_error e
+  in
+  let common = Page.read_common buf in
+  Alcotest.(check bool) "rightmost leaf actually has entries" true (common.n_keys > 0);
+  (* Copy the page (leaving its entry bytes exactly as they are) and rewrite
+     only the header, claiming far more entries than are actually present. *)
+  let corrupt = Cstruct.create Page.page_size in
+  Cstruct.blit buf 0 corrupt 0 Page.page_size;
+  Page.write_common corrupt { common with n_keys = common.n_keys + 1000 };
+  Page.seal corrupt;
+  Pager.write pager leaf_pid corrupt;
+  match run (Btree.max_key !t) with
+  | Error (Btree.Tree_corrupt _) -> ()
+  | Error e -> Alcotest.failf "expected Tree_corrupt, got: %a" Btree.pp_error e
+  | Ok (Some k) ->
+    Alcotest.failf
+      "expected Tree_corrupt, got a too-low key instead: %s"
+      (Bytes.to_string k)
+  | Ok None -> Alcotest.fail "expected Tree_corrupt, got None (silent too-low fallback)"
+;;
+
 module S = Granary_store.Store
 
 let lwt f = Lwt_main.run (f ())
@@ -633,6 +698,10 @@ let () =
             `Quick
             test_branch_over_all_empty_leaves
         ; Alcotest.test_case "negative rowid keys" `Quick test_negative_rowid_keys
+        ; Alcotest.test_case
+            "truncated leaf is Tree_corrupt, not a too-low key"
+            `Quick
+            test_truncated_leaf_is_tree_corrupt
         ] )
     ; ( "store"
       , [ Alcotest.test_case "mem rw shadow" `Quick test_store_mem_rw

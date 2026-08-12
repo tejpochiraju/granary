@@ -1339,25 +1339,55 @@ let max_key t : (bytes option, error) result Lwt.t =
                if n = 0
                then Lwt.return (Ok (`Key None))
                else (
-                 let rec scan off i last_key =
+                 (* #716 finding 1: walk with ONE reused span (allocates
+                    nothing per entry, unlike [leaf_entry_at]) and copy only
+                    the final key, once, at the very end. *)
+                 let span = Page.leaf_span_create () in
+                 let rec scan off i last =
                    if i >= n
-                   then last_key
-                   else (
-                     match Page.leaf_entry_at buf ~offset:off with
-                     | `End -> last_key
-                     | `Entry e -> scan e.Page.next_offset (i + 1) (Some e.Page.key))
+                   then Ok last
+                   else if Page.leaf_span_at buf ~offset:off span
+                   then
+                     scan
+                       span.Page.sp_next_offset
+                       (i + 1)
+                       (Some (span.Page.sp_key_off, span.Page.sp_key_len))
+                   else
+                     (* #716 finding 3: [n_keys] promised [n] entries but the
+                        page ran out of entry bytes first. Answering with
+                        [last] (or [None]) here would silently return a key
+                        SMALLER than the tree's true maximum -- exactly the
+                        "answer too low" failure this function exists to
+                        avoid (it feeds [next_rowid]; a too-low answer
+                        reissues a live rowid, #589's symptom). Fail loud
+                        instead of guessing. *)
+                     Error
+                       (Tree_corrupt
+                          (Printf.sprintf
+                             "max_key: leaf entries end before n_keys (saw %d of %d)"
+                             i
+                             n))
                  in
-                 Lwt.return (Ok (`Key (scan Page.data_offset 0 None))))
+                 match scan Page.data_offset 0 None with
+                 | Error e -> Lwt.return (Error e)
+                 | Ok None -> Lwt.return (Ok (`Key None))
+                 | Ok (Some (off, len)) ->
+                   Lwt.return (Ok (`Key (Some (Page.copy_span buf ~off ~len)))))
              | Page.Branch ->
-               let entries, _ = decode_branch_entries buf common in
-               (* Ascending child order is [e0.left_child; …; e_{n-1}.left_child;
-                  right_page], so right-to-left is [right_page] followed by the
-                  [left_child]s reversed. *)
+               let n = common.Page.n_keys in
+               let right_page = common.Page.right_page in
+               (* #716 finding 2: derive child pointers with [branch_child_at]
+                  instead of decoding the whole page into a [branch_entry
+                  list] (which copies every separator key) and reversing it.
+                  [branch_child_at]'s convention is [idx >= n_keys] ->
+                  [right_page]; ascending child order is [idx = 0] ->
+                  [e0.left_child] through [idx = n - 1] -> [e_{n-1}.left_child]
+                  then [idx = n] -> [right_page]. Right-to-left is therefore
+                  [idx] running from [n] down to [0]. *)
                let children =
-                 page_id_of_int32 common.Page.right_page
-                 :: List.rev_map
-                      (fun (e : Page.branch_entry) -> page_id_of_int32 e.Page.left_child)
-                      entries
+                 List.init (n + 1) (fun k ->
+                   page_id_of_int32
+                     (Page.branch_child_at buf ~n_keys:n ~right_page ~idx:(n - k)))
                in
                Lwt.return (Ok (`Children children))
              | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
