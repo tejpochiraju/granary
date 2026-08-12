@@ -1709,7 +1709,6 @@
   granary.unix
   granary.store
   granary.storage
-  granary.catalog
   granary.encoding
   alcotest
   qcheck-core

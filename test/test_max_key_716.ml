@@ -406,6 +406,67 @@ let prop_agrees_with_full_scan_btree =
               Lwt.return_unit)))
 ;;
 
+module Db = Granary.Db
+
+let exec db sql =
+  match Lwt_main.run (Db.execute db sql) with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "error in %S: %a" sql Db.pp_error e
+;;
+
+let render (v : Db.value) =
+  match v with
+  | Db.V_int n -> Int64.to_string n
+  | Db.V_text s -> s
+  | Db.V_real f -> Printf.sprintf "%g" f
+  | Db.V_null -> "NULL"
+  | Db.V_blob b -> Bytes.to_string b
+;;
+
+let rows db sql =
+  match Lwt_main.run (Db.query db sql) with
+  | Error e -> Alcotest.failf "query error in %S: %a" sql Db.pp_error e
+  | Ok stream ->
+    List.map
+      (fun row -> String.concat "|" (Array.to_list (Array.map render row)))
+      (Lwt_main.run (Lwt_stream.to_list stream))
+;;
+
+(* End-to-end form of the empty-rightmost-leaf hazard: a table whose highest
+   rowids were deleted and COMMITTED, then a rolled-back INSERT. The rollback
+   recompute must restore max(rowid)+1 over the surviving rows, not collapse
+   the counter to 1 and start overwriting them.
+
+   This is a BEHAVIOUR-PRESERVATION test: it must pass before the
+   [S.cursor_open] -> [S.max_key] conversion in [recover_next_rowid] just as
+   much as after. *)
+let test_rollback_recompute_after_tail_delete () =
+  let db = Lwt_main.run (Db.open_in_memory ()) in
+  (* [id] is the INTEGER PRIMARY KEY rowid alias — this engine has no bare
+     [SELECT rowid] / [WHERE rowid > ...] over an ordinary table (see
+     test_e2e.ml's note near "this engine has no [SELECT rowid]"), so the
+     alias column is how the rowid is observed and filtered. *)
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+  List.iter
+    (fun i ->
+       ignore i;
+       exec db (Printf.sprintf "INSERT INTO t (v) VALUES ('%s')" (String.make 100 'x')))
+    (List.init 200 Fun.id);
+  exec db "DELETE FROM t WHERE id > 100";
+  exec db "BEGIN";
+  exec db "INSERT INTO t (v) VALUES ('doomed')";
+  exec db "ROLLBACK";
+  exec db "INSERT INTO t (v) VALUES ('after')";
+  (match rows db "SELECT id FROM t WHERE v = 'after'" with
+   | [ r ] ->
+     Alcotest.(check string) "the post-rollback insert reuses rowid 101, never 1" "101" r
+   | _ -> Alcotest.fail "expected exactly one 'after' row");
+  (match rows db "SELECT COUNT(*) FROM t" with
+   | [ c ] -> Alcotest.(check string) "no row was overwritten" "101" c
+   | _ -> Alcotest.fail "expected one count row");
+  Lwt_main.run (Db.close db)
+;;
+
 let () =
   Alcotest.run
     "max_key_716"
@@ -440,5 +501,11 @@ let () =
       , List.map
           QCheck_alcotest.to_alcotest
           [ prop_agrees_with_full_scan_mem; prop_agrees_with_full_scan_btree ] )
+    ; ( "catalog"
+      , [ Alcotest.test_case
+            "rollback recompute after a committed tail delete"
+            `Quick
+            test_rollback_recompute_after_tail_delete
+        ] )
     ]
 ;;

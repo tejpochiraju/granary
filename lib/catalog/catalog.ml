@@ -2033,10 +2033,12 @@ let load_mirror_entries store =
 ;;
 
 (* #175: recover next_rowid for tables reconstructed from the mirror.
-   Scan the table's data tree for the maximum integer rowid key (the
-   tree is keyed by [Rowid.encode], whose offset-binary encoding sorts
-   negatives correctly, so the last key in byte-sorted order is the maximum
-   rowid).  Return [next_rowid = max + 1], or [empty_next_rowid] for an empty or
+   Ask the store for the data tree's maximum key (#716: an O(log n) rightmost
+   descent — this used to drain the whole tree through [S.cursor_open] and walk
+   it, which at TPC-C scale was 358.9 ms per rollback).  [Rowid.encode]'s
+   offset-binary encoding sorts negatives correctly, so the greatest key in
+   byte order is the greatest rowid.
+   Return [next_rowid = max + 1], or [empty_next_rowid] for an empty or
    unreadable tree (#250: so a subsequent NULL insert seeds at 1 and an explicit
    below-counter id seeds from its own value, exactly as in-session).  WITHOUT
    ROWID tables are skipped — they don't use rowid keys. *)
@@ -2061,20 +2063,9 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
   else
     S.with_ro store
     @@ fun tx ->
-    let%lwt cur = S.cursor_open tx tree_id in
-    let _sr = S.cursor_first cur in
-    let max_key = ref None in
-    let rec walk () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (k, _) ->
-        max_key := Some k;
-        walk ()
-    in
-    walk ();
-    S.cursor_close cur;
+    let%lwt mk = S.max_key tx tree_id in
     let recovered =
-      match !max_key with
+      match mk with
       | None -> empty_next_rowid
       | Some k -> Int64.add (Rowid.decode k) 1L
     in
@@ -2354,11 +2345,11 @@ let rollback_schema_changes t = Schema_cache.rollback t.sc
    RW lock is released (so [recover_next_rowid]'s own RO txn cannot deadlock).
 
    We recompute ONLY the [rowid_bumped_in_txn] set — usually a single table —
-   rather than every cached rowid table.  [recover_next_rowid] is an O(n) tree
-   walk to find max(rowid); scanning every table would make a rollback cost
-   O(total rows across ALL tables), a regression on a perf-sensitive engine
-   (cf. #228/#229 driving cursor_open O(n)->O(log n)).  Restricting to the
-   bumped set keeps rollback ~O(1) in the common case.  A bumped name that is no
+   rather than every cached rowid table.  Since #716 [recover_next_rowid] is an
+   O(log n) rightmost descent rather than a full scan, so this is no longer the
+   difference between a fast rollback and a catastrophic one; it remains right
+   for the same reason it always was — scanning tables this transaction never
+   touched is work with no possible effect.  A bumped name that is no
    longer cached (e.g. its CREATE TABLE rolled back in the same txn) or that is
    WITHOUT ROWID is skipped.  The set is CLEARED here so it never leaks into a
    later transaction; commit clears it too (via [commit_schema_changes]), which
@@ -2843,10 +2834,10 @@ let bump_next_rowid_in_txn ?(defer_counter = false) t ~name ~at_least (tx : S.rw
 (* #312.1: largest stored rowid in a table's data tree, computed within an
    already-open txn.  Used only on the uncommon lower-clamp path of a writable
    [sqlite_sequence] SET/INSERT, to avoid lowering the counter below the live
-   max(rowid).  The store has no [cursor_last]/[cursor_prev], so this reuses the
-   forward walk from [recover_next_rowid]: [Rowid.encode]'s offset-binary
-   encoding sorts integer rowids correctly, so the last key in byte order is the
-   maximum.  Returns [None] for an empty tree. *)
+   max(rowid).  Uses [S.max_key] (#716), the same O(log n) rightmost descent
+   [recover_next_rowid] takes.  [Rowid.encode]'s offset-binary encoding sorts
+   integer rowids correctly, so the tree's greatest key is the greatest rowid.
+   Returns [None] for an empty tree. *)
 let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
   match Schema_cache.find_table t.sc name with
   (* Private helper; the sole caller ([set_next_rowid_in_txn]) has already
@@ -2858,22 +2849,8 @@ let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
       | Row { tree_id; _ } -> tree_id
       | Columnar _ -> failwith "max_rowid_in_txn on columnar table"
     in
-    let%lwt cur = S.cursor_open tx tree_id in
-    let _sr = S.cursor_first cur in
-    let max_key = ref None in
-    let rec walk () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (k, _) ->
-        max_key := Some k;
-        walk ()
-    in
-    walk ();
-    S.cursor_close cur;
-    Lwt.return
-      (match !max_key with
-       | None -> None
-       | Some k -> Some (Rowid.decode k))
+    let%lwt mk = S.max_key tx tree_id in
+    Lwt.return (Option.map Rowid.decode mk)
 ;;
 
 (* #409: SQLite keeps no persisted counter for a plain (non-AUTOINCREMENT)
