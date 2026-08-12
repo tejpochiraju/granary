@@ -174,8 +174,17 @@ let test_store_mem_rw () =
 ;;
 
 (* Mem backend, RO txn: must read the snapshot captured at ro_begin (#178),
-   NOT the live tree — otherwise a concurrent writer's uncommitted keys leak
-   in and survive its rollback. *)
+   NOT the live tree — otherwise a concurrent writer's committed-after-the-
+   snapshot keys leak in.
+
+   tx2's "z" is COMMITTED (not just written-and-rolled-back) before the
+   [max_key ro] read, on purpose: an RW [put] on the Mem backend never
+   touches the live tree at all (it writes only to [mem_rw_shadow]), so if
+   tx2's write were left uncommitted, an implementation that wrongly reads
+   the live tree in the [Ro]+[Mem] arm would still see [a;b] and this test
+   would pass either way. Committing makes "z" visible on the live tree,
+   which is the only way a live-tree read and a snapshot read can be told
+   apart. *)
 let test_store_mem_ro_ignores_uncommitted () =
   lwt (fun () ->
     let s = S.create () in
@@ -185,12 +194,12 @@ let test_store_mem_ro_ignores_uncommitted () =
     let%lwt ro = S.ro_begin s in
     let%lwt tx2 = S.rw_begin s in
     let%lwt () = put_keys tx2 [ "z" ] in
+    let%lwt () = S.commit tx2 in
     let%lwt mk = S.max_key ro tid in
     Alcotest.(check (option string))
-      "RO snapshot does not see the concurrent writer's 'z'"
+      "RO snapshot does not see the writer's post-snapshot commit of 'z'"
       (Some "b")
       (Option.map Bytes.to_string mk);
-    let%lwt () = S.rollback tx2 in
     S.ro_end ro)
 ;;
 
@@ -242,12 +251,67 @@ let test_store_btree_empty_rightmost_leaf () =
       S.close s))
 ;;
 
+(* Btree backend, RW txn: [Cat.max_rowid_in_txn] (catalog.ml:2851) calls
+   [max_key] on the caller's OPEN txn and must see writes that txn has made
+   but not yet committed — read-your-own-writes on the on-disk backend. This
+   is the one arm ([Rw]+[Btree]) none of the other store cases exercise:
+   [test_store_mem_rw] covers [Rw]+[Mem], and
+   [test_store_btree_empty_rightmost_leaf] only ever reads through a
+   SEPARATE, later RO txn after committing. Deletes run inside the still-open
+   RW txn here, and [max_key] is read BEFORE [S.commit]. *)
+let test_store_btree_rw_sees_own_writes () =
+  let path = Printf.sprintf "/tmp/granary_max_key_716_rw_%d.db" (Unix.getpid ()) in
+  let cleanup () =
+    try Sys.remove path with
+    | Sys_error _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    lwt (fun () ->
+      let%lwt s =
+        match%lwt Granary_unix.Store.open_file ~path () with
+        | Ok s -> Lwt.return s
+        | Error e -> Alcotest.failf "open_file: %a" S.pp_error e
+      in
+      let value = Bytes.make 100 'x' in
+      let key i = b (Printf.sprintf "k%04d" i) in
+      let n = 60 in
+      let%lwt tx = S.rw_begin s in
+      let%lwt () =
+        Lwt_list.iter_s (fun i -> S.put tx tid (key i) value) (List.init n Fun.id)
+      in
+      let%lwt () = S.commit tx in
+      let%lwt tx = S.rw_begin s in
+      let%lwt () =
+        Lwt_list.iter_s
+          (fun i -> S.del tx tid (key i))
+          (List.init (n / 2) (fun i -> n - 1 - i))
+      in
+      (* Read within the still-open txn, BEFORE commit. *)
+      let%lwt mk = S.max_key tx tid in
+      Alcotest.(check (option string))
+        "RW txn sees its own uncommitted deletes"
+        (Some (Bytes.to_string (key ((n / 2) - 1))))
+        (Option.map Bytes.to_string mk);
+      let%lwt () = S.commit tx in
+      S.close s))
+;;
+
 (* The new path must agree with the old one on arbitrary insert/delete
-   sequences: max_key = the last key a full forward cursor scan yields. *)
-let prop_agrees_with_full_scan =
+   sequences: max_key = the last key a full forward cursor scan yields.
+
+   This Mem-backend version is close to tautological: [cursor_open]'s Rw+Mem
+   arm computes [Bytes_map.bindings map] and [max_key]'s Rw+Mem arm computes
+   [Bytes_map.max_binding_opt map] from the SAME map, via byte-identical arm
+   selection — so this really asserts [Map.max_binding_opt = List.last
+   (Map.bindings)], a stdlib property, and can never catch a bug in
+   [Btree.max_key] itself. Kept anyway as a cheap regression net over the Mem
+   arms; [prop_agrees_with_full_scan_btree] below is the one that exercises
+   the risky code. *)
+let prop_agrees_with_full_scan_mem =
   QCheck.Test.make
     ~count:200
-    ~name:"max_key agrees with a full cursor scan"
+    ~name:"max_key agrees with a full cursor scan (mem backend)"
     QCheck.(list (pair (int_bound 200) bool))
     (fun ops ->
        lwt (fun () ->
@@ -277,6 +341,71 @@ let prop_agrees_with_full_scan =
          Lwt.return (Option.map Bytes.to_string mk = Option.map Bytes.to_string !last)))
 ;;
 
+(* The B-tree-backed version of the same property: a genuinely independent
+   oracle (a full forward cursor scan through [Btree.cursor_next]) checked
+   against [Btree.max_key]'s own rightmost descent, on the real disk-backed
+   structure the catalog actually uses. A small key space (0-19) with a
+   raised op count (100-300 ops/case) means deletes routinely hit live keys,
+   so the maximum actually moves across the run instead of only ever growing.
+
+   Each case opens and closes its own temp file (unique per case via an
+   incrementing counter, since QCheck may run many cases and shrinks). *)
+let prop_agrees_with_full_scan_btree =
+  let case_no = ref 0 in
+  QCheck.Test.make
+    ~count:100
+    ~name:"max_key agrees with a full cursor scan (btree backend)"
+    QCheck.(list_size (Gen.int_range 100 300) (pair (int_bound 19) bool))
+    (fun ops ->
+       lwt (fun () ->
+         incr case_no;
+         let path =
+           Printf.sprintf
+             "/tmp/granary_max_key_716_prop_%d_%d.db"
+             (Unix.getpid ())
+             !case_no
+         in
+         let cleanup () =
+           try Sys.remove path with
+           | Sys_error _ -> ()
+         in
+         cleanup ();
+         Lwt.finalize
+           (fun () ->
+              let%lwt s =
+                match%lwt Granary_unix.Store.open_file ~path () with
+                | Ok s -> Lwt.return s
+                | Error e -> Alcotest.failf "open_file: %a" S.pp_error e
+              in
+              let%lwt tx = S.rw_begin s in
+              let k i = b (Printf.sprintf "k%04d" i) in
+              let%lwt () =
+                Lwt_list.iter_s
+                  (fun (i, insert) ->
+                     if insert then S.put tx tid (k i) (b "v") else S.del tx tid (k i))
+                  ops
+              in
+              let%lwt cur = S.cursor_open tx tid in
+              let _sr = S.cursor_first cur in
+              let last = ref None in
+              let rec walk () =
+                match S.cursor_next cur with
+                | None -> ()
+                | Some (key, _) ->
+                  last := Some key;
+                  walk ()
+              in
+              walk ();
+              S.cursor_close cur;
+              let%lwt mk = S.max_key tx tid in
+              let%lwt () = S.commit tx in
+              let%lwt () = S.close s in
+              Lwt.return (Option.map Bytes.to_string mk = Option.map Bytes.to_string !last))
+           (fun () ->
+              cleanup ();
+              Lwt.return_unit)))
+;;
+
 let () =
   Alcotest.run
     "max_key_716"
@@ -302,7 +431,14 @@ let () =
             "btree empty rightmost leaf"
             `Quick
             test_store_btree_empty_rightmost_leaf
+        ; Alcotest.test_case
+            "btree rw sees own writes"
+            `Quick
+            test_store_btree_rw_sees_own_writes
         ] )
-    ; "property", List.map QCheck_alcotest.to_alcotest [ prop_agrees_with_full_scan ]
+    ; ( "property"
+      , List.map
+          QCheck_alcotest.to_alcotest
+          [ prop_agrees_with_full_scan_mem; prop_agrees_with_full_scan_btree ] )
     ]
 ;;
