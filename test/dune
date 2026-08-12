@@ -1717,3 +1717,11 @@
   unix)
  (preprocess
   (pps lwt_ppx)))
+
+; #716: rollback-recompute timing. Print-only, gated by
+; GRANARY_BENCH_ROLLBACK_716; not a CI gate.
+
+(test
+ (name bench_rollback_recompute_716)
+ (modules bench_rollback_recompute_716)
+ (libraries granary granary.unix alcotest lwt.unix unix))
