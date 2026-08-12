@@ -1304,6 +1304,80 @@ let rightmost_append_cursor t : (append_cursor option, error) result Lwt.t =
 (* The maximum key of an append cursor (the tree's current rightmost key). *)
 let append_cursor_max_key (ac : append_cursor) = ac.ac_max_key
 
+(* #716: the tree's maximum key, by a right-to-left descent.
+   Replaces the caller-side full scan that [Cat.recover_next_rowid] and
+   [Cat.max_rowid_in_txn] used to do through [Store.cursor_open] (which
+   materialises every key and value into a list before the caller sees one).
+
+   NOT [rightmost_append_cursor]: that function answers [None] both for an
+   empty tree and for an empty rightmost LEAF, and cannot distinguish them.
+   For an append that is harmless (fall back to the general path); read as
+   "this tree has no keys" it is silent corruption, because there is no
+   merge/rebalance here — [del_from_leaf] leaves an emptied non-root leaf
+   linked in its parent — so an empty rightmost leaf above live data is an
+   ordinary state after deleting a table's highest rowids.
+
+   Hence: at a branch, try children right-to-left and take the first subtree
+   that yields a key. Normally one page per level; it degrades only by the
+   number of EMPTY pages skipped, never to a full entry scan. *)
+let max_key t : (bytes option, error) result Lwt.t =
+  if Int64.compare t.root_page 0L = 0
+  then return_ok None
+  else (
+    let rec descend pid =
+      let* r =
+        Pager.read_borrow
+          ?snapshot_frames:t.snapshot_frames
+          ?pin_set:t.pin_set
+          t.pager
+          pid
+          (fun buf ->
+             let common = Page.read_common buf in
+             match common.Page.kind with
+             | Page.Leaf ->
+               let n = common.Page.n_keys in
+               if n = 0
+               then Lwt.return (Ok (`Key None))
+               else (
+                 let rec scan off i last_key =
+                   if i >= n
+                   then last_key
+                   else (
+                     match Page.leaf_entry_at buf ~offset:off with
+                     | `End -> last_key
+                     | `Entry e -> scan e.Page.next_offset (i + 1) (Some e.Page.key))
+                 in
+                 Lwt.return (Ok (`Key (scan Page.data_offset 0 None))))
+             | Page.Branch ->
+               let entries, _ = decode_branch_entries buf common in
+               (* Ascending child order is [e0.left_child; …; e_{n-1}.left_child;
+                  right_page], so right-to-left is [right_page] followed by the
+                  [left_child]s reversed. *)
+               let children =
+                 page_id_of_int32 common.Page.right_page
+                 :: List.rev_map
+                      (fun (e : Page.branch_entry) -> page_id_of_int32 e.Page.left_child)
+                      entries
+               in
+               Lwt.return (Ok (`Children children))
+             | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
+      in
+      bind_pager r (function
+        | Error e -> return_error e
+        | Ok (`Key k) -> return_ok k
+        | Ok (`Children cs) -> first_child_with_key cs)
+    and first_child_with_key = function
+      | [] -> return_ok None
+      | pid :: rest ->
+        let* r = descend pid in
+        (match r with
+         | Error e -> return_error e
+         | Ok (Some k) -> return_ok (Some k)
+         | Ok None -> first_child_with_key rest)
+    in
+    descend t.root_page)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* DEL                                                                  *)
 (* ------------------------------------------------------------------ *)

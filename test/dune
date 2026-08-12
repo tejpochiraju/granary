@@ -1698,3 +1698,21 @@
  (name test_point_lookup_alloc_416)
  (modules test_point_lookup_alloc_416)
  (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #716: max_key — O(log n) rightmost descent replacing the full-tree drain.
+
+(test
+ (name test_max_key_716)
+ (modules test_max_key_716)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  granary.catalog
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))

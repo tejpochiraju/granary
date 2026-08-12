@@ -91,6 +91,15 @@ val try_inplace_append
     (re)prime the cursor after a general-path append or a split. *)
 val rightmost_append_cursor : t -> (append_cursor option, error) result Lwt.t
 
+(** #716: the tree's maximum key, or [None] when the tree holds no keys
+    anywhere.  A right-to-left descent: one page per level in the normal case,
+    degrading only by the number of empty pages it skips.
+
+    Do not reimplement this with {!rightmost_append_cursor} — that returns
+    [None] for an empty rightmost leaf as well as for an empty tree, and the
+    two are different answers here. *)
+val max_key : t -> (bytes option, error) result Lwt.t
+
 (** Delete a key.  No-op if absent.  Returns an updated [t].
 
     Phase 1 deletion is lazy: an emptied leaf is left in the tree (callers
