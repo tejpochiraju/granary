@@ -50,8 +50,7 @@ let populate db ~rows =
   while !inserted < rows do
     let n = min batch_size (rows - !inserted) in
     exec db "BEGIN";
-    for i = 1 to n do
-      ignore i;
+    for _ = 1 to n do
       exec db "INSERT INTO t (v) VALUES ('x')"
     done;
     exec db "COMMIT";
@@ -66,7 +65,7 @@ let median (xs : float array) =
   if n mod 2 = 1 then sorted.(n / 2) else (sorted.((n / 2) - 1) +. sorted.(n / 2)) /. 2.0
 ;;
 
-let time_rollback db =
+let time_begin_insert_rollback db =
   let t0 = Unix.gettimeofday () in
   exec db "BEGIN";
   exec db "INSERT INTO t (v) VALUES ('doomed')";
@@ -102,17 +101,19 @@ let main () =
          let trials = 5 in
          let durations = Array.make trials 0.0 in
          for i = 0 to trials - 1 do
-           let d = time_rollback db in
+           let d = time_begin_insert_rollback db in
            durations.(i) <- d;
            Printf.printf
-             "bench_rollback_recompute_716: trial %d/%d ROLLBACK = %.3f ms\n%!"
+             "bench_rollback_recompute_716: trial %d/%d BEGIN+INSERT+ROLLBACK = %.3f ms\n\
+              %!"
              (i + 1)
              trials
              (d *. 1000.0)
          done;
          let med = median durations in
          Printf.printf
-           "bench_rollback_recompute_716: rows=%d median ROLLBACK = %.3f ms\n%!"
+           "bench_rollback_recompute_716: rows=%d median BEGIN+INSERT+ROLLBACK = %.3f ms\n\
+            %!"
            rows
            (med *. 1000.0);
          run (Db.close db)))

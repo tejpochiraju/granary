@@ -333,8 +333,11 @@ val cursor_next : cursor -> (bytes * bytes) option
 val cursor_value : cursor -> bytes option
 
 (** #716: the tree's greatest key, or [None] when the tree is empty, in
-    O(log n) — a rightmost descent rather than a scan.  Sees the same snapshot
-    as {!get} / {!cursor_open} on the same transaction.
+    O(log n) — a rightmost descent rather than a scan, degrading only by the
+    number of empty pages it skips (a table whose rows were all deleted and
+    committed leaves a branch over N empty leaves, and this still costs
+    O(pages) rather than O(1)).  Sees the same snapshot as {!get} /
+    {!cursor_open} on the same transaction.
 
     Use this instead of draining a cursor to find a maximum: {!cursor_open}
     materialises every key and value in the tree before returning. *)

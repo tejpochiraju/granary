@@ -2345,16 +2345,28 @@ let rollback_schema_changes t = Schema_cache.rollback t.sc
    RW lock is released (so [recover_next_rowid]'s own RO txn cannot deadlock).
 
    We recompute ONLY the [rowid_bumped_in_txn] set — usually a single table —
-   rather than every cached rowid table.  Since #716 [recover_next_rowid] is an
-   O(log n) rightmost descent rather than a full scan, so this is no longer the
-   difference between a fast rollback and a catastrophic one; it remains right
-   for the same reason it always was — scanning tables this transaction never
-   touched is work with no possible effect.  A bumped name that is no
-   longer cached (e.g. its CREATE TABLE rolled back in the same txn) or that is
-   WITHOUT ROWID is skipped.  The set is CLEARED here so it never leaks into a
-   later transaction; commit clears it too (via [commit_schema_changes]), which
-   is why a COMMIT keeps the bumped counter yet a subsequent unrelated ROLLBACK
-   does not wrongly recompute it.
+   rather than every cached rowid table.  This is primarily a CORRECTNESS
+   restriction, not a cost one: recomputing a table this transaction never
+   touched derives its counter from the (rolled-back) data instead of trusting
+   the cached high-water, and for an untouched table [cas_rowid_durable]'s
+   [expected] IS the live value, so the CAS always succeeds and the recomputed
+   value is published unconditionally.  If a committed, earlier transaction
+   deleted that table's high-water row in a way [note_rowid_deleted] did not
+   catch, the cached counter sits ABOVE [max(rowid) + 1]; including the table
+   here would LOWER it and the next INSERT would reissue a still-live rowid —
+   #589's symptom, reached by scanning a table nobody touched.  Secondarily it
+   is also right for cost, since the recomputed value must equal the cached
+   counter in the benign case anyway and computing it is pure waste.  Since
+   #716 [recover_next_rowid] is an O(log n) rightmost descent rather than a
+   full scan, the cost side of this argument is far weaker than it used to be
+   (a full-tree drain per table would have justified the restriction on cost
+   alone) — which is exactly why the correctness reason above has to be
+   stated explicitly rather than left to ride along with it.  A bumped name
+   that is no longer cached (e.g. its CREATE TABLE rolled back in the same
+   txn) or that is WITHOUT ROWID is skipped.  The set is CLEARED here so it
+   never leaks into a later transaction; commit clears it too (via
+   [commit_schema_changes]), which is why a COMMIT keeps the bumped counter
+   yet a subsequent unrelated ROLLBACK does not wrongly recompute it.
 
    #299: AUTOINCREMENT tables take a DIFFERENT branch.  Their counter is a
    sticky high-water that a committed DELETE never lowers, so recomputing
@@ -2831,17 +2843,22 @@ let bump_next_rowid_in_txn ?(defer_counter = false) t ~name ~at_least (tx : S.rw
       if defer_counter then Lwt.return_unit else put_table_counter_tx tx m')
 ;;
 
-(* #312.1: largest stored rowid in a table's data tree, computed within an
-   already-open txn.  Used only on the uncommon lower-clamp path of a writable
-   [sqlite_sequence] SET/INSERT, to avoid lowering the counter below the live
-   max(rowid).  Uses [S.max_key] (#716), the same O(log n) rightmost descent
-   [recover_next_rowid] takes.  [Rowid.encode]'s offset-binary encoding sorts
-   integer rowids correctly, so the tree's greatest key is the greatest rowid.
-   Returns [None] for an empty tree. *)
+(* #312.1/#409: largest stored rowid in a table's data tree, computed within
+   an already-open txn.  Uses [S.max_key] (#716), the same O(log n) rightmost
+   descent [recover_next_rowid] takes.  [Rowid.encode]'s offset-binary
+   encoding sorts integer rowids correctly, so the tree's greatest key is the
+   greatest rowid.  Returns [None] for an empty tree.
+
+   Two callers, both per-statement rather than administrative: the lower-clamp
+   path of a writable [sqlite_sequence] SET/INSERT ([set_next_rowid_in_txn],
+   below), avoiding lowering the counter below the live max(rowid); and
+   [note_rowid_deleted] (#409), which fires on every plain-rowid-table DELETE
+   of the current high-water row — not uncommon at all under a delete-heavy
+   workload. *)
 let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
   match Schema_cache.find_table t.sc name with
-  (* Private helper; the sole caller ([set_next_rowid_in_txn]) has already
-     confirmed the table is present, so this arm is unreachable in practice. *)
+  (* Private helper; both callers have already confirmed the table is
+     present, so this arm is unreachable in practice. *)
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
     let tree_id =

@@ -61,8 +61,35 @@ let make_pager () =
 ;;
 
 let empty_tree () = Btree.create (make_pager ()) ~root_page:0L
+
+(* Like [empty_tree] but also hands back the [Pager.t] backing it, so a
+   caller can read pages directly (bypassing [Btree] entirely) to measure the
+   tree's actual shape — see [depth_of] below. *)
+let empty_tree_with_pager () =
+  let pager = make_pager () in
+  Btree.create pager ~root_page:0L, pager
+;;
+
 let run = Lwt_main.run
 let b s = Bytes.of_string s
+
+(* The tree's depth, measured independently of [Btree] by reading pages
+   directly off [pager] and following [common.right_page] (the rightmost
+   child) from the root down to a leaf. Because the tree is a balanced
+   B+-tree every leaf sits at the same depth, so following the rightmost
+   spine gives the true depth, not just a lower bound. A [Leaf] page counts
+   as depth 1. *)
+let rec depth_of pager page_id =
+  match run (Pager.read pager page_id) with
+  | Error e -> Alcotest.failf "pager read while measuring depth: %a" Pager.pp_error e
+  | Ok buf ->
+    let common = Page.read_common buf in
+    (match common.kind with
+     | Page.Leaf -> 1
+     | Page.Branch -> 1 + depth_of pager (Int64.of_int32 common.right_page)
+     | Page.Header | Page.Freelist | Page.Overflow ->
+       Alcotest.failf "unexpected page kind while measuring tree depth")
+;;
 
 let ok_btree : type a. (a, Btree.error) result -> a = function
   | Ok x -> x
@@ -132,6 +159,64 @@ let test_multiple_empty_rightmost_leaves () =
     t := ok_btree (run (Btree.del !t (key i)))
   done;
   check_max "max after deleting the top half" (Some (key ((n / 2) - 1))) !t
+;;
+
+(* FIX 5(a): a tree of depth 3 — a branch over branches. Every case above
+   reaches depth 2 only: branch entries are ~9-15 bytes for the short keys
+   used there, so one 4080-byte branch page holds every leaf produced by
+   n=60/n=200 short/medium-key trees. Fat ~200-byte keys make branch
+   entries just as fat as leaf entries (a branch entry stores the same
+   separator key), so a modest few-hundred-entry tree overflows a single
+   branch page too and forces a root branch OVER branch pages.
+
+   Depth-3 correctness follows by induction from [Btree]'s uniform per-level
+   recursion, so this is confirmation rather than suspicion — but nothing
+   else in the suite exercises a branch-of-branches, and reading the actual
+   pages via [depth_of] turns "this should be depth 3" into a verified fact
+   instead of an assumption baked silently into the entry count. *)
+let test_depth_three () =
+  let t, pager = empty_tree_with_pager () in
+  let t = ref t in
+  let n = 300 in
+  (* 5 + 195 = 200-byte keys; the numeric prefix is fixed-width so byte order
+     agrees with numeric order despite the shared filler suffix. *)
+  let key i = b (Printf.sprintf "k%04d%s" i (String.make 195 'q')) in
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.put !t (key i) (b "v")))
+  done;
+  let depth = depth_of pager (Btree.root_page !t) in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "tree reaches depth >= 3 (branch over branches); measured depth = %d"
+       depth)
+    true
+    (depth >= 3);
+  check_max "max of a depth-3 tree" (Some (key (n - 1))) !t
+;;
+
+(* FIX 5(b): a branch over leaves that are ALL empty must answer [None].
+   [test_all_keys_deleted] only exercises the single-root-LEAF collapse
+   (root_page -> 0L, per [btree.ml]'s [del_from_leaf] comment, which fires
+   only for a lone empty ROOT leaf). This case keeps the root a Branch — the
+   n=60/100-byte-value shape splits it into multiple leaves — and deletes
+   every key, so every leaf beneath the (unchanged, un-rebalanced) branch
+   page ends at n_keys = 0 while the branch page itself still lists them
+   all. That is precisely the shape [first_child_with_key]'s [[] -> None]
+   arm at a BRANCH exists for, and nothing else reaches it: the
+   empty-rightmost-leaf cases above always leave at least one live leaf
+   until the very last deletion collapses differently. *)
+let test_branch_over_all_empty_leaves () =
+  let t = ref (empty_tree ()) in
+  let value = Bytes.make 100 'x' in
+  let n = 60 in
+  let key i = b (Printf.sprintf "k%04d" i) in
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.put !t (key i) value))
+  done;
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.del !t (key i)))
+  done;
+  check_max "branch over leaves that are all empty" None !t
 ;;
 
 (* Rowid keys are [Rowid.encode]'s offset-binary form, whose byte order IS
@@ -348,8 +433,48 @@ let prop_agrees_with_full_scan_mem =
    raised op count (100-300 ops/case) means deletes routinely hit live keys,
    so the maximum actually moves across the run instead of only ever growing.
 
+   FIX 6: with a 1-byte value, a leaf entry is only 4 + 5 + 1 = 10 bytes, so
+   all 20 possible keys (~200 bytes) fit in one 4080-byte leaf with room to
+   spare — this property ran over a SINGLE leaf and never reached
+   [Btree.max_key]'s branch-traversal arm at all, despite its own header
+   claiming to be "the one that exercises the risky code". [prop_value] is
+   300 bytes, making each entry 4 + 5 + 300 = 309 bytes and leaf capacity
+   floor(4080 / 309) = 13 — below the 20-key space, so the tree is forced to
+   split as soon as more than ~13 keys are simultaneously live, which the
+   100-300 op range routinely produces. Confirmed empirically (not just by
+   this arithmetic): [test_property_fixture_splits_multi_leaf] below builds a
+   tree from the same key range and the same [prop_value] and asserts
+   [depth_of] the result is > 1.
+
    Each case opens and closes its own temp file (unique per case via an
    incrementing counter, since QCheck may run many cases and shrinks). *)
+let prop_value = Bytes.make 300 'v'
+
+(* Confirms the arithmetic in the comment above by direct measurement rather
+   than trusting it: build a tree from the SAME key range (0-19) and the SAME
+   [prop_value] the property below uses, and check the result actually spans
+   more than one leaf. If a future change to entry overhead or page size ever
+   makes this single-leaf again, the property above silently reverts to only
+   exercising leaf-level [Btree.max_key] and this is the test that would
+   catch it. *)
+let test_property_fixture_splits_multi_leaf () =
+  let t, pager = empty_tree_with_pager () in
+  let t = ref t in
+  let k i = b (Printf.sprintf "k%04d" i) in
+  for i = 0 to 19 do
+    t := ok_btree (run (Btree.put !t (k i) prop_value))
+  done;
+  let depth = depth_of pager (Btree.root_page !t) in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "the property's fixture (20 keys, %d-byte values) splits into multiple leaves; \
+        measured depth = %d"
+       (Bytes.length prop_value)
+       depth)
+    true
+    (depth > 1)
+;;
+
 let prop_agrees_with_full_scan_btree =
   let case_no = ref 0 in
   QCheck.Test.make
@@ -382,7 +507,7 @@ let prop_agrees_with_full_scan_btree =
               let%lwt () =
                 Lwt_list.iter_s
                   (fun (i, insert) ->
-                     if insert then S.put tx tid (k i) (b "v") else S.del tx tid (k i))
+                     if insert then S.put tx tid (k i) prop_value else S.del tx tid (k i))
                   ops
               in
               let%lwt cur = S.cursor_open tx tid in
@@ -406,7 +531,11 @@ let prop_agrees_with_full_scan_btree =
               Lwt.return_unit)))
 ;;
 
-module Db = Granary.Db
+module Db = struct
+  include Granary.Db
+
+  let open_file = Granary_unix.open_file
+end
 
 let exec db sql =
   match Lwt_main.run (Db.execute db sql) with
@@ -439,32 +568,51 @@ let rows db sql =
 
    This is a BEHAVIOUR-PRESERVATION test: it must pass before the
    [S.cursor_open] -> [S.max_key] conversion in [recover_next_rowid] just as
-   much as after. *)
+   much as after.
+
+   File-backed (not [Db.open_in_memory]) so [S.max_key] actually takes the
+   [Btree] arm and descends a real rightmost spine, rather than the [Mem]
+   backend's [Bytes_map.max_binding_opt] — the latter never reaches a leaf at
+   all, so an in-memory version of this test would not be end-to-end coverage
+   of the empty-rightmost-leaf hazard its own header claims to pin. *)
 let test_rollback_recompute_after_tail_delete () =
-  let db = Lwt_main.run (Db.open_in_memory ()) in
-  (* [id] is the INTEGER PRIMARY KEY rowid alias — this engine has no bare
-     [SELECT rowid] / [WHERE rowid > ...] over an ordinary table (see
-     test_e2e.ml's note near "this engine has no [SELECT rowid]"), so the
-     alias column is how the rowid is observed and filtered. *)
-  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
-  List.iter
-    (fun i ->
-       ignore i;
-       exec db (Printf.sprintf "INSERT INTO t (v) VALUES ('%s')" (String.make 100 'x')))
-    (List.init 200 Fun.id);
-  exec db "DELETE FROM t WHERE id > 100";
-  exec db "BEGIN";
-  exec db "INSERT INTO t (v) VALUES ('doomed')";
-  exec db "ROLLBACK";
-  exec db "INSERT INTO t (v) VALUES ('after')";
-  (match rows db "SELECT id FROM t WHERE v = 'after'" with
-   | [ r ] ->
-     Alcotest.(check string) "the post-rollback insert reuses rowid 101, never 1" "101" r
-   | _ -> Alcotest.fail "expected exactly one 'after' row");
-  (match rows db "SELECT COUNT(*) FROM t" with
-   | [ c ] -> Alcotest.(check string) "no row was overwritten" "101" c
-   | _ -> Alcotest.fail "expected one count row");
-  Lwt_main.run (Db.close db)
+  let path = Printf.sprintf "/tmp/granary_max_key_716_catalog_%d.db" (Unix.getpid ()) in
+  let cleanup () =
+    try Sys.remove path with
+    | Sys_error _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    let db =
+      match Lwt_main.run (Db.open_file ~path ()) with
+      | Ok d -> d
+      | Error e -> Alcotest.failf "open_file: %a" Db.pp_error e
+    in
+    (* [id] is the INTEGER PRIMARY KEY rowid alias — this engine has no bare
+          [SELECT rowid] / [WHERE rowid > ...] over an ordinary table (see
+          test_e2e.ml's note near "this engine has no [SELECT rowid]"), so the
+          alias column is how the rowid is observed and filtered. *)
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    List.iter
+      (fun _ ->
+         exec db (Printf.sprintf "INSERT INTO t (v) VALUES ('%s')" (String.make 100 'x')))
+      (List.init 200 Fun.id);
+    exec db "DELETE FROM t WHERE id > 100";
+    exec db "BEGIN";
+    exec db "INSERT INTO t (v) VALUES ('doomed')";
+    exec db "ROLLBACK";
+    exec db "INSERT INTO t (v) VALUES ('after')";
+    (match rows db "SELECT id FROM t WHERE v = 'after'" with
+     | [ r ] ->
+       Alcotest.(check string)
+         "the post-rollback insert reuses rowid 101, never 1"
+         "101"
+         r
+     | _ -> Alcotest.fail "expected exactly one 'after' row");
+    (match rows db "SELECT COUNT(*) FROM t" with
+     | [ c ] -> Alcotest.(check string) "no row was overwritten" "101" c
+     | _ -> Alcotest.fail "expected one count row");
+    Lwt_main.run (Db.close db))
 ;;
 
 let () =
@@ -479,6 +627,11 @@ let () =
             "multiple empty rightmost leaves"
             `Quick
             test_multiple_empty_rightmost_leaves
+        ; Alcotest.test_case "depth three (branch over branches)" `Quick test_depth_three
+        ; Alcotest.test_case
+            "branch over all-empty leaves"
+            `Quick
+            test_branch_over_all_empty_leaves
         ; Alcotest.test_case "negative rowid keys" `Quick test_negative_rowid_keys
         ] )
     ; ( "store"
@@ -498,9 +651,13 @@ let () =
             test_store_btree_rw_sees_own_writes
         ] )
     ; ( "property"
-      , List.map
-          QCheck_alcotest.to_alcotest
-          [ prop_agrees_with_full_scan_mem; prop_agrees_with_full_scan_btree ] )
+      , Alcotest.test_case
+          "property fixture actually splits into multiple leaves"
+          `Quick
+          test_property_fixture_splits_multi_leaf
+        :: List.map
+             QCheck_alcotest.to_alcotest
+             [ prop_agrees_with_full_scan_mem; prop_agrees_with_full_scan_btree ] )
     ; ( "catalog"
       , [ Alcotest.test_case
             "rollback recompute after a committed tail delete"
