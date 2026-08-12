@@ -3018,6 +3018,53 @@ let cursor_value c =
   | _ -> None
 ;;
 
+(* #716: a tree's maximum key without materialising the tree.
+   Deliberately mirrors [cursor_open]'s four arms so the snapshot rules of the
+   two cannot drift: an RO Mem read MUST come from [rs_mem_snap] (#178) or a
+   concurrent writer's uncommitted rows leak in and survive its rollback, and
+   an RW Mem read MUST come from the shadow or it misses this txn's own writes.
+   [Bytes_map] is [Map.Make (Bytes)], so [max_binding_opt] is the map's own
+   rightmost descent — the Mem arms are not scans either. *)
+let max_key : type a. a txn -> tree_id -> bytes option Lwt.t =
+  fun tx tid ->
+  let of_btree label bt =
+    let* r = Btree.max_key bt in
+    match r with
+    | Error e ->
+      Lwt.fail_with
+        (Format.asprintf "Store.max_key%s: %a" label pp_error (map_btree_err e))
+    | Ok k -> Lwt.return k
+  in
+  match tx with
+  | Ro snap ->
+    (match snap.rs_store.backend with
+     | Mem _ ->
+       let map =
+         match snap.rs_mem_snap with
+         | Some snap -> mem_tree_snap snap tid
+         | None -> Bytes_map.empty
+       in
+       Lwt.return (Option.map fst (Bytes_map.max_binding_opt map))
+     | Btree st ->
+       let* r = bt_get_tree_ro snap st tid in
+       let* bt = unwrap_error r in
+       of_btree "(ro)" bt)
+  | Rw _ ->
+    let t = txn_store tx in
+    (match t.backend with
+     | Mem trees ->
+       let map =
+         match t.mem_rw_shadow with
+         | None -> !(mem_tree trees tid)
+         | Some shadow -> shadow_get shadow trees tid
+       in
+       Lwt.return (Option.map fst (Bytes_map.max_binding_opt map))
+     | Btree st ->
+       let* r = bt_get_tree st tid in
+       let* bt = unwrap_error r in
+       of_btree "" bt)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Native streaming seek (#228, #229)                                   *)
 (*                                                                       *)

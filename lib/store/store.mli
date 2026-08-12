@@ -332,6 +332,14 @@ val cursor_next : cursor -> (bytes * bytes) option
     or [None] if the cursor is not positioned (exhausted or before first). *)
 val cursor_value : cursor -> bytes option
 
+(** #716: the tree's greatest key, or [None] when the tree is empty, in
+    O(log n) — a rightmost descent rather than a scan.  Sees the same snapshot
+    as {!get} / {!cursor_open} on the same transaction.
+
+    Use this instead of draining a cursor to find a maximum: {!cursor_open}
+    materialises every key and value in the tree before returning. *)
+val max_key : _ txn -> tree_id -> bytes option Lwt.t
+
 (** A lazy, streaming forward cursor positioned by {!seek_ge}.  Unlike
     {!cursor}, it does NOT materialise the whole tree: it descends the
     B+-tree in O(log n) and reads only the entries the caller consumes.

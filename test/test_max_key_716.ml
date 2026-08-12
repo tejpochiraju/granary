@@ -152,6 +152,131 @@ let test_negative_rowid_keys () =
       (Granary_encoding.Rowid.decode k)
 ;;
 
+module S = Granary_store.Store
+
+let lwt f = Lwt_main.run (f ())
+let tid = 7
+let put_keys tx ks = Lwt_list.iter_s (fun k -> S.put tx tid (b k) (b "v")) ks
+
+(* Mem backend, RW txn: reads the per-txn shadow, so keys written in this
+   transaction are visible to it. *)
+let test_store_mem_rw () =
+  lwt (fun () ->
+    let s = S.create () in
+    let%lwt tx = S.rw_begin s in
+    let%lwt () = put_keys tx [ "b"; "a"; "c" ] in
+    let%lwt mk = S.max_key tx tid in
+    Alcotest.(check (option string))
+      "max over the RW shadow"
+      (Some "c")
+      (Option.map Bytes.to_string mk);
+    S.rollback tx)
+;;
+
+(* Mem backend, RO txn: must read the snapshot captured at ro_begin (#178),
+   NOT the live tree — otherwise a concurrent writer's uncommitted keys leak
+   in and survive its rollback. *)
+let test_store_mem_ro_ignores_uncommitted () =
+  lwt (fun () ->
+    let s = S.create () in
+    let%lwt tx = S.rw_begin s in
+    let%lwt () = put_keys tx [ "a"; "b" ] in
+    let%lwt () = S.commit tx in
+    let%lwt ro = S.ro_begin s in
+    let%lwt tx2 = S.rw_begin s in
+    let%lwt () = put_keys tx2 [ "z" ] in
+    let%lwt mk = S.max_key ro tid in
+    Alcotest.(check (option string))
+      "RO snapshot does not see the concurrent writer's 'z'"
+      (Some "b")
+      (Option.map Bytes.to_string mk);
+    let%lwt () = S.rollback tx2 in
+    S.ro_end ro)
+;;
+
+let test_store_mem_empty () =
+  lwt (fun () ->
+    let s = S.create () in
+    S.with_ro s (fun tx ->
+      let%lwt mk = S.max_key tx tid in
+      Alcotest.(check (option string)) "empty tree" None (Option.map Bytes.to_string mk);
+      Lwt.return_unit))
+;;
+
+(* Btree backend on disk, through the same suffix-deletion shape as the btree
+   test — this is the arm the catalog actually uses. *)
+let test_store_btree_empty_rightmost_leaf () =
+  let path = Printf.sprintf "/tmp/granary_max_key_716_%d.db" (Unix.getpid ()) in
+  let cleanup () =
+    try Sys.remove path with
+    | Sys_error _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    lwt (fun () ->
+      let%lwt s =
+        match%lwt Granary_unix.Store.open_file ~path () with
+        | Ok s -> Lwt.return s
+        | Error e -> Alcotest.failf "open_file: %a" S.pp_error e
+      in
+      let value = Bytes.make 100 'x' in
+      let key i = b (Printf.sprintf "k%04d" i) in
+      let n = 60 in
+      let%lwt tx = S.rw_begin s in
+      let%lwt () =
+        Lwt_list.iter_s (fun i -> S.put tx tid (key i) value) (List.init n Fun.id)
+      in
+      let%lwt () = S.commit tx in
+      let%lwt tx = S.rw_begin s in
+      let%lwt () =
+        Lwt_list.iter_s
+          (fun i -> S.del tx tid (key i))
+          (List.init (n / 2) (fun i -> n - 1 - i))
+      in
+      let%lwt () = S.commit tx in
+      let%lwt mk = S.with_ro s (fun tx -> S.max_key tx tid) in
+      Alcotest.(check (option string))
+        "btree backend skips the emptied rightmost leaves"
+        (Some (Bytes.to_string (key ((n / 2) - 1))))
+        (Option.map Bytes.to_string mk);
+      S.close s))
+;;
+
+(* The new path must agree with the old one on arbitrary insert/delete
+   sequences: max_key = the last key a full forward cursor scan yields. *)
+let prop_agrees_with_full_scan =
+  QCheck.Test.make
+    ~count:200
+    ~name:"max_key agrees with a full cursor scan"
+    QCheck.(list (pair (int_bound 200) bool))
+    (fun ops ->
+       lwt (fun () ->
+         let s = S.create () in
+         let%lwt tx = S.rw_begin s in
+         let k i = b (Printf.sprintf "k%04d" i) in
+         let%lwt () =
+           Lwt_list.iter_s
+             (fun (i, insert) ->
+                if insert then S.put tx tid (k i) (b "v") else S.del tx tid (k i))
+             ops
+         in
+         let%lwt cur = S.cursor_open tx tid in
+         let _sr = S.cursor_first cur in
+         let last = ref None in
+         let rec walk () =
+           match S.cursor_next cur with
+           | None -> ()
+           | Some (key, _) ->
+             last := Some key;
+             walk ()
+         in
+         walk ();
+         S.cursor_close cur;
+         let%lwt mk = S.max_key tx tid in
+         let%lwt () = S.rollback tx in
+         Lwt.return (Option.map Bytes.to_string mk = Option.map Bytes.to_string !last)))
+;;
+
 let () =
   Alcotest.run
     "max_key_716"
@@ -166,5 +291,18 @@ let () =
             test_multiple_empty_rightmost_leaves
         ; Alcotest.test_case "negative rowid keys" `Quick test_negative_rowid_keys
         ] )
+    ; ( "store"
+      , [ Alcotest.test_case "mem rw shadow" `Quick test_store_mem_rw
+        ; Alcotest.test_case
+            "mem ro snapshot ignores uncommitted"
+            `Quick
+            test_store_mem_ro_ignores_uncommitted
+        ; Alcotest.test_case "mem empty" `Quick test_store_mem_empty
+        ; Alcotest.test_case
+            "btree empty rightmost leaf"
+            `Quick
+            test_store_btree_empty_rightmost_leaf
+        ] )
+    ; "property", List.map QCheck_alcotest.to_alcotest [ prop_agrees_with_full_scan ]
     ]
 ;;

@@ -1715,4 +1715,6 @@
   qcheck-core
   qcheck-alcotest
   lwt.unix
-  unix))
+  unix)
+ (preprocess
+  (pps lwt_ppx)))
