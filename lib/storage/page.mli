@@ -267,7 +267,16 @@ val branch_child_at : Cstruct.t -> n_keys:int -> right_page:int32 -> idx:int -> 
     single left-to-right entry pass on first demand past [right_page], not
     one [branch_child_at] call per child (#716; that pattern is O(n^2)).
     Used by {!Btree.max_key}'s right-to-left descent, whose common case
-    consumes only the first element. *)
+    consumes only the first element.
+
+    BUFFER LIFETIME (#716 round-3 review finding 2): the returned [Seq.t] is
+    lazy and closes over [buf] — forcing its tail past [right_page] reads
+    [buf] again, possibly long after the call that produced the sequence
+    returned, e.g. after an intervening [Lwt] yield. [buf] must therefore
+    come from a source whose contract permits retention past that single
+    call — {!Pager.read_shared}, never {!Pager.read_borrow}, whose contract
+    is scoped to the extent of its own callback and which, on the writer
+    path, hands out the live buffer {!Pager.dirty_buffer} mutates in place. *)
 val branch_children_right_to_left
   :  Cstruct.t
   -> n_keys:int

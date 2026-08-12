@@ -1324,31 +1324,50 @@ let max_key t : (bytes option, error) result Lwt.t =
   if Int64.compare t.root_page 0L = 0
   then return_ok None
   else (
+    (* #716 round-3 review finding 2: [Pager.read_shared], not
+       [Pager.read_borrow]. The [Branch] arm below hands
+       [Page.branch_children_right_to_left]'s lazy [Seq.t] out of this
+       function into [first_child_with_key], which forces its tail only
+       after at least one [descend] — i.e. after an [Lwt] yield — so the
+       [Seq.t] RETAINS [buf] past the scope of a single read. [read_borrow]'s
+       contract is scoped to its callback's extent; handing a lazily-forced
+       value out of that callback is retention by definition, and
+       [read_borrow] hands out the pager's live buffer, which on the writer
+       path is the buffer [Pager.dirty_buffer] mutates in place — so a
+       concurrent write into that same page could have changed the bytes a
+       still-unforced [Seq.t] tail later reads. [read_shared]'s contract
+       explicitly permits retention (its own [.mli] doc: "byte-for-byte
+       {!read} on the writer path", i.e. it copies dirty pages rather than
+       aliasing them), which is exactly what the lazy-[Seq] shape needs.
+       Latent, not firing, today: the writer lock serializes writers and
+       nothing on the [max_key] read path mutates a page, but the retention
+       must be sound independent of that, per [read_borrow]'s own contract. *)
     let rec descend pid =
       let* r =
-        Pager.read_borrow
+        Pager.read_shared
           ?snapshot_frames:t.snapshot_frames
           ?pin_set:t.pin_set
           t.pager
           pid
-          (fun buf ->
-             let common = Page.read_common buf in
-             match common.Page.kind with
-             | Page.Leaf ->
-               let n = common.Page.n_keys in
-               if n = 0
-               then Lwt.return (Ok (`Key None))
-               else (
-                 (* #716 finding 1: walk with ONE reused span (allocates
+      in
+      bind_pager r (fun buf ->
+        let common = Page.read_common buf in
+        match common.Page.kind with
+        | Page.Leaf ->
+          let n = common.Page.n_keys in
+          if n = 0
+          then return_ok None
+          else (
+            (* #716 finding 1: walk with ONE reused span (allocates
                     nothing per entry, unlike [leaf_entry_at]) and copy only
                     the final key, once, at the very end. *)
-                 let span = Page.leaf_span_create () in
-                 let rec scan off i last =
-                   if i >= n
-                   then Ok last
-                   else if Page.leaf_span_at buf ~offset:off span
-                   then
-                     (* #716 finding 1: [leaf_span_at] SUCCEEDS on trailing
+            let span = Page.leaf_span_create () in
+            let rec scan off i last =
+              if i >= n
+              then Ok last
+              else if Page.leaf_span_at buf ~offset:off span
+              then
+                (* #716 finding 1: [leaf_span_at] SUCCEEDS on trailing
                         zero bytes past the last real entry -- it reads them
                         as a spurious empty entry ([key_len = 0][val_len = 0])
                         rather than running off the page, so the finding-3
@@ -1368,22 +1387,22 @@ let max_key t : (bytes option, error) result Lwt.t =
                         makes the signature exactly "an all-zero span", never
                         a coincidence with some future value encoding that
                         might legitimately store a 0-length payload. *)
-                     if span.Page.sp_key_len = 0 && span.Page.sp_val_len = 0
-                     then
-                       Error
-                         (Tree_corrupt
-                            (Printf.sprintf
-                               "max_key: leaf entry %d of %d is zero padding, not a real \
-                                entry (n_keys overstates the leaf)"
-                               i
-                               n))
-                     else
-                       scan
-                         span.Page.sp_next_offset
-                         (i + 1)
-                         (Some (span.Page.sp_key_off, span.Page.sp_key_len))
-                   else
-                     (* #716 finding 3: [n_keys] promised [n] entries but the
+                if span.Page.sp_key_len = 0 && span.Page.sp_val_len = 0
+                then
+                  Error
+                    (Tree_corrupt
+                       (Printf.sprintf
+                          "max_key: leaf entry %d of %d is zero padding, not a real \
+                           entry (n_keys overstates the leaf)"
+                          i
+                          n))
+                else
+                  scan
+                    span.Page.sp_next_offset
+                    (i + 1)
+                    (Some (span.Page.sp_key_off, span.Page.sp_key_len))
+              else
+                (* #716 finding 3: [n_keys] promised [n] entries but the
                         page ran out of entry bytes first. Answering with
                         [last] (or [None]) here would silently return a key
                         SMALLER than the tree's true maximum -- exactly the
@@ -1391,22 +1410,21 @@ let max_key t : (bytes option, error) result Lwt.t =
                         avoid (it feeds [next_rowid]; a too-low answer
                         reissues a live rowid, #589's symptom). Fail loud
                         instead of guessing. *)
-                     Error
-                       (Tree_corrupt
-                          (Printf.sprintf
-                             "max_key: leaf entries end before n_keys (saw %d of %d)"
-                             i
-                             n))
-                 in
-                 match scan Page.data_offset 0 None with
-                 | Error e -> Lwt.return (Error e)
-                 | Ok None -> Lwt.return (Ok (`Key None))
-                 | Ok (Some (off, len)) ->
-                   Lwt.return (Ok (`Key (Some (Page.copy_span buf ~off ~len)))))
-             | Page.Branch ->
-               let n = common.Page.n_keys in
-               let right_page = common.Page.right_page in
-               (* #716 finding 2: [Page.branch_children_right_to_left] gives a
+                Error
+                  (Tree_corrupt
+                     (Printf.sprintf
+                        "max_key: leaf entries end before n_keys (saw %d of %d)"
+                        i
+                        n))
+            in
+            match scan Page.data_offset 0 None with
+            | Error e -> return_error e
+            | Ok None -> return_ok None
+            | Ok (Some (off, len)) -> return_ok (Some (Page.copy_span buf ~off ~len)))
+        | Page.Branch ->
+          let n = common.Page.n_keys in
+          let right_page = common.Page.right_page in
+          (* #716 finding 2: [Page.branch_children_right_to_left] gives a
                   LAZY right-to-left child sequence instead of eagerly
                   materialising every child pointer. The naive
                   [List.init (n + 1) (fun k -> branch_child_at ... ~idx:(n-k))]
@@ -1416,17 +1434,14 @@ let max_key t : (bytes option, error) result Lwt.t =
                   pointers whenever [first_child_with_key] below only needed
                   the first (the common case: the rightmost subtree holds a
                   key). The lazy sequence costs O(1) for that common case and
-                  O(n), never O(n^2), when every child must be tried. *)
-               let children =
-                 Page.branch_children_right_to_left buf ~n_keys:n ~right_page
-               in
-               Lwt.return (Ok (`Children children))
-             | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
-      in
-      bind_pager r (function
-        | Error e -> return_error e
-        | Ok (`Key k) -> return_ok k
-        | Ok (`Children cs) -> first_child_with_key cs)
+                  O(n), never O(n^2), when every child must be tried. Its
+                  tail is forced (possibly after an [Lwt] yield, in
+                  [first_child_with_key] below) past the point where [buf]
+                  was read, hence [read_shared] above, not [read_borrow] —
+                  see the comment on [descend] itself. *)
+          let children = Page.branch_children_right_to_left buf ~n_keys:n ~right_page in
+          first_child_with_key children
+        | _ -> return_error (Tree_corrupt "non-tree page in tree"))
     and first_child_with_key (cs : int32 Seq.t) =
       match cs () with
       | Seq.Nil -> return_ok None

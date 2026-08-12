@@ -865,12 +865,136 @@ let test_recover_next_rowid_falls_back_on_corrupt_tree () =
       ; fk_constraints = []
       }
     in
-    let%lwt recovered = Cat.recover_next_rowid store meta in
+    let%lwt recovered = Cat.recover_next_rowid ~tolerate_unreadable:true store meta in
     let _, nrid, _, _ = Cat.row_storage recovered in
     Alcotest.(check int64)
-      "recover_next_rowid degrades to empty_next_rowid on a corrupt tree, not raise"
+      "recover_next_rowid degrades to empty_next_rowid on a corrupt tree under \
+       ~tolerate_unreadable:true (open_'s mirror-reconstruction path)"
       Cat.empty_next_rowid
       nrid;
+    S.close store)
+;;
+
+(* #716 ROUND-3 REVIEW FINDING 1 — the regression test.  Same corrupt-leaf
+   construction as [test_recover_next_rowid_falls_back_on_corrupt_tree]
+   directly above, but exercised at the DEFAULT [~tolerate_unreadable:false]
+   — the shape [recompute_rowid_counters_after_rollback] actually calls
+   ([:~2494] in [catalog.ml]).  Before this fix, [recover_next_rowid] caught
+   every exception unconditionally, so a live ROLLBACK's counter recompute
+   hitting a corrupt/truncated leaf silently reset the table's counter to
+   [empty_next_rowid] instead of raising — reproducing #589's symptom (the
+   next INSERT reissues an already-used rowid) instead of surfacing the
+   corruption loudly. This test pins that the default now RAISES rather than
+   silently resetting. *)
+let test_recover_next_rowid_raises_by_default_on_corrupt_tree () =
+  let mb = make_mock () in
+  let read_page, write_page, sync, resize = mock_callbacks mb in
+  let tid = 56 in
+  let key i = Granary_encoding.Rowid.encode i in
+  lwt (fun () ->
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:true
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "open_block: %a" S.pp_error e
+    in
+    let%lwt tx = S.rw_begin store in
+    let%lwt () = Lwt_list.iter_s (fun i -> S.put tx tid (key i) (b "v")) [ 1L; 2L; 3L ] in
+    let%lwt () = S.commit tx in
+    let target_keys = List.map key [ 1L; 2L; 3L ] in
+    let holds_a_target_key buf ~n_keys =
+      let rec scan off i =
+        if i >= n_keys
+        then false
+        else (
+          match Page.leaf_entry_at buf ~offset:off with
+          | `End -> false
+          | `Entry (e : Page.leaf_entry) ->
+            if List.exists (Bytes.equal e.key) target_keys
+            then true
+            else scan e.next_offset (i + 1))
+      in
+      scan Page.data_offset 0
+    in
+    let leaf_pid =
+      Hashtbl.fold
+        (fun pid bytes acc ->
+           match acc with
+           | Some _ -> acc
+           | None ->
+             let buf = Cstruct.of_bytes bytes in
+             let common = Page.read_common buf in
+             (match common.Page.kind with
+              | Page.Leaf when holds_a_target_key buf ~n_keys:common.Page.n_keys ->
+                Some pid
+              | _ -> acc))
+        mb.store
+        None
+    in
+    let leaf_pid =
+      match leaf_pid with
+      | Some pid -> pid
+      | None -> Alcotest.fail "could not locate the leaf holding the test rows"
+    in
+    let buf = Cstruct.of_bytes (Hashtbl.find mb.store leaf_pid) in
+    let common = Page.read_common buf in
+    let corrupt = Cstruct.create Page.page_size in
+    Cstruct.blit buf 0 corrupt 0 Page.page_size;
+    Page.write_common corrupt { common with n_keys = common.n_keys + 1 };
+    Page.seal corrupt;
+    let corrupt_bytes = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes corrupt 0 corrupt_bytes 0 Page.page_size;
+    Hashtbl.replace mb.store leaf_pid corrupt_bytes;
+    let%lwt () = S.close store in
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:false
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "reopen_block: %a" S.pp_error e
+    in
+    let meta : Cat.table_meta =
+      { name = "corrupt_test_default"
+      ; storage =
+          Cat.Row
+            { tree_id = tid
+            ; next_rowid = Cat.empty_next_rowid
+            ; without_rowid = false
+            ; autoincrement = false
+            }
+      ; columns = []
+      ; fk_constraints = []
+      }
+    in
+    let%lwt raised =
+      Lwt.catch
+        (fun () ->
+           let%lwt (_ : Cat.table_meta) = Cat.recover_next_rowid store meta in
+           Lwt.return false)
+        (fun _exn -> Lwt.return true)
+    in
+    Alcotest.(check bool)
+      "recover_next_rowid RAISES by default on a corrupt tree — the live-DML \
+       (rollback-recompute) shape must never silently reset the counter"
+      true
+      raised;
     S.close store)
 ;;
 
@@ -934,6 +1058,10 @@ let () =
             "recover_next_rowid falls back to empty_next_rowid on a corrupt tree"
             `Quick
             test_recover_next_rowid_falls_back_on_corrupt_tree
+        ; Alcotest.test_case
+            "recover_next_rowid raises by default on a corrupt tree (round-3 finding 1)"
+            `Quick
+            test_recover_next_rowid_raises_by_default_on_corrupt_tree
         ] )
     ]
 ;;

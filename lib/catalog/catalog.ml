@@ -2045,21 +2045,41 @@ let load_mirror_entries store =
 
    #716 finding 3: "unreadable" above must include a tree [S.max_key] cannot
    even READ (a truncated/corrupt leaf, [Btree.Tree_corrupt], surfaced by
-   [S.max_key] as an [Lwt.fail_with]) — not just an empty one — or this
-   function stops delivering the contract its own doc comment promises.  This
-   is the ONLY [S.max_key] caller that catches: it is reached from [open_]'s
-   mirror-reconstruction loop, which is explicitly "best-effort" and exists
-   so a database THAT IS ALREADY DAMAGED can still be opened by recovery
-   tooling ([:2205]'s "warn (but stay openable)"). Letting the exception
-   propagate would make a corrupt tree refuse to open at all — defeating the
-   very path meant to recover it. [max_rowid_in_txn] below is the deliberate
-   asymmetry: its callers are live DML ([note_rowid_deleted],
-   [set_next_rowid_in_txn]), where silently substituting a wrong counter
-   because a page came back corrupt is exactly the #589 hazard [Tree_corrupt]
-   exists to catch, so it stays loud. Best-effort recovery degrades; live DML
-   fails loud. Do not "unify" the two by adding a catch there too, or by
-   removing this one. *)
-let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
+   [S.max_key] as an [Lwt.fail_with], i.e. an OCaml [Failure]) — not just an
+   empty one — but ONLY for [open_]'s best-effort mirror-reconstruction
+   caller ([:~2211], "warn (but stay openable)"), which by construction only
+   ever runs on an already-damaged database and must stay openable for
+   recovery tooling. Letting the exception propagate there would make a
+   corrupt tree refuse to open at all — defeating the very path meant to
+   recover it. That caller passes [~tolerate_unreadable:true] explicitly.
+
+   #716 round-3 review finding 1: this function has a SECOND caller,
+   [recompute_rowid_counters_after_rollback] ([:~2494]), and that one is live
+   DML — a [ROLLBACK] that bumped this table's counter earlier in the same
+   transaction. A read failure there must NOT be papered over the same way:
+   silently substituting [empty_next_rowid] resets a live counter to
+   [Int64.min_int], and the next INSERT allocates rowid 1 over a row that is
+   still on disk — precisely the #589 hazard [Tree_corrupt] exists to catch.
+   [tolerate_unreadable] therefore DEFAULTS TO [false] (raise), and only
+   [open_]'s mirror loop opts into the degraded behaviour. A previous
+   revision of this comment claimed this was the ONLY [S.max_key] caller that
+   catches — that premise was false (this function's own rollback-recompute
+   caller three paragraphs below the same comment named it), and the catch
+   was unconditional, so it degraded the live-DML caller too. Do not restore
+   an unconditional catch, and do not widen the default to [true] — a future
+   THIRD caller must inherit the loud behaviour, not the degraded one.
+
+   The catch itself is scoped to [Failure _] — the exact shape [S.max_key]
+   raises on a [Btree.error] — rather than every exception, so
+   [Lwt.Canceled] and anything else propagates even under
+   [~tolerate_unreadable:true]. [max_rowid_in_txn] below stays unconditional
+   and loud for the same live-DML reason: its callers ([note_rowid_deleted],
+   [set_next_rowid_in_txn]) must never substitute a wrong counter for a
+   corrupt read. Best-effort recovery degrades only when explicitly asked;
+   live DML always fails loud. *)
+let recover_next_rowid ?(tolerate_unreadable = false) store (m : table_meta)
+  : table_meta Lwt.t
+  =
   let without_rowid, autoincrement, next_rowid, tree_id =
     match m.storage with
     | Row { without_rowid; autoincrement; next_rowid; tree_id } ->
@@ -2078,17 +2098,22 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
        this branch. *)
     Lwt.return m
   else (
+    let compute () =
+      S.with_ro store
+      @@ fun tx ->
+      let%lwt mk = S.max_key tx tree_id in
+      Lwt.return
+        (match mk with
+         | None -> empty_next_rowid
+         | Some k -> Int64.add (Rowid.decode k) 1L)
+    in
     let%lwt recovered =
-      Lwt.catch
-        (fun () ->
-           S.with_ro store
-           @@ fun tx ->
-           let%lwt mk = S.max_key tx tree_id in
-           Lwt.return
-             (match mk with
-              | None -> empty_next_rowid
-              | Some k -> Int64.add (Rowid.decode k) 1L))
-        (fun _exn -> Lwt.return empty_next_rowid)
+      if tolerate_unreadable
+      then
+        Lwt.catch compute (function
+          | Failure _ -> Lwt.return empty_next_rowid
+          | exn -> Lwt.fail exn)
+      else compute ()
     in
     Lwt.return
       { m with
@@ -2208,7 +2233,7 @@ let open_ store =
   let%lwt () =
     Lwt_list.iter_s
       (fun (m : table_meta) ->
-         let%lwt recovered = recover_next_rowid store m in
+         let%lwt recovered = recover_next_rowid ~tolerate_unreadable:true store m in
          Hashtbl.replace cache recovered.name recovered;
          Lwt.return_unit)
       reconstructed
