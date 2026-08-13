@@ -3035,6 +3035,20 @@ let max_key : type a. a txn -> tree_id -> bytes option Lwt.t =
     | Error e -> Lwt.fail (Max_key_error (map_btree_err e))
     | Ok k -> Lwt.return k
   in
+  (* #716 round-5 review finding 2: NOT [unwrap_error], which raises a
+     STRINGIFIED [Failure]. Resolving the data tree's root reads the META tree,
+     so corruption there fails here rather than in [Btree.max_key] — and a
+     [Failure] escapes every caller matching on this function's documented
+     [Max_key_error], notably [Cat.recover_next_rowid]'s [~tolerate_unreadable]
+     catch, which then let [Cat.open_] refuse to open the very database its
+     mirror-reconstruction loop exists to recover. Both failure sites now carry
+     the same typed error, so the error KIND (corruption vs a transient
+     [Block_error]) survives to the caller that has to tell them apart. *)
+  let unwrap_typed r =
+    match r with
+    | Ok v -> Lwt.return v
+    | Error e -> Lwt.fail (Max_key_error e)
+  in
   match tx with
   | Ro snap ->
     (match snap.rs_store.backend with
@@ -3047,7 +3061,7 @@ let max_key : type a. a txn -> tree_id -> bytes option Lwt.t =
        Lwt.return (Option.map fst (Bytes_map.max_binding_opt map))
      | Btree st ->
        let* r = bt_get_tree_ro snap st tid in
-       let* bt = unwrap_error r in
+       let* bt = unwrap_typed r in
        of_btree "(ro)" bt)
   | Rw _ ->
     let t = txn_store tx in
@@ -3061,7 +3075,7 @@ let max_key : type a. a txn -> tree_id -> bytes option Lwt.t =
        Lwt.return (Option.map fst (Bytes_map.max_binding_opt map))
      | Btree st ->
        let* r = bt_get_tree st tid in
-       let* bt = unwrap_error r in
+       let* bt = unwrap_typed r in
        of_btree "" bt)
 ;;
 

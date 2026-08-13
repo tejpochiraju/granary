@@ -1236,6 +1236,284 @@ let test_recover_next_rowid_propagates_io_error_even_when_tolerating () =
     S.close store)
 ;;
 
+(* #716 round-5 review finding 1: [recover_next_rowid]'s [Columnar] arm maps to
+   [(without_rowid = false, autoincrement = false, tree_id = -1)], and NEITHER
+   early-out fires for it, so the tail rebuilds [m.storage] as
+   [Row { tree_id = -1; ... }] unconditionally — silently converting a columnar
+   table into a rowid table over a tree that does not exist.
+
+   [open_]'s mirror-reconstruction loop calls this on EVERY reconstructed meta
+   with no [is_columnar] filter (unlike [recompute_rowid_counters_after_rollback],
+   which has one), and [decode_table_meta] genuinely produces [Columnar] from a
+   [storage_kind = 1] mirror row. So a [USING COLUMNSTORE] table whose primary
+   [_sys_tables] row is lost but whose mirror row survives comes back from
+   [open_] as a rowid table pointing at tree -1, and reads answer wrong/empty
+   instead of failing. The counter this function exists to recover is
+   meaningless for a columnar table, so the meta must come back untouched. *)
+let test_recover_next_rowid_leaves_columnar_storage_alone () =
+  let mb = make_mock () in
+  let read_page, write_page, sync, resize = mock_callbacks mb in
+  lwt (fun () ->
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:true
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "open_block: %a" S.pp_error e
+    in
+    let meta : Cat.table_meta =
+      { name = "columnar_test"
+      ; storage = Cat.Columnar (Granary_columnar.Col_store.create [], 41)
+      ; columns = []
+      ; fk_constraints = []
+      }
+    in
+    let%lwt recovered = Cat.recover_next_rowid store meta in
+    (match recovered.storage with
+     | Cat.Columnar (_, tid) ->
+       Alcotest.(check int) "the columnar tree_id survives untouched" 41 tid
+     | Cat.Row { tree_id; _ } ->
+       Alcotest.failf
+         "recover_next_rowid converted a Columnar table into Row storage over tree %d — \
+          open_'s mirror loop calls this on every reconstructed meta, so a columnstore \
+          table recovered from its mirror row would answer reads against a tree that \
+          does not exist"
+         tree_id);
+    (* The same must hold under [~tolerate_unreadable:true], which is the flag
+       [open_]'s mirror loop actually passes — the arm order must not make the
+       columnar early-out depend on it. *)
+    let%lwt recovered = Cat.recover_next_rowid ~tolerate_unreadable:true store meta in
+    (match recovered.storage with
+     | Cat.Columnar _ -> ()
+     | Cat.Row _ ->
+       Alcotest.fail
+         "recover_next_rowid converted a Columnar table into Row storage under \
+          ~tolerate_unreadable:true (open_'s own spelling)");
+    S.close store)
+;;
+
+(* #716 round-5 review finding 2: [Store.max_key] resolves the tree's ROOT
+   through [bt_get_tree_ro] / [bt_get_tree] and unwraps that with
+   [Store.unwrap_error], which raises a STRINGIFIED [Failure], not
+   [Max_key_error]. So corruption hit while resolving the root escapes both the
+   typed [S.Max_key_error (S.Corruption _)] arm of [recover_next_rowid]'s
+   [~tolerate_unreadable] catch AND the [Invalid_argument] one — and [Cat.open_]
+   refuses to open, which is exactly the outcome that flag exists to prevent
+   ("stay openable so recovery tooling can still run").
+
+   Corrupts the META tree's page rather than the data tree's: the meta tree is
+   what [bt_get_tree*] reads to find the data tree's root, so this exercises the
+   resolution step specifically, which no existing test in this file reaches. *)
+let test_meta_tree_corruption_is_typed_and_tolerated () =
+  let mb = make_mock () in
+  let read_page, write_page, sync, resize = mock_callbacks mb in
+  let tid = 63 in
+  let keys = [ "m1"; "m2"; "m3" ] in
+  lwt (fun () ->
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:true
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "open_block: %a" S.pp_error e
+    in
+    let%lwt tx = S.rw_begin store in
+    let%lwt () = put_keys tx keys in
+    let%lwt () = S.commit tx in
+    (* The data leaf is the Leaf page holding our keys; the META tree's leaf is
+       the OTHER Leaf page (it maps tree ids to root page ids). Assert exactly
+       one of each was found, so this cannot silently corrupt the wrong page and
+       pass for the wrong reason. *)
+    let holds_a_test_key buf ~n_keys =
+      let rec scan off i =
+        if i >= n_keys
+        then false
+        else (
+          match Page.leaf_entry_at buf ~offset:off with
+          | `End -> false
+          | `Entry (e : Page.leaf_entry) ->
+            if List.exists (fun k -> Bytes.equal e.key (b k)) keys
+            then true
+            else scan e.next_offset (i + 1))
+      in
+      scan Page.data_offset 0
+    in
+    let leaf_pids =
+      Hashtbl.fold
+        (fun pid bytes acc ->
+           let buf = Cstruct.of_bytes bytes in
+           let common = Page.read_common buf in
+           match common.Page.kind with
+           | Page.Leaf -> (pid, holds_a_test_key buf ~n_keys:common.Page.n_keys) :: acc
+           | _ -> acc)
+        mb.store
+        []
+    in
+    let meta_leaf_pids = List.filter (fun (_, is_data) -> not is_data) leaf_pids in
+    let data_leaf_pids = List.filter (fun (_, is_data) -> is_data) leaf_pids in
+    Alcotest.(check int) "exactly one data leaf" 1 (List.length data_leaf_pids);
+    Alcotest.(check int) "exactly one meta leaf" 1 (List.length meta_leaf_pids);
+    let meta_pid = fst (List.hd meta_leaf_pids) in
+    (* Corrupt by KIND, not by [n_keys]: an inflated count on the meta tree
+       makes [Btree.get] read zero padding and answer [Ok None] ("tree not
+       found"), which is not an error at all. A non-tree kind is what
+       [Btree]'s own descent rejects as [Tree_corrupt]. *)
+    let buf = Cstruct.of_bytes (Hashtbl.find mb.store meta_pid) in
+    let common = Page.read_common buf in
+    let corrupt = Cstruct.create Page.page_size in
+    Cstruct.blit buf 0 corrupt 0 Page.page_size;
+    Page.write_common corrupt { common with kind = Page.Overflow };
+    Page.seal corrupt;
+    let corrupt_bytes = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes corrupt 0 corrupt_bytes 0 Page.page_size;
+    Hashtbl.replace mb.store meta_pid corrupt_bytes;
+    let%lwt () = S.close store in
+    let%lwt store =
+      match%lwt
+        S.open_block
+          ~init_if_corrupt:false
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages:0L
+          ~close:(fun () -> Lwt.return_unit)
+          ()
+      with
+      | Ok s -> Lwt.return s
+      | Error e -> Alcotest.failf "reopen_block: %a" S.pp_error e
+    in
+    (* Half 1: the error is TYPED. [Max_key_error] is [store.mli]'s documented
+       contract for [max_key] ("Raises Max_key_error on a B+-tree backend
+       error"), and a stringified [Failure] silently breaks it for every caller
+       that matches on the type. *)
+    let%lwt kind =
+      Lwt.catch
+        (fun () ->
+           let%lwt (_ : bytes option) = S.with_ro store (fun tx -> S.max_key tx tid) in
+           Lwt.return `No_error)
+        (function
+          | S.Max_key_error _ -> Lwt.return `Typed
+          | Failure _ -> Lwt.return `Stringified
+          | exn -> Lwt.fail exn)
+    in
+    (match kind with
+     | `Typed -> ()
+     | `Stringified ->
+       Alcotest.fail
+         "S.max_key raised a stringified Failure for a corrupt META tree (root \
+          resolution) instead of Max_key_error — store.mli promises the typed exception, \
+          and recover_next_rowid's ~tolerate_unreadable catch matches on it"
+     | `No_error -> Alcotest.fail "S.max_key did not fail on a corrupted meta tree");
+    (* Half 2: and therefore [~tolerate_unreadable:true] degrades instead of
+       propagating — [open_]'s mirror loop must still open the database. *)
+    let meta : Cat.table_meta =
+      { name = "meta_corrupt_test"
+      ; storage =
+          Cat.Row
+            { tree_id = tid
+            ; next_rowid = Cat.empty_next_rowid
+            ; without_rowid = false
+            ; autoincrement = false
+            }
+      ; columns = []
+      ; fk_constraints = []
+      }
+    in
+    let%lwt degraded =
+      Lwt.catch
+        (fun () ->
+           let%lwt recovered =
+             Cat.recover_next_rowid ~tolerate_unreadable:true store meta
+           in
+           let _, nrid, _, _ = Cat.row_storage recovered in
+           Lwt.return (`Degraded nrid))
+        (fun exn -> Lwt.return (`Raised exn))
+    in
+    (match degraded with
+     | `Degraded nrid ->
+       Alcotest.(check int64)
+         "degrades to empty_next_rowid on a corrupt meta tree"
+         Cat.empty_next_rowid
+         nrid
+     | `Raised exn ->
+       Alcotest.failf
+         "recover_next_rowid ~tolerate_unreadable:true propagated %s from a corrupt meta \
+          tree, so Cat.open_ would refuse to open a database its mirror loop exists to \
+          recover"
+         (Printexc.to_string exn));
+    S.close store)
+;;
+
+(* #716 round-5 review finding 3: [first_child_with_key] recurses into itself
+   inside [descend]'s bind continuation, and [Pager.read_shared] resolves
+   SYNCHRONOUSLY on a cache hit, so Lwt runs the continuation inline rather
+   than yielding. Stack depth is therefore proportional to the number of PAGES
+   VISITED, not to tree height — and [store.mli] documents the degraded case
+   this file also tests ("a table whose rows were all deleted and committed
+   leaves a branch over N empty leaves") as supported, because [del_from_leaf]
+   retains emptied non-root leaves. A [DELETE FROM t] on a large table then
+   walks every empty leaf in one unbroken synchronous recursion.
+
+   The overflow itself is not reachable at test size — it needs ~100k empty
+   leaves, i.e. a ~400 MB tree — so what is pinned here is the MECHANISM that
+   bounds it: the walk must hand control back to the scheduler rather than
+   running to completion in one synchronous burst. An unyielding walk resolves
+   the promise before [Lwt.state] is ever consulted, so [Sleep] here is
+   precisely "the recursion was broken up". The [visited] set (round-4) does
+   not cover this: these are DISTINCT pages, so nothing is revisited. *)
+let test_max_key_yields_while_walking_many_empty_leaves () =
+  let t = ref (empty_tree ()) in
+  (* Values large enough that each leaf holds only a handful of entries, so a
+     few thousand keys produce several hundred leaves cheaply — but still under
+     [Btree]'s 800-byte [inline_value_threshold]: an OVERFLOWING value leaves a
+     17-byte marker in the leaf, which packs ~200 entries per leaf and would
+     produce only a handful of leaves for the same key count. *)
+  let value = Bytes.make 700 'x' in
+  let n = 2000 in
+  let key i = b (Printf.sprintf "k%05d" i) in
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.put !t (key i) value))
+  done;
+  for i = 0 to n - 1 do
+    t := ok_btree (run (Btree.del !t (key i)))
+  done;
+  let p = Btree.max_key !t in
+  let yielded =
+    match Lwt.state p with
+    | Lwt.Sleep -> true
+    | _ -> false
+  in
+  (* Correctness is unchanged either way: every leaf is empty, so the answer is
+     [None]. Checked first so a broken walk reports the wrong ANSWER as an
+     answer failure rather than as a yield failure. *)
+  (match ok_btree (run p) with
+   | None -> ()
+   | Some k ->
+     Alcotest.failf "expected None over all-empty leaves, got %S" (Bytes.to_string k));
+  Alcotest.(check bool)
+    "max_key yields to the scheduler while walking many empty leaves (bounding stack \
+     depth, which otherwise grows with pages visited)"
+    true
+    yielded
+;;
+
 let () =
   Alcotest.run
     "max_key_716"
@@ -1267,6 +1545,10 @@ let () =
              finding 2)"
             `Quick
             test_self_referential_right_page_is_tree_corrupt
+        ; Alcotest.test_case
+            "yields while walking many empty leaves (round-5 finding 3)"
+            `Quick
+            test_max_key_yields_while_walking_many_empty_leaves
         ] )
     ; ( "store"
       , [ Alcotest.test_case "mem rw shadow" `Quick test_store_mem_rw
@@ -1315,6 +1597,15 @@ let () =
              (round-4 finding 1, too broad)"
             `Quick
             test_recover_next_rowid_propagates_io_error_even_when_tolerating
+        ; Alcotest.test_case
+            "recover_next_rowid leaves Columnar storage alone (round-5 finding 1)"
+            `Quick
+            test_recover_next_rowid_leaves_columnar_storage_alone
+        ; Alcotest.test_case
+            "corrupt meta tree (root resolution) is typed and tolerated (round-5 finding \
+             2)"
+            `Quick
+            test_meta_tree_corruption_is_typed_and_tolerated
         ] )
     ]
 ;;

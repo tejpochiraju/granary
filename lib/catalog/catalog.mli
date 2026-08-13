@@ -117,6 +117,13 @@ val empty_next_rowid : int64
       reset a live counter and let the next INSERT reissue an on-disk rowid,
       the #589 hazard [Tree_corrupt] exists to catch.
 
+    A [Columnar] table is returned UNTOUCHED, like a [WITHOUT ROWID] one:
+    it has no rowid counter to recover, and this function rebuilds [storage]
+    as [Row] otherwise — which silently converted a columnstore table into a
+    rowid table over tree -1, since [open_]'s loop calls this on every
+    reconstructed meta and [decode_table_meta] does decode [Columnar] from a
+    mirror row (#716 round-5 review finding 1).
+
     [~tolerate_unreadable] defaults to [false] so a future third caller
     inherits the loud behaviour, not the degraded one; only [open_]'s loop
     opts in explicitly. Exposed (otherwise private to [catalog.ml]) so

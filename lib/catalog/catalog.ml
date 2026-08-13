@@ -2095,46 +2095,56 @@ let load_mirror_entries store =
 let recover_next_rowid ?(tolerate_unreadable = false) store (m : table_meta)
   : table_meta Lwt.t
   =
-  let without_rowid, autoincrement, next_rowid, tree_id =
-    match m.storage with
-    | Row { without_rowid; autoincrement; next_rowid; tree_id } ->
-      without_rowid, autoincrement, next_rowid, tree_id
-    | Columnar _ -> false, false, empty_next_rowid, -1
-  in
-  if without_rowid
-  then Lwt.return m
-  else if autoincrement && not (Int64.equal next_rowid empty_next_rowid)
-  then
-    (* #314: the mirror (v3) carries the sticky high-water for AUTOINCREMENT
+  match m.storage with
+  | Columnar _ ->
+    (* #716 round-5 review finding 1: a columnar table has no rowid counter to
+       recover, and the tail of this function rebuilds [m.storage] as [Row]
+       UNCONDITIONALLY — so without this arm a [Columnar] meta came back as
+       [Row { tree_id = -1; ... }], silently converting a columnstore table
+       into a rowid table over a tree that does not exist. [open_]'s
+       mirror-reconstruction loop calls this on EVERY reconstructed meta with
+       no [is_columnar] filter (unlike [recompute_rowid_counters_after_rollback],
+       which has one) and [decode_table_meta] genuinely decodes [Columnar] from
+       a [storage_kind = 1] mirror row, so a [USING COLUMNSTORE] table
+       recovered from its mirror answered reads against nothing.
+       Mirrors the [without_rowid] arm below: nothing to recover, return the
+       meta untouched. *)
+    Lwt.return m
+  | Row { without_rowid; autoincrement; next_rowid; tree_id } ->
+    if without_rowid
+    then Lwt.return m
+    else if autoincrement && not (Int64.equal next_rowid empty_next_rowid)
+    then
+      (* #314: the mirror (v3) carries the sticky high-water for AUTOINCREMENT
        tables; trust it instead of recomputing max(rowid)+1, which would make a
        committed-DELETE high-water reusable.  Only a v3 AUTOINCREMENT mirror
        entry decodes to a non-empty [next_rowid], so the rollback-recompute
        caller (which passes live-cache, non-AUTOINCREMENT metas) never trips
        this branch. *)
-    Lwt.return m
-  else (
-    let compute () =
-      S.with_ro store
-      @@ fun tx ->
-      let%lwt mk = S.max_key tx tree_id in
+      Lwt.return m
+    else (
+      let compute () =
+        S.with_ro store
+        @@ fun tx ->
+        let%lwt mk = S.max_key tx tree_id in
+        Lwt.return
+          (match mk with
+           | None -> empty_next_rowid
+           | Some k -> Int64.add (Rowid.decode k) 1L)
+      in
+      let%lwt recovered =
+        if tolerate_unreadable
+        then
+          Lwt.catch compute (function
+            | S.Max_key_error (S.Corruption _) -> Lwt.return empty_next_rowid
+            | Invalid_argument _ -> Lwt.return empty_next_rowid
+            | exn -> Lwt.fail exn)
+        else compute ()
+      in
       Lwt.return
-        (match mk with
-         | None -> empty_next_rowid
-         | Some k -> Int64.add (Rowid.decode k) 1L)
-    in
-    let%lwt recovered =
-      if tolerate_unreadable
-      then
-        Lwt.catch compute (function
-          | S.Max_key_error (S.Corruption _) -> Lwt.return empty_next_rowid
-          | Invalid_argument _ -> Lwt.return empty_next_rowid
-          | exn -> Lwt.fail exn)
-      else compute ()
-    in
-    Lwt.return
-      { m with
-        storage = Row { tree_id; next_rowid = recovered; without_rowid; autoincrement }
-      })
+        { m with
+          storage = Row { tree_id; next_rowid = recovered; without_rowid; autoincrement }
+        })
 ;;
 
 (* #299: read a table's LAST-COMMITTED [next_rowid] straight from its

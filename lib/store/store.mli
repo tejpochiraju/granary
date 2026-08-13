@@ -343,7 +343,12 @@ val cursor_value : cursor -> bytes option
     materialises every key and value in the tree before returning.
 
     Raises {!Max_key_error} on a B+-tree backend error (never on the
-    in-memory backend, which cannot fail here). *)
+    in-memory backend, which cannot fail here).  That covers BOTH failure
+    sites, which matters because they read different trees: the descent
+    itself, and resolving [tree_id]'s root, which reads the META tree and so
+    fails on damage the data tree does not have.  Root resolution used to
+    raise a stringified [Failure] instead, escaping every caller matching on
+    this exception (#716 round-5 review finding 2). *)
 val max_key : _ txn -> tree_id -> bytes option Lwt.t
 
 (** Raised by {!max_key} to carry the underlying B+-tree {!error} typed,

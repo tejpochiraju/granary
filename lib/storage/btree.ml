@@ -1479,15 +1479,33 @@ let max_key t : (bytes option, error) result Lwt.t =
             let children = Page.branch_children_right_to_left buf ~n_keys:n ~right_page in
             first_child_with_key children
           | _ -> return_error (Tree_corrupt "non-tree page in tree")))
-    and first_child_with_key (cs : int32 Seq.t) =
+    and first_child_with_key ?(since_yield = 0) (cs : int32 Seq.t) =
       match cs () with
       | Seq.Nil -> return_ok None
       | Seq.Cons (pid, rest) ->
+        (* #716 round-5 review finding 3: [Pager.read_shared] resolves
+           SYNCHRONOUSLY on a cache hit, and [Lwt.bind] on an already-resolved
+           promise runs its continuation inline — so without this yield the
+           stack grows by one [descend]/[first_child_with_key] frame per PAGE
+           VISITED, not per level of tree height. The [visited] set above does
+           not bound that: these are DISTINCT pages, so nothing is revisited.
+           The shape that reaches it is documented and supported, not corrupt —
+           [del_from_leaf] retains emptied non-root leaves, so a committed
+           [DELETE FROM t] on a large table leaves a branch over N empty
+           leaves, and [note_rowid_deleted] (#409) walks all of them on the
+           next high-water delete. [Lwt.pause] returns a PENDING promise, so
+           binding on it unwinds the stack and resumes from the scheduler.
+           Every [yield_every] children costs one scheduler turn, which is
+           nothing against the page reads it interleaves, and the healthy path
+           (the rightmost subtree answers immediately) never reaches it. *)
+        let yield_every = 64 in
+        let* () = if since_yield >= yield_every then Lwt.pause () else Lwt.return_unit in
+        let since_yield = if since_yield >= yield_every then 0 else since_yield in
         let* r = descend (page_id_of_int32 pid) in
         (match r with
          | Error e -> return_error e
          | Ok (Some k) -> return_ok (Some k)
-         | Ok None -> first_child_with_key rest)
+         | Ok None -> first_child_with_key ~since_yield:(since_yield + 1) rest)
     in
     descend t.root_page)
 ;;
