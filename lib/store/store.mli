@@ -332,6 +332,34 @@ val cursor_next : cursor -> (bytes * bytes) option
     or [None] if the cursor is not positioned (exhausted or before first). *)
 val cursor_value : cursor -> bytes option
 
+(** #716: the tree's greatest key, or [None] when the tree is empty, in
+    O(log n) — a rightmost descent rather than a scan, degrading only by the
+    number of empty pages it skips (a table whose rows were all deleted and
+    committed leaves a branch over N empty leaves, and this still costs
+    O(pages) rather than O(1)).  Sees the same snapshot as {!get} /
+    {!cursor_open} on the same transaction.
+
+    Use this instead of draining a cursor to find a maximum: {!cursor_open}
+    materialises every key and value in the tree before returning.
+
+    Raises {!Max_key_error} on a B+-tree backend error (never on the
+    in-memory backend, which cannot fail here).  That covers BOTH failure
+    sites, which matters because they read different trees: the descent
+    itself, and resolving [tree_id]'s root, which reads the META tree and so
+    fails on damage the data tree does not have.  Root resolution used to
+    raise a stringified [Failure] instead, escaping every caller matching on
+    this exception (#716 round-5 review finding 2). *)
+val max_key : _ txn -> tree_id -> bytes option Lwt.t
+
+(** Raised by {!max_key} to carry the underlying B+-tree {!error} typed,
+    rather than flattened into a string (#716 round-4 review finding 1).
+    [Corruption] is the class a caller may choose to tolerate — a damaged
+    page or a [Btree.Tree_corrupt] guard firing; every other constructor,
+    in particular [Block_error] (a transient I/O failure), should propagate:
+    tolerating corruption is not the same as tolerating a device that failed
+    to answer a healthy read. *)
+exception Max_key_error of error
+
 (** A lazy, streaming forward cursor positioned by {!seek_ge}.  Unlike
     {!cursor}, it does NOT materialise the whole tree: it descends the
     B+-tree in O(log n) and reads only the entries the caller consumes.

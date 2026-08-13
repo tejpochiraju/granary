@@ -92,6 +92,50 @@ val tid_of_storage : storage -> Granary_store.Store.tree_id
     [sqlite_sequence] until its first insert).  See #250/#312. *)
 val empty_next_rowid : int64
 
+(** #175: recompute [next_rowid = max(rowid) + 1] over a table's data tree
+    (via {!Granary_store.Store.max_key}, #716's O(log n) rightmost descent).
+    Returns [m] unchanged for a WITHOUT ROWID table or a live AUTOINCREMENT
+    high-water; otherwise [empty_next_rowid] for an empty tree.
+
+    Two callers, and they disagree deliberately on what a READ FAILURE means
+    (#716 round-3 review finding 1):
+    - [open_]'s best-effort mirror-reconstruction path passes
+      [~tolerate_unreadable:true]: by construction it only ever runs on an
+      already-damaged database and must stay openable for recovery tooling,
+      so a read failure there degrades to [empty_next_rowid] rather than
+      refusing to open at all — but ONLY when the failure is corruption
+      ([Store.Max_key_error (Store.Corruption _)], from [Btree.Tree_corrupt]
+      or a [Pager.Corruption]; or [Invalid_argument] from [Rowid.decode]
+      choking on a too-short key). A transient I/O error
+      ([Store.Max_key_error (Store.Block_error _)]) still propagates even
+      under [~tolerate_unreadable:true] — degrading it would reset a
+      perfectly healthy table's counter (#716 round-4 review finding 1).
+    - [recompute_rowid_counters_after_rollback]'s caller (live DML: a
+      [ROLLBACK] recomputing a counter it bumped earlier in the same
+      transaction) takes the default [~tolerate_unreadable:false] and RAISES
+      on every read failure — substituting [empty_next_rowid] there would
+      reset a live counter and let the next INSERT reissue an on-disk rowid,
+      the #589 hazard [Tree_corrupt] exists to catch.
+
+    A [Columnar] table is returned UNTOUCHED, like a [WITHOUT ROWID] one:
+    it has no rowid counter to recover, and this function rebuilds [storage]
+    as [Row] otherwise — which silently converted a columnstore table into a
+    rowid table over tree -1, since [open_]'s loop calls this on every
+    reconstructed meta and [decode_table_meta] does decode [Columnar] from a
+    mirror row (#716 round-5 review finding 1).
+
+    [~tolerate_unreadable] defaults to [false] so a future third caller
+    inherits the loud behaviour, not the degraded one; only [open_]'s loop
+    opts in explicitly. Exposed (otherwise private to [catalog.ml]) so
+    [test/test_max_key_716.ml] can pin both behaviours directly against a
+    genuinely corrupted on-disk leaf, without needing a public seam into
+    [open_]'s internal mirror-reconstruction loop. *)
+val recover_next_rowid
+  :  ?tolerate_unreadable:bool
+  -> Granary_store.Store.t
+  -> table_meta
+  -> table_meta Lwt.t
+
 (** #243 (T1): index of the INTEGER PRIMARY KEY column that aliases the rowid,
     if the table qualifies (rowid table, single INTEGER PRIMARY KEY column).
     For such tables the table tree is keyed by this column's value and no

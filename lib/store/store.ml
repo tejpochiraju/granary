@@ -3018,6 +3018,67 @@ let cursor_value c =
   | _ -> None
 ;;
 
+(* #716: a tree's maximum key without materialising the tree.
+   Deliberately mirrors [cursor_open]'s four arms so the snapshot rules of the
+   two cannot drift: an RO Mem read MUST come from [rs_mem_snap] (#178) or a
+   concurrent writer's uncommitted rows leak in and survive its rollback, and
+   an RW Mem read MUST come from the shadow or it misses this txn's own writes.
+   [Bytes_map] is [Map.Make (Bytes)], so [max_binding_opt] is the map's own
+   rightmost descent — the Mem arms are not scans either. *)
+exception Max_key_error of error
+
+let max_key : type a. a txn -> tree_id -> bytes option Lwt.t =
+  fun tx tid ->
+  let of_btree _label bt =
+    let* r = Btree.max_key bt in
+    match r with
+    | Error e -> Lwt.fail (Max_key_error (map_btree_err e))
+    | Ok k -> Lwt.return k
+  in
+  (* #716 round-5 review finding 2: NOT [unwrap_error], which raises a
+     STRINGIFIED [Failure]. Resolving the data tree's root reads the META tree,
+     so corruption there fails here rather than in [Btree.max_key] — and a
+     [Failure] escapes every caller matching on this function's documented
+     [Max_key_error], notably [Cat.recover_next_rowid]'s [~tolerate_unreadable]
+     catch, which then let [Cat.open_] refuse to open the very database its
+     mirror-reconstruction loop exists to recover. Both failure sites now carry
+     the same typed error, so the error KIND (corruption vs a transient
+     [Block_error]) survives to the caller that has to tell them apart. *)
+  let unwrap_typed r =
+    match r with
+    | Ok v -> Lwt.return v
+    | Error e -> Lwt.fail (Max_key_error e)
+  in
+  match tx with
+  | Ro snap ->
+    (match snap.rs_store.backend with
+     | Mem _ ->
+       let map =
+         match snap.rs_mem_snap with
+         | Some snap -> mem_tree_snap snap tid
+         | None -> Bytes_map.empty
+       in
+       Lwt.return (Option.map fst (Bytes_map.max_binding_opt map))
+     | Btree st ->
+       let* r = bt_get_tree_ro snap st tid in
+       let* bt = unwrap_typed r in
+       of_btree "(ro)" bt)
+  | Rw _ ->
+    let t = txn_store tx in
+    (match t.backend with
+     | Mem trees ->
+       let map =
+         match t.mem_rw_shadow with
+         | None -> !(mem_tree trees tid)
+         | Some shadow -> shadow_get shadow trees tid
+       in
+       Lwt.return (Option.map fst (Bytes_map.max_binding_opt map))
+     | Btree st ->
+       let* r = bt_get_tree st tid in
+       let* bt = unwrap_typed r in
+       of_btree "" bt)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Native streaming seek (#228, #229)                                   *)
 (*                                                                       *)

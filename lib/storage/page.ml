@@ -704,6 +704,50 @@ let branch_child_at buf ~n_keys ~right_page ~idx : int32 =
   else branch_child_at_loop buf (Cstruct.length buf) n_keys right_page idx data_offset 0
 ;;
 
+(* #716 finding 2: a right-to-left child sequence for a branch page, built
+   without [branch_child_at]'s O(idx) cost paid once per child.
+   [branch_child_at] restarts its entry walk from the page start on EVERY
+   call, so deriving all [n_keys + 1] children via
+   [List.init (n+1) (fun k -> branch_child_at ... ~idx:(n - k))] is O(n^2)
+   per branch page. It is also eager, where the caller ([Btree.max_key]'s
+   right-to-left descent) almost always consumes only the FIRST element: the
+   rightmost subtree holds a key in a non-degenerate tree, so the other [n]
+   pointers were computed and thrown away.
+
+   [right_page] (idx = n) is free — it's a header field, no entry decode at
+   all — so it is always this sequence's first element, produced with zero
+   page work. Only if the caller pulls past it do we pay for the rest, and
+   even then only ONCE: a single left-to-right pass over the page's entries
+   (mirroring [branch_child_at_loop]'s per-index truncation fallback to
+   [right_page] exactly, entry by entry) fills an array of [left_child]
+   pointers, which is then handed out n-1 downto 0 by plain array indexing.
+   Total cost: O(1) in the common case, O(n) — never O(n^2) — when every
+   child must be tried. Ascending child order is [idx = 0] -> [e0.left_child]
+   through [idx = n-1] -> [e_{n-1}.left_child] then [idx = n] -> [right_page],
+   matching [branch_child_at]; right-to-left is therefore [right_page]
+   followed by [idx = n-1] downto [0]. *)
+let branch_children_right_to_left buf ~n_keys ~right_page : int32 Seq.t =
+  fun () ->
+  Seq.Cons
+    ( right_page
+    , fun () ->
+        let page_size = Cstruct.length buf in
+        let arr = Array.make n_keys right_page in
+        let rec loop offset i =
+          if i >= n_keys || offset + 6 > page_size
+          then ()
+          else (
+            let key_len = Cstruct.BE.get_uint16 buf offset in
+            if offset + 2 + key_len + 4 > page_size
+            then ()
+            else (
+              arr.(i) <- Cstruct.BE.get_uint32 buf (offset + 2 + key_len);
+              loop (offset + 2 + key_len + 4) (i + 1)))
+        in
+        loop data_offset 0;
+        Seq.init n_keys (fun k -> arr.(n_keys - 1 - k)) () )
+;;
+
 (* Build a new branch page identical to [buf] except the child pointer at
    [child_ptr_offset] is replaced with [new_child].  If [child_ptr_offset < 0]
    the [right_page] header field is updated instead.  Returns a fresh,

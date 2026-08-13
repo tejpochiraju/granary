@@ -2033,55 +2033,118 @@ let load_mirror_entries store =
 ;;
 
 (* #175: recover next_rowid for tables reconstructed from the mirror.
-   Scan the table's data tree for the maximum integer rowid key (the
-   tree is keyed by [Rowid.encode], whose offset-binary encoding sorts
-   negatives correctly, so the last key in byte-sorted order is the maximum
-   rowid).  Return [next_rowid = max + 1], or [empty_next_rowid] for an empty or
+   Ask the store for the data tree's maximum key (#716: an O(log n) rightmost
+   descent — this used to drain the whole tree through [S.cursor_open] and walk
+   it, which at TPC-C scale was 358.9 ms per rollback).  [Rowid.encode]'s
+   offset-binary encoding sorts negatives correctly, so the greatest key in
+   byte order is the greatest rowid.
+   Return [next_rowid = max + 1], or [empty_next_rowid] for an empty or
    unreadable tree (#250: so a subsequent NULL insert seeds at 1 and an explicit
    below-counter id seeds from its own value, exactly as in-session).  WITHOUT
-   ROWID tables are skipped — they don't use rowid keys. *)
-let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
-  let without_rowid, autoincrement, next_rowid, tree_id =
-    match m.storage with
-    | Row { without_rowid; autoincrement; next_rowid; tree_id } ->
-      without_rowid, autoincrement, next_rowid, tree_id
-    | Columnar _ -> false, false, empty_next_rowid, -1
-  in
-  if without_rowid
-  then Lwt.return m
-  else if autoincrement && not (Int64.equal next_rowid empty_next_rowid)
-  then
-    (* #314: the mirror (v3) carries the sticky high-water for AUTOINCREMENT
+   ROWID tables are skipped — they don't use rowid keys.
+
+   #716 finding 3: "unreadable" above must include a tree [S.max_key] cannot
+   even READ (a truncated/corrupt leaf, [Btree.Tree_corrupt]) — not just an
+   empty one — but ONLY for [open_]'s best-effort mirror-reconstruction
+   caller ([:~2211], "warn (but stay openable)"), which by construction only
+   ever runs on an already-damaged database and must stay openable for
+   recovery tooling. Letting the exception propagate there would make a
+   corrupt tree refuse to open at all — defeating the very path meant to
+   recover it. That caller passes [~tolerate_unreadable:true] explicitly.
+
+   #716 round-3 review finding 1: this function has a SECOND caller,
+   [recompute_rowid_counters_after_rollback] ([:~2494]), and that one is live
+   DML — a [ROLLBACK] that bumped this table's counter earlier in the same
+   transaction. A read failure there must NOT be papered over the same way:
+   silently substituting [empty_next_rowid] resets a live counter to
+   [Int64.min_int], and the next INSERT allocates rowid 1 over a row that is
+   still on disk — precisely the #589 hazard [Tree_corrupt] exists to catch.
+   [tolerate_unreadable] therefore DEFAULTS TO [false] (raise), and only
+   [open_]'s mirror loop opts into the degraded behaviour. A previous
+   revision of this comment claimed this was the ONLY [S.max_key] caller that
+   catches — that premise was false (this function's own rollback-recompute
+   caller three paragraphs below the same comment named it), and the catch
+   was unconditional, so it degraded the live-DML caller too. Do not restore
+   an unconditional catch, and do not widen the default to [true] — a future
+   THIRD caller must inherit the loud behaviour, not the degraded one.
+
+   #716 round-4 review finding 1: the catch used to be scoped to [Failure _],
+   the shape [S.max_key] used to raise unconditionally regardless of WHY it
+   failed — which was simultaneously too broad (a transient I/O error on an
+   otherwise healthy tree, [S.Block_error], is not corruption, and degrading
+   it to [empty_next_rowid] would reset a live table's counter and let a
+   subsequent NULL insert overwrite rowid 1) and too narrow (a damaged key
+   can surface through [Rowid.decode] below as [Invalid_argument] — e.g. a
+   key shorter than the 8 bytes it unconditionally indexes — which is not a
+   [Failure] and used to escape the catch entirely, defeating
+   [~tolerate_unreadable:true] for exactly the corrupt-tree case it exists
+   to handle). [S.max_key] now raises the typed [S.Max_key_error of S.error]
+   (store.ml's existing idiom — see [S.History_error]), so the catch below
+   can discriminate on the error's CLASS: [S.Corruption] (from
+   [Btree.Tree_corrupt] or a [Pager.Corruption]) is tolerated, along with
+   [Invalid_argument] from the [Rowid.decode] call a few lines down inside
+   [compute] (also corruption, just detected one level up rather than inside
+   the btree) — everything else, notably [S.Max_key_error (S.Block_error _)]
+   and any exception neither of those, propagates unconditionally, including
+   under [~tolerate_unreadable:true]. [max_rowid_in_txn] below stays
+   unconditional and loud for the same live-DML reason: its callers
+   ([note_rowid_deleted], [set_next_rowid_in_txn]) must never substitute a
+   wrong counter for a corrupt read. Best-effort recovery degrades only when
+   explicitly asked, and only for damage — not for an I/O error, and never
+   silently; live DML always fails loud. *)
+let recover_next_rowid ?(tolerate_unreadable = false) store (m : table_meta)
+  : table_meta Lwt.t
+  =
+  match m.storage with
+  | Columnar _ ->
+    (* #716 round-5 review finding 1: a columnar table has no rowid counter to
+       recover, and the tail of this function rebuilds [m.storage] as [Row]
+       UNCONDITIONALLY — so without this arm a [Columnar] meta came back as
+       [Row { tree_id = -1; ... }], silently converting a columnstore table
+       into a rowid table over a tree that does not exist. [open_]'s
+       mirror-reconstruction loop calls this on EVERY reconstructed meta with
+       no [is_columnar] filter (unlike [recompute_rowid_counters_after_rollback],
+       which has one) and [decode_table_meta] genuinely decodes [Columnar] from
+       a [storage_kind = 1] mirror row, so a [USING COLUMNSTORE] table
+       recovered from its mirror answered reads against nothing.
+       Mirrors the [without_rowid] arm below: nothing to recover, return the
+       meta untouched. *)
+    Lwt.return m
+  | Row { without_rowid; autoincrement; next_rowid; tree_id } ->
+    if without_rowid
+    then Lwt.return m
+    else if autoincrement && not (Int64.equal next_rowid empty_next_rowid)
+    then
+      (* #314: the mirror (v3) carries the sticky high-water for AUTOINCREMENT
        tables; trust it instead of recomputing max(rowid)+1, which would make a
        committed-DELETE high-water reusable.  Only a v3 AUTOINCREMENT mirror
        entry decodes to a non-empty [next_rowid], so the rollback-recompute
        caller (which passes live-cache, non-AUTOINCREMENT metas) never trips
        this branch. *)
-    Lwt.return m
-  else
-    S.with_ro store
-    @@ fun tx ->
-    let%lwt cur = S.cursor_open tx tree_id in
-    let _sr = S.cursor_first cur in
-    let max_key = ref None in
-    let rec walk () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (k, _) ->
-        max_key := Some k;
-        walk ()
-    in
-    walk ();
-    S.cursor_close cur;
-    let recovered =
-      match !max_key with
-      | None -> empty_next_rowid
-      | Some k -> Int64.add (Rowid.decode k) 1L
-    in
-    Lwt.return
-      { m with
-        storage = Row { tree_id; next_rowid = recovered; without_rowid; autoincrement }
-      }
+      Lwt.return m
+    else (
+      let compute () =
+        S.with_ro store
+        @@ fun tx ->
+        let%lwt mk = S.max_key tx tree_id in
+        Lwt.return
+          (match mk with
+           | None -> empty_next_rowid
+           | Some k -> Int64.add (Rowid.decode k) 1L)
+      in
+      let%lwt recovered =
+        if tolerate_unreadable
+        then
+          Lwt.catch compute (function
+            | S.Max_key_error (S.Corruption _) -> Lwt.return empty_next_rowid
+            | Invalid_argument _ -> Lwt.return empty_next_rowid
+            | exn -> Lwt.fail exn)
+        else compute ()
+      in
+      Lwt.return
+        { m with
+          storage = Row { tree_id; next_rowid = recovered; without_rowid; autoincrement }
+        })
 ;;
 
 (* #299: read a table's LAST-COMMITTED [next_rowid] straight from its
@@ -2196,7 +2259,7 @@ let open_ store =
   let%lwt () =
     Lwt_list.iter_s
       (fun (m : table_meta) ->
-         let%lwt recovered = recover_next_rowid store m in
+         let%lwt recovered = recover_next_rowid ~tolerate_unreadable:true store m in
          Hashtbl.replace cache recovered.name recovered;
          Lwt.return_unit)
       reconstructed
@@ -2354,16 +2417,50 @@ let rollback_schema_changes t = Schema_cache.rollback t.sc
    RW lock is released (so [recover_next_rowid]'s own RO txn cannot deadlock).
 
    We recompute ONLY the [rowid_bumped_in_txn] set — usually a single table —
-   rather than every cached rowid table.  [recover_next_rowid] is an O(n) tree
-   walk to find max(rowid); scanning every table would make a rollback cost
-   O(total rows across ALL tables), a regression on a perf-sensitive engine
-   (cf. #228/#229 driving cursor_open O(n)->O(log n)).  Restricting to the
-   bumped set keeps rollback ~O(1) in the common case.  A bumped name that is no
-   longer cached (e.g. its CREATE TABLE rolled back in the same txn) or that is
-   WITHOUT ROWID is skipped.  The set is CLEARED here so it never leaks into a
-   later transaction; commit clears it too (via [commit_schema_changes]), which
-   is why a COMMIT keeps the bumped counter yet a subsequent unrelated ROLLBACK
-   does not wrongly recompute it.
+   rather than every cached rowid table.  This is primarily a CORRECTNESS
+   restriction, not a cost one: recomputing a table this transaction never
+   touched derives its counter from data (or, for AUTOINCREMENT, from the
+   persisted mark — see #299 below) instead of trusting the value already
+   published, and for an untouched table [cas_rowid_durable]'s [expected] IS
+   the live value, so the CAS always succeeds and the recomputed value
+   publishes unconditionally.  The mechanism that makes that genuinely
+   unsafe, not merely wasteful, is #706's own race: the shared
+   [Store.rowid_counters] entry can already reflect a SIBLING worker
+   handle's allocation that has not yet reached the data tree —
+   [S.rollback] released the writer lock before this recompute's RO scan
+   runs, so a concurrent [rw_begin]/allocate/commit on an untouched table
+   can land in that exact window.  If it lands BEFORE this recompute
+   captures [expected], [expected] still equals the (about-to-go-stale)
+   live value, the CAS succeeds, and the publish lowers the counter below
+   an id the sibling has already committed — #589's symptom, reached
+   through the #706 window rather than through a missed delete.
+
+   A committed DELETE of the high-water row that [note_rowid_deleted]
+   missed is NOT such a case: recomputing an untouched table from data can
+   only land AT OR ABOVE the true [max(rowid) + 1] (every live row is still
+   visible to the scan), so the next INSERT would reissue a DEAD rowid —
+   #409's intended reuse, not an overwrite.  (A deliberate [sqlite_sequence]
+   SET — [set_next_rowid_in_txn], which raises on anything that is not
+   AUTOINCREMENT — can legitimately push a table's counter above
+   [max(rowid) + 1] too, but it is not a hazard to THIS restriction
+   specifically: [recover_next_rowid] already refuses to touch a populated
+   AUTOINCREMENT counter regardless of whether it is called on a bumped or
+   an untouched table, and the [autoincrement] branch below never calls it
+   for such a table in the first place — see #299.)
+
+   Secondarily it is also right for cost, since the recomputed value must
+   equal the cached counter in the benign case anyway and computing it is
+   pure waste.  Since #716 [recover_next_rowid] is an O(log n) rightmost
+   descent rather than a full scan, the cost side of this argument is far
+   weaker than it used to be (a full-tree drain per table would have
+   justified the restriction on cost alone) — which is exactly why the
+   correctness reason above has to be stated explicitly rather than left to
+   ride along with it.  A bumped name that is no longer cached (e.g. its
+   CREATE TABLE rolled back in the same txn) or that is WITHOUT ROWID is
+   skipped.  The set is CLEARED here so it never leaks into a later
+   transaction; commit clears it too (via [commit_schema_changes]), which
+   is why a COMMIT keeps the bumped counter yet a subsequent unrelated
+   ROLLBACK does not wrongly recompute it.
 
    #299: AUTOINCREMENT tables take a DIFFERENT branch.  Their counter is a
    sticky high-water that a committed DELETE never lowers, so recomputing
@@ -2840,17 +2937,22 @@ let bump_next_rowid_in_txn ?(defer_counter = false) t ~name ~at_least (tx : S.rw
       if defer_counter then Lwt.return_unit else put_table_counter_tx tx m')
 ;;
 
-(* #312.1: largest stored rowid in a table's data tree, computed within an
-   already-open txn.  Used only on the uncommon lower-clamp path of a writable
-   [sqlite_sequence] SET/INSERT, to avoid lowering the counter below the live
-   max(rowid).  The store has no [cursor_last]/[cursor_prev], so this reuses the
-   forward walk from [recover_next_rowid]: [Rowid.encode]'s offset-binary
-   encoding sorts integer rowids correctly, so the last key in byte order is the
-   maximum.  Returns [None] for an empty tree. *)
+(* #312.1/#409: largest stored rowid in a table's data tree, computed within
+   an already-open txn.  Uses [S.max_key] (#716), the same O(log n) rightmost
+   descent [recover_next_rowid] takes.  [Rowid.encode]'s offset-binary
+   encoding sorts integer rowids correctly, so the tree's greatest key is the
+   greatest rowid.  Returns [None] for an empty tree.
+
+   Two callers, both per-statement rather than administrative: the lower-clamp
+   path of a writable [sqlite_sequence] SET/INSERT ([set_next_rowid_in_txn],
+   below), avoiding lowering the counter below the live max(rowid); and
+   [note_rowid_deleted] (#409), which fires on every plain-rowid-table DELETE
+   of the current high-water row — not uncommon at all under a delete-heavy
+   workload. *)
 let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
   match Schema_cache.find_table t.sc name with
-  (* Private helper; the sole caller ([set_next_rowid_in_txn]) has already
-     confirmed the table is present, so this arm is unreachable in practice. *)
+  (* Private helper; both callers have already confirmed the table is
+     present, so this arm is unreachable in practice. *)
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
     let tree_id =
@@ -2858,22 +2960,8 @@ let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
       | Row { tree_id; _ } -> tree_id
       | Columnar _ -> failwith "max_rowid_in_txn on columnar table"
     in
-    let%lwt cur = S.cursor_open tx tree_id in
-    let _sr = S.cursor_first cur in
-    let max_key = ref None in
-    let rec walk () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (k, _) ->
-        max_key := Some k;
-        walk ()
-    in
-    walk ();
-    S.cursor_close cur;
-    Lwt.return
-      (match !max_key with
-       | None -> None
-       | Some k -> Some (Rowid.decode k))
+    let%lwt mk = S.max_key tx tree_id in
+    Lwt.return (Option.map Rowid.decode mk)
 ;;
 
 (* #409: SQLite keeps no persisted counter for a plain (non-AUTOINCREMENT)

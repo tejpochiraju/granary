@@ -1698,3 +1698,32 @@
  (name test_point_lookup_alloc_416)
  (modules test_point_lookup_alloc_416)
  (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #716: max_key — O(log n) rightmost descent replacing the full-tree drain.
+
+(test
+ (name test_max_key_716)
+ (modules test_max_key_716)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  granary.encoding
+  granary.catalog
+  granary.columnar
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix)
+ (preprocess
+  (pps lwt_ppx)))
+
+; #716: rollback-recompute timing. Print-only, gated by
+; GRANARY_BENCH_ROLLBACK_716; not a CI gate.
+
+(test
+ (name bench_rollback_recompute_716)
+ (modules bench_rollback_recompute_716)
+ (libraries granary granary.unix alcotest lwt.unix unix))
