@@ -15,6 +15,17 @@ let buf_of_bytes b =
   cs
 ;;
 
+let getenv_float k d =
+  try float_of_string (Sys.getenv k) with
+  | _ -> d
+;;
+
+(* The timer's nominal deadline in [read_page_yields_to_timer_test].  Named
+   once because two things depend on it agreeing: the [Lwt_unix.sleep] that
+   posts the timer, and the guard that decides whether the reader outlasted it
+   and so whether the ordering assertion means anything. *)
+let timer_deadline_s = 0.05
+
 (* Counter for unique test file names *)
 let counter = ref 0
 
@@ -492,32 +503,76 @@ let cross_process_lock_test () =
        let* _ = UF.resize t ~n_pages:1L in
        let* _ = UF.close t in
        Lwt.return_unit);
-  let r_pipe, w_pipe = Unix.pipe () in
+  (* Two pipes, so the child holds the lock for exactly as long as the parent
+     needs it and not one instant less.
+
+     It used to be one pipe plus [Unix.sleep 2] in the child: the child
+     signalled "locked", slept a fixed two seconds and exited.  That is a race
+     with a two-second window, not a synchronisation — if the parent's
+     [UF.open_] took longer than the child's remaining sleep (entirely possible
+     on a loaded CI runner, where this whole suite is competing for the box),
+     the lock was already released by the time the parent probed, [open_]
+     SUCCEEDED, and the test failed with "expected open to fail while child
+     holds the lock".  A green run proved the machine was fast that minute, not
+     that locking works.
+
+     Now: child locks, says so, and blocks reading [release_r] until the parent
+     has finished probing.  No timing assumption survives, and the test also
+     stops costing two seconds of wall clock. *)
+  let ready_r, ready_w = Unix.pipe () in
+  let release_r, release_w = Unix.pipe () in
   match Unix.fork () with
   | 0 ->
-    (* Child: open the file, lock it, signal parent, sleep, exit. *)
-    Unix.close r_pipe;
+    (* Child: open the file, lock it, signal the parent, wait to be released. *)
+    Unix.close ready_r;
+    Unix.close release_w;
     let fd = Unix.openfile path [ Unix.O_RDWR ] 0o644 in
     Unix.lockf fd Unix.F_TLOCK 0;
-    let _ = Unix.write w_pipe (Bytes.of_string "x") 0 1 in
-    Unix.close w_pipe;
-    Unix.sleep 2;
-    Unix.close fd;
-    exit 0
-  | child_pid ->
-    Unix.close w_pipe;
-    (* Wait for child to signal it has the lock *)
+    let _ = Unix.write ready_w (Bytes.of_string "x") 0 1 in
+    Unix.close ready_w;
+    (* Blocks until the parent closes [release_w] (or writes to it).  Either
+       way the child outlives the parent's probe by construction.
+
+       EINTR must be retried rather than treated as "released": a signal
+       arriving mid-read would otherwise drop the lock while the parent is
+       still probing, which is the very race the handshake replaces.  Any
+       other error IS a release — the parent has gone away. *)
     let buf = Bytes.create 1 in
-    let _ = Unix.read r_pipe buf 0 1 in
-    Unix.close r_pipe;
+    let rec wait_for_release () =
+      match Unix.read release_r buf 0 1 with
+      | _ -> ()
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> wait_for_release ()
+      | exception _ -> ()
+    in
+    wait_for_release ();
+    Unix.close release_r;
+    Unix.close fd;
+    (* [_exit], not [exit]: the child inherited the parent's stdout buffer, and
+       [exit] would run [at_exit] and flush a copy of everything the parent had
+       buffered before the fork. *)
+    Unix._exit 0
+  | child_pid ->
+    Unix.close ready_w;
+    Unix.close release_r;
+    (* Wait for the child to signal it holds the lock. *)
+    let buf = Bytes.create 1 in
+    let _ = Unix.read ready_r buf 0 1 in
+    Unix.close ready_r;
+    (* [Fun.protect] so an exception escaping the probe still releases the
+       child.  Without it the child stays blocked holding the lock on [path]
+       until the test binary exits — the 2 s sleep this handshake replaced was
+       at least self-limiting. *)
     let result =
-      Lwt_main.run
-        (let* r = UF.open_ ~path () in
-         match r with
-         | Ok t ->
-           let* _ = UF.close t in
-           Lwt.return `Success
-         | Error _ -> Lwt.return `Locked)
+      Fun.protect
+        ~finally:(fun () -> Unix.close release_w)
+        (fun () ->
+           Lwt_main.run
+             (let* r = UF.open_ ~path () in
+              match r with
+              | Ok t ->
+                let* _ = UF.close t in
+                Lwt.return `Success
+              | Error _ -> Lwt.return `Locked))
     in
     let _ = Unix.waitpid [] child_pid in
     cleanup path;
@@ -763,8 +818,23 @@ let prop_resize_n_pages_correct =
    [read_page] loop.  If [read_page] is genuinely async the timer fires
    close to its scheduled deadline and well before the reader finishes;
    if it isn't, the timer is delayed until after the entire read loop.
-   The 5x slack on the timer-fired-before-reader-done assertion absorbs
-   container/CI jitter.  *)
+
+   {b This is a wall-clock gate, and it used to be armed everywhere.}  It was
+   missing from the [GRANARY_BENCH_*] family and therefore from the neutralizer
+   list every automated job sets, so a loaded runner could breach the ceiling
+   and fail a PR that changed nothing — see CLAUDE.md's timing-gate table, which
+   this test now appears in.  [GRANARY_BENCH_MAX_TIMER_S] raises the ceiling the
+   same way [GRANARY_BENCH_MAX_WRITER_S] does for [bench_slow_read_yield].
+
+   {b The ordering assertion could also fail from being too FAST}, which is the
+   subtler half.  If the reader completes all 10 000 [read_page] calls before
+   the timer's 50 ms deadline, the timer necessarily fires after the reader
+   finishes — and that says nothing at all about cooperation, because a
+   NON-cooperative reader that quick would look identical.  The comparison is
+   not evidence either way, so the run is reported as inconclusive rather than
+   failed: a measurement that cannot discriminate must not be a gate.  (This is
+   the same discipline #481's unarmed allocation gate follows — measure, print,
+   and only block on what the measurement can actually support.)  *)
 let read_page_yields_to_timer_test () =
   Lwt_main.run
     (let path = fresh_path () in
@@ -793,14 +863,20 @@ let read_page_yields_to_timer_test () =
        let timer_fired_at = ref None in
        let reader_done_at = ref None in
        let timer =
-         let* () = Lwt_unix.sleep 0.05 in
+         let* () = Lwt_unix.sleep timer_deadline_s in
          timer_fired_at := Some (Unix.gettimeofday () -. t0);
          Lwt.return_unit
        in
        let reader =
          let rbuf = make_buf () in
+         (* Loop until BOTH a floor of iterations and a floor of wall-time are
+            reached.  The wall-time floor is what makes the ordering assertion
+            below discriminating: without it the reader could finish inside the
+            timer's own deadline on a fast box, leaving nothing for the timer to
+            be scheduled *inside* and reducing the comparison to a coin flip in
+            the band just above it. *)
          let rec loop i =
-           if i >= 10_000
+           if i >= 10_000 && Unix.gettimeofday () -. t0 >= 4. *. timer_deadline_s
            then Lwt.return_unit
            else (
              let pid = Int64.of_int (i mod 16) in
@@ -815,11 +891,17 @@ let read_page_yields_to_timer_test () =
        let* _ = UF.close t in
        cleanup path;
        (* The timer must have fired during the reader's run, not after it
-         completed.  If the reader monopolised the scheduler, both would
-         land at the same wall-time, so we require the timer to fire by
-         5x its nominal deadline (250 ms) — wide enough to absorb the
-         worst container/CI jitter we've observed, tight enough to fail
-         loudly if cooperation regresses to "never yields". *)
+         completed.  If the reader monopolised the scheduler, both would land
+         at the same wall-time.
+
+         Two assertions follow and they are not equally trustworthy.  The
+         ORDERING one ([timer_at < reader_at]) is the real gate: it needs no
+         prediction about how fast this box is, and the reader's wall-time
+         floor above guarantees a wide margin for it to be read against.  The
+         CEILING one is a prediction — 0.25 s was chosen as 5x the nominal
+         deadline for jitter headroom, and #730 is the record of it being
+         wrong on a loaded runner — so it is the one under
+         [GRANARY_BENCH_MAX_TIMER_S] and the one CI neutralizes. *)
        let timer_at =
          match !timer_fired_at with
          | Some t -> t
@@ -830,17 +912,53 @@ let read_page_yields_to_timer_test () =
          | Some t -> t
          | None -> Alcotest.fail "reader never finished"
        in
-       Alcotest.(check bool)
-         (Printf.sprintf "timer fired (%.3fs) inside Lwt-budget (≤ 0.25s)" timer_at)
-         true
-         (timer_at <= 0.25);
+       (* Print the two measurements on EVERY run, pass or fail.  They are what
+          tells a reader whether the ordering assertion had any margin to be read
+          against, and #730 was diagnosed without them. *)
+       Printf.eprintf
+         "  read_page_yields_to_timer: timer_at=%.3fs reader_at=%.3fs (deadline %.3fs)\n\
+          %!"
+         timer_at
+         reader_at
+         timer_deadline_s;
+       let max_timer_s = getenv_float "GRANARY_BENCH_MAX_TIMER_S" 0.25 in
        Alcotest.(check bool)
          (Printf.sprintf
-            "timer fired (%.3fs) before reader finished (%.3fs)"
+            "timer fired (%.3fs) inside Lwt-budget (<= %.3fs; raise with \
+             GRANARY_BENCH_MAX_TIMER_S)"
             timer_at
-            reader_at)
+            max_timer_s)
          true
-         (timer_at < reader_at);
+         (timer_at <= max_timer_s);
+       (* Belt and braces.  The reader's wall-time floor above should make this
+          unreachable — it does not return before 4x the deadline — but if some
+          future edit removes that floor, refusing to assert is better than
+          asserting something the run cannot support.  The band is 2x the
+          deadline, not exactly it: at [reader_at] a hair above [timer_deadline_s]
+          the ordering assertion would demand the timer fire within a fraction of
+          a millisecond of its nominal deadline, which is a coin flip whether or
+          not [read_page] cooperates.
+          Printed to stderr, unconditionally, the way #481's unarmed gate prints
+          its slope: a run that has silently lost #158's coverage must not look
+          identical to one that kept it. *)
+       if reader_at <= 2. *. timer_deadline_s
+       then
+         Printf.eprintf
+           "  read_page_yields_to_timer: INCONCLUSIVE — reader finished in %.3fs, within \
+            2x the timer's %.3fs deadline, so the ordering says nothing about \
+            cooperation (timer fired at %.3fs)\n\
+            %!"
+           reader_at
+           timer_deadline_s
+           timer_at
+       else
+         Alcotest.(check bool)
+           (Printf.sprintf
+              "timer fired (%.3fs) before reader finished (%.3fs)"
+              timer_at
+              reader_at)
+           true
+           (timer_at < reader_at);
        Lwt.return_unit)
 ;;
 

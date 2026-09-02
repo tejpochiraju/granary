@@ -51,12 +51,17 @@ jobs:
           GRANARY_BENCH_PARALLEL_MAX: "1000000"
           GRANARY_BENCH_MAX_WRITER_S: "1000000"
           GRANARY_BENCH_MAX_RATIO: "1000000"
+          # #730: read_page_yields_to_timer_test in test_unix_file is a
+          # wall-clock gate too, and was missing from this list — so a loaded
+          # runner could fail a PR that changed nothing.
+          GRANARY_BENCH_MAX_TIMER_S: "1000000"
         run: |
           docker run --rm --platform=linux/${{ matrix.arch }} --user root \
             -v "$PWD":/workspace -w /workspace \
             -e HOME=/home/opam -e OPAMROOT=/home/opam/.opam \
             -e GRANARY_BENCH_MIN_SPEEDUP -e GRANARY_BENCH_PARALLEL_MAX \
             -e GRANARY_BENCH_MAX_WRITER_S -e GRANARY_BENCH_MAX_RATIO \
+            -e GRANARY_BENCH_MAX_TIMER_S \
             ocaml/opam:ubuntu-24.04-ocaml-5.4 bash -c '
               set -eu
               echo "matrix.arch=${{ matrix.arch }}"

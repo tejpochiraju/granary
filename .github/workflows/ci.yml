@@ -60,6 +60,10 @@ jobs:
           GRANARY_BENCH_PARALLEL_MAX: "1000000"
           GRANARY_BENCH_MAX_WRITER_S: "1000000"
           GRANARY_BENCH_MAX_RATIO: "1000000"
+          # #730: read_page_yields_to_timer_test in test_unix_file is a
+          # wall-clock gate too, and was missing from this list — so a loaded
+          # runner could fail a PR that changed nothing.
+          GRANARY_BENCH_MAX_TIMER_S: "1000000"
         run: opam exec -- dune runtest
 
       - name: Report test count

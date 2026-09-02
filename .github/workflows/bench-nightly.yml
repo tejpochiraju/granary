@@ -5,7 +5,8 @@ name: Timing gates nightly (#549)
 # Every other job that invokes `dune runtest` neutralizes them (#549):
 #   .github/workflows/ci.yml, coverage.yml, cross-arch.yml and their
 #   .forgejo/ counterparts all set GRANARY_BENCH_MIN_SPEEDUP=0,
-#   GRANARY_BENCH_PARALLEL_MAX / _MAX_WRITER_S / _MAX_RATIO = 1000000.
+#   GRANARY_BENCH_PARALLEL_MAX / _MAX_WRITER_S / _MAX_RATIO /
+#   _MAX_TIMER_S = 1000000.
 # That is deliberate — those jobs share a loaded runner with every other PR
 # and a wall-clock gate flakes there — but the consequence was that
 # test_fts_scaling (#233), test_insert_scaling (#228/#229) and the bench_*
@@ -107,7 +108,7 @@ jobs:
 
       - name: Test with the timing gates ARMED
         # DELIBERATELY no GRANARY_BENCH_MIN_SPEEDUP / _PARALLEL_MAX /
-        # _MAX_WRITER_S / _MAX_RATIO here. That is the entire point of this
+        # _MAX_WRITER_S / _MAX_RATIO / _MAX_TIMER_S here. That is the entire point of this
         # job (#549) — do not "fix" a flaky nightly by adding them back.
         #
         # GRANARY_BENCH_TRIALS is a tuning knob, not a gate: it cannot make a

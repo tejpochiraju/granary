@@ -82,6 +82,33 @@ O(n²) bulk insert, a lost reader/writer overlap:
 | `bench_wal_fsync_overlap` | #149/#159 fsync overlap | overlap ≤ 1.15, speedup ≥ 1.2 | `GRANARY_BENCH_MIN_SPEEDUP` |
 | `bench_wal_reader_scaling` | #149 parallel-read regression | parallel ≤ 2.0x serial | `GRANARY_BENCH_PARALLEL_MAX` |
 | `bench_slow_read_yield` | reader starving the writer | writer ≤ 3.0 s | `GRANARY_BENCH_MAX_WRITER_S` |
+| `test_unix_file` (`read_page_yields_to_timer_test`) | #158 `read_page` not yielding to the scheduler | timer fires ≤ 0.25 s | `GRANARY_BENCH_MAX_TIMER_S` |
+
+**`test_unix_file`'s row was missing from this table until #730, and that cost
+real PR time.** It is an ordinary wall-clock gate — a 50 ms timer posted
+alongside a 10 000-iteration `read_page` loop, asserted to fire within 0.25 s —
+but it carried no `GRANARY_BENCH_*` knob, so it was armed in *every* job
+including the six that neutralize everything else. On a loaded runner it failed
+PRs that changed nothing, and because it lives in `test_unix_file` rather than a
+`bench_*` file, nobody looking at the neutralizer list noticed it was missing.
+**A new wall-clock assertion belongs in this table and in all six workflow
+files, whatever file it is written in.**
+
+Two further things about that test are worth knowing before editing it:
+
+- **It can fail from being too FAST, not only too slow.** If the reader finishes
+  all 10 000 reads inside the timer's 50 ms deadline, the timer necessarily
+  fires after the reader, and the ordering assertion inverts — while proving
+  nothing, because a *non*-cooperative reader that quick would look identical.
+  Since #730 that case prints `INCONCLUSIVE` and does not assert: a measurement
+  that cannot discriminate must not be a gate.
+- **Its cross-process `lockf` test used to be a two-second race, not a
+  synchronisation.** The child locked the file, signalled, then `Unix.sleep 2`
+  and exited; if the parent's `UF.open_` probe took longer than the child's
+  remaining sleep, the lock was already gone, `open_` succeeded, and the test
+  failed. A green run proved the machine was fast that minute. It is now a
+  two-pipe handshake — the child holds the lock until the parent says it is done
+  probing — so no timing assumption survives.
 
 Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
 
@@ -252,6 +279,7 @@ prerequisites, both of which the `coverage.yml` workflow also applies:
 podman run --rm -v "$(pwd):/workspace:z" -w /workspace \
   -e GRANARY_BENCH_MIN_SPEEDUP=0 -e GRANARY_BENCH_PARALLEL_MAX=1000000 \
   -e GRANARY_BENCH_MAX_WRITER_S=1000000 -e GRANARY_BENCH_MAX_RATIO=1000000 \
+  -e GRANARY_BENCH_MAX_TIMER_S=1000000 \
   granary-dev bash -c '
     opam pin add -y -k git bisect_ppx \
       "https://github.com/patricoferris/bisect_ppx.git#7061d643ff492b0045796357ee6917ded21fb1f0"
