@@ -102,8 +102,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.4-lint-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
-          restore-keys: opam-5.4-lint-
+          # #728: the prefix was bumped `lint` -> `lint2` to EVICT the poisoned
+          # entry rather than only cope with it.  `actions/cache` skips its save
+          # step when the primary key hits, and that key is a hash of two rarely
+          # changing files — so the bad entry would otherwise be restored by
+          # every future run via `restore-keys`, forever.  The cleanup in the
+          # next step is still the belt: it covers a cache that gets poisoned
+          # again, which a one-time key bump cannot.
+          key: opam-5.4-lint2-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
+          restore-keys: opam-5.4-lint2-
 
       - name: Install opam packages + merlint
         run: |
@@ -112,6 +119,27 @@ jobs:
             mirage-crypto mirage-crypto-rng alcotest-lwt sqlite3 \
             nottui nottui-lwt lwd
           # merlint is git-only (no opam release); pin the known-good commit.
+          #
+          # Clear any pin and its source tree FIRST (#728).  The `~/.opam` cache
+          # restored above can carry a partial or broken
+          # `.opam-switch/sources/merlint` checkout; opam then tries to
+          # *synchronize* that directory rather than clone a fresh one, and
+          # `git fetch` inside a broken repo exits 128 — failing the job with
+          #   Could not synchronize .../sources/merlint ... exited with code 128
+          # while the pinned commit itself is perfectly fetchable.  Because the
+          # cache key falls back through `restore-keys`, one poisoned entry
+          # fails every later run that restores it.  Observed 2026-09-02 on the
+          # lint job; the build-and-test job has its own cache and no pin, which
+          # is why only lint was affected.
+          #
+          # This weakens no gate: the same commit is pinned either way, and
+          # merlint still blocks on findings (#173).
+          # `|| true` alone makes the "not pinned" case non-fatal; stderr is
+          # kept deliberately, so that if this line ever fails for some OTHER
+          # reason the log still shows it — this is the step that exists to
+          # unbreak the lint job (#728).
+          opam pin remove -y merlint >/dev/null || true
+          rm -rf "$(opam var prefix)/.opam-switch/sources/merlint"
           opam pin add -y -k git merlint \
             "https://github.com/samoht/merlint.git#d5548822dea1ad3b845eabd4b569946a05e42423"
 

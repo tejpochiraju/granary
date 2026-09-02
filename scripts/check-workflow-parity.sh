@@ -18,8 +18,13 @@ set -eu
 cd "$(dirname "$0")/.."
 
 # <workflow file>|<exact step name>
+# #728: the merlint pin (its commit sha AND the pre-pin cleanup around it) must
+# be identical on both forges, or the two lint jobs silently run different
+# merlint versions — or one of them keeps failing on a poisoned opam cache after
+# the other is fixed.
 SHARED_STEPS='ci.yml|Policy — no real-SQLite outside gated comparison files (#370)
-ci.yml|Workflow mirror drift check (.forgejo vs .github)'
+ci.yml|Workflow mirror drift check (.forgejo vs .github)
+ci.yml|Install opam packages + merlint'
 
 # Print the named step, re-indented relative to its own `- name:` line, so that
 # a difference in surrounding job nesting is not reported as drift.
