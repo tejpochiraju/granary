@@ -32,7 +32,30 @@
     - the same, after close and REOPEN. A corrupted [generated_as] is only
       re-parsed on a later open, so an in-session assertion misses it entirely
       (noted on the issue);
-    - [sqlite_master] DDL and [Db.dump] output replay into a fresh database. *)
+    - [sqlite_master] DDL and [Db.dump] output replay into a fresh database.
+
+    {2 Soft and hard reserved words — pick a HARD one, or the case is inert}
+
+    A reserved word here is not automatically a load-bearing test input. The
+    corruption this file guards against writes the new name into a bare
+    position, so a case only goes red if the resulting text FAILS to re-parse.
+    Measured against a pre-fix catalog: of the 197 words in
+    {!Granary_encoding.Sql_ident.sql_keywords}, {b 126 are "soft"} — the
+    grammar still accepts them bare in the position they land in, so the
+    corrupted text re-parses and the test passes {i against the bug} — and only
+    71 are "hard".
+
+    [key] is soft. [order], [select] and [group] are hard, which is why every
+    case below is written with one of those three. #617 was exactly this trap:
+    [build_everything] renamed the GENERATED table's column to ["key"], so that
+    surface contributed nothing to the sensitivity of
+    [sqlite_master_ddl_replays] or [dump_round_trips] — both stayed red pre-fix
+    only through the CHECK and partial-index surfaces, and a future change that
+    broke GENERATED alone would have left both green.
+
+    The QCheck property at the bottom is the exception, and deliberately so: it
+    draws [~count:60] over all 197 words, so P(a green run against the bug) is
+    about [0.64 ** 60] — around [2e-12]. *)
 
 open Lwt.Syntax
 open Granary_sql
@@ -343,7 +366,7 @@ let build_everything db =
   exec db "CREATE INDEX ei ON p (a + 1)";
   List.iter
     (fun (t, w) -> exec db (Printf.sprintf "ALTER TABLE %s RENAME COLUMN a TO %s" t w))
-    [ "r", "\"order\""; "g", "\"key\""; "p", "\"group\"" ]
+    [ "r", "\"order\""; "g", "\"select\""; "p", "\"group\"" ]
 ;;
 
 let sqlite_master_ddl_replays () =
@@ -360,7 +383,7 @@ let sqlite_master_ddl_replays () =
     List.iter (fun s -> expect_ok db "replayed DDL" s) (tables @ indexes);
     expect_ok db "replayed CHECK" "INSERT INTO r VALUES (1, 1)";
     expect_constraint_violation db "replayed CHECK" "INSERT INTO r VALUES (0, 1)";
-    expect_ok db "replayed GENERATED" "INSERT INTO g (\"key\") VALUES (7)";
+    expect_ok db "replayed GENERATED" "INSERT INTO g (\"select\") VALUES (7)";
     Alcotest.(check int64) "generated value" 8L (one_int db "SELECT d FROM g"))
 ;;
 
@@ -369,7 +392,7 @@ let dump_round_trips () =
     with_db (fun db ->
       build_everything db;
       exec db "INSERT INTO r VALUES (1, 1)";
-      exec db "INSERT INTO g (\"key\") VALUES (7)";
+      exec db "INSERT INTO g (\"select\") VALUES (7)";
       exec db "INSERT INTO p VALUES (1, 5)";
       match run (Db.dump_to_string db ()) with
       | Ok s -> s
@@ -380,7 +403,7 @@ let dump_round_trips () =
     (fun needle ->
        if not (lower_contains script needle)
        then Alcotest.failf "dump lost the delimiters around %s:\n%s" needle script)
-    [ "\"order\""; "\"key\""; "\"group\"" ];
+    [ "\"order\""; "\"select\""; "\"group\"" ];
   with_db (fun db ->
     String.split_on_char '\n' script
     |> List.iter (fun line ->
