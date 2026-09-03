@@ -177,6 +177,74 @@ let dirty_changes ({ changes; _ } : dirty_tables_acc) : (string * row_change lis
     |> List.sort (fun (a, _) (b, _) -> String.compare a b)
 ;;
 
+(* #666: a mark/restore point for the #417 row-level delta log, so a write the
+   store UNDOES cannot leave a delta describing it behind.
+
+   Rollback used to revert two of the three pieces of per-statement state — the
+   [Store] trees and the [Schema_cache] — and not the ambient accumulator here.
+   The two halves of the accumulator are not equally dangerous and are treated
+   differently on purpose:
+
+   - the #240 NAME set is an invalidation HINT.  A stale entry costs an external
+     cache one miss, and is deliberately NOT reverted: over-invalidation is
+     free, whereas under-invalidation (a mark site this restore failed to
+     account for) is a stale-cache wrong answer.  Note [record_change] marks the
+     name as well as recording the delta, so restoring the delta and keeping the
+     name lands on exactly that safe side.
+   - the #417 delta log is a statement of FACT about rows.  A stale [Inserted]
+     is a PHANTOM ROW in a materialised reactive view ([Db.drive_reactive]
+     absorbs it and the maintenance applies it), which is a wrong answer, not a
+     cost.  So it is reverted.
+
+   The log is prepend-only per table and its per-table [ref] is created once and
+   never replaced, so a mark is exactly each table's current list — which later
+   prepends leave as the tail — and a restore is an assignment back to it plus
+   the removal of tables that did not exist at mark time.  That makes both
+   operations O(tables touched), never O(rows): [execute_insert] takes one mark
+   per ROW, so anything proportional to the deltas already recorded would make a
+   multi-row INSERT quadratic. *)
+type changes_mark =
+  | Cm_none
+  | Cm_marked of
+      { log : (string, row_change list ref) Hashtbl.t
+      ; saved : (string * row_change list) list
+      }
+
+(* Capture the delta log's current tails.  [Cm_none] when no accumulator is
+   installed or capture is off — the common case, and one predicted branch. *)
+let changes_mark () : changes_mark =
+  match Lwt.get dirty_tables_key with
+  | None | Some { changes = None; _ } -> Cm_none
+  | Some { changes = Some log; _ } ->
+    Cm_marked { log; saved = Hashtbl.fold (fun k r acc -> (k, !r) :: acc) log [] }
+;;
+
+(* Discard every delta recorded since [m] was taken.  Call it wherever the STORE
+   is reverted (an autocommit [S.rollback] of a skipped row, or #631's
+   statement savepoint) and NOT where effects survive — a raising statement in a
+   borrowed transaction keeps its partial writes, so it must keep their deltas.
+
+   Two passes, each O(tables): drop the tables that did not exist at mark time,
+   then put every table that did back to its marked tail.  The second pass
+   re-adds a missing entry rather than assuming one is there.  That case is
+   believed unreachable — only a restore removes an entry, and it removes only
+   tables absent at ITS OWN mark, which (marks nest LIFO) can never include a
+   table present at an enclosing mark — but the invariant is subtle enough that
+   depending on it silently would be the wrong trade for one [Hashtbl.replace]. *)
+let changes_restore (m : changes_mark) : unit =
+  match m with
+  | Cm_none -> ()
+  | Cm_marked { log; saved } ->
+    Hashtbl.fold (fun k _ acc -> k :: acc) log []
+    |> List.iter (fun k -> if not (List.mem_assoc k saved) then Hashtbl.remove log k);
+    List.iter
+      (fun (k, tail) ->
+         match Hashtbl.find_opt log k with
+         | Some r -> r := tail
+         | None -> Hashtbl.replace log k (ref tail))
+      saved
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
@@ -4675,9 +4743,25 @@ let stmt_savepoint_release ~(cat : Cat.t) tx (sp : string option) : unit Lwt.t =
     Lwt.return_unit
 ;;
 
-let stmt_savepoint_finish ~(cat : Cat.t) tx ~(wrote : bool) (sp : string option)
+(* #666: [mark] is the row's #417 delta-log mark and [owned] says whether the
+   transaction is this statement's own.  A row that did not write must leave no
+   delta behind, and the store is reverted for it by ONE of two mechanisms:
+   in autocommit ([owned]) the skip arms of [execute_insert_write] /
+   [execute_upsert_update] have already rolled the whole per-row transaction
+   back; in a borrowed transaction it is the savepoint rolled back just below,
+   which exists only inside #631's intersection.  Restore exactly then — with
+   [not owned] and no savepoint nothing was reverted, and dropping the deltas
+   would lose a real trigger write instead of a phantom one. *)
+let stmt_savepoint_finish
+      ~(cat : Cat.t)
+      tx
+      ~(wrote : bool)
+      ~(owned : bool)
+      ~(mark : changes_mark)
+      (sp : string option)
   : unit Lwt.t
   =
+  if (not wrote) && (owned || Option.is_some sp) then changes_restore mark;
   let* () =
     match sp with
     | Some name when not wrote ->
@@ -4741,6 +4825,14 @@ let execute_insert
       tx
       ~take:((not owned) && Option.is_some before_hook && on_conflict = Some Ast.CA_ignore)
   in
+  (* #666: the delta-log counterpart of that undo point, and deliberately WIDER
+     than it.  The savepoint is only needed when the transaction is borrowed;
+     the stale-delta hole is just as real in autocommit, where the skip arms
+     roll the whole per-row transaction back and the accumulator — which rides
+     Lwt storage across that rollback — kept the trigger's [Inserted] anyway.
+     Marking is O(tables touched) and [Cm_none] when nobody is capturing, so
+     the unconditional mark costs the plain write path one branch. *)
+  let mark = changes_mark () in
   Lwt.catch
     (fun () ->
        let* () =
@@ -4881,7 +4973,7 @@ let execute_insert
              ~on_upsert_update
          in
          if updated then mark_dirty table_meta.Cat.name;
-         let* () = stmt_savepoint_finish ~cat tx ~wrote:updated sp in
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:updated ~owned ~mark sp in
          Lwt.return updated
        | _ ->
          let* inserted =
@@ -4915,15 +5007,23 @@ let execute_insert
          then (
            mark_dirty table_meta.Cat.name;
            record_change table_meta.Cat.name (Inserted { rowid; row }));
-         let* () = stmt_savepoint_finish ~cat tx ~wrote:inserted sp in
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:inserted ~owned ~mark sp in
          Lwt.return inserted)
     (fun exn ->
        (* On any exception: rollback if we own the txn, then re-raise.  #631:
           the statement savepoint is released, not rolled back — a raising
           statement's partial effects already survive in a borrowed
           transaction, and this fix is about a SKIP, not about statement
-          atomicity on error.  Releasing only keeps the stack bounded. *)
+          atomicity on error.  Releasing only keeps the stack bounded.
+
+          #666: the deltas follow the STORE, so they are dropped exactly when
+          the store is — in autocommit, where [S.rollback] below undoes the
+          whole per-row transaction.  In a borrowed transaction the partial
+          effects survive, so their deltas must survive with them; a consumer
+          that then loses them is a different defect in the opposite direction
+          (see [Db.drive_reactive]'s [Error] arm). *)
        let* () = stmt_savepoint_release ~cat tx sp in
+       if owned then changes_restore mark;
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
 ;;
