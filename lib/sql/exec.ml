@@ -2865,7 +2865,17 @@ let rec substitute_excluded (excluded_row : Row.t) (e : Plan.expr) : Plan.expr =
       }
   | Plan.P_cast (e, ty) -> Plan.P_cast (substitute_excluded excluded_row e, ty)
   | Plan.P_collate (e, c) -> Plan.P_collate (substitute_excluded excluded_row e, c)
-  | other -> other
+  (* Leaves, and the three subquery-bearing nodes whose inner [Ast.stmt] carries
+     no [EXCLUDED] reference to substitute.  Exhaustive rather than [| other ->]
+     for the reason #670 gives: a catch-all is what lets a newly added
+     constructor fall through a walker silently. *)
+  | Plan.P_lit _
+  | Plan.P_col _
+  | Plan.P_param _
+  | Plan.P_window_slot _
+  | Plan.P_subquery _
+  | Plan.P_exists _
+  | Plan.P_in_select _ -> e
 ;;
 
 (** True if any value in the list is NULL. *)
@@ -9212,7 +9222,33 @@ let rec plan_expr_has_subquery : Plan.expr -> bool = function
     || Option.fold ~none:false ~some:plan_expr_has_subquery else_
   | Plan.P_cast (e, _) -> plan_expr_has_subquery e
   | Plan.P_collate (e, _) -> plan_expr_has_subquery e
-  | _ -> false
+  (* #670: the leaves are listed rather than caught by [| _ ->].  This walker is
+     one of four over [Plan.expr] that look for subquery-bearing nodes, and a
+     catch-all in one of them is how they came to disagree: a [P_collate] arm
+     missing from ONE of the four turned a correlated subquery under COLLATE
+     into a refusal, with the other three insisting it was correlated.  An
+     exhaustive match makes the next constructor a compile error in all four
+     rather than a silent fall-through in whichever ones forgot it.
+
+     Extended past the four the issue named, so the claim and the guard have
+     the same extent: [substitute_excluded], [pre_eval_subquery] and
+     [Planner.substitute_window_slots] are exhaustive too.  Nothing was broken
+     in those three — all had their [P_collate] arm — but [pre_eval_subquery]
+     sits directly on this same correlated-subquery path (it is what folds
+     [P_subquery] / [P_exists] / [P_in_select]), so a catch-all there is the
+     same latent hole in the same place.  [plan_expr_reads_only_cols] and
+     [eval_expr] were already exhaustive.  No REWRITING walker over [Plan.expr]
+     ends in a catch-all any more, in either file.  Two catch-alls over
+     [Plan.expr] remain and are deliberate, because neither is a walker:
+     [eval_expr]'s local [is_nocase] predicate (a two-way test, not a
+     traversal) and [plan_and_conjuncts]'s [| e -> [ e ]] (its base case — any
+     non-[And] node IS a leaf conjunct, and a new constructor is correctly one
+     too). *)
+  | Plan.P_lit _
+  | Plan.P_col _
+  | Plan.P_param _
+  | Plan.P_excluded_col _
+  | Plan.P_window_slot _ -> false
 ;;
 
 (* #674 (item 1 of 3): does [e] read only columns [ok] accepts, and carry no
@@ -9541,7 +9577,12 @@ let rec plan_expr_subqueries_use_param : Plan.expr -> bool = function
             plan_expr_subqueries_use_param c || plan_expr_subqueries_use_param r)
          branches
     || Option.fold ~none:false ~some:plan_expr_subqueries_use_param else_
-  | _ -> false
+  (* #670: exhaustive, not [| _ ->] — see {!plan_expr_has_subquery}. *)
+  | Plan.P_lit _
+  | Plan.P_col _
+  | Plan.P_param _
+  | Plan.P_excluded_col _
+  | Plan.P_window_slot _ -> false
 ;;
 
 (** #493: every [Ast.stmt] a plan expression carries in a subquery position.
@@ -9573,7 +9614,12 @@ let rec plan_expr_embedded_stmts : Plan.expr -> Ast.stmt list = function
         (fun (c, r) -> plan_expr_embedded_stmts c @ plan_expr_embedded_stmts r)
         branches
     @ Option.fold ~none:[] ~some:plan_expr_embedded_stmts else_
-  | _ -> []
+  (* #670: exhaustive, not [| _ ->] — see {!plan_expr_has_subquery}. *)
+  | Plan.P_lit _
+  | Plan.P_col _
+  | Plan.P_param _
+  | Plan.P_excluded_col _
+  | Plan.P_window_slot _ -> []
 ;;
 
 (** #493: flatten a plan predicate's top-level [AND] spine.
@@ -9829,7 +9875,32 @@ let rec substitute_outer_in_expr
   | Ast.E_subquery inner -> Ast.E_subquery (go_s inner)
   | Ast.E_exists inner -> Ast.E_exists (go_s inner)
   | Ast.E_in_select (x, inner) -> Ast.E_in_select (go x, go_s inner)
-  | _ -> e
+  (* #670: the same missing COLLATE descent as in {!substitute_outer_in_plan_expr},
+     one level up.  This walker handles a correlated reference inside the
+     subquery's OWN clauses, so without this arm
+     [EXISTS (SELECT 1 FROM i WHERE i.v = o.x COLLATE NOCASE)] left [o.x]
+     unsubstituted and was refused — a second reachable spelling of the same
+     defect, and one the plan-level fix does not cover. *)
+  | Ast.E_collate (x, c) -> Ast.E_collate (go x, c)
+  (* True leaves: nothing inside to substitute.  [E_fts_snippet] belongs here
+     and not below — it is a record of a table name, a column index, three
+     string tags and a token count ([Ast.E_fts_snippet], ast.ml:247), with no
+     [expr] field anywhere, so there is no spelling in which an outer reference
+     could appear inside it. *)
+  | Ast.E_lit _ | Ast.E_param _ | Ast.E_match _ | Ast.E_fts_snippet _ -> e
+  (* [E_col] / [E_tbl_col] the enclosing scope DOES own — the two guarded arms
+     at the top of this match handle the ones it does not.  Listed rather than
+     left to a catch-all so those guards cannot be edited into a silent hole. *)
+  | Ast.E_col _ | Ast.E_tbl_col _ -> e
+  (* These three DO carry sub-expressions and are deliberately NOT descended
+     into.  Descending would be an error-to-answer change of its own — each is
+     a distinct spelling in which a correlated reference could newly resolve,
+     and each needs its own oracle-checked test, which #670 is not the place
+     for.  Listed explicitly rather than caught by [| _ ->] so that the choice
+     is visible: an exhaustive match is also what makes a NEW constructor a
+     compile error here instead of the silent refusal #670 is about.
+     Tracked as #721. *)
+  | Ast.E_agg _ | Ast.E_agg_distinct _ | Ast.E_window _ -> e
 
 (** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST
     stmt.  [enclosing] is the union of the scopes of every subquery between this
@@ -9856,6 +9927,22 @@ and substitute_outer_in_stmt
     Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
   | Ast.S_with_cte { name; def; query; recursive } ->
     Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
+  (* #732: the one remaining catch-all in this function group, and it is the
+     next instance of exactly the defect #670 is about — a walker not
+     descending into a place that carries expressions, turning a runnable query
+     into a refusal.  Two holes, not one:
+
+     - the [S_select] arm above rewrites only [where] / [having] / [joins.*.on];
+       [columns], [group_by] and [order] are passed through by [{ r with ... }],
+       so an outer reference in the subquery's own PROJECTION is never
+       substituted and the statement is refused (#626's message);
+     - this arm passes every other statement form through untouched.
+
+     Left as-is deliberately.  Widening it is an error-to-answer change for
+     each newly reachable spelling and needs its own oracle-checked tests, so
+     it is #732's work rather than #670's.  Note that widening the substituter
+     also widens the detector for free: [stmt_has_free_column_ref] below RUNS
+     this function with a recording probe rather than duplicating its walk. *)
   | _ -> s
 
 (** Substitute outer column refs in any embedded Ast.stmt nodes inside a
@@ -9888,23 +9975,29 @@ and substitute_outer_in_plan_expr
       ; else_ = Option.map go else_
       }
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
-  (* #493 review: there is NO [P_collate] arm here, while
+  (* #670: this arm is the fix, and its absence was the bug.  This is one of
+     four walkers over [Plan.expr] that look for subquery-bearing nodes;
      {!plan_expr_has_subquery}, {!plan_expr_subqueries_use_param} and
-     {!plan_expr_embedded_stmts} all recurse into it — a four-way walker set
-     over one node set, of which this one is the odd member. The consequence:
-     a correlated subquery under a COLLATE ([x = (SELECT …) COLLATE NOCASE])
-     falls to the catch-all with its outer reference unsubstituted, and is
-     therefore REFUSED rather than answered.
+     {!plan_expr_embedded_stmts} all descended into [P_collate] and this one did
+     not.  So for [x = (SELECT …) COLLATE NOCASE] the other three agreed the
+     subquery was correlated while the one that would have RESOLVED it left the
+     outer reference in place — the statement then failed [Sema.bind] and was
+     refused by [correlated_filter_refusal].  A refusal, not a wrong answer, but
+     for a query the engine is perfectly able to run.
 
-     The arm was added in the first round of this PR and is deliberately
-     reverted. Adding it is an error-to-answer change — it turns a refusal into
-     rows — and this PR cannot be built, so it could not be given the test that
-     such a change needs; nothing in [test/] exercises COLLATE over a subquery
-     today. A PR whose other half is about not letting refusals move silently
-     should not move one silently on the way past. Tracked as #670; the one-line
-     fix is [| Plan.P_collate (e, c) -> Plan.P_collate (go e, c)] plus a test
-     that pins the answer it produces. *)
-  | _ -> e
+     #493 wrote the arm and then reverted it deliberately: it turns a refusal
+     into rows, and that PR shipped in a batch that could not be built, so it
+     could not carry the test such a change needs.  The test exists now
+     ([test/test_collate_outer_ref_670.ml]) and pins the rows. *)
+  | Plan.P_collate (e, c) -> Plan.P_collate (go e, c)
+  (* #670: exhaustive, not [| _ ->].  The catch-all is what let the missing arm
+     above be invisible for as long as it was, in the one walker of four where
+     it changed an answer — see {!plan_expr_has_subquery}. *)
+  | Plan.P_lit _
+  | Plan.P_col _
+  | Plan.P_param _
+  | Plan.P_excluded_col _
+  | Plan.P_window_slot _ -> e
 ;;
 
 (** #635: does [s] carry a {b free} column reference — a name no scope inside
@@ -10259,7 +10352,16 @@ let rec pre_eval_subquery
   | Plan.P_collate (e, c) ->
     let* e' = pre_eval_subquery clock store params cat_opt e in
     Lwt.return (Plan.P_collate (e', c))
-  | _ -> Lwt.return e
+  (* Leaves — nothing inside to fold.  Exhaustive rather than [| _ ->]: this
+     walker sits directly on the correlated-subquery path (it is what folds
+     [P_subquery] / [P_exists] / [P_in_select], handled above), so a newly added
+     constructor falling through it silently is precisely the failure mode #670
+     is about. *)
+  | Plan.P_lit _
+  | Plan.P_col _
+  | Plan.P_param _
+  | Plan.P_excluded_col _
+  | Plan.P_window_slot _ -> Lwt.return e
 
 (* Scalar subquery: run [inner_ast], yield its first column's first value as a
    literal (NULL if empty); returns [e] unchanged if it fails to bind. *)

@@ -2245,7 +2245,18 @@ let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =
       }
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
   | Plan.P_collate (e, c) -> Plan.P_collate (go e, c)
-  | e' -> e'
+  (* Leaves, and the three subquery-bearing nodes — a window slot inside a
+     subquery's own [Ast.stmt] is that statement's to substitute, not this
+     one's.  Exhaustive rather than [| e' -> e'] for the reason #670 gives: a
+     catch-all is what lets a newly added constructor fall through a walker
+     silently. *)
+  | Plan.P_lit _
+  | Plan.P_col _
+  | Plan.P_param _
+  | Plan.P_excluded_col _
+  | Plan.P_subquery _
+  | Plan.P_exists _
+  | Plan.P_in_select _ -> e
 ;;
 
 (* #507: an aggregated projection item may be an expression over the aggregate

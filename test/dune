@@ -1736,3 +1736,13 @@
  (name test_lock_stats_718)
  (modules test_lock_stats_718)
  (libraries granary granary.unix granary.store alcotest lwt.unix unix))
+
+; #670: a correlated subquery under COLLATE is answered, not refused —
+; substitute_outer_in_plan_expr was the one walker of four with no P_collate
+; arm. The fixtures differ only in case, so the same queries without the
+; COLLATE answer nothing and the assertions cannot pass vacuously.
+
+(test
+ (name test_collate_outer_ref_670)
+ (modules test_collate_outer_ref_670)
+ (libraries granary alcotest lwt.unix))
