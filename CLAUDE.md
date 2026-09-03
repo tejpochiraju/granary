@@ -729,6 +729,19 @@ EOF
   **not** follow — it reports on cells already on disk whose only repair is to
   rewrite them, which is meaningless for a column never read from disk. Pinned by
   `test/test_not_null_629.ml`.
+- **`Db.dump`'s #548 NOT NULL refusal points at the PRAGMAs (#583, fixed
+  2026-09-03).** The refusal is raised from inside the row stream, so it names
+  the violation it *stopped on*, not the scope. Hand-writing the repairing
+  `DELETE` for that one `(table, column)` made an operator repair table by
+  table off successive dump failures — exactly what #563's report mode exists
+  to prevent. The message now leads with `PRAGMA not_null_check` (the whole
+  scope in one pass) and `PRAGMA not_null_repair`, and keeps the hand-written
+  `UPDATE`/`DELETE` as the manual escape hatch: #548 refuses in order to stop
+  information being destroyed silently, so the non-destructive `UPDATE` must
+  stay visible. `~data_only:true` is still named as the way to get rows out of
+  an unrepaired file. Pinned by `test/test_dump_not_null_check_583.ml`;
+  `test/test_dump_null_pk_548.ml` still asserts the manual statements are
+  present, so the demotion cannot become a deletion.
 - **An explicit `ON CONFLICT` target beats the statement's conflict-resolution
   modifier, for the index it names (#639, decided 2026-08-06).** The modifier
   still governs every *other* index. Before this, `CA_ignore` matched above the

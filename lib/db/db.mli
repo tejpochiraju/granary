@@ -780,11 +780,20 @@ val query_columns : t -> string -> (string list, error) result Lwt.t
     [PRIMARY KEY (a, b)], or a column added by [ALTER TABLE ... ADD COLUMN ...
     PRIMARY KEY]. Rendering the current declaration and then emitting those rows
     produces a script that dies on the first offending row. Rather than emit it,
-    [dump] fails with [Error (Runtime msg)] naming the table, the column, and both
-    repairs — the [UPDATE] that keeps the rows and the [DELETE] that drops them.
+    [dump] fails with [Error (Runtime msg)] naming the table and the column.
     The alternative — silently emitting the column
     without its NOT NULL — would restore, but by downgrading the schema without
-    saying so. Detection rides along with the row stream, so a healthy database
+    saying so.
+
+    {b The diagnostic points at [PRAGMA not_null_check] (#583).} The refusal is
+    raised from inside the row stream, so it names the violation it stopped on
+    and knows nothing about the rest of the file; repairing table by table off
+    successive dump failures is what #563's report mode exists to prevent. The
+    message therefore leads with [PRAGMA not_null_check] (every offending
+    (table, column, count) in one pass) and [PRAGMA not_null_repair] (deletes
+    them through the ordinary delete path, so indexes and ON DELETE cascades are
+    honoured), and keeps the hand-written [UPDATE] that preserves the rows and
+    [DELETE] that drops them as the manual escape hatch. Detection rides along with the row stream, so a healthy database
     pays no extra read; a refused dump has already emitted [BEGIN] and is closed
     with [ROLLBACK], so a streaming sink is left with a script that undoes itself
     rather than one that half-applies.

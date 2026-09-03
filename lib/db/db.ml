@@ -2990,6 +2990,18 @@ let dump_index_is_implied (meta : Cat.table_meta) ~indexes (idx : Cat.index_info
    describable in SQL; saying so is the only answer that never lies.  The message
    names the repair, and [~data_only:true] still dumps the rows.
 
+   #583: the refusal reports the violation the dump STOPPED ON, not the scope —
+   it is raised from inside the row stream, so it names one (table, column) and
+   knows nothing about the rest of the file.  An operator repairing table by
+   table off successive dump failures is doing exactly what #563's report mode
+   was built to prevent, so the headline instruction is now [PRAGMA
+   not_null_check] (every offending (table, column, count) in one pass) followed
+   by [PRAGMA not_null_repair] (deletes them through [apply_delete_row], so
+   indexes and ON DELETE cascades are honoured).  The hand-written UPDATE/DELETE
+   stay in the message as the manual escape hatch — #548 refuses precisely to
+   stop information being destroyed silently, so the non-destructive repair must
+   remain visible — but they are no longer what the message leads with.
+
    Detected while the rows stream past, so a healthy database pays nothing: no
    extra scan, no extra query.  A dump that trips this has already emitted
    [BEGIN] and some statements, so [dump]'s handler closes it with [ROLLBACK] —
@@ -2999,9 +3011,13 @@ let not_null_violation_message ~table ~column =
   Printf.sprintf
     "dump %s: column %s is declared NOT NULL but a stored row holds NULL, so the emitted \
      schema contradicts the emitted rows and the script would fail to replay (#548).  \
-     This database predates #530 (every PRIMARY KEY column implies NOT NULL).  Repair it \
-     first — UPDATE %s SET %s = <value> WHERE %s IS NULL keeps the rows, DELETE FROM %s \
-     WHERE %s IS NULL drops them — or dump the rows alone with ~data_only:true."
+     This database predates #530 (every PRIMARY KEY column implies NOT NULL).  This \
+     names the violation the dump stopped on, not the scope: run PRAGMA not_null_check \
+     to see every offending (table, column, count) in the file, then PRAGMA \
+     not_null_repair to delete those rows through the ordinary delete path (indexes and \
+     ON DELETE cascades honoured).  To repair by hand instead, UPDATE %s SET %s = <value> \
+     WHERE %s IS NULL keeps the rows and DELETE FROM %s WHERE %s IS NULL drops them.  To \
+     extract the rows from the unrepaired file, dump with ~data_only:true."
     table
     column
     (Sql.Exec.quote_ident table)

@@ -1773,3 +1773,20 @@
  (name test_compound_order_by_662)
  (modules test_compound_order_by_662)
  (libraries granary alcotest lwt.unix))
+
+; #583: Db.dump's #548 NOT NULL refusal points at PRAGMA not_null_check for the
+; scope and PRAGMA not_null_repair for the repair, keeping the hand-written
+; UPDATE/DELETE as the manual escape hatch.
+
+(test
+ (name test_dump_not_null_check_583)
+ (modules test_dump_not_null_check_583)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
