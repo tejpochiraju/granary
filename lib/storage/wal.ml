@@ -820,7 +820,7 @@ let next_generation_marker t =
 
    {b Failure is not an error.} A device that refuses [ftruncate] costs disk
    space, not correctness, and turning that into a failed [reset] would turn a
-   benign EPERM into a failed checkpoint ([Store.checkpoint_unlocked] raises on
+   benign EPERM into a failed checkpoint ([Store.ckpt_install] raises on
    a reset error).  So the result is deliberately dropped — but [size_bytes] is
    lowered only on success, because it and the file length have to keep
    describing the same device.  The two errors are not symmetric: leaving

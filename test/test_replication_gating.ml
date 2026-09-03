@@ -190,7 +190,8 @@ let test_replication_gating_survives_epoch_bump () =
        | Ok s -> s
        | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
-     (* Register callback so checkpoint_unlocked re-pins the floor. *)
+     (* Register callback so the checkpoint's post-reset bookkeeping re-pins the
+        floor. *)
      let* () =
        Store.set_commit_callback
          st
@@ -226,7 +227,7 @@ let test_replication_gating_survives_epoch_bump () =
      Alcotest.(check bool) "epoch bumped after ckpt" true (epoch1 > epoch0);
      Alcotest.(check bool) "WAL reset after ckpt" true (frames1 < frames0);
      (* Epoch 1: commit again WITHOUT explicitly setting the floor.
-        If the re-pin in checkpoint_unlocked is working, the floor was
+        If the re-pin in after_ckpt_reset is working, the floor was
         reset to 0 after Wal.reset and the autocheckpoint parks.
         If the re-pin is missing, the floor is stale at max_int and
         the autocheckpoint proceeds without waiting — observable as

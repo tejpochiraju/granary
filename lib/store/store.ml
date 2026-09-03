@@ -253,20 +253,31 @@ type bt_state =
   ; mutable closing : bool
     (* #338: set by [close] to signal teardown.  [maybe_autockpt_after_commit]
        then dispatches no fresh checkpoint, and an in-flight/parked one unwinds
-       without touching the pager/WAL fds ([checkpoint_unlocked] and
-       [wait_for_readers_past] bail on it).  Lets [close] drain checkpoints
-       without acquiring [t.lock] — which an abandoned write txn holds until
-       commit/rollback, so taking it would hang close. *)
+       without touching the pager/WAL fds ([checkpoint_body]'s entry check,
+       [unlocked_ckpt_passes], [ckpt_install_guarded], [ckpt_install]'s
+       post-gate check and [wait_for_readers_past] all bail on it).  Lets
+       [close] drain checkpoints without acquiring [t.lock] — which an abandoned
+       write txn holds until commit/rollback, so taking it would hang close.
+
+       #719: the migration now runs OUTSIDE [t.lock], so a closing store is
+       checked between passes as well as at the two lock-scoped points; a pass
+       already in flight finishes (it is counted in [ckpt_io_in_flight], so
+       [close] waits for it) and no further pass starts. *)
   ; mutable ckpt_io_in_flight : int
-    (* #338 (review r2): count of checkpoints that have passed the gate and are
-       actively performing pager/WAL fd I/O ([checkpoint_unlocked], both the auto
-       and manual paths).  Incremented AFTER lock acquisition + the [closing]
-       check, so a checkpoint merely parked on [acquire_write] (e.g. behind an
-       abandoned write txn) is NOT counted — [close] therefore never waits on it
-       (it aborts on [closing] if it ever acquires the lock).  [close] drains
-       this to 0 (together with [sink_ships_in_flight]) before fd teardown.
-       Distinct from [autockpt_in_flight], which is dispatch-intent (coalescing)
-       only. *)
+    (* #338 (review r2): count of checkpoints actively performing pager/WAL fd
+       I/O, in both the auto and manual paths.  [close] drains this to 0
+       (together with [sink_ships_in_flight]) before fd teardown.
+
+       #719: there are now TWO bracketed regions per checkpoint, not one — the
+       unlocked migration ([ckpt_scan]) and the locked install
+       ([ckpt_install_guarded]) — and the gap between them is exactly the
+       [acquire_writer] that separates them.  Keeping the count OUT of that gap
+       is what preserves #338's property: a checkpoint merely parked on the
+       writer lock (e.g. behind an abandoned write txn) is not counted, so
+       [close] never waits on it, and it aborts on [closing] if it ever does
+       acquire.  Distinct from [autockpt_in_flight], which is dispatch-intent
+       (coalescing) for the auto path only; cross-path exclusion is
+       [ckpt_mutex]. *)
   ; mutable last_checkpoint_error : string option
     (* #638: message of the most recent checkpoint failure, or [None] when no
        checkpoint has failed since the last one that completed.  Sticky across
@@ -287,8 +298,23 @@ type bt_state =
        checkpoint's [Wal.reset] would recycle/zero those frames and bump the
        epoch out from under an in-flight reader ([Corrupt_frame] / stale
        epoch).  Incremented synchronously at dispatch (before the [Lwt.async]);
-       decremented in the callback's finalize.  [checkpoint_unlocked] waits for
+       decremented in the callback's finalize.  [ckpt_install] waits for
        this to reach 0 before [Wal.reset]. *)
+  ; ckpt_mutex : Lwt_mutex.t
+    (* #719: serialises checkpoints against each other.  Until #719 that job
+       belonged to [t.lock], which a checkpoint held from its first frame read
+       to [Wal.reset]; now the migration runs OUTSIDE the writer lock, so two
+       checkpoints could otherwise overlap and the second's [Wal.reset] would
+       recycle the frame indices the first is still reading — it would then
+       copy a NEW generation's bytes into an OLD generation's page.  This is
+       the one thing the split genuinely gave up, and this mutex is what buys
+       it back.  Distinct from [autockpt_in_flight] (dispatch-intent for the
+       auto path only): this also excludes the manual [checkpoint] path, which
+       that flag never did.
+
+       Lock ORDER is [ckpt_mutex] then [t.lock], never the reverse.  Nothing
+       else in this file takes [ckpt_mutex], and no path holds [t.lock] while
+       reaching for it. *)
   }
 
 let default_wal_autocheckpoint_threshold = 1000
@@ -812,6 +838,7 @@ let make_btree_store
     ; clock = (fun () -> 0.)
     ; sink_shipped_frames = 0
     ; sink_ships_in_flight = 0
+    ; ckpt_mutex = Lwt_mutex.create ()
     ; closing = false
     ; ckpt_io_in_flight = 0
     ; last_checkpoint_error = None
@@ -830,7 +857,7 @@ let make_btree_store
 
 (* #338 (review r2): event-driven wait until [pred] holds, parking on
    [reader_done_cond] (broadcast whenever an in-flight counter changes).  Shared
-   by [close] (drain checkpoint fd-I/O + sink ships) and [checkpoint_unlocked]
+   by [close] (drain checkpoint fd-I/O + sink ships) and [ckpt_install]
    (drain sink ships before [Wal.reset]).  Cooperative Lwt: the pred check and
    the [Lwt_condition.wait] register with no yield between, so no wakeup is
    lost. *)
@@ -854,8 +881,9 @@ let close (t : t) : unit Lwt.t =
        it (review r2 #3) — signal teardown via [st.closing]:
 
        - [maybe_autockpt_after_commit] dispatches no fresh checkpoint once set;
-       - a checkpoint parked on the gate or [acquire_write] unwinds without fd
-         I/O ([wait_for_readers_past]/[checkpoint_unlocked] bail on [closing]);
+       - a checkpoint parked on the gate or [acquire_write] unwinds without
+         further fd I/O ([wait_for_readers_past], [unlocked_ckpt_passes] and
+         [ckpt_install]'s post-gate check all bail on [closing]);
        - the broadcast wakes a checkpoint parked on the replication floor.
 
        We then drain — event-driven — the work that is ACTUALLY mid-fd-I/O:
@@ -1735,7 +1763,7 @@ let write_freelist_pages pager : int64 Lwt.t =
 ;;
 
 (* Block until it is safe to recycle WAL frames below [target].  Used by
-   [checkpoint_unlocked] before [Wal.reset] truncates the index — otherwise
+   [ckpt_install] before [Wal.reset] truncates the index — otherwise
    an in-flight reader's [find_page_at] would resolve to a recycled frame
    index after the next writer's append.
 
@@ -1762,9 +1790,6 @@ let write_freelist_pages pager : int64 Lwt.t =
     gate check + wait register atomically (no yield between them), so the
     standard POSIX condvar mutex pairing isn't needed.  Would need revisiting
     under a preemptive or effect-based multicore runtime. *)
-(** Body of [checkpoint] without mutex management. Caller MUST already
-     hold [t.lock] (e.g. during [commit]). Defined here so [commit]
-     can invoke it via [maybe_autocheckpoint] below. *)
 let rec wait_for_readers_past
           (st : bt_state)
           ~target
@@ -1774,7 +1799,7 @@ let rec wait_for_readers_past
   if st.closing
   then
     (* #338: close is tearing down — stop gating so a parked checkpoint unwinds;
-       [checkpoint_unlocked] then aborts before any fd I/O. *)
+       [ckpt_install] then aborts before [Wal.reset]. *)
     Lwt.return_unit
   else if ro_readers_below st ~target
   then
@@ -1816,141 +1841,347 @@ let rec wait_for_readers_past
   else Lwt.return_unit
 ;;
 
-let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
-  let target = Wal.committed_frames wal in
-  (* #382: [Checkpoint_begin] is a best-effort signal — if the checkpoint
-     aborts early (store closing, or an I/O error before [Wal.reset]), no
-     matching [Checkpoint_end] is emitted.  Monitor consumers must tolerate an
-     unbalanced begin. *)
-  emit_event st (Store_event.Checkpoint_begin { target_frames = target });
-  let* () =
+(* #719: the RO-snapshot half of the gate above, on its own.
+
+   The two halves guard DIFFERENT operations, and separating them is what lets
+   the migration leave the writer lock.
+
+   - The replication (#263) and backup (#265) floors guard frame RECYCLING.
+     Only [Wal.reset] recycles, so they belong immediately before it — and only
+     there, or their bounded-yield budgets would be spent several times per
+     checkpoint.
+   - An RO snapshot guards something the migration itself can break.  A snapshot
+     at frame [m] resolves a page through [Wal.find_page_at ~max_frame:m], and
+     falls through to the MAIN FILE for any page whose every frame is at or
+     above [m].  Writing that page's newer content into the main file is then
+     visible to it — a snapshot violation, with no [Wal.reset] involved.  The
+     invariant that rules it out is "no live snapshot sits below the highest
+     frame this pass migrates", and it has to hold before each pass of the
+     migration, not merely before the truncation.
+
+   Honored unconditionally, like its counterpart in [wait_for_readers_past]: a
+   local reader always eventually fires [ro_end]'s broadcast, and there is no
+   equivalent of a dead standby to time out. *)
+let rec wait_for_ro_readers_past (st : bt_state) ~target =
+  if st.closing
+  then Lwt.return_unit
+  else if ro_readers_below st ~target
+  then
+    let* () = Lwt_condition.wait st.reader_done_cond in
+    wait_for_ro_readers_past st ~target
+  else Lwt.return_unit
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Checkpoint (#719: the migration no longer runs under the writer lock) *)
+(* ------------------------------------------------------------------ *)
+
+(* #719 — why the writer lock is not held for the migration.
+
+   Under #718's accounting a one-terminal TPC-C run spent 25.1% of the interval
+   with the background autocheckpoint holding the writer lock, and that hold was
+   the blocker for 99.99% of all writer-lock wait in the run.  Practically all of
+   it is the migration: ~1000 WAL frame reads, ~1000 main-file page writes and
+   one fsync, per checkpoint.  None of that needs the lock, and the argument is
+   the same one [Replication.checkpoint_wal_to_main] already runs on:
+
+   - A committed WAL frame's bytes are IMMUTABLE for the life of the generation.
+     Appends only ever land at or above [committed_frames], so a concurrent
+     commit cannot rewrite a frame this loop is reading.
+   - In WAL mode the main file is written by NOTHING ELSE.  A commit writes
+     frames; only a checkpoint writes pages.  (A commit's [Pager.alloc] can
+     ftruncate the main file LONGER, which moves no data and is why the
+     migration's page writes stay in bounds.)
+   - A half-migrated main file is INVISIBLE.  Every read — writer, snapshot
+     reader, or the pager's own — resolves a page through the WAL overlay first
+     and only falls through to the main file when the WAL has no frame for it.
+     A page we have migrated still has its frame, so the overlay still answers.
+     Only [Wal.reset] retires the overlay, and that is the one step still taken
+     under the lock.
+   - Crash safety is unchanged in kind: an interrupted migration leaves the WAL
+     intact and it replays on the next open, exactly as an interrupted migration
+     did before.
+
+   The last point is worth one more sentence, because the split WIDENS one
+   pre-existing window and a future editor should know why it is still sound.
+   [commit_wal] releases the writer lock BEFORE its fsync, so the frames a
+   checkpoint migrates may be published but not yet durable — true before #719
+   too, but now for a whole migration's duration rather than an instant.  Crash
+   between the main-file fsync and [Wal.reset]'s marker fsync and recovery reads
+   the WAL's durable prefix [P]: pages with a frame in [P] resolve through the
+   overlay, and pages we migrated from a frame ABOVE [P] resolve to the main
+   file's newer bytes.  Those are unreachable rather than wrong.  Both header
+   pages are rewritten every commit and a checkpoint spans many, so the recovered
+   root is the root as of [P]; and under copy-on-write a page whose only frame is
+   above [P] was either freshly allocated or taken from the freelist by a commit
+   after [P], so nothing the [P]-root references points at it.  The file is
+   consistent as of [P], with some orphaned pages.
+
+   What the lock WAS also providing, and now has to be provided explicitly:
+
+   - Exclusion against a second checkpoint, whose [Wal.reset] would recycle the
+     frame indices this one is still reading.  [st.ckpt_mutex] does that, and it
+     covers the manual path too — [autockpt_in_flight] never did.
+   - The guarantee that [Wal.reset] retires a WAL whose every frame has been
+     migrated AND fsynced (that is the premise of [Wal.reset]'s own crash-safety
+     note).  The unlocked passes cannot promise that, because a writer keeps
+     appending underneath them; the final pass runs under the lock, where
+     [committed_frames] cannot move, and is therefore by construction the last
+     one needed. *)
+
+(* #719: how many migration passes run OUTSIDE the writer lock before the
+   remainder is finished under it.  Each pass only has to cover what the
+   previous pass's concurrent commits appended, so the passes shrink fast — the
+   bound exists to guarantee termination against a writer that never stops, not
+   because convergence is expected to need it. *)
+let max_unlocked_ckpt_passes = 4
+
+(* Copy one WAL frame into the main file.  Split out of [migrate_ckpt_pass] so
+   the pass's own loop stays flat; the two [Lwt.fail_with] messages are the ones
+   the pre-#719 checkpoint raised, unchanged, since they reach
+   [note_checkpoint_failure] and then [PRAGMA checkpoint_status]. *)
+let migrate_one_page (st : bt_state) (wal : Wal.t) ~pid ~idx : unit Lwt.t =
+  let* r = Wal.read_frame wal idx in
+  match r with
+  | Error e -> Lwt.fail_with (Format.asprintf "checkpoint read: %a" Wal.pp_error e)
+  | Ok page ->
+    let* wr = Pager.flush_one_to_main st.pager ~page_id:pid ~buf:page in
+    (match wr with
+     | Error e -> Lwt.fail_with (Format.asprintf "checkpoint write: %a" Pager.pp_error e)
+     | Ok () -> Lwt.return_unit)
+;;
+
+(* #719: one migration pass.  Awaits [gate] against the pass's own boundary,
+   then writes to the main file the newest committed WAL frame of every page
+   whose newest frame index lies in the half-open range [since, head).
+   Returns [(head, n)]: [head] is [Wal.committed_frames] as observed at the
+   START of the pass, [n] is how many pages the pass wrote.
+
+   [head] is the pass's coverage boundary, and it bounds the window at BOTH
+   ends: this pass migrates a page only if its newest frame index lies in
+   the half-open range [since, head).
+
+   The upper bound is not an optimisation, it is the reader-safety invariant.
+   [gate ~target:head] runs first and leaves every live RO snapshot at or above
+   [head]; a snapshot there resolves any page with a frame below [head] through
+   the WAL, so the bytes this pass puts in the main file are invisible to it.
+   Migrating a frame at or above [head] would break exactly that — a snapshot
+   sitting AT [head] falls through to the main file for a page whose only frame
+   is above it.
+
+   Coverage is still complete, because the bounds interlock: the next pass is
+   called with [~since:head], and every frame a concurrent commit publishes
+   after [head] was read lands at [head] or above (appends only ever go above
+   [committed_frames], which is already at least [head]).  So a page skipped
+   here for being too new is picked up there, with its newest content, and a
+   page skipped for being too old was written by an earlier pass.
+
+   The index snapshot is taken AFTER the gate rather than before it: the gate
+   yields, and a snapshot from before it would be stale in a way the [head]
+   bound could not describe.  Snapshot and filter are then synchronous, which
+   under cooperative Lwt makes them one atom. *)
+let migrate_ckpt_pass (st : bt_state) (wal : Wal.t) ~since ~(migrated : int ref) ~gate
+  : (int * int) Lwt.t
+  =
+  let head = Wal.committed_frames wal in
+  let* () = gate ~target:head in
+  (* #338: the gate returns immediately once [close] has signalled teardown, so
+     the invariant it was there to establish does not hold — do not migrate.
+     The caller's [closing] checks then unwind without touching [Wal.reset]. *)
+  if st.closing
+  then Lwt.return (head, 0)
+  else (
+    let pairs = ref [] in
+    Wal.iter_index wal (fun pid idx ->
+      if idx >= since && idx < head then pairs := (pid, idx) :: !pairs);
+    let n = List.length !pairs in
+    let rec write_each = function
+      | [] -> Lwt.return_unit
+      | (pid, idx) :: rest ->
+        let* () = migrate_one_page st wal ~pid ~idx in
+        incr migrated;
+        write_each rest
+    in
+    let* () = write_each !pairs in
+    Lwt.return (head, n))
+;;
+
+let sync_ckpt_main (st : bt_state) : unit Lwt.t =
+  let* sr = Pager.flush_sync_main st.pager in
+  match sr with
+  | Error e -> Lwt.fail_with (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
+  | Ok () -> Lwt.return_unit
+;;
+
+(* #338 (review r2): bracket the fd I/O so [close] drains it before teardown.
+   Both phases use this — the unlocked migration touches the pager/WAL fds just
+   as the locked install does.  It is deliberately NOT held across
+   [acquire_writer]: a checkpoint parked on the writer lock behind an abandoned
+   write txn must stay invisible to [close], or it would wedge it. *)
+let with_ckpt_io (st : bt_state) f =
+  st.ckpt_io_in_flight <- st.ckpt_io_in_flight + 1;
+  Lwt.finalize f (fun () ->
+    st.ckpt_io_in_flight <- st.ckpt_io_in_flight - 1;
+    Lwt_condition.broadcast st.reader_done_cond ();
+    Lwt.return_unit)
+;;
+
+let rec unlocked_ckpt_passes (st : bt_state) (wal : Wal.t) ~since ~migrated ~pass =
+  if st.closing
+  then Lwt.return since
+  else
+    let gate = wait_for_ro_readers_past st in
+    let* head, n = migrate_ckpt_pass st wal ~since ~migrated ~gate in
+    if n = 0 || pass >= max_unlocked_ckpt_passes
+    then Lwt.return head
+    else unlocked_ckpt_passes st wal ~since:head ~migrated ~pass:(pass + 1)
+;;
+
+(* #719 phase A: migrate outside the writer lock, then fsync the main file
+   outside it too.  The fsync is repeated under the lock only if the final
+   catch-up pass wrote something, so the common case pays the EXPENSIVE fsync
+   (the whole migration's worth of pages) with the lock free and at most a
+   handful of pages' worth with it held. *)
+let ckpt_scan (st : bt_state) (wal : Wal.t) ~migrated : int Lwt.t =
+  with_ckpt_io st (fun () ->
+    let* since = unlocked_ckpt_passes st wal ~since:0 ~migrated ~pass:1 in
+    let* () = if !migrated > 0 then sync_ckpt_main st else Lwt.return_unit in
+    Lwt.return since)
+;;
+
+(* Bookkeeping that follows a successful [Wal.reset]. *)
+let after_ckpt_reset (st : bt_state) (wal : Wal.t) ~migrated =
+  (* #382: WAL is reset to a fresh epoch and the migration is done.  Read
+     [Wal.epoch] AFTER reset for the new epoch. *)
+  emit_event st (Store_event.Wal_reset { epoch = Wal.epoch wal });
+  emit_event st (Store_event.Checkpoint_end { pages_migrated = migrated });
+  (* #638: the WAL has actually been truncated — clear the sticky failure
+     signal. *)
+  note_checkpoint_success st;
+  (* #298/#1: checkpoint is a full-sync durability anchor — everything is now
+     durable and the WAL starts a fresh epoch at frame 0.  Reset the sink ship
+     counter (new epoch) and the batched durability counters so a long unsynced
+     window doesn't carry stale state across the anchor. *)
+  st.sink_shipped_frames <- 0;
+  st.unsynced_commits <- 0;
+  st.last_sync_time <- st.clock ();
+  (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
+     committed_frames, but [replication_shipped_frames] still refers to the old
+     epoch's absolute count.  Without re-pinning, the next checkpoint would see
+     a stale floor that appears to be past the new target, silently allowing
+     frame recycling before the sink ships them. *)
+  if st.on_committed_frames <> None
+  then st.replication_shipped_frames <- Wal.committed_frames wal;
+  (* Re-pin the backup floor for the new epoch (#265).  Same reasoning. *)
+  if st.backup_shipped_frames <> max_int
+  then st.backup_shipped_frames <- Wal.committed_frames wal
+;;
+
+(* #719 phase B — the part that genuinely needs the writer lock.  The caller
+   holds it, so [Wal.committed_frames] cannot move: the one further pass from
+   [since] is by construction the last one, and [head] is the final target.
+
+   [synced_through] is [!migrated] as of the last main-file fsync, so the fsync
+   here is skipped entirely when the catch-up pass found nothing to write. *)
+let ckpt_install (st : bt_state) (wal : Wal.t) ~since ~migrated ~synced_through =
+  (* This pass's gate is the FULL one — RO snapshots plus the replication (#263)
+     and backup (#265) floors — because this is the pass [Wal.reset] follows.
+     The unlocked passes use the RO half alone: nothing they do recycles a
+     frame, and running the floors per pass would spend their bounded-yield
+     budgets several times over in one checkpoint.
+
+     The target is the caught-up one, which may exceed the target
+     [Checkpoint_begin] announced: the frames the unlocked passes caught up on
+     are about to be recycled too, so they are what a floor must be past. *)
+  let gate ~target =
     wait_for_readers_past
       st
       ~target
       ~replication_max_yields:st.replication_gate_max_yields
       ~backup_max_yields:st.backup_gate_max_yields
   in
+  let* _head, _n = migrate_ckpt_pass st wal ~since ~migrated ~gate in
+  let* () = if !migrated > synced_through then sync_ckpt_main st else Lwt.return_unit in
   if st.closing
   then
-    (* #338: [close] signalled teardown while we were gated — abort before any
-       pager/WAL fd I/O.  [close] fsyncs the WAL itself; the un-migrated frames
-       replay on next open.  No data loss. *)
+    (* #338: [close] signalled teardown while we were gated — abort before
+       [Wal.reset].  The un-migrated frames (and the migrated ones) replay on
+       next open.  No data loss. *)
     Lwt.return_unit
-  else (
-    (* #338 (review r2): past the gate and about to touch fds — register as
-       in-flight so [close] drains us before teardown (covers BOTH the auto path
-       and the manual [checkpoint] path, which share this function).  A
-       checkpoint still parked above on [acquire_write]/the gate is NOT yet
-       counted, so it cannot wedge close. *)
-    st.ckpt_io_in_flight <- st.ckpt_io_in_flight + 1;
-    Lwt.finalize
-      (fun () ->
-         let pairs = ref [] in
-         Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
-         (* #382: count the pages actually migrated to the main file so the
-            [Checkpoint_end] event reports the real work done. *)
-         let migrated = ref 0 in
-         let rec write_each = function
-           | [] -> Lwt.return_unit
-           | (pid, idx) :: rest ->
-             let* r = Wal.read_frame wal idx in
-             (match r with
-              | Error e ->
-                Lwt.fail_with (Format.asprintf "checkpoint read: %a" Wal.pp_error e)
-              | Ok page ->
-                let* wr = Pager.flush_one_to_main st.pager ~page_id:pid ~buf:page in
-                (match wr with
-                 | Error e ->
-                   Lwt.fail_with (Format.asprintf "checkpoint write: %a" Pager.pp_error e)
-                 | Ok () ->
-                   incr migrated;
-                   write_each rest))
-         in
-         let* () = write_each !pairs in
-         let* sr = Pager.flush_sync_main st.pager in
-         match sr with
-         | Error e ->
-           Lwt.fail_with (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
-         | Ok () ->
-           (* #337: an async sink ship dispatched from [commit_wal] reads its
-            frame payloads LAZILY.  [Wal.reset] below recycles/zeroes those
-            frames and bumps the epoch, so wait for any in-flight ship to finish
-            reading first.  The ship runs without [t.lock] (it only reads
-            frames), so it makes progress while this fiber holds the lock and
-            parks here.  [Wal.reset] itself now yields (#562: it fsyncs the
-            rotated generation marker), but only a commit can dispatch a ship
-            and this fiber holds the writer lock, so nothing can slip in
-            between the count reaching 0 and the reset landing. *)
-           let* () = wait_until st (fun () -> st.sink_ships_in_flight = 0) in
-           let* rr = Wal.reset wal in
-           let () =
-             match rr with
-             | Ok () -> ()
-             | Error e ->
-               failwith (Format.asprintf "checkpoint wal reset: %a" Wal.pp_error e)
-           in
-           (* #382: WAL is reset to a fresh epoch and the migration is done.
-              Read [Wal.epoch] AFTER reset for the new epoch. *)
-           emit_event st (Store_event.Wal_reset { epoch = Wal.epoch wal });
-           emit_event st (Store_event.Checkpoint_end { pages_migrated = !migrated });
-           (* #638: the WAL has actually been truncated — clear the sticky
-              failure signal. *)
-           note_checkpoint_success st;
-           (* #298/#1: checkpoint is a full-sync durability anchor — everything
-            is now durable and the WAL starts a fresh epoch at frame 0.  Reset
-            the sink ship counter (new epoch) and the batched durability counters
-            so a long unsynced window doesn't carry stale state across the
-            anchor. *)
-           st.sink_shipped_frames <- 0;
-           st.unsynced_commits <- 0;
-           st.last_sync_time <- st.clock ();
-           (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
-             committed_frames, but [replication_shipped_frames] still refers to
-             the old epoch's absolute count.  Without re-pinning, the next
-             checkpoint would see a stale floor that appears to be past the new
-             target, silently allowing frame recycling before the sink ships
-             them. *)
-           if st.on_committed_frames <> None
-           then st.replication_shipped_frames <- Wal.committed_frames wal;
-           (* Re-pin the backup floor for the new epoch (#265).  Same
-             reasoning: without re-pinning, the next checkpoint would see a
-             stale backup floor from the old epoch and recycle frames before
-             the backup consumer has captured them. *)
-           if st.backup_shipped_frames <> max_int
-           then st.backup_shipped_frames <- Wal.committed_frames wal;
-           Lwt.return_unit)
-      (fun () ->
-         st.ckpt_io_in_flight <- st.ckpt_io_in_flight - 1;
-         Lwt_condition.broadcast st.reader_done_cond ();
-         Lwt.return_unit))
+  else
+    (* #337: an async sink ship dispatched from [commit_wal] reads its frame
+       payloads LAZILY.  [Wal.reset] below recycles/zeroes those frames and
+       bumps the epoch, so wait for any in-flight ship to finish reading first.
+       The ship runs without [t.lock] (it only reads frames), so it makes
+       progress while this fiber holds the lock and parks here.  [Wal.reset]
+       itself yields (#562: it fsyncs the rotated generation marker), but only a
+       commit can dispatch a ship and this fiber holds the writer lock, so
+       nothing can slip in between the count reaching 0 and the reset landing. *)
+    let* () = wait_until st (fun () -> st.sink_ships_in_flight = 0) in
+    let* rr = Wal.reset wal in
+    (match rr with
+     | Error e -> failwith (Format.asprintf "checkpoint wal reset: %a" Wal.pp_error e)
+     | Ok () ->
+       after_ckpt_reset st wal ~migrated:!migrated;
+       Lwt.return_unit)
 ;;
 
-(** Called from [commit] while [lock] is still held (exclusive). If the WAL has
-    grown past the per-connection threshold, migrate it inline so
-    subsequent commits start fresh. Best-effort: a checkpoint failure does not
-    fail the commit (which already succeeded) — but since #638 it is no longer
-    discarded either: it is counted on the store and emitted as
-    [Store_event.Checkpoint_failed]. *)
-let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
-  match st.wal with
-  | None -> Lwt.return_unit
-  | Some wal ->
-    let thr = st.wal_autocheckpoint_threshold in
-    if thr <= 0
-    then Lwt.return_unit
-    else if Wal.committed_frames wal < thr
+let ckpt_install_guarded (st : bt_state) (wal : Wal.t) ~since ~migrated ~synced_through =
+  if st.closing
+  then Lwt.return_unit
+  else with_ckpt_io st (fun () -> ckpt_install st wal ~since ~migrated ~synced_through)
+;;
+
+let ckpt_finish t st wal ~(site : Lock_stats.site) ~since ~migrated ~synced_through =
+  let* () = acquire_writer t site in
+  Lwt.finalize
+    (fun () -> ckpt_install_guarded st wal ~since ~migrated ~synced_through)
+    (fun () ->
+       release_writer t;
+       Lwt.return_unit)
+;;
+
+(* #719: the whole checkpoint.  Phase A migrates and fsyncs with the writer lock
+   FREE; phase B takes it once, catches up on whatever was committed meanwhile,
+   and truncates the WAL.
+
+   [site] is the acquisition site phase B's single [acquire_writer] reports to
+   #718's accounting — [Autocheckpoint] for the background path, [Checkpoint]
+   for the explicit one.  There is still exactly one acquisition per checkpoint,
+   so no new [Lock_stats.site] constructor is owed; what changed is that the
+   hold now covers the install rather than the whole migration.
+
+   [Checkpoint_begin] is emitted before any of it and reports the target as of
+   phase A's start.  #382 already requires consumers to tolerate an unbalanced
+   begin (an abort past it emits no [Checkpoint_end]); it is now also true that
+   the [Checkpoint_end] that does arrive may have recycled MORE frames than the
+   begin announced, because the install gates and resets against the caught-up
+   target rather than the announced one.
+
+   #638: a failure is recorded and emitted here, at the one place that knows the
+   target, and then re-raised.  The auto path swallows it (nobody awaits that
+   fiber and the commit that dispatched it has already succeeded); the explicit
+   path lets it propagate, as it always did. *)
+let checkpoint_body t (st : bt_state) (wal : Wal.t) ~(site : Lock_stats.site) =
+  Lwt_mutex.with_lock st.ckpt_mutex (fun () ->
+    let target = Wal.committed_frames wal in
+    (* #382: [Checkpoint_begin] is a best-effort signal — if the checkpoint
+       aborts early (store closing, or an I/O error before [Wal.reset]), no
+       matching [Checkpoint_end] is emitted.  Monitor consumers must tolerate an
+       unbalanced begin. *)
+    emit_event st (Store_event.Checkpoint_begin { target_frames = target });
+    if st.closing
     then Lwt.return_unit
     else (
-      (* Read the target BEFORE the attempt: a failure past [Wal.reset] would
-         leave [committed_frames] at 0 and the event would report target=0. *)
-      let target = Wal.committed_frames wal in
+      let migrated = ref 0 in
       Lwt.catch
-        (fun () -> checkpoint_unlocked st wal)
+        (fun () ->
+           let* since = ckpt_scan st wal ~migrated in
+           let synced_through = !migrated in
+           ckpt_finish t st wal ~site ~since ~migrated ~synced_through)
         (fun exn ->
-           (* #638: record + emit rather than discard.  Still does not fail the
-              commit that got us here. *)
            note_checkpoint_failure st ~target exn;
-           Lwt.return_unit))
+           Lwt.fail exn)))
 ;;
 
 (* Group-commit coordinator (#77, #151).  One fiber per [commit_queue]
@@ -2118,7 +2349,8 @@ let commit_prepare_btree
    - Mem backend: no I/O, just release the writer lock.
    - Btree backend without WAL: flush all currently-open trees'
      root_pages into the meta-tree, then write a new header pointing at
-     the new meta root, sync inline, autocheckpoint, release.
+     the new meta root, sync inline, release.  (Nothing to checkpoint: no
+     WAL.)
    - Btree backend with WAL: same prepare phase but using
      [Header.commit_no_sync] so the writer can release [lock]
      before the fsync.  Writers then converge on a per-store
@@ -2147,31 +2379,20 @@ let maybe_autockpt_after_commit t st =
   then Lwt.return_unit
   else (
     st.autockpt_in_flight <- true;
-    (* #638: captured before the attempt — see [maybe_autocheckpoint]. *)
-    let target =
-      match st.wal with
-      | Some w -> Wal.committed_frames w
-      | None -> 0
-    in
     Lwt.async (fun () ->
       Lwt.finalize
         (fun () ->
            Lwt.catch
              (fun () ->
-                let* () = acquire_writer t Lock_stats.Autocheckpoint in
-                Lwt.finalize
-                  (fun () ->
-                     match st.wal with
-                     | None -> Lwt.return_unit
-                     | Some wal -> checkpoint_unlocked st wal)
-                  (fun () ->
-                     release_writer t;
-                     Lwt.return_unit))
-             (fun exn ->
-                (* #638: this is the background path — nobody is awaiting this
-                   fiber, so discarding here was the most invisible failure in
-                   the engine. *)
-                note_checkpoint_failure st ~target exn;
+                match st.wal with
+                | None -> Lwt.return_unit
+                | Some wal -> checkpoint_body t st wal ~site:Lock_stats.Autocheckpoint)
+             (fun _exn ->
+                (* #638: [checkpoint_body] has already recorded and emitted the
+                   failure, at the one place that knows the target.  Swallowing
+                   it HERE is the #638 asymmetry: nobody awaits this fiber, and
+                   the commit that dispatched it has already succeeded — so the
+                   failure is surfaced, never raised. *)
                 Lwt.return_unit))
         (fun () ->
            st.autockpt_in_flight <- false;
@@ -2281,7 +2502,7 @@ let commit_wal t st =
                 let epoch = Wal.epoch wal in
                 (* #337: register the ship as in-flight SYNCHRONOUSLY (before the
                    [Lwt.async] yields) so a checkpoint dispatched right after
-                   sees the count and waits in [checkpoint_unlocked] before
+                   sees the count and waits in [ckpt_install] before
                    [Wal.reset]; decrement + wake the gate when the lazy reader
                    completes. *)
                 st.sink_ships_in_flight <- st.sink_ships_in_flight + 1;
@@ -2351,8 +2572,13 @@ let commit (Rw t : rw txn) : unit Lwt.t =
         let* () =
           Lwt.finalize
             (fun () ->
-               let* () = commit_prepare_btree ~header_commit:Header.commit st in
-               maybe_autocheckpoint st)
+               (* #719: no autocheckpoint here.  This arm is [st.wal = None],
+                  and a store with no WAL has nothing to checkpoint — the
+                  [maybe_autocheckpoint] that used to be called was a no-op for
+                  exactly that reason.  It is gone rather than rewritten because
+                  the checkpoint now manages [t.lock] itself, and this is the
+                  one site that would have called it WHILE HOLDING that lock. *)
+               commit_prepare_btree ~header_commit:Header.commit st)
             (fun () ->
                release_writer t;
                Lwt.return_unit)
@@ -2427,24 +2653,11 @@ let checkpoint (t : t) : unit Lwt.t =
     (match st.wal with
      | None -> Lwt.return_unit
      | Some wal ->
-       let* () = acquire_writer t Lock_stats.Checkpoint in
-       (* Read under the lock, and before the attempt: a failure past
-          [Wal.reset] would leave [committed_frames] at 0. *)
-       let target = Wal.committed_frames wal in
-       Lwt.finalize
-         (fun () ->
-            (* #638: an explicit checkpoint already surfaces its failure by
-               raising, so this path was never silent — but it feeds the same
-               counters so [checkpoint_health] describes the store, not just its
-               automatic path.  The exception is re-raised unchanged. *)
-            Lwt.catch
-              (fun () -> checkpoint_unlocked st wal)
-              (fun exn ->
-                 note_checkpoint_failure st ~target exn;
-                 Lwt.fail exn))
-         (fun () ->
-            release_writer t;
-            Lwt.return_unit))
+       (* #638: an explicit checkpoint already surfaces its failure by raising,
+          so this path was never silent — but [checkpoint_body] feeds the same
+          counters so [checkpoint_health] describes the store, not just its
+          automatic path.  The exception is re-raised unchanged. *)
+       checkpoint_body t st wal ~site:Lock_stats.Checkpoint)
 ;;
 
 (** #638: the checkpoint-failure signal. *)

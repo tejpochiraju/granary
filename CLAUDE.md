@@ -1627,7 +1627,7 @@ autocheckpoint holds it for **25.1%** of the interval while being the blocker
 for **100%** of all writer-lock wait. That settles #716 item 2 — `BEGIN` is
 waiting, and it waits for `maybe_autockpt_after_commit` — and it means no part
 of #716's headline converts to throughput at `TERMINALS > 1` until something
-leaves the critical section. Tracked as #719.
+leaves the critical section. Tracked as #719, **fixed** — see below.
 
 **This instrument cannot see scheduler drain, so it narrows that hypothesis
 rather than excluding it.** An uncontended `Rwlock.acquire_write` returns an
@@ -1643,6 +1643,124 @@ Any test of this must be **file-backed and WAL-mode** for the site attribution:
 the Mem backend has no WAL, so `Store.checkpoint` returns before it acquires
 anything and no autocheckpoint is ever dispatched — an in-memory version passes
 while measuring nothing. `test/test_lock_stats_718.ml` is.
+
+### The checkpoint migrates outside the writer lock (#719)
+
+**A checkpoint no longer holds the writer lock while it copies pages.** It still
+takes it exactly once — so #718's `Lock_stats.site` constructors did not have to
+grow, and `unattributed_waits`/`unbalanced_releases` are still the detectors —
+but the hold now covers the *install* (a final catch-up pass, the gate, and
+`Wal.reset`) rather than the migration. Option 1 from the issue (raise
+`default_wal_autocheckpoint_threshold`) was explicitly **not** taken: it makes
+the holds fewer and longer, which is the same 25% differently spelled.
+
+The migration is safe outside the lock for three reasons, and all three have to
+keep holding:
+
+- a committed WAL frame's bytes are **immutable** for the life of the
+  generation, and an append only ever lands at or above `committed_frames`;
+- in WAL mode the main file is written by **nothing but a checkpoint** (a
+  commit's `Pager.alloc` can `ftruncate` it *longer*, which moves no data);
+- a half-migrated main file is **invisible**, because every read resolves
+  through the WAL overlay first and a page we have migrated still has its frame.
+  Only `Wal.reset` retires the overlay, and that step is still under the lock.
+
+**Two things the lock was silently providing had to be provided explicitly, and
+they are the whole risk surface of this change.**
+
+**1. Exclusion between checkpoints — `st.ckpt_mutex`.** `autockpt_in_flight`
+only ever coalesced the *auto* path against itself; the manual `Store.checkpoint`
+was excluded by the writer lock. With the migration unlocked, a second
+checkpoint's `Wal.reset` would recycle the frame indices the first is still
+reading, and it would then copy a *new* generation's bytes into an *old*
+generation's page — silent corruption, not a crash. The mutex covers both paths.
+**Lock order is `ckpt_mutex` then `t.lock`, never the reverse**; nothing else
+takes `ckpt_mutex`, and the one site that would have reached for it while
+holding `t.lock` (the non-WAL commit arm's `maybe_autocheckpoint`) was a
+provable no-op and is gone.
+
+**2. Snapshot isolation — the reader gate moved, and it is per pass.** This is
+the part that is easy to get wrong, and the first revision of this fix did. The
+old code ran the whole gate *before* the migration; the obvious split runs it
+just before `Wal.reset` instead, which is what `Replication.checkpoint_wal_to_main`
+documents as benign. **It is not benign here, and that comment's reasoning is
+incomplete.** A snapshot at frame `m` resolves a page through
+`Wal.find_page_at ~max_frame:m` and falls through to the **main file** for any
+page whose every frame is at or above `m` — a page written for the first time
+since the reader began. Writing that page's newer content into the main file is
+immediately visible to that reader, with no `Wal.reset` anywhere near it.
+
+So the two halves of `wait_for_readers_past` guard different operations and are
+now called from different places:
+
+- the **replication (#263) and backup (#265) floors** guard frame *recycling*,
+  so they run once, immediately before `Wal.reset`, under the lock — running
+  them per pass would spend their bounded-yield budgets several times per
+  checkpoint;
+- the **RO-snapshot gate** guards the *migration*, so `wait_for_ro_readers_past`
+  runs before **every** pass, including the unlocked ones.
+
+That gate is what makes the pass's frame window **bounded at both ends**:
+`migrate_ckpt_pass` migrates a page only when its newest frame index is in
+`[since, head)`, where `head` is `committed_frames` read at the pass's start and
+gated on. The upper bound is not an optimisation — without it a pass could
+migrate a frame at or above `head` while a snapshot sits exactly *at* `head`,
+which is the violation above. Coverage stays complete because the bounds
+interlock: the next pass is called with `~since:head`, and every frame published
+after `head` was read necessarily lands at or above it.
+
+Two further properties worth knowing before editing this:
+
+- **The catch-up pass under the lock is what makes `Wal.reset` legal.**
+  `Wal.reset`'s own crash-safety note assumes "the caller has already migrated
+  and fsynced exactly those pages"; the unlocked passes cannot promise that,
+  because a writer keeps appending underneath them. The final pass runs where
+  `committed_frames` cannot move, so it is by construction the last one needed.
+  A commit that lands mid-migration is therefore migrated, not lost — that is
+  `a_commit_during_the_migration_is_migrated_not_lost`, and it is the case a
+  wrong split fails *silently*.
+- **`ckpt_io_in_flight` now brackets two regions, not one**, and the gap between
+  them is exactly the `acquire_writer` that separates them. Keeping the count
+  out of that gap is what preserves #338: a checkpoint merely parked on the
+  writer lock behind an abandoned write txn stays invisible to `close`, so it
+  cannot wedge it.
+
+**One pre-existing window is WIDENED, and it is still sound.** `commit_wal`
+releases the writer lock before its fsync, so the frames a checkpoint migrates
+may be published but not yet durable — true before #719 too, but now for a whole
+migration's duration rather than an instant. Crash between the main-file fsync
+and `Wal.reset`'s marker fsync and recovery reads the WAL's durable prefix `P`;
+pages migrated from a frame above `P` then resolve to the main file's newer
+bytes. They are unreachable rather than wrong: both header pages are rewritten
+every commit and a checkpoint spans many, so the recovered root is the root as of
+`P`, and under copy-on-write a page whose only frame is above `P` was freshly
+allocated or taken from the freelist by a commit after `P`. The file is
+consistent as of `P`, with some orphaned pages. The argument is in
+`checkpoint`'s header comment in `store.ml`; anything that makes a commit write
+a page **in place** would break it.
+
+**Accepted trade, recorded so it is not found by surprise:** the locked gate now
+runs against the *caught-up* target rather than the announced one, so an RO
+snapshot that registered during the migration, at a frame below that final
+target, can block the install while the lock is held. The window is the commits
+that landed during the last unlocked pass, and #382 already requires consumers
+to tolerate an unbalanced `Checkpoint_begin`; it is now also true that the
+`Checkpoint_end` which does arrive may have recycled **more** frames than the
+begin announced.
+
+**Not fixed, and pre-existing:** a *follower*'s `ro_begin_at` registers at
+`min(committed_frames, follower_ack_position)`, which can be *below* the
+checkpoint's target, so a follower reader that registers after the gate is not
+covered by it. That was true before this change (the gate has always raced
+reader registration, since `Rwlock` readers never block) and a follower never
+runs the auto path, because `rw_begin` rejects writes in follower mode.
+
+Pinned by `test/test_autocheckpoint_lock_719.ml`, which is **file-backed and
+WAL-mode** for the reason the #718 section gives. Its first two cases **hook the
+main file's `write_page`** so the migration can be parked at a chosen page: the
+property under test is "the lock is free *during* the migration", and a test
+that merely sampled the accounting at a convenient moment would pass on the old
+code whenever it sampled outside a checkpoint.
 
 ### One `Db.t`, one explicit transaction (#555)
 

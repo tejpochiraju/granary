@@ -34,7 +34,7 @@
 
     And one thing that is deliberately NOT load-bearing: a truncation failure is
     swallowed. It costs disk space, not correctness, and [reset] returning an
-    error fails the entire checkpoint ([Store.checkpoint_unlocked] raises).
+    error fails the entire checkpoint ([Store.ckpt_install] raises).
     [truncation_failure_is_not_fatal] pins that too.
 
     Readers: a checkpoint is already gated behind live RO snapshots
@@ -43,7 +43,17 @@
     older snapshot. #612 makes that gate matter more than it did — before,
     a racing reader got stale-but-present bytes; now it would get EOF — so
     [snapshot_reader_is_not_broken_by_a_checkpoint] asserts the gate directly
-    rather than trusting it. *)
+    rather than trusting it.
+
+    #719 makes it matter again, and in a second way. The checkpoint's page
+    migration now runs OUTSIDE the writer lock, so the RO half of that gate had
+    to move with it: it runs before every migration pass, not merely before
+    [Wal.reset]. A snapshot at frame [m] falls through to the MAIN FILE for any
+    page whose every frame is at or above [m], so migrating such a page is
+    visible to it with no truncation involved. This test is what catches that:
+    it holds a snapshot below the checkpoint target and reads THROUGH the window
+    in which a gate-before-reset-only split would have migrated underneath
+    it. *)
 
 open Lwt.Syntax
 module Wal = Granary_storage.Wal

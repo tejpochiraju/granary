@@ -173,10 +173,13 @@ val open_block_wal
       begun after close starts is rejected ({!rw_begin} fails once closing).
     - An in-flight autocheckpoint or replication sink ship that is actively
       touching the fds is drained first, so teardown never pulls the WAL/pager
-      out from under it.
+      out from under it.  Since #719 a checkpoint's page migration is one such
+      region (it no longer runs under the write lock), so [close] waits for the
+      migration pass in flight and no further pass starts.
     - An autocheckpoint merely parked (on the replication floor, or on the write
-      lock behind an open txn) is abandoned cleanly without performing its I/O;
-      its frames remain in the WAL and replay on next open (no data loss).
+      lock behind an open txn) is abandoned cleanly without performing further
+      I/O; the WAL is left un-truncated and replays on next open (no data
+      loss).
 
     After [close] returns, any further use of the store or its txns is
     undefined. *)
@@ -399,9 +402,19 @@ val seek_close : seek_cursor -> unit
     [open_block_wal]). *)
 val wal_mode : t -> bool
 
-(** Migrate every page in the WAL index to the main DB, sync, then
-    reset the WAL. No-op outside WAL mode. Acquires the RW mutex
-    internally so it serialises with commits. *)
+(** Migrate every page in the WAL index to the main DB, sync, then reset the
+    WAL.  No-op outside WAL mode.
+
+    {b #719: this no longer holds the writer lock for the whole migration.}  The
+    page copying and its fsync run with the lock free — a half-migrated main
+    file is invisible, because every read resolves through the WAL overlay until
+    [Wal.reset] retires it — and the lock is taken once, at the end, to catch up
+    on whatever was committed meanwhile and truncate the WAL.  So this
+    serialises with commits only for that final step, and a commit issued while
+    a checkpoint is copying pages no longer waits for it.
+
+    Checkpoints still serialise against {e each other} (including the background
+    autocheckpoint) for the whole of their duration. *)
 val checkpoint : t -> unit Lwt.t
 
 (** #638: the checkpoint-failure signal.  [last_error] is the message of the
@@ -831,7 +844,7 @@ val follower_ack_position : t -> int option
 
 (** Wait for in-flight RO snapshots whose [snap_frames] is below [target] to
     complete.  Reuses the same reader-pin gating as the inline checkpoint
-    ([checkpoint_unlocked]): local RO readers are waited on unconditionally;
+    ([ckpt_install]): local RO readers are waited on unconditionally;
     the replication and backup floors are subject to the store's configured
     bounded-yield budgets (#207, #265).  No-op on the in-memory backend.
 
