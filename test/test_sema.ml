@@ -2237,10 +2237,12 @@ let bind_select_agg_expr_arg_accepted_488 () =
 ;;
 
 (* The half of the old guarantee that survives #488: an aggregate argument the
-   binder cannot bind is still refused rather than silently mis-bound.  Two
-   shapes are still refused by [Sema.bind_agg_arg] — a nested aggregate and a
-   subquery — and both are checked here, at the binder level, because the
-   end-to-end SQL spellings live in test_agg_expr_495_488.ml. *)
+   binder cannot bind is still refused rather than silently mis-bound.  ONE
+   shape is still refused by [Sema.bind_agg_arg] — a nested aggregate — and it
+   is checked here, at the binder level, because the end-to-end SQL spellings
+   live in test_agg_expr_495_488.ml.  A subquery used to be the second; #664
+   made it bind (and [Exec.stream_aggregate] evaluate it), which the case below
+   now pins from this side. *)
 let bind_select_agg_nested_agg_arg_rejected_488 () =
   let cat = two_col_cat () in
   let stmt = agg_proj_stmt (Ast.E_agg (Ast.Agg_count, Some (Ast.E_col "id"))) in
@@ -2249,7 +2251,10 @@ let bind_select_agg_nested_agg_arg_rejected_488 () =
   | _ -> Alcotest.fail "expected Unsupported for a nested aggregate arg (#488)"
 ;;
 
-let bind_select_agg_subquery_arg_rejected_488 () =
+(* #664: a subquery in an aggregate argument BINDS, as an [arg_expr] with no
+   column ordinal — the same shape any other computed argument binds to.  It
+   used to be [Unsupported]. *)
+let bind_select_agg_subquery_arg_accepted_664 () =
   let cat = two_col_cat () in
   let inner =
     Ast.S_select
@@ -2270,8 +2275,16 @@ let bind_select_agg_subquery_arg_rejected_488 () =
     agg_proj_stmt (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_subquery inner))
   in
   match bind cat stmt with
-  | Error (Sema.Unsupported _) -> ()
-  | _ -> Alcotest.fail "expected Unsupported for a subquery inside an agg arg (#488)"
+  | Ok
+      (Sema.BS_select
+         { aggs =
+             [ { func = Ast.Agg_sum; col_ord = None; arg_expr = Some _; distinct = false }
+             ]
+         ; _
+         }) -> ()
+  | _ ->
+    Alcotest.fail
+      "expected Ok with SUM(id + (SELECT 1)) bound as an expression arg (#664)"
 ;;
 
 let bind_select_col_not_in_group_by_rejected () =
@@ -6010,9 +6023,9 @@ let () =
             `Quick
             bind_select_agg_nested_agg_arg_rejected_488
         ; Alcotest.test_case
-            "bind_select_agg_subquery_arg_rejected_488"
+            "bind_select_agg_subquery_arg_accepted_664"
             `Quick
-            bind_select_agg_subquery_arg_rejected_488
+            bind_select_agg_subquery_arg_accepted_664
         ; Alcotest.test_case
             "bind_select_col_not_in_group_by_rejected"
             `Quick

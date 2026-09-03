@@ -190,6 +190,10 @@ type op =
       ; ordinals : int list
       ; source : op
       ; on_conflict : Ast.conflict_action option
+      ; upsert_update : (string list * (int * expr) list) option
+        (** #653: the [ON CONFLICT (cols) DO UPDATE SET ...] clause, carried so
+            [Exec] can hand it to the same per-row [execute_insert] the VALUES
+            form uses. *)
       }
   | Op_seq_scan of
       { table_meta : Cat.table_meta
@@ -431,6 +435,9 @@ type op =
   | Op_pragma_checkpoint_status
   (** #638 read the checkpoint-failure signal: one row of
       (total_failures, consecutive_failures, last_error). *)
+  | Op_pragma_wal_replay_check
+  (** #637 report recovery's generation-boundary evidence: one row of
+      (status, frames_walked, header_frames, detail). *)
   | Op_pragma_get_wal_autocheckpoint (** Read per-connection auto-checkpoint threshold. *)
   | Op_pragma_set_wal_autocheckpoint of { n : int64 }
   (** Set per-connection auto-checkpoint threshold (0 disables). *)

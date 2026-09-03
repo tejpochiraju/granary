@@ -1,7 +1,15 @@
 (library
  (name granary_unix)
  (public_name granary.unix)
- (libraries lwt lwt.unix unix cstruct granary.store granary.storage granary)
+ (libraries
+  lwt
+  lwt.unix
+  unix
+  cstruct
+  mirage-crypto-rng.unix
+  granary.store
+  granary.storage
+  granary)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

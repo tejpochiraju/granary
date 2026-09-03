@@ -424,7 +424,7 @@ let cstruct_dup src =
    [t.cached_wal_epoch] would by then already be the new epoch — no later
    [sync_wal_epoch] would ever purge it again.  The result is a permanently
    poisoned entry and a silent wrong answer for every subsequent reader.  The
-   window is real: [Store.checkpoint_unlocked]'s reader gate is
+   window is real: [Store.ckpt_install]'s reader gate is
    [ro_readers_below] ([m < target]), so a reader at the WAL head is not gated
    and runs concurrently with [Wal.reset].
 

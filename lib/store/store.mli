@@ -173,10 +173,13 @@ val open_block_wal
       begun after close starts is rejected ({!rw_begin} fails once closing).
     - An in-flight autocheckpoint or replication sink ship that is actively
       touching the fds is drained first, so teardown never pulls the WAL/pager
-      out from under it.
+      out from under it.  Since #719 a checkpoint's page migration is one such
+      region (it no longer runs under the write lock), so [close] waits for the
+      migration pass in flight and no further pass starts.
     - An autocheckpoint merely parked (on the replication floor, or on the write
-      lock behind an open txn) is abandoned cleanly without performing its I/O;
-      its frames remain in the WAL and replay on next open (no data loss).
+      lock behind an open txn) is abandoned cleanly without performing further
+      I/O; the WAL is left un-truncated and replays on next open (no data
+      loss).
 
     After [close] returns, any further use of the store or its txns is
     undefined. *)
@@ -189,7 +192,18 @@ val close : t -> unit Lwt.t
     in-memory backend. *)
 val set_tree_tag : t -> tree_id -> int32 -> unit
 
-(** Begin a read-only transaction. Multiple RO txns may run concurrently. *)
+(** Begin a read-only transaction. Multiple RO txns may run concurrently.
+
+    Fails when the store is closing, and — on a FOLLOWER only — when the
+    snapshot's frame horizon would sit below content a checkpoint has already
+    copied into the main file (#739).  A snapshot resolves any page whose every
+    WAL frame is at or above its horizon from the main file, so such a snapshot
+    would observe data past this follower's last-applied commit; the horizon of
+    a non-follower is [Wal.committed_frames] and is at or above that boundary by
+    construction, so this can never fire there.  {!checkpoint} refuses to start
+    in follower mode, so the only way to reach the refusal is switching follower
+    mode on while a checkpoint is already migrating; it clears when that
+    checkpoint completes. *)
 val ro_begin : t -> ro txn Lwt.t
 
 (** [history_pin t ~txn_id] (#266) sets the retention floor: pages reachable from
@@ -224,7 +238,10 @@ val history_enabled : t -> bool
     As-of reads serve {b only} what an active retention floor protects: with no
     floor set (via {!history_pin}) every target resolves to [History_pruned],
     because uncapped commits recycle superseded pages and a snapshot would read
-    garbage.  The floor is not retroactive — see {!history_pin}. *)
+    garbage.  The floor is not retroactive — see {!history_pin}.
+
+    Subject to {!ro_begin}'s #739 refusal too: a retained historical root is
+    still resolved through the snapshot's frame horizon. *)
 val ro_begin_as_of : t -> History.target -> ro txn Lwt.t
 
 (** Raised by {!ro_begin_as_of} to carry an as-of {!error}. *)
@@ -399,9 +416,29 @@ val seek_close : seek_cursor -> unit
     [open_block_wal]). *)
 val wal_mode : t -> bool
 
-(** Migrate every page in the WAL index to the main DB, sync, then
-    reset the WAL. No-op outside WAL mode. Acquires the RW mutex
-    internally so it serialises with commits. *)
+(** Migrate every page in the WAL index to the main DB, sync, then reset the
+    WAL.  No-op outside WAL mode.
+
+    {b #719: this no longer holds the writer lock for the whole migration.}  The
+    page copying and its fsync run with the lock free — a half-migrated main
+    file is invisible, because every read resolves through the WAL overlay until
+    [Wal.reset] retires it — and the lock is taken once, at the end, to catch up
+    on whatever was committed meanwhile and truncate the WAL.  So this
+    serialises with commits only for that final step, and a commit issued while
+    a checkpoint is copying pages no longer waits for it.
+
+    Checkpoints still serialise against {e each other} (including the background
+    autocheckpoint) for the whole of their duration.
+
+    {b #739: rejected while the store is in follower mode.}  A follower's WAL
+    belongs to the replication apply loop, and {!ro_begin} caps every snapshot at
+    {!follower_ack_position} so a reader never observes a frame past the last
+    applied commit.  A checkpoint copies frames into the main file and then
+    retires the overlay, where that cap cannot reach them — so it would make the
+    guarantee permanently unenforceable rather than merely racy.  The
+    autocheckpoint path was already unreachable there ({!rw_begin} refuses writes,
+    so no commit dispatches one).  [Standby] is unaffected: it migrates through
+    [Replication.checkpoint_wal_to_main], not this function. *)
 val checkpoint : t -> unit Lwt.t
 
 (** #638: the checkpoint-failure signal.  [last_error] is the message of the
@@ -423,6 +460,70 @@ type checkpoint_health =
     observable at all.  Returns the all-clear on the in-memory backend, which
     has no WAL. *)
 val checkpoint_health : t -> checkpoint_health
+
+(** #637: what recovery's WAL walk observed about generation boundaries at
+    open, lifted from {!Granary_storage.Wal.replay_check}.
+
+    {b What it detects.}  Before #636, [Wal.reset] cleared only in-memory state:
+    every frame of the checkpointed generation stayed on disk under an unchanged
+    [(salt, seed)] marker and therefore still verified, so the next open replayed
+    it — over newer data when the successor generation was shorter.  Each commit
+    writes exactly one header page with [txn_id = previous + 1], so a header
+    [txn_id] that fails to increase as recovery walks forward means the walk has
+    left the newest generation and entered the remains of an older one.  That is
+    the signature, and it is present in both of #636's outcomes.
+
+    {b What it does NOT detect, and why the status has three values rather than
+    two.}
+    - Damage that a PREVIOUS open already replayed into the main file.  The
+      row-loss variant leaves a structurally valid database, so no integrity
+      check finds it either, and once the WAL has been rotated by a post-#636
+      checkpoint the evidence is gone.  This is a report on {i this open's} WAL,
+      not a verdict on the file.
+    - A stale remainder that is a fragment of a single old commit batch carrying
+      no header-page frame.  Recovery can consume such a fragment, and if it
+      contains a commit-flagged frame the fragment is applied — undetected.  Any
+      stale remainder spanning a whole old commit does contain a header frame.
+    - A stale remainder that recovery walked but never APPLIED, because no
+      commit frame followed it.  That is deliberately not reported: it is the
+      ordinary residue of a crash-torn write, harms nothing, and flagging it
+      would make the detector cry wolf on correct databases.
+    - A database that will not open at all (#636's other outcome) never reaches
+      this, but it is loud by construction.
+
+    So [Wal_replay_no_evidence] means "walked, compared, and nothing regressed",
+    never "verified clean"; and a walk with fewer than two header frames to
+    compare reports {!Wal_replay_not_examined} rather than pretending to the
+    former.  [frames_walked] and [header_frames] are reported so a reader can
+    see how much material the test had. *)
+type wal_replay_status =
+  | Wal_replay_not_examined
+  (** No WAL, or fewer than two header frames were walked: the check had
+        nothing to compare.  Not a claim either way. *)
+  | Wal_replay_no_evidence
+  (** The frames recovery walked at this open showed no generation
+        regression.  Not a clean bill of health for the database. *)
+  | Wal_replay_stale_generation of
+      { frame_idx : int
+      ; previous_txn_id : int64
+      ; frame_txn_id : int64
+      }
+  (** Recovery walked into frames belonging to an older generation: at
+        [frame_idx] a header page carried [frame_txn_id], no greater than the
+        [previous_txn_id] already seen.  A database written by a pre-#636 binary
+        has replayed stale data over newer data. *)
+
+(** #637: {!wal_replay_status} plus how much material the check had. *)
+type wal_replay_check =
+  { status : wal_replay_status
+  ; frames_walked : int
+  ; header_frames : int
+  }
+
+(** The stale-generation report for this store (#637).  Reports
+    {!Wal_replay_not_examined} on the in-memory backend and outside WAL mode.
+    Surfaced to SQL as [PRAGMA wal_replay_check]. *)
+val wal_replay_check : t -> wal_replay_check
 
 (** Clear the sticky checkpoint-failure signal ([last_error] and
     [consecutive_failures]); [total_failures] is left alone.  For an operator
@@ -809,8 +910,14 @@ val set_event_callback : t -> (Event.t -> unit) option -> unit
 (** Enable or disable follower mode.  When [true], {!rw_begin} rejects
     write transactions on the B+-tree backend with an exception, keeping
     the standby's WAL from diverging from the master's stream while the
-    follower loop is applying incoming frames.  No-op on the in-memory
-    backend (Mem stores have no standby semantics). *)
+    follower loop is applying incoming frames, and {!checkpoint} is rejected
+    too (#739).  No-op on the in-memory backend (Mem stores have no standby
+    semantics).
+
+    Switching it on while a checkpoint is already in flight does not stop that
+    checkpoint — it is past the refusal — so until it completes {!ro_begin} may
+    refuse a snapshot whose horizon sits below what that checkpoint has already
+    migrated, rather than serving one that would read the migrated pages. *)
 val set_follower : t -> bool -> unit
 
 (** True iff follower mode is active (write transactions are rejected). *)
@@ -831,7 +938,7 @@ val follower_ack_position : t -> int option
 
 (** Wait for in-flight RO snapshots whose [snap_frames] is below [target] to
     complete.  Reuses the same reader-pin gating as the inline checkpoint
-    ([checkpoint_unlocked]): local RO readers are waited on unconditionally;
+    ([ckpt_install]): local RO readers are waited on unconditionally;
     the replication and backup floors are subject to the store's configured
     bounded-yield budgets (#207, #265).  No-op on the in-memory backend.
 

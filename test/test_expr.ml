@@ -362,13 +362,16 @@ let eval_lt_blob () =
 ;;
 
 let eval_cmp_cross_type () =
-  (* Cross-type comparison: int vs text — returns false (0) *)
+  (* #734: a cross-CLASS comparison is ordered, not false. [cmp_result]
+     delegates to [Exec.compare_values], whose class rank puts every number
+     below every text — the same order [Index_key.encode_value]'s tag bytes
+     encode. sqlite3 answers 1 for [5 < 'abc']; this used to answer 0. *)
   let row = [| Row.V_int 5L; Row.V_text "abc" |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_col 1) in
   Alcotest.(check bool)
-    "int < text (cross-type) → 0"
+    "int < text (cross-class) → 1"
     true
-    (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
+    (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 ;;
 
 (* arith_op real + int — covers exec.ml lines 131-133 *)
@@ -382,21 +385,18 @@ let eval_arith_real_int () =
 ;;
 
 let eval_compare_values_cross_type () =
-  (* What this pins is [cmp_result]'s cross-CLASS catch-all: every comparison
-     between a text and an int is false, in both directions. That is still the
-     behaviour (#734 tracks whether it should be — sqlite3 answers 1 for
-     [5 < 'abc']).
+  (* The reverse operand order of the case above, which was a separate arm of
+     the old catch-all. #734: a text is ABOVE every number, so this is now 1.
 
-     It is NOT [compare_values]: since #579 that function orders cross-class
-     pairs by storage class rather than answering 0, and [cmp_result] never
-     reaches it for a cross-class pair anyway. The name in this test dates from
-     when the two were assumed to be one comparator. *)
+     The name dates from when [cmp_result] and [compare_values] were assumed to
+     be one comparator. Since #733/#734 they effectively are again — the former
+     is the latter plus three-valued NULL handling. *)
   let row = [| Row.V_text "x"; Row.V_int 5L |] in
   let e = Plan.P_binop (Plan.Gt, Plan.P_col 0, Plan.P_col 1) in
   Alcotest.(check bool)
-    "text > int (cross-type) → 0"
+    "text > int (cross-class) → 1"
     true
-    (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
+    (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 ;;
 
 let eval_arith_text_error () =

@@ -176,6 +176,9 @@ type bound_stmt =
       ; ordinals : int list
       ; source : bound_stmt
       ; on_conflict : Ast.conflict_action option
+      ; upsert_update : (string list * (int * bound_expr) list) option
+        (** #653: the bound [ON CONFLICT (cols) DO UPDATE SET ...] clause, bound
+            by the same helper the VALUES form uses. *)
       }
   | BS_select of
       { distinct : bool

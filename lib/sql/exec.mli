@@ -202,14 +202,28 @@ val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 val current_dirty_acc : unit -> dirty_tables_acc option
 
 (** The user tables recorded in [acc]: sorted, deduplicated, with SQLite-reserved
-    [sqlite_…] objects (sqlite_master / sqlite_sequence) excluded. *)
+    [sqlite_…] objects (sqlite_master / sqlite_sequence) excluded.
+
+    #666: this is an invalidation {e hint} and is deliberately {b not} reverted
+    when a statement's writes are rolled back — an [OR IGNORE] skip whose BEFORE
+    INSERT trigger wrote and was undone still reports the trigger's table.  A
+    superfluous entry costs an external cache one miss; a missing one is a stale
+    read.  Contrast {!dirty_changes}, which is reverted. *)
 val dirty_elements : dirty_tables_acc -> string list
 
 (** #417: the per-row {!row_change} deltas recorded in [acc], as [(table,
     changes)] pairs sorted by table name, each table's changes in application
     order.  SQLite-reserved [sqlite_…] objects are excluded, matching
     {!dirty_elements}.  Always [[]] for a non-capturing accumulator
-    ({!make_dirty_acc}). *)
+    ({!make_dirty_acc}).
+
+    #666: unlike {!dirty_elements} these are statements of fact about rows, and
+    a delta describing a row the store no longer holds is a phantom row in a
+    materialised reactive view — so they are reverted whenever the write they
+    describe is.  Concretely: a row skipped by [OR IGNORE] contributes nothing,
+    including the nested DML of a BEFORE INSERT trigger that had already run,
+    in a borrowed transaction (#631's savepoint) and in autocommit (the skip
+    arms' whole-transaction rollback) alike. *)
 val dirty_changes : dirty_tables_acc -> (string * row_change list) list
 
 (** #514: what the DML (UPDATE/DELETE) index-seek path did with its candidate
@@ -352,7 +366,9 @@ val eval_expr
     cannot reach the magnitudes that matter: the defect it guards is invisible
     below 2^53 and invisible to any fixture that happens to be sorted.
 
-    This is [compare_values]'s order only. [cmp_result], the WHERE-predicate
-    comparator, still promotes inexactly above 2^53 (#733) and answers false
-    for every cross-class comparison (#734). *)
+    Since #733/#734 this is also the WHERE-predicate order for [<], [<=], [>]
+    and [>=]: [cmp_result] delegates here, adding only three-valued NULL
+    handling.  [=] and [<>] keep their own arms, and their cross-NUMERIC
+    answers still differ from this order — an equality conjunct is consumed by
+    the index access path, so both levels have to move together (#738). *)
 val compare_values : Granary_encoding.Row.value -> Granary_encoding.Row.value -> int

@@ -425,15 +425,17 @@ let classify_range_bound (ty : Row.ty) = function
   | _ -> `Unknown
 ;;
 
-(** Order two [`Orderable] bounds for the same column.  [Float.compare] is the
-    same total order {!Granary_sql.Exec.compare_values} applies in the residual
-    predicate and {!Granary_encoding.Index_key.encode_value} encodes, so the
-    fold can never pick a bound the predicate and the key order disagree
-    about.  #527: a mixed int/real pair is ordered through [Int64.to_float],
-    which above 2^53 can name the wrong one "tightest".  That is a perf
-    question, not a soundness one — the fold only ever picks between candidates
-    that are each individually a sound bound, and no conjunct is marked
-    consumed, so a wrong pick loses a narrowing and never a row. *)
+(** Order two [`Orderable] bounds for the same column.  Within a single numeric
+    type [Float.compare] / [Int64.compare] agree with
+    {!Granary_sql.Exec.compare_values} (the residual predicate's order since
+    #733) and with {!Granary_encoding.Index_key.encode_value}, so the fold can
+    never pick a bound the predicate and the key order disagree about.  #527: a
+    mixed int/real pair is ordered here through [Int64.to_float], which above
+    2^53 can name the wrong one "tightest" — and since #733 the predicate no
+    longer promotes that way, so the two genuinely differ there.  That is a
+    perf question, not a soundness one — the fold only ever picks between
+    candidates that are each individually a sound bound, and no conjunct is
+    marked consumed, so a wrong pick loses a narrowing and never a row. *)
 let compare_range_bounds a b =
   match a, b with
   | Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_int y) -> Some (Int64.compare x y)
@@ -2897,12 +2899,16 @@ let indexes_of cat (table_meta : Cat.table_meta) =
   | None -> []
 ;;
 
+(* #653: shared by both INSERT shapes, so a future change to how an upsert's
+   assignments are planned cannot reach one spelling and miss the other. *)
+let plan_upsert_update upsert_update =
+  match upsert_update with
+  | None -> None
+  | Some (cols, assigns) -> Some (cols, List.map (fun (i, e) -> i, plan_expr e) assigns)
+;;
+
 let plan_insert ~table_meta ~ordinals ~values ~on_conflict ~returning ~upsert_update =
-  let plan_upsert =
-    match upsert_update with
-    | None -> None
-    | Some (cols, assigns) -> Some (cols, List.map (fun (i, e) -> i, plan_expr e) assigns)
-  in
+  let plan_upsert = plan_upsert_update upsert_update in
   Plan.Op_insert
     { table_meta
     ; ordinals
@@ -3130,6 +3136,7 @@ let plan_pragma_rows cat kind =
   | Ast.Pragma_defer_foreign_keys_set _
   | Ast.Pragma_wal_checkpoint
   | Ast.Pragma_checkpoint_status
+  | Ast.Pragma_wal_replay_check
   | Ast.Pragma_wal_autocheckpoint
   | Ast.Pragma_wal_autocheckpoint_set _
   | Ast.Pragma_synchronous
@@ -3160,6 +3167,7 @@ let plan_pragma cat kind =
   | Ast.Pragma_defer_foreign_keys_set on -> Plan.Op_pragma_set_defer_fk { on }
   | Ast.Pragma_wal_checkpoint -> Plan.Op_pragma_wal_checkpoint
   | Ast.Pragma_checkpoint_status -> Plan.Op_pragma_checkpoint_status
+  | Ast.Pragma_wal_replay_check -> Plan.Op_pragma_wal_replay_check
   | Ast.Pragma_wal_autocheckpoint -> Plan.Op_pragma_get_wal_autocheckpoint
   | Ast.Pragma_wal_autocheckpoint_set n -> Plan.Op_pragma_set_wal_autocheckpoint { n }
   | Ast.Pragma_synchronous -> Plan.Op_pragma_get_synchronous
@@ -3196,8 +3204,14 @@ let rec plan ?cat = function
       ; without_rowid
       ; autoincrement
       }
-  | Sema.BS_insert_select { table_meta; ordinals; source; on_conflict } ->
-    Plan.Op_insert_select { table_meta; ordinals; source = plan ?cat source; on_conflict }
+  | Sema.BS_insert_select { table_meta; ordinals; source; on_conflict; upsert_update } ->
+    Plan.Op_insert_select
+      { table_meta
+      ; ordinals
+      ; source = plan ?cat source
+      ; on_conflict
+      ; upsert_update = plan_upsert_update upsert_update
+      }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }
     -> plan_insert ~table_meta ~ordinals ~values ~on_conflict ~returning ~upsert_update
   | Sema.BS_select

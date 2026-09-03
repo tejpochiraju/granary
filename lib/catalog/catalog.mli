@@ -878,24 +878,37 @@ val remove_view
   -> name:string
   -> unit Lwt.t
 
-(** #427: load all reactive-view definitions as [(name, create_sql)] pairs. *)
-val load_all_reactive_views : Granary_store.Store.t -> (string * string) list Lwt.t
+(** #427: load all reactive-view definitions as [(name, create_sql)] pairs.
+
+    #476: returns [Error msg] on a store fault instead of raising.  Unlike the
+    view/trigger siblings, the reactive-view registry's callers sit directly
+    under [Db.execute]'s [(unit, error) result] contract, so a raise here
+    escaped an API that promises an [Error]. *)
+val load_all_reactive_views
+  :  Granary_store.Store.t
+  -> ((string * string) list, string) result Lwt.t
 
 (** #427: persist a reactive view's [CREATE REACTIVE VIEW] SQL text.  [?txn] as
-    for {!persist_view}. *)
+    for {!persist_view}.
+
+    #476: returns [Error msg] on a store fault instead of raising — see
+    {!load_all_reactive_views}. *)
 val persist_reactive_view
   :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> Granary_store.Store.t
   -> name:string
   -> sql:string
-  -> unit Lwt.t
+  -> (unit, string) result Lwt.t
 
-(** #427: remove a reactive view's SQL text.  [?txn] as above. *)
+(** #427: remove a reactive view's SQL text.  [?txn] as above.
+
+    #476: returns [Error msg] on a store fault instead of raising — see
+    {!load_all_reactive_views}. *)
 val remove_reactive_view
   :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> Granary_store.Store.t
   -> name:string
-  -> unit Lwt.t
+  -> (unit, string) result Lwt.t
 
 (** Load all persisted trigger definitions. Returns [(trigger_name, create_trigger_sql)] pairs. *)
 val load_all_triggers : Granary_store.Store.t -> (string * string) list Lwt.t

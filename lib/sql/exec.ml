@@ -177,6 +177,74 @@ let dirty_changes ({ changes; _ } : dirty_tables_acc) : (string * row_change lis
     |> List.sort (fun (a, _) (b, _) -> String.compare a b)
 ;;
 
+(* #666: a mark/restore point for the #417 row-level delta log, so a write the
+   store UNDOES cannot leave a delta describing it behind.
+
+   Rollback used to revert two of the three pieces of per-statement state — the
+   [Store] trees and the [Schema_cache] — and not the ambient accumulator here.
+   The two halves of the accumulator are not equally dangerous and are treated
+   differently on purpose:
+
+   - the #240 NAME set is an invalidation HINT.  A stale entry costs an external
+     cache one miss, and is deliberately NOT reverted: over-invalidation is
+     free, whereas under-invalidation (a mark site this restore failed to
+     account for) is a stale-cache wrong answer.  Note [record_change] marks the
+     name as well as recording the delta, so restoring the delta and keeping the
+     name lands on exactly that safe side.
+   - the #417 delta log is a statement of FACT about rows.  A stale [Inserted]
+     is a PHANTOM ROW in a materialised reactive view ([Db.drive_reactive]
+     absorbs it and the maintenance applies it), which is a wrong answer, not a
+     cost.  So it is reverted.
+
+   The log is prepend-only per table and its per-table [ref] is created once and
+   never replaced, so a mark is exactly each table's current list — which later
+   prepends leave as the tail — and a restore is an assignment back to it plus
+   the removal of tables that did not exist at mark time.  That makes both
+   operations O(tables touched), never O(rows): [execute_insert] takes one mark
+   per ROW, so anything proportional to the deltas already recorded would make a
+   multi-row INSERT quadratic. *)
+type changes_mark =
+  | Cm_none
+  | Cm_marked of
+      { log : (string, row_change list ref) Hashtbl.t
+      ; saved : (string * row_change list) list
+      }
+
+(* Capture the delta log's current tails.  [Cm_none] when no accumulator is
+   installed or capture is off — the common case, and one predicted branch. *)
+let changes_mark () : changes_mark =
+  match Lwt.get dirty_tables_key with
+  | None | Some { changes = None; _ } -> Cm_none
+  | Some { changes = Some log; _ } ->
+    Cm_marked { log; saved = Hashtbl.fold (fun k r acc -> (k, !r) :: acc) log [] }
+;;
+
+(* Discard every delta recorded since [m] was taken.  Call it wherever the STORE
+   is reverted (an autocommit [S.rollback] of a skipped row, or #631's
+   statement savepoint) and NOT where effects survive — a raising statement in a
+   borrowed transaction keeps its partial writes, so it must keep their deltas.
+
+   Two passes, each O(tables): drop the tables that did not exist at mark time,
+   then put every table that did back to its marked tail.  The second pass
+   re-adds a missing entry rather than assuming one is there.  That case is
+   believed unreachable — only a restore removes an entry, and it removes only
+   tables absent at ITS OWN mark, which (marks nest LIFO) can never include a
+   table present at an enclosing mark — but the invariant is subtle enough that
+   depending on it silently would be the wrong trade for one [Hashtbl.replace]. *)
+let changes_restore (m : changes_mark) : unit =
+  match m with
+  | Cm_none -> ()
+  | Cm_marked { log; saved } ->
+    Hashtbl.fold (fun k _ acc -> k :: acc) log []
+    |> List.iter (fun k -> if not (List.mem_assoc k saved) then Hashtbl.remove log k);
+    List.iter
+      (fun (k, tail) ->
+         match Hashtbl.find_opt log k with
+         | Some r -> r := tail
+         | None -> Hashtbl.replace log k (ref tail))
+      saved
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
@@ -227,14 +295,13 @@ let row_value_to_index_value : Row.value -> Index_key.value = function
    index-key comparison cannot disagree about which CLASS sorts first.  They
    still disagree about INTEGER vs REAL *within* the numeric class, because the
    encoding gives them separate tags and therefore puts every integer before
-   every real — but that disagreement is pre-existing and already true of
-   [cmp_result], the predicate comparator, which promotes numerically.
+   every real — but that disagreement is pre-existing.
 
-   Within the numeric class, making [compare_values] promote reduces the number
-   of distinct answers in the engine rather than adding one.  Across classes it
-   does NOT: [cmp_result] answers false for every cross-class predicate, so
-   this change trades a cross-numeric disagreement for a cross-class one.  See
-   #734, and the note on [compare_values] itself. *)
+   #733/#734: [cmp_result], the WHERE-predicate comparator, now delegates to
+   [compare_values] outright, so this rank order is the one the ordering
+   operators apply too.  It briefly was not — #579 gave [compare_values] a
+   class order while [cmp_result] still answered false for every cross-class
+   predicate — and that gap is what those two issues closed. *)
 let value_class_rank (v : Row.value) : int =
   match v with
   | Row.V_null -> 0
@@ -288,6 +355,31 @@ let cmp_int_real (x : int64) (y : float) : int =
     else 0)
 ;;
 
+(* #738: the int64 a REAL is exactly equal to, or [None] when no integer is.
+
+   Declines a NaN, an infinity, anything outside int64 range (where
+   [Int64.of_float] is unspecified) and any value with a fraction.  Every
+   declined case is a genuine "no integer equals this", which is what lets an
+   equality seek turn [None] into an empty result rather than a wider scan. *)
+let int64_of_exact_real (f : float) : int64 option =
+  if Float.is_nan f || f >= two_pow_63_cmp || f < -.two_pow_63_cmp
+  then None
+  else if Float.equal f (Float.trunc f)
+  then Some (Int64.of_float f)
+  else None
+;;
+
+(* #738: the float an int64 is exactly equal to, or [None] when no REAL is.
+
+   [Int64.to_float] rounds to nearest, so above 2^53 the result names a
+   DIFFERENT integer; {!cmp_int_real} is the exact test for whether it landed on
+   [n] itself, and reusing it is what keeps this helper and the [=] predicate
+   from ever disagreeing. *)
+let exact_real_of_int64 (n : int64) : float option =
+  let f = Int64.to_float n in
+  if cmp_int_real n f = 0 then Some f else None
+;;
+
 (* #579: a TOTAL order over values, which is what every caller needs and what
    this did not used to be.
 
@@ -312,18 +404,15 @@ let cmp_int_real (x : int64) (y : float) : int =
      [NULL < NaN < every number] — NULL is a lower CLASS, so both halves hold);
    - across classes, order by {!value_class_rank}.
 
-   Only the FIRST of those is a rule [cmp_result] already applied, and it
-   applies it in a weaker form.  Do not read this comment as saying the two
-   comparators now agree — they do not, in two separate ways, and both are
-   filed:
-
-   - [cmp_result] promotes int-vs-real through [Int64.to_float], so above 2^53
-     it still answers equal for pairs this function now separates.  #733.
-   - [cmp_result] ends in [| _ -> Row.V_int 0L], i.e. EVERY cross-class
-     predicate is false — it applies no class order at all.  So after this
-     change [ORDER BY] says [5 < 'abc'] while [WHERE] says that is false.
-     That WHERE/sort disagreement is NEW in the cross-class direction, traded
-     for removing the cross-numeric one this issue is about.  #734.
+   #733/#734: [cmp_result] — the [<]/[<=]/[>]/[>=] half of a WHERE predicate —
+   is now this function plus three-valued NULL handling, so an ORDER BY and a
+   WHERE can no longer disagree about where a value sits.  For one release they
+   did, in two separate ways: [cmp_result] promoted int-vs-real through
+   [Int64.to_float] (inexact above 2^53, #733) and ended in
+   [| _ -> Row.V_int 0L], applying no class order at all (#734).  Both are
+   gone.  What is NOT routed through here is [Eq]/[Ne], whose cross-NUMERIC
+   answers still differ from this function's — see {!cmp_result} and #738 for
+   why that one cannot move without the index equality path moving with it.
 
    DISTINCT is deliberately NOT routed through this: it dedups on [row_key]'s
    string rendering, where [1] and [1.0] are different keys.  So DISTINCT and
@@ -340,10 +429,9 @@ let compare_values (a : Row.value) (b : Row.value) : int =
   | Row.V_real x, Row.V_real y -> Float.compare x y
   | Row.V_text x, Row.V_text y -> String.compare x y
   | Row.V_blob x, Row.V_blob y -> Bytes.compare x y
-  (* #579: numeric promotion, but EXACT — see {!cmp_int_real}.  [cmp_result]
-     promotes through [Int64.to_float] instead and is therefore still inexact
-     above 2^53; that residual is #733, and it is why the claim below is about
-     this function rather than about the engine. *)
+  (* #579: numeric promotion, but EXACT — see {!cmp_int_real}.  #733 routed
+     [cmp_result] through here, so the WHERE predicate is exact at these
+     magnitudes too. *)
   | Row.V_int x, Row.V_real y -> cmp_int_real x y
   | Row.V_real x, Row.V_int y -> -cmp_int_real y x
   (* #579: everything left is a genuine cross-CLASS pair (number/text/blob in
@@ -351,8 +439,7 @@ let compare_values (a : Row.value) (b : Row.value) : int =
 
      With the exact numeric arm above, this function IS a total order — every
      pair of values is related, antisymmetrically and transitively — for every
-     input, with no magnitude caveat.  That claim is about THIS function only;
-     see the note above for the two ways [cmp_result] still differs. *)
+     input, with no magnitude caveat. *)
   | _, _ -> Int.compare (value_class_rank a) (value_class_rank b)
 ;;
 
@@ -1615,6 +1702,190 @@ let int_bitop lv rv f =
   | _ -> Row.V_null
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #722: COLLATE is a comparison attribute, not a value transform.      *)
+(* ------------------------------------------------------------------ *)
+
+(* The comparison KEY of [v] under [c].  A key is only ever compared, never
+   emitted, so folding case here cannot change what a projection returns —
+   which is the whole of #722.  [Collate_binary] and [Collate_rtrim] are the
+   identity, exactly as they were before. *)
+let collate_key (c : Ast.collation) (v : Row.value) : Row.value =
+  match c, v with
+  | Ast.Collate_nocase, Row.V_text s -> Row.V_text (String.lowercase_ascii s)
+  | _, v -> v
+;;
+
+(* The collation governing a comparison whose operand is [e].
+
+   SQLite's rule is that an operand has an explicit collating-function
+   assignment if ANY subexpression of it uses the postfix COLLATE operator, and
+   the leftmost such assignment wins.  So
+   [(x COLLATE NOCASE) || '!' = 'HELLO!'] compares under NOCASE even though the
+   COLLATE sits two nodes down — oracle-checked, sqlite3 answers both the
+   'HELLO' and the 'Hello' row where granary answered neither.
+
+   A subquery ([P_subquery] / [P_exists], and the statement half of
+   [P_in_select]) is an opaque leaf here: its result column's collation is a
+   property of the inner SELECT, not of this expression, and none of the four
+   walkers over [Plan.expr] descends into an [Ast.stmt] either. *)
+let rec expr_collation (e : Plan.expr) : Ast.collation =
+  match e with
+  | Plan.P_collate (_, c) -> c
+  | Plan.P_lit _ | Plan.P_col _ | Plan.P_param _ -> Ast.Collate_binary
+  | Plan.P_subquery _ | Plan.P_exists _ -> Ast.Collate_binary
+  | Plan.P_excluded_col _ | Plan.P_window_slot _ -> Ast.Collate_binary
+  | Plan.P_not e | Plan.P_is_null e | Plan.P_is_not_null e -> expr_collation e
+  | Plan.P_neg e | Plan.P_bitnot e | Plan.P_cast (e, _) -> expr_collation e
+  | Plan.P_in_select (x, _) -> expr_collation x
+  | Plan.P_binop (_, l, r) -> collation2 l r
+  | Plan.P_between (x, lo, hi) -> collation3 x lo hi
+  | Plan.P_in (x, vals) -> collation_in x vals
+  | Plan.P_func (_, args) -> collation_of_list args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    (match collation_opt scrutinee with
+     | Ast.Collate_binary ->
+       (match collation_of_branches branches with
+        (* every subexpression *)
+        | Ast.Collate_binary -> collation_opt else_
+        | c -> c)
+     | c -> c)
+
+and collation_opt (e : Plan.expr option) : Ast.collation =
+  match e with
+  | None -> Ast.Collate_binary
+  | Some e -> expr_collation e
+
+(* Every subexpression of a CASE's branches — what {!expr_collation} needs when
+   the whole CASE is an operand of an outer comparison. *)
+and collation_of_branches (bs : (Plan.expr * Plan.expr) list) : Ast.collation =
+  match bs with
+  | [] -> Ast.Collate_binary
+  | (cond, result) :: rest ->
+    (match collation2 cond result with
+     | Ast.Collate_binary -> collation_of_branches rest
+     | c -> c)
+
+(* Only the WHEN conditions — the comparison a [CASE x WHEN w] performs is
+   [x = w], so a THEN result is not an operand of it.  Scanned in place rather
+   than through [List.map fst] because this is reached per ROW. *)
+and collation_of_conds (bs : (Plan.expr * Plan.expr) list) : Ast.collation =
+  match bs with
+  | [] -> Ast.Collate_binary
+  | (cond, _) :: rest ->
+    (match expr_collation cond with
+     | Ast.Collate_binary -> collation_of_conds rest
+     | c -> c)
+
+(* Two operands, leftmost explicit assignment wins.  Spelled out rather than
+   going through {!collation_of_list} because this runs per ROW for every
+   comparison in every WHERE clause: a list and a thunk per evaluation would be
+   a real allocation on the TPC-C path, where the answer is [Collate_binary]
+   after two constructor matches. *)
+and collation2 (a : Plan.expr) (b : Plan.expr) : Ast.collation =
+  match expr_collation a with
+  | Ast.Collate_binary -> expr_collation b
+  | c -> c
+
+and collation3 (a : Plan.expr) (b : Plan.expr) (c : Plan.expr) : Ast.collation =
+  match collation2 a b with
+  | Ast.Collate_binary -> expr_collation c
+  | x -> x
+
+and collation_in (x : Plan.expr) (vals : Plan.expr list) : Ast.collation =
+  match expr_collation x with
+  | Ast.Collate_binary -> collation_of_list vals
+  | c -> c
+
+and collation_of_list (es : Plan.expr list) : Ast.collation =
+  match es with
+  | [] -> Ast.Collate_binary
+  | e :: rest ->
+    (match expr_collation e with
+     | Ast.Collate_binary -> collation_of_list rest
+     | c -> c)
+;;
+
+(* [compare_values] under a collation: both sides are keyed, so the comparison
+   is collation-aware while the values the caller keeps are untouched. *)
+let compare_collated (c : Ast.collation) (a : Row.value) (b : Row.value) : int =
+  compare_values (collate_key c a) (collate_key c b)
+;;
+
+(* An aggregate's comparison collation comes from its argument expression.  The
+   bare-column forms carry [arg_expr = None] and are always BINARY, which is
+   what they were before #722. *)
+let agg_spec_collation (spec : Plan.agg_spec) : Ast.collation =
+  match spec.Plan.arg_expr with
+  | Some e -> expr_collation e
+  | None -> Ast.Collate_binary
+;;
+
+(* Per-output-column collation of a row-producing plan op.
+
+   #722: DISTINCT and the three set operations compare the OUTPUT row and hold
+   no expressions of their own — [Op_distinct] is literally [{ child : op }] —
+   so the collation has to be read back off the projection underneath them.
+   A column this cannot resolve answers [Collate_binary], which is what every
+   column answered before #722 unless the projection happened to lower-case it. *)
+let rec output_collations (op : Plan.op) : Ast.collation list =
+  match op with
+  | Plan.Op_expr_project { exprs; _ } | Plan.Op_const_select { exprs } ->
+    List.map (fun (e, _) -> expr_collation e) exprs
+  | Plan.Op_project { ordinals; child } ->
+    let inner = output_collations child in
+    let at i = Option.value (List.nth_opt inner i) ~default:Ast.Collate_binary in
+    List.map at ordinals
+  | Plan.Op_aggregate { proj; aggs; _ } -> List.map (proj_item_collation aggs) proj
+  | Plan.Op_sort { child; _ }
+  | Plan.Op_limit { child; _ }
+  | Plan.Op_filter { child; _ }
+  | Plan.Op_distinct { child } -> output_collations child
+  | Plan.Op_union { left; _ } | Plan.Op_intersect { left; _ } | Plan.Op_except { left; _ }
+    -> output_collations left
+  | _ -> []
+
+and proj_item_collation (aggs : Plan.agg_spec list) (pi : Plan.proj_item) : Ast.collation =
+  match pi with
+  | Plan.PI_expr e -> expr_collation e
+  | Plan.PI_agg_slot k ->
+    (match List.nth_opt aggs k with
+     | Some spec -> agg_spec_collation spec
+     | None -> Ast.Collate_binary)
+  | Plan.PI_group_col _ | Plan.PI_window_slot _ -> Ast.Collate_binary
+;;
+
+(* The dedup-key function for rows whose columns carry [cols].  When every
+   column is BINARY — the overwhelmingly common case, and every case before
+   #722 — this IS [row_key], so DISTINCT and the set operations pay nothing at
+   all for the feature; the all-binary test is made once per operator rather
+   than once per row. *)
+let collated_row_keyer (cols : Ast.collation list) : Row.t -> string =
+  if List.for_all (fun c -> c = Ast.Collate_binary) cols
+  then row_key
+  else (
+    let arr = Array.of_list cols in
+    let at i = if i < Array.length arr then arr.(i) else Ast.Collate_binary in
+    fun row -> row_key (Array.mapi (fun i v -> collate_key (at i) v) row))
+;;
+
+(* Only a COMPARISON takes a collation from its operands; every other binop is
+   a value computation and must not fold.  Before #722 the fold ran for EVERY
+   operator, so [(x COLLATE NOCASE) || 'B'] answered ['hellob'] where sqlite3
+   answers ['HELLOB'].
+
+   [Like] is excluded because {!like_match} already lower-cases both sides, and
+   [Glob] because sqlite3's GLOB is case-sensitive regardless of collation
+   (oracle-checked: [x COLLATE NOCASE GLOB 'HELL*'] matches only ['HELLO']). *)
+let binop_takes_collation (op : Plan.binop) : bool =
+  match op with
+  | Plan.Eq | Plan.Ne | Plan.Lt | Plan.Le | Plan.Gt | Plan.Ge -> true
+  | Plan.Like | Plan.Glob -> false
+  | Plan.Add | Plan.Sub | Plan.Mul | Plan.Div | Plan.Mod -> false
+  | Plan.And | Plan.Or | Plan.Concat -> false
+  | Plan.Bit_and | Plan.Bit_or | Plan.Lshift | Plan.Rshift -> false
+;;
+
 let rec eval_expr
           (clock : (unit -> float) option)
           (params : Row.value array)
@@ -1643,9 +1914,14 @@ let rec eval_expr
      any cross-type pair, which made both ends true at once and the whole
      predicate true for every row. [x] is still evaluated once. *)
   | Plan.P_between (x, lo, hi) ->
-    let vx = eval_expr clock params row x in
-    let vlo = eval_expr clock params row lo in
-    let vhi = eval_expr clock params row hi in
+    (* #722: BETWEEN reached [eval_binop] directly, bypassing the collation
+       propagation the [P_binop] arm did, so [x COLLATE NOCASE BETWEEN a AND b]
+       folded [x] but neither bound and answered NO rows where sqlite3 answers
+       two.  Both ends are now keyed with the same collation as [x]. *)
+    let c = collation3 x lo hi in
+    let vx = collate_key c (eval_expr clock params row x) in
+    let vlo = collate_key c (eval_expr clock params row lo) in
+    let vhi = collate_key c (eval_expr clock params row hi) in
     eval_binop Plan.And (eval_binop Plan.Ge vx vlo) (eval_binop Plan.Le vx vhi)
   | Plan.P_in (x, vals) -> eval_in clock params row x vals
   | Plan.P_is_null e ->
@@ -1660,26 +1936,19 @@ let rec eval_expr
     (match eval_expr clock params row e with
      | Row.V_null -> Row.V_null
      | v -> if value_truthy v then Row.V_int 0L else Row.V_int 1L)
+  (* #722: the collation is read off the OPERAND EXPRESSIONS and applied to
+     both comparison keys.  Before, it was applied by [P_collate] to its own
+     value and to the other operand, which made a collated value observable
+     wherever it was not compared. *)
   | Plan.P_binop (op, lhs_e, rhs_e) ->
     let lv = eval_expr clock params row lhs_e in
     let rv = eval_expr clock params row rhs_e in
-    let is_nocase = function
-      | Plan.P_collate (_, Ast.Collate_nocase) -> true
-      | _ -> false
-    in
-    let nocase_text v =
-      match v with
-      | Row.V_text s -> Row.V_text (String.lowercase_ascii s)
-      | o -> o
-    in
-    let lv', rv' =
-      if is_nocase lhs_e
-      then lv, nocase_text rv
-      else if is_nocase rhs_e
-      then nocase_text lv, rv
-      else lv, rv
-    in
-    eval_binop op lv' rv'
+    if not (binop_takes_collation op)
+    then eval_binop op lv rv
+    else (
+      match collation2 lhs_e rhs_e with
+      | Ast.Collate_binary -> eval_binop op lv rv
+      | c -> eval_binop op (collate_key c lv) (collate_key c rv))
   | Plan.P_func (func, args) ->
     eval_func clock func (List.map (eval_expr clock params row) args)
   | Plan.P_case { scrutinee; branches; else_ } ->
@@ -1694,19 +1963,20 @@ let rec eval_expr
     failwith
       "Exec: P_window_slot in eval_expr — must be substituted by planner before \
        evaluation"
-  | Plan.P_collate (e, Ast.Collate_nocase) ->
-    let v = eval_expr clock params row e in
-    (match v with
-     | Row.V_text s -> Row.V_text (String.lowercase_ascii s)
-     | o -> o)
-  | Plan.P_collate (e, _) ->
-    eval_expr clock params row e (* Collate_binary and Collate_rtrim are identity *)
+  (* #722: a COLLATE never changes the VALUE.  It is read by the comparison
+     sites through {!expr_collation}; here it is the identity, so a projected
+     or concatenated or CAST-wrapped collated column returns what is stored. *)
+  | Plan.P_collate (e, _) -> eval_expr clock params row e
 
 and eval_in clock params row x vals =
-  let vx = eval_expr clock params row x in
-  if vx = Row.V_null
+  let vx_raw = eval_expr clock params row x in
+  if vx_raw = Row.V_null
   then Row.V_null
   else (
+    (* #722: [IN] is a disjunction of equalities, so it takes a collation from
+       its operands the way [=] does. *)
+    let c = collation_in x vals in
+    let vx = collate_key c vx_raw in
     let result =
       List.fold_left
         (fun acc ve ->
@@ -1714,7 +1984,7 @@ and eval_in clock params row x vals =
            match acc with
            | `Found -> `Found
            | _ when v = Row.V_null -> `Maybe
-           | _ when compare_values vx v = 0 -> `Found
+           | _ when compare_values vx (collate_key c v) = 0 -> `Found
            | acc -> acc)
         `Not_found
         vals
@@ -1725,7 +1995,16 @@ and eval_in clock params row x vals =
     | `Not_found -> Row.V_int 0L)
 
 and eval_case_expr clock params row scrutinee branches else_ =
-  let scr_val = Option.map (eval_expr clock params row) scrutinee in
+  (* #722: [CASE x WHEN v THEN ...] is an equality against [x], so it takes a
+     collation from the scrutinee and the branch conditions. *)
+  let c =
+    match collation_opt scrutinee with
+    | Ast.Collate_binary -> collation_of_conds branches
+    | c -> c
+  in
+  let scr_val =
+    Option.map (fun e -> collate_key c (eval_expr clock params row e)) scrutinee
+  in
   let rec find_match = function
     | [] ->
       (match else_ with
@@ -1736,7 +2015,7 @@ and eval_case_expr clock params row scrutinee branches else_ =
         match scr_val with
         | None -> value_truthy (eval_expr clock params row cond)
         | Some sv ->
-          let cv = eval_expr clock params row cond in
+          let cv = collate_key c (eval_expr clock params row cond) in
           (match sv, cv with
            | Row.V_null, _ | _, Row.V_null -> false
            | _ -> compare_values sv cv = 0)
@@ -1744,6 +2023,14 @@ and eval_case_expr clock params row scrutinee branches else_ =
       if matched then eval_expr clock params row result else find_match rest
   in
   find_match branches
+
+(* #722: a sort / partition / peer-boundary key is a COMPARISON key — it is
+   never emitted — so the key expression's collation is applied to it here.
+   Before #722 the same effect fell out of [P_collate] rewriting the value,
+   which is why ORDER BY ... COLLATE NOCASE worked while a projection of the
+   same expression did not. *)
+and eval_sort_key clock params row (e : Plan.expr) : Row.value =
+  collate_key (expr_collation e) (eval_expr clock params row e)
 
 and eval_func
       (clock : (unit -> float) option)
@@ -1792,29 +2079,28 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
     else if (not ln) && not rn
     then Row.V_int 0L
     else Row.V_null
-  (* NULL compared with anything yields NULL (3-valued logic). Cross-type → false. *)
-  | Plan.Eq ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int x, Row.V_int y -> if Int64.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_text x, Row.V_text y ->
-       if String.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_real x, Row.V_real y ->
-       if Float.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_blob x, Row.V_blob y ->
-       if Bytes.equal x y then Row.V_int 1L else Row.V_int 0L
-     | _ -> Row.V_int 0L)
-  | Plan.Ne ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int x, Row.V_int y -> if Int64.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_text x, Row.V_text y ->
-       if String.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_real x, Row.V_real y ->
-       if Float.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_blob x, Row.V_blob y ->
-       if Bytes.equal x y then Row.V_int 0L else Row.V_int 1L
-     | _ -> Row.V_int 0L)
+  (* NULL compared with anything yields NULL (3-valued logic), which
+     {!cmp_result}'s own first arm supplies.
+
+     #738: [Eq] and [Ne] go through {!cmp_result} like the four ordering
+     operators, so ALL SIX comparisons are {!compare_values} and there is no
+     longer a comparator that answers [=] one way and [<=]/[>=] another.  Before
+     it they enumerated the four same-type pairs and fell to a catch-all, so
+     [1 = 1.0] and [1 <> 1.0] were BOTH false while [1 <= 1.0] and [1 >= 1.0]
+     were both true.
+
+     {b The three sites this rests on must never move apart again.}  Unlike a
+     range conjunct, an EQUALITY conjunct IS consumed by the access path
+     ([Planner.recognise_eq_col_lit] -> [access_path_for_eqs], whose [consumed]
+     positions [residual_filter] removes), so no residual re-checks a seek's
+     output.  Making this arm exact therefore required
+     {!index_lookup_values}, {!stream_rowid_lookup} and {!seek_candidates}'s
+     [Seek_rowid] arm to learn the same cross-numeric equality in the same
+     change — otherwise [WHERE i = 1.0] on an indexed INTEGER column returns
+     nothing while the predicate says the row qualifies.  Rows lost silently is
+     the failure mode; see #738. *)
+  | Plan.Eq -> cmp_result lv rv (fun c -> c = 0)
+  | Plan.Ne -> cmp_result lv rv (fun c -> c <> 0)
   | Plan.Lt -> cmp_result lv rv (fun c -> c < 0)
   | Plan.Le -> cmp_result lv rv (fun c -> c <= 0)
   | Plan.Gt -> cmp_result lv rv (fun c -> c > 0)
@@ -1874,22 +2160,47 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
        Row.V_int (if glob_match pat 0 str 0 then 1L else 0L)
      | _ -> Row.V_null)
 
+(* #733/#734/#738: a WHERE predicate's comparison — all six of [=], [<>], [<],
+   [<=], [>], [>=] — is {!compare_values} with three-valued logic layered on
+   top, and nothing else.
+
+   It used to be a third comparator with its own two disagreements:
+
+   - it promoted int-vs-real through [Int64.to_float], so above 2^53 the
+     PREDICATE answered equal for pairs the ORDERING separated (#733).
+     sqlite3 answers 1 for [9007199254740993 > 9007199254740992.0]; this
+     answered 0.
+   - it ended in [| _ -> Row.V_int 0L], applying no cross-CLASS order at all,
+     so [ORDER BY] said [5 < 'abc'] while [WHERE] said that was false
+     (#734).  sqlite3 answers 1, and NUMBER < TEXT < BLOB is exactly
+     {!value_class_rank}'s order and exactly
+     {!Granary_encoding.Index_key.encode_value}'s tag-byte order — so
+     [cmp_result] was the wrong half of the disagreement, not [compare_values].
+
+   NULL stays a separate arm above the delegation and must: [compare_values]
+   ORDERS NULL below everything (it is a total order, so it has to answer
+   something), whereas a predicate over a NULL is UNKNOWN.  Routing NULL
+   through it would make [WHERE x < 5] true for a NULL [x].
+
+   {b The index path is unaffected and the reason is worth keeping.}
+   {!range_bound_key}'s [pred]/[succ] widening was written to compensate for
+   the inexact promotion this removes, so the seek is now WIDER than the
+   predicate needs rather than exactly as wide.  That is the safe direction:
+   {!Granary_sql.Planner.range_for_index} never marks a range conjunct
+   consumed, so a residual filter runs over every row a seek yields.  See
+   {!range_bound_key}'s own comment for the full argument.
+
+   #738 routed [Eq] and [Ne] through here too.  They used to enumerate the four
+   same-type pairs and fall to a catch-all, so [1 = 1.0] and [1 <> 1.0] were
+   both false while [1 <= 1.0] and [1 >= 1.0] were both true.  That could not be
+   fixed in {!eval_binop} alone: an equality conjunct IS consumed by the access
+   path, so {!index_lookup_values}, {!stream_rowid_lookup} and
+   {!seek_candidates}'s [Seek_rowid] arm learned the cross-numeric case in the
+   same change.  Do not move one of the four without the other three. *)
 and cmp_result lv rv pred =
   match lv, rv with
   | Row.V_null, _ | _, Row.V_null -> Row.V_null
-  | Row.V_int _, Row.V_int _
-  | Row.V_text _, Row.V_text _
-  | Row.V_real _, Row.V_real _
-  | Row.V_blob _, Row.V_blob _ ->
-    if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
-  (* Cross-type numeric comparisons: promote int to float *)
-  | Row.V_real a, Row.V_int b ->
-    let c = Float.compare a (Int64.to_float b) in
-    if pred c then Row.V_int 1L else Row.V_int 0L
-  | Row.V_int a, Row.V_real b ->
-    let c = Float.compare (Int64.to_float a) b in
-    if pred c then Row.V_int 1L else Row.V_int 0L
-  | _ -> Row.V_int 0L (* cross-type comparisons are false *)
+  | _, _ -> if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
 
 and arith_op lv rv int_f float_f =
   match lv, rv with
@@ -3058,6 +3369,24 @@ let encode_index_key_prefix (ivs : Index_key.value list) : bytes * int =
       equal.  Note this must NOT become an [IK_null] prefix: that is a real seek
       key selecting the index's NULL entries, not an empty result.
 
+    #738: a value of the OTHER numeric type is the exception, and it has to be,
+    because the residual predicate no longer declines it.  [=] is
+    {!compare_values} now, so [i = 1.0] is TRUE for the stored integer [1] —
+    and an equality conjunct is CONSUMED by the access path
+    ([Planner.residual_filter]), so nothing re-checks the rows a seek yields.
+    Declining here would therefore lose them silently rather than merely
+    widening the scan.  The translation is exact in both directions and
+    [None] still means "matches nothing", never "seek wider":
+
+    - a REAL probe on an INTEGER column becomes [IK_int] when the float names
+      an integer exactly ({!int64_of_exact_real}); otherwise no integer equals
+      it, so [None] is the honest answer — [i = 1.5] genuinely matches nothing.
+      A NaN or an infinity is declined by the same helper, so neither can reach
+      the key as an "integral" real.
+    - an INTEGER probe on a REAL column becomes [IK_real] only when the
+      round-trip is exact ({!exact_real_of_int64}); above 2^53 [Int64.to_float]
+      names a different integer, and no stored double equals the one asked for.
+
     The read ([stream_index_lookup]) and write ([seek_index_candidates]) paths
     share this so they can never disagree about which rows a key matches. *)
 let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list option =
@@ -3070,9 +3399,34 @@ let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list 
        | Row.V_real f, Row.Real -> go (Index_key.IK_real f :: acc) rest
        | Row.V_blob b, Row.Blob -> go (Index_key.IK_blob b :: acc) rest
        | Row.V_null, _ -> None (* [col = NULL] never matches *)
+       (* #738: cross-numeric, exactly — see the note above. *)
+       | Row.V_real f, Row.Integer ->
+         (match int64_of_exact_real f with
+          | Some n -> go (Index_key.IK_int n :: acc) rest
+          | None -> None)
+       | Row.V_int n, Row.Real ->
+         (match exact_real_of_int64 n with
+          | Some f -> go (Index_key.IK_real f :: acc) rest
+          | None -> None)
        | _, _ -> None (* type mismatch: no stored key can equal this *))
   in
   go [] vs
+;;
+
+(** #738: the rowid an equality probe on the INTEGER PRIMARY KEY rowid alias
+    addresses, or [None] when no rowid can equal it.
+
+    The alias column IS the table key, so there is no index and no
+    [Index_key.value] — but the question is the same one {!index_lookup_values}
+    answers for an indexed column, and the answer must agree with it and with
+    [=]'s residual, which since #738 is {!compare_values}.  Both the read path
+    ({!stream_rowid_lookup}) and the DML path ({!seek_candidates}'s
+    [Seek_rowid] arm) go through here so they cannot drift apart. *)
+let rowid_lookup_key (v : Row.value) : int64 option =
+  match v with
+  | Row.V_int n -> Some n
+  | Row.V_real f -> int64_of_exact_real f
+  | Row.V_null | Row.V_text _ | Row.V_blob _ -> None
 ;;
 
 (* [2^63] as a float — exactly representable, and one past [Int64.max_int].  A
@@ -3101,23 +3455,41 @@ let two_pow_63 = 9.2233720368547758e18
     runs on every yielded row, so no strictness has to be tracked.
 
     On an integer column the rounding is {b widened by one float step first}
-    ([ceil (pred f)], [floor (succ f)]), and that step is load-bearing.  Plain
-    [ceil]/[floor] would be exact under {i exact} int-vs-real comparison — but
-    that is not the semantics the residual predicate uses.  [compare_values]
-    compares [V_int a] against [V_real b] as [Float.compare (Int64.to_float a)
-    b], so it admits every int64 whose {i rounded} float value satisfies the
-    bound.  Above 2^53, where a float ULP exceeds 1, many integers strictly
-    below a lower bound [f] round up onto [f] and so qualify; [ceil f] would
-    seek past all of them and drop those rows (256 of them at 2^62, ~1024 near
-    2^63).  One [pred]/[succ] step covers the whole gap, because it moves the
-    bound by exactly one ULP — the same grid spacing that creates it — while
-    below 2^53 it moves by less than 1 and so changes nothing after the
-    [ceil]/[floor]: [ceil (pred 100.5) = 101], [ceil (pred 280.0) = 280],
-    [floor (succ 119.5) = 119], [floor (succ 280.0) = 280].  The seek is thus a
-    superset of the predicate under the predicate's own semantics, at a cost of
-    at most one extra key below 2^53.  Above it the widening admits up to a
-    whole ULP of extra keys (512 at 2^62), but those are not waste: they are
-    exactly the keys the predicate accepts, which is why the widening exists.
+    ([ceil (pred f)], [floor (succ f)]).  {b Read the history before touching
+    it: the widening is now a deliberate over-approximation, not a
+    requirement.}
+
+    It was written against the {i inexact} residual predicate that existed
+    until #733.  [cmp_result] then compared [V_int a] against [V_real b] as
+    [Float.compare (Int64.to_float a) b], so it admitted every int64 whose
+    {i rounded} float value satisfied the bound.  Above 2^53, where a float ULP
+    exceeds 1, many integers strictly below a lower bound [f] rounded up onto
+    [f] and so qualified; [ceil f] would have sought past all of them and
+    dropped those rows (256 of them at 2^62, ~1024 near 2^63).  One
+    [pred]/[succ] step covers exactly that gap, moving the bound by one ULP —
+    the same grid spacing that creates it — while below 2^53 it moves by less
+    than 1 and so changes nothing after the [ceil]/[floor]:
+    [ceil (pred 100.5) = 101], [ceil (pred 280.0) = 280],
+    [floor (succ 119.5) = 119], [floor (succ 280.0) = 280].
+
+    Since #733 the residual predicate compares exactly ({!cmp_int_real}), so
+    plain [ceil]/[floor] {i would} now be the tight boundary and the widening
+    buys at most one ULP of keys the predicate then rejects (512 at 2^62, one
+    key below 2^53).  It is kept, for two reasons:
+
+    - the seek stays a {b superset} of the qualifying set under {i both} the
+      old and the new predicate semantics.  A widened seek plus an exact
+      residual is safe (superset in, correct filter after); a tightened seek is
+      only safe while the predicate stays exact, so keeping the widening means
+      no future change to {!cmp_result} can silently turn this into a rows-lost
+      bug.
+    - the safety of tightening it rests entirely on
+      {!Granary_sql.Planner.range_for_index} never marking a range conjunct
+      consumed, i.e. on a residual filter always running over the seek's
+      output.  That holds today and is asserted there, but it is a property of
+      another module; over-approximating here does not depend on it.
+
+    Tightening it is a separable performance change, not a correctness one.
 
     The result must be an [IK_int] on an integer column, not the real as given:
     {!Granary_encoding.Index_key.encode_value} emits a distinct leading type tag
@@ -3138,9 +3510,11 @@ let two_pow_63 = 9.2233720368547758e18
     A NaN is deliberately {i not} declined: it goes through as [IK_real nan],
     which {!Granary_encoding.Index_key.encode_value} writes as its own
     single-byte [0x01] tag (#578), sorting below every INTEGER/REAL key but
-    above NULL's [0x00].  That matches the residual predicate, whose
-    [Float.compare] also orders NaN below every number, and is the existing
-    behaviour for a same-type NaN bound — see [range_seek_bounds]. *)
+    above NULL's [0x00].  That matches the residual predicate, which since
+    #733 orders NaN below every number through {!cmp_int_real} (#536's decided
+    rule) rather than through [Float.compare]'s accident — the same answer, now
+    by construction — and is the existing behaviour for a same-type NaN bound —
+    see [range_seek_bounds]. *)
 let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
   : Index_key.value option
   =
@@ -3179,7 +3553,11 @@ let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
        the two questions always coincide: the numeric arms above exist precisely
        because they do not.  If [index_lookup_values] ever changes which of
        these it accepts, re-check that the new answer is still a sound bound
-       rather than assuming it carries over. *)
+       rather than assuming it carries over.
+
+       #738 did change it — it taught the equality path the two numeric
+       cross-type pairs — and this function is untouched by that precisely
+       because both arms above intercept them before the delegation. *)
     (match index_lookup_values [ v, ty ] with
      | Some [ iv ] -> Some iv
      | Some _ | None -> None)
@@ -3213,7 +3591,8 @@ let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
     The mirror case is a NaN {i bound}, which encodes to its own one byte and
     so makes [past_end] fire on the very first key whose tag is [0x02] or
     above — the seek returns nothing, which agrees with the residual
-    predicate, whose [Float.compare] also orders NaN below every number.
+    predicate, which also orders NaN below every number (#536, via
+    {!cmp_int_real} since #733).
 
     #527: an end whose type is not the column's is not simply dropped — a
     numeric one is promoted across the int/real boundary by {!range_bound_key},
@@ -4675,9 +5054,25 @@ let stmt_savepoint_release ~(cat : Cat.t) tx (sp : string option) : unit Lwt.t =
     Lwt.return_unit
 ;;
 
-let stmt_savepoint_finish ~(cat : Cat.t) tx ~(wrote : bool) (sp : string option)
+(* #666: [mark] is the row's #417 delta-log mark and [owned] says whether the
+   transaction is this statement's own.  A row that did not write must leave no
+   delta behind, and the store is reverted for it by ONE of two mechanisms:
+   in autocommit ([owned]) the skip arms of [execute_insert_write] /
+   [execute_upsert_update] have already rolled the whole per-row transaction
+   back; in a borrowed transaction it is the savepoint rolled back just below,
+   which exists only inside #631's intersection.  Restore exactly then — with
+   [not owned] and no savepoint nothing was reverted, and dropping the deltas
+   would lose a real trigger write instead of a phantom one. *)
+let stmt_savepoint_finish
+      ~(cat : Cat.t)
+      tx
+      ~(wrote : bool)
+      ~(owned : bool)
+      ~(mark : changes_mark)
+      (sp : string option)
   : unit Lwt.t
   =
+  if (not wrote) && (owned || Option.is_some sp) then changes_restore mark;
   let* () =
     match sp with
     | Some name when not wrote ->
@@ -4741,6 +5136,14 @@ let execute_insert
       tx
       ~take:((not owned) && Option.is_some before_hook && on_conflict = Some Ast.CA_ignore)
   in
+  (* #666: the delta-log counterpart of that undo point, and deliberately WIDER
+     than it.  The savepoint is only needed when the transaction is borrowed;
+     the stale-delta hole is just as real in autocommit, where the skip arms
+     roll the whole per-row transaction back and the accumulator — which rides
+     Lwt storage across that rollback — kept the trigger's [Inserted] anyway.
+     Marking is O(tables touched) and [Cm_none] when nobody is capturing, so
+     the unconditional mark costs the plain write path one branch. *)
+  let mark = changes_mark () in
   Lwt.catch
     (fun () ->
        let* () =
@@ -4881,7 +5284,7 @@ let execute_insert
              ~on_upsert_update
          in
          if updated then mark_dirty table_meta.Cat.name;
-         let* () = stmt_savepoint_finish ~cat tx ~wrote:updated sp in
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:updated ~owned ~mark sp in
          Lwt.return updated
        | _ ->
          let* inserted =
@@ -4915,15 +5318,30 @@ let execute_insert
          then (
            mark_dirty table_meta.Cat.name;
            record_change table_meta.Cat.name (Inserted { rowid; row }));
-         let* () = stmt_savepoint_finish ~cat tx ~wrote:inserted sp in
+         let* () = stmt_savepoint_finish ~cat tx ~wrote:inserted ~owned ~mark sp in
          Lwt.return inserted)
     (fun exn ->
        (* On any exception: rollback if we own the txn, then re-raise.  #631:
           the statement savepoint is released, not rolled back — a raising
           statement's partial effects already survive in a borrowed
           transaction, and this fix is about a SKIP, not about statement
-          atomicity on error.  Releasing only keeps the stack bounded. *)
+          atomicity on error.  Releasing only keeps the stack bounded.
+
+          #666: the deltas follow the STORE, so they are dropped exactly when
+          the store is — in autocommit, where [S.rollback] below undoes the
+          whole per-row transaction.  In a borrowed transaction the partial
+          effects survive, so their deltas must survive with them.
+
+          #737 (fixed): the consumer that used to lose them —
+          [Db.drive_reactive]'s [Error] arm — no longer absorbs the
+          accumulator at all on failure; it schedules a resync of the affected
+          reactive views instead.  So no OTHER exception handler in this module
+          owes itself a mark: whatever a raising statement left in the delta
+          log is discarded, and the views are rebuilt from the base tables.
+          A mark here is still correct and is kept, because it also serves the
+          non-raising SKIP path through [stmt_savepoint_finish]. *)
        let* () = stmt_savepoint_release ~cat tx sp in
+       if owned then changes_restore mark;
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
 ;;
@@ -6310,11 +6728,15 @@ let seek_candidates
   =
   match seek with
   | Plan.Seek_rowid e ->
-    (match eval_expr clock params [||] e with
-     | Row.V_int n ->
+    (* #738: an integral REAL addresses the rowid it names, exactly as it does
+       on the index path — the DML seek is a restriction, but the residual it
+       restricts now says [id = 1.0] is true, so declining here would make
+       [DELETE ... WHERE id = 1.0] a silent no-op. *)
+    (match rowid_lookup_key (eval_expr clock params [||] e) with
+     | Some n ->
        let* () = emit_candidate ~stats ~emit n in
        Lwt.return_false
-     | _ -> Lwt.return_false (* NULL or non-integer matches no rowid *))
+     | None -> Lwt.return_false (* NULL, non-numeric or fractional: no rowid *))
   | Plan.Seek_index { idx_tree; keys; range } ->
     seek_index_candidates
       tx
@@ -6560,8 +6982,8 @@ let apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches =
            let rec cmp = function
              | [] -> 0
              | (e, dir, nulls) :: rest ->
-               let va = eval_expr clock params ra e in
-               let vb = eval_expr clock params rb e in
+               let va = eval_sort_key clock params ra e in
+               let vb = eval_sort_key clock params rb e in
                let c = compare_with_nulls dir nulls va vb in
                if c <> 0 then c else cmp rest
            in
@@ -7455,6 +7877,7 @@ let op_name = function
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_pragma_wal_checkpoint -> "Pragma(wal_checkpoint)"
   | Plan.Op_pragma_checkpoint_status -> "Pragma(checkpoint_status)"
+  | Plan.Op_pragma_wal_replay_check -> "Pragma(wal_replay_check)"
   | Plan.Op_pragma_get_wal_autocheckpoint -> "Pragma(get_wal_autocheckpoint)"
   | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
     Printf.sprintf "Pragma(set_wal_autocheckpoint=%Ld)" n
@@ -7716,6 +8139,17 @@ let to_stream_ref
     failwith "to_stream_ref not yet initialised")
 ;;
 
+(** #588: forward reference to [not_null_repair_run], the shared core of
+    [PRAGMA not_null_repair].  It lives in the same mutually-recursive block as
+    [to_stream], and [execute_with_count] — defined above it — needs it so the
+    repair is reachable through the WRITE api ([Db.execute]) and not only
+    through [Db.query].  Returns the report rows and the number of rows actually
+    deleted; the write path reports the latter as the statement's change count,
+    the query path streams the former. *)
+let not_null_repair_run_ref : (S.t -> txn_mode -> Cat.t -> (Row.t list * int) Lwt.t) ref =
+  ref (fun _store _mode _cat -> failwith "not_null_repair_run_ref not yet initialised")
+;;
+
 (* Op_create_table: register the table, its UNIQUE indexes, and FK constraints. *)
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
@@ -7867,6 +8301,7 @@ let execute_insert_select_op
       ~ordinals
       ~source
       ~on_conflict
+      ~upsert_update
   : int Lwt.t
   =
   let n_cols = List.length table_meta.Cat.columns in
@@ -7888,12 +8323,18 @@ let execute_insert_select_op
        List.iteri
          (fun i ord -> if i < Array.length src_row then row_arr.(ord) <- src_row.(i))
          ordinals;
+       (* #653: the SELECT form is the VALUES form one row at a time — the
+          upsert clause is handed to the SAME [execute_insert], so #639's target
+          pass, the rowid-alias pre-probe, the NOT NULL ordering and #667's
+          pre-write uniqueness check all apply here by construction rather than
+          by a second implementation agreeing with the first. *)
        let* inserted =
          execute_insert
            ~mode
            ~params
            ~clock
            ~on_conflict
+           ~upsert_update
            ~before_hook:bh
            ~after_hook:ah
            ~on_replace_delete_before
@@ -8577,8 +9018,12 @@ let execute_with_count
       ~values
       ~on_conflict
       ~upsert_update
-  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict }
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict; upsert_update = _ }
     when Cat.is_columnar table_meta ->
+    (* #653: [upsert_update] is [None] here by construction —
+       [Sema.bind_upsert_clause] refuses an ON CONFLICT ... DO UPDATE on a
+       COLUMNSTORE table, because the columnar write path probes for no conflict
+       and the clause could only ever be dropped. *)
     let col_store = col_store_of_meta table_meta in
     let n_cols = List.length table_meta.Cat.columns in
     let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
@@ -8608,7 +9053,7 @@ let execute_with_count
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.fail exn)
-  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict; upsert_update } ->
     execute_insert_select_op
       store
       cat
@@ -8625,6 +9070,7 @@ let execute_with_count
       ~ordinals
       ~source
       ~on_conflict
+      ~upsert_update
   | Plan.Op_create_index
       { name
       ; table
@@ -8814,6 +9260,19 @@ let execute_with_count
     Lwt.return 0
   | Plan.Op_vacuum ->
     Lwt.fail_with "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
+  (* #588: [PRAGMA not_null_repair] DELETEs rows, so it belongs on the WRITE
+     path.  It used to be reachable only through [Exec.query] / [Db.query]: the
+     natural call for a statement that mutates and returns no interesting rows
+     — [Db.execute] — answered "use Exec.query for read operations" and deleted
+     nothing, so a caller had to route a destructive operation through the read
+     api to make it happen.  Both entry points now perform the repair, and they
+     differ only in what they hand back: [Db.execute] reports the number of rows
+     deleted as the statement's change count, [Db.query] streams the per-column
+     (table, column, count) report.  Its read-only half, [PRAGMA
+     not_null_check], stays on the query path alone. *)
+  | Plan.Op_pragma_not_null_repair ->
+    let* _rows, deleted = !not_null_repair_run_ref store mode cat in
+    Lwt.return deleted
   | Plan.Op_attach _
   | Plan.Op_detach _
   | Plan.Op_database_list
@@ -8839,7 +9298,6 @@ let execute_with_count
   | Plan.Op_pragma_get_user_version
   | Plan.Op_pragma_integrity_check
   | Plan.Op_pragma_not_null_check
-  | Plan.Op_pragma_not_null_repair
   | Plan.Op_pragma_get_fk
   | Plan.Op_pragma_get_recursive_triggers
   | Plan.Op_pragma_get_defer_fk
@@ -8866,6 +9324,7 @@ let execute_with_count
   | Plan.Op_sqlite_sequence
   | Plan.Op_pragma_get_synchronous
   | Plan.Op_pragma_checkpoint_status
+  | Plan.Op_pragma_wal_replay_check
   | Plan.Op_pragma_get_wal_batch_commits
   | Plan.Op_pragma_get_wal_batch_interval_ms ->
     failwith "Exec.execute: use Exec.query for read operations"
@@ -9772,6 +10231,53 @@ let agg_subquery_refusal () =
    values, and nothing else of the input rows."
 ;;
 
+(** #665: the message the SUM/AVG accumulators fail with when a value that is
+    not a number reaches them.
+
+    [Sema.agg_arg_static_ty] now refuses at BIND time every SUM/AVG argument
+    whose type is statically known to be TEXT or BLOB, in all three spellings
+    — a bare column, a wrapped aggregate, and #488's expression argument.  What
+    still reaches here is an argument whose type could not be known until a row
+    arrived: a scalar function, a bound parameter, a subquery, or a CASE whose
+    arms disagree.  For those the offending value's storage class is the whole
+    diagnostic the caller gets, so it is named rather than left to be guessed.
+
+    Defined at the top level rather than inside the accumulator's [let rec]
+    group on purpose: it returns ['a] and is instantiated at three different
+    types (the [int64] and [float] SUM folds, and [unit] in
+    [make_agg_acc_over_values]), which monomorphic recursion inside the group
+    would not allow. *)
+let agg_non_numeric_failure (what : string) (v : Row.value) =
+  let cls =
+    match v with
+    | Row.V_null -> "NULL"
+    | Row.V_int _ -> "INTEGER"
+    | Row.V_real _ -> "REAL"
+    | Row.V_text _ -> "TEXT"
+    | Row.V_blob _ -> "BLOB"
+  in
+  failwith (Printf.sprintf "%s on non-numeric value (%s)" what cls)
+;;
+
+(** #664: the message used when a subquery inside an aggregate ARGUMENT cannot
+    be resolved.
+
+    Deliberately distinct from {!agg_subquery_refusal}, because the two are
+    about different rows.  A subquery in [having] or [proj] is evaluated per
+    aggregate OUTPUT row, which carries only the grouped columns and the
+    aggregate values — so only a GROUP BY column can be its outer reference.
+    An ARGUMENT is evaluated per INPUT row, before any grouping, so any column
+    the child carries is fair game and this fires only when the child's base
+    tables cannot be located at all, or the reference names none of their
+    columns.  Reporting the group-by message for an argument would send the
+    reader to a rule that does not apply to it. *)
+let agg_arg_subquery_refusal () =
+  "Exec: a correlated subquery in an aggregate argument cannot be resolved — its outer \
+   column reference has no source in the rows being aggregated (#664). Rewrite it as an \
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
+;;
+
 (** #558: bind outer column references appearing in an aggregate projection or
     HAVING against one aggregate {i output} row, whose leading
     [List.length group_cols] slots hold the grouped columns in order.  [metas]
@@ -9915,8 +10421,15 @@ let no_inner_scope : inner_scope =
     subquery owns it" — which reduces to the pre-#592 behaviour of rewriting
     only qualified references. Anything else would rewrite on a guess.
 
-    A non-SELECT has no clauses this module rewrites, so both halves default to
-    "shadowed" there. *)
+    #732: a FROM-LESS SELECT ([S_const_select], the shape of
+    [(SELECT o.n * 10)]) owns nothing — it has no inputs at all — so it is
+    {!no_inner_scope}, and every column reference in it is by construction the
+    enclosing query's. That is not the same as the default below: "owns
+    everything" would shadow the outer reference the substitution exists to
+    resolve, and this is now a statement form whose clauses {i are} rewritten.
+
+    Every other non-SELECT has no clauses this module rewrites, so both halves
+    default to "shadowed" there. *)
 let inner_scope_of (cat_opt : Cat.t option) (s : Ast.stmt) : inner_scope =
   match s with
   | Ast.S_select r ->
@@ -9948,6 +10461,7 @@ let inner_scope_of (cat_opt : Cat.t option) (s : Ast.stmt) : inner_scope =
         fun name -> List.exists (String.equal name) cols)
     in
     { has_col; has_table }
+  | Ast.S_const_select _ -> no_inner_scope
   | _ -> { has_col = (fun _ -> true); has_table = (fun _ -> true) }
 ;;
 
@@ -10018,19 +10532,73 @@ let rec substitute_outer_in_expr
      at the top of this match handle the ones it does not.  Listed rather than
      left to a catch-all so those guards cannot be edited into a silent hole. *)
   | Ast.E_col _ | Ast.E_tbl_col _ -> e
-  (* These three DO carry sub-expressions and are deliberately NOT descended
-     into.  Descending would be an error-to-answer change of its own — each is
-     a distinct spelling in which a correlated reference could newly resolve,
-     and each needs its own oracle-checked test, which #670 is not the place
-     for.  Listed explicitly rather than caught by [| _ ->] so that the choice
-     is visible: an exhaustive match is also what makes a NEW constructor a
-     compile error here instead of the silent refusal #670 is about.
-     Tracked as #721. *)
-  | Ast.E_agg _ | Ast.E_agg_distinct _ | Ast.E_window _ -> e
+  (* #721: these three carry sub-expressions and are now descended into.  #670
+     listed them explicitly with [-> e] to make the omission visible; each was
+     a spelling in which a correlated reference sat somewhere this walker never
+     looked, so the reference survived, [Sema.bind] failed on it, and the
+     statement came back as a refusal.
 
-(** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST
-    stmt.  [enclosing] is the union of the scopes of every subquery between this
-    one and the row [bnd] describes; it is {!no_inner_scope} at the top. *)
+     [E_agg] is the one that is reachable on its own, in a correlated
+     subquery's HAVING —
+     [EXISTS (SELECT 1 FROM i WHERE i.fk = o.k GROUP BY i.fk
+              HAVING SUM(i.v + o.n) > 0)] — and #488, which made an aggregate's
+     argument a general expression rather than a bare column, is what widened
+     that surface.  [E_agg_distinct] is the same node with DISTINCT.
+     [E_window] cannot appear in WHERE or HAVING at all, so its only spelling
+     is a subquery's PROJECTION, which is #732's half of this fix; the two
+     arrive together for that reason.
+
+     [window_spec.frame] carries no [expr] — [frame_bound]'s offsets are [int]
+     ([Ast.frame_bound], ast.ml:158) — so [partition_by] and [order_by] are the
+     whole of it. *)
+  | Ast.E_agg (f, a) -> Ast.E_agg (f, Option.map go a)
+  | Ast.E_agg_distinct (f, a) -> Ast.E_agg_distinct (f, go a)
+  | Ast.E_window { func; args; window } ->
+    let go_key (k : Ast.order_key) = { k with Ast.expr = go k.Ast.expr } in
+    Ast.E_window
+      { func
+      ; args = List.map go args
+      ; window =
+          { window with
+            Ast.partition_by = List.map go window.Ast.partition_by
+          ; Ast.order_by = List.map go_key window.Ast.order_by
+          }
+      }
+
+(** Apply substitute_outer_in_expr to every clause of an AST stmt that can carry
+    an outer reference.  [enclosing] is the union of the scopes of every
+    subquery between this one and the row [bnd] describes; it is
+    {!no_inner_scope} at the top.
+
+    #732: this used to rewrite only WHERE / HAVING / [joins.*.on] and end in a
+    [| _ -> s] catch-all, so an outer reference in the subquery's own
+    PROJECTION was never substituted and the statement was refused with #626's
+    message — for [SELECT k, (SELECT i.m + o.n FROM i WHERE i.fk = o.k) FROM o],
+    which sqlite3 answers.  See {!substitute_outer_proj} for the projection and
+    the arms below for the rest.
+
+    Two clauses of [S_select] are still passed through, and neither is a hole:
+    [limit] / [offset] are [int option] and [group_by] is a
+    [(string * string option) list] ([Ast.group_by_item]) — neither can hold a
+    substituted literal, so there is no spelling in which an outer reference
+    reaches them.  (sqlite3 rejects [GROUP BY <outer col>] in a subquery with
+    "no such column" in any case.)
+
+    [order] is passed through {b deliberately}, and this is the one judgement
+    call in #732:
+    - sqlite3 refuses a correlated reference in a subquery's ORDER BY outright
+      ([SELECT k, (SELECT i.v FROM i WHERE i.fk = o.k ORDER BY o.n LIMIT 1)
+       FROM o] → "no such column: o.n", oracle-checked on 3.45.1), so granary's
+      refusal already agrees with it and rewriting the clause would {i create} a
+      divergence rather than remove one;
+    - an ORDER BY key may name an OUTPUT ALIAS rather than an input column
+      (#489/#663), and an alias is not in [inner_scope_of]'s [has_col].  So a
+      subquery whose alias happens to share a name with an outer column would
+      have that key rewritten to a literal — an ORDER BY over a constant, i.e.
+      a silently unsorted result.  That is precisely the "plausible wrong
+      answer" class this whole area exists to avoid, and it is a worse outcome
+      than the refusal it would replace.
+    [S_compound]'s [order] is passed through for the same two reasons. *)
 and substitute_outer_in_stmt
       ~(cat : Cat.t option)
       ~(enclosing : inner_scope)
@@ -10045,7 +10613,8 @@ and substitute_outer_in_stmt
   | Ast.S_select r ->
     Ast.S_select
       { r with
-        where = Option.map go_e r.where
+        proj = substitute_outer_proj go_e r.proj
+      ; where = Option.map go_e r.where
       ; having = Option.map go_e r.having
       ; joins = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins
       }
@@ -10053,23 +10622,80 @@ and substitute_outer_in_stmt
     Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
   | Ast.S_with_cte { name; def; query; recursive } ->
     Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
-  (* #732: the one remaining catch-all in this function group, and it is the
-     next instance of exactly the defect #670 is about — a walker not
-     descending into a place that carries expressions, turning a runnable query
-     into a refusal.  Two holes, not one:
+  (* #732: a FROM-less subquery — [SELECT k, (SELECT o.n * 10) FROM o], which
+     sqlite3 answers — parses to [S_const_select] and so fell to the catch-all
+     with everything else.  [inner_scope_of] gives it {!no_inner_scope} (it owns
+     no input, so it can shadow nothing), which is what makes [scope] here
+     exactly the union of the enclosing subqueries' scopes and every remaining
+     column reference the outer row's. *)
+  | Ast.S_const_select { exprs } ->
+    Ast.S_const_select { exprs = List.map (fun (e, a) -> go_e e, a) exprs }
+  (* #732: exhaustive, not [| _ -> s].  None of these can appear as the body of
+     an [E_subquery] / [E_exists] / [E_in_select] or of the [Plan] equivalents —
+     the grammar admits only a SELECT there — so listing them changes nothing
+     today.  It is listed rather than caught so that a NEW statement form that
+     CAN appear there is a compile error here instead of the silent refusal
+     #670, #721 and this issue are all instances of. *)
+  | Ast.S_create_table _
+  | Ast.S_insert _
+  | Ast.S_insert_select _
+  | Ast.S_create_index _
+  | Ast.S_update _
+  | Ast.S_delete _
+  | Ast.S_drop_table _
+  | Ast.S_drop_index _
+  | Ast.S_alter_table _
+  | Ast.S_begin
+  | Ast.S_commit
+  | Ast.S_rollback
+  | Ast.S_savepoint _
+  | Ast.S_release _
+  | Ast.S_rollback_to _
+  | Ast.S_create_fts_table _
+  | Ast.S_pragma _
+  | Ast.S_create_view _
+  | Ast.S_create_reactive_view _
+  | Ast.S_drop_view _
+  | Ast.S_drop_reactive_view _
+  | Ast.S_create_trigger _
+  | Ast.S_drop_trigger _
+  | Ast.S_explain _
+  | Ast.S_vacuum
+  | Ast.S_attach _
+  | Ast.S_detach _ -> s
 
-     - the [S_select] arm above rewrites only [where] / [having] / [joins.*.on];
-       [columns], [group_by] and [order] are passed through by [{ r with ... }],
-       so an outer reference in the subquery's own PROJECTION is never
-       substituted and the statement is refused (#626's message);
-     - this arm passes every other statement form through untouched.
+(** #732: rewrite a SELECT's projection.
 
-     Left as-is deliberately.  Widening it is an error-to-answer change for
-     each newly reachable spelling and needs its own oracle-checked tests, so
-     it is #732's work rather than #670's.  Note that widening the substituter
-     also widens the detector for free: [stmt_has_free_column_ref] below RUNS
-     this function with a recording probe rather than duplicating its walk. *)
-  | _ -> s
+    [`Cols] is a [string list], so it cannot hold the literal a substitution
+    produces — but it is exactly the shape an {b unqualified} outer reference
+    parses to ([SELECT k, (SELECT n FROM i WHERE i.fk = o.k) FROM o] when [i]
+    has no [n]; the parser emits [`Cols] only when every item is a bare
+    [E_col], parser.mly:897).  So a name the binding resolves promotes the whole
+    projection to [`Exprs].
+
+    The promotion is conditional on a substitution actually happening, which
+    keeps two things true: an unchanged projection keeps the AST shape the rest
+    of the engine sees today, and the probe binding
+    {!stmt_has_free_column_ref} runs with — which resolves nothing — never
+    reshapes the statement it is only supposed to inspect. *)
+and substitute_outer_proj
+      (go_e : Ast.expr -> Ast.expr)
+      (proj : [ `All | `Cols of string list | `Exprs of (Ast.expr * string option) list ])
+  : [ `All | `Cols of string list | `Exprs of (Ast.expr * string option) list ]
+  =
+  match proj with
+  | `All -> proj
+  | `Exprs items -> `Exprs (List.map (fun (e, a) -> go_e e, a) items)
+  | `Cols names ->
+    let subst = List.map (fun n -> n, go_e (Ast.E_col n)) names in
+    let substituted (n, e') =
+      match e' with
+      | Ast.E_col m -> not (String.equal m n)
+      | _ -> true
+    in
+    if List.exists substituted subst
+    then `Exprs (List.map (fun (n, e') -> e', Some n) subst)
+    else proj
 
 (** Substitute outer column refs in any embedded Ast.stmt nodes inside a
     Plan.expr (correlated subqueries / EXISTS / IN). *)
@@ -10159,7 +10785,20 @@ and substitute_outer_in_plan_expr
     before, and when a statement it flags turns out to have no resolvable outer
     source, the refusal it eventually raises is the one that was raised before.
     [inner_scope_of] answers "owned" for everything it cannot resolve, so an
-    unresolvable FROM never manufactures a free reference. *)
+    unresolvable FROM never manufactures a free reference.
+
+    #721/#732 widened {!substitute_outer_in_stmt} — into aggregate and window
+    arguments, into a SELECT's projection, and into a FROM-less
+    [S_const_select] — and this detector therefore widened with it, by
+    construction rather than by a matching edit. That is the intended
+    consequence and it is bounded by the paragraph above: the statements it
+    newly flags are exactly the ones whose outer reference the substituter can
+    now resolve, and any it flags without resolving reach the same refusal as
+    before.
+
+    The probe is also why the [`Cols] promotion in {!substitute_outer_proj} is
+    conditional: a probe binding resolves nothing, so no name changes, so the
+    projection keeps its shape and this function inspects without rewriting. *)
 let stmt_has_free_column_ref (cat : Cat.t option) (s : Ast.stmt) : bool =
   let seen = ref false in
   let probe : outer_binding =
@@ -10633,7 +11272,8 @@ and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
 and eval_partition_key clock params (row : Row.t) (partition_by : Plan.expr list)
   : Row.value list
   =
-  List.map (eval_expr clock params row) partition_by
+  (* #722: a partition key is compared, never emitted — see {!eval_sort_key}. *)
+  List.map (eval_sort_key clock params row) partition_by
 
 and partition_keys_equal (a : Row.value list) (b : Row.value list) : bool =
   List.length a = List.length b && List.for_all2 (fun x y -> compare_values x y = 0) a b
@@ -10673,8 +11313,8 @@ and sort_partition_by
          let rec cmp = function
            | [] -> 0
            | (e, dir, nulls) :: rest ->
-             let va = eval_expr clock params ra e in
-             let vb = eval_expr clock params rb e in
+             let va = eval_sort_key clock params ra e in
+             let vb = eval_sort_key clock params rb e in
              let c = compare_with_nulls dir nulls va vb in
              if c <> 0 then c else cmp rest
          in
@@ -10700,8 +11340,8 @@ and win_rank
              compare_with_nulls
                dir
                nulls
-               (eval_expr clock params sorted_rows.(pos) e)
-               (eval_expr clock params sorted_rows.(pos - 1) e)
+               (eval_sort_key clock params sorted_rows.(pos) e)
+               (eval_sort_key clock params sorted_rows.(pos - 1) e)
              <> 0)
           wplan.Plan.order_by
       in
@@ -10728,8 +11368,8 @@ and win_dense_rank
              compare_with_nulls
                dir
                nulls
-               (eval_expr clock params sorted_rows.(pos) e)
-               (eval_expr clock params sorted_rows.(pos - 1) e)
+               (eval_sort_key clock params sorted_rows.(pos) e)
+               (eval_sort_key clock params sorted_rows.(pos - 1) e)
              <> 0)
           wplan.Plan.order_by
       in
@@ -10875,8 +11515,8 @@ and win_percent_rank
                compare_with_nulls
                  dir
                  nulls
-                 (eval_expr clock params sorted_rows.(pos) e)
-                 (eval_expr clock params sorted_rows.(pos - 1) e)
+                 (eval_sort_key clock params sorted_rows.(pos) e)
+                 (eval_sort_key clock params sorted_rows.(pos - 1) e)
                <> 0)
             wplan.Plan.order_by
         in
@@ -10911,8 +11551,8 @@ and win_cume_dist
                 compare_with_nulls
                   dir
                   nulls
-                  (eval_expr clock params sorted_rows.(!peer_end + 1) e)
-                  (eval_expr clock params sorted_rows.(!peer_end) e)
+                  (eval_sort_key clock params sorted_rows.(!peer_end + 1) e)
+                  (eval_sort_key clock params sorted_rows.(!peer_end) e)
                 = 0)
              wplan.Plan.order_by
       do
@@ -11402,8 +12042,8 @@ and stream_sort clock params store mode cat keys child =
          if acc <> 0
          then acc
          else (
-           let va = eval_expr clock params a key
-           and vb = eval_expr clock params b key in
+           let va = eval_sort_key clock params a key
+           and vb = eval_sort_key clock params b key in
            compare_with_nulls dir nulls va vb))
       0
       keys'
@@ -11495,13 +12135,15 @@ and stream_index_lookup
 
 (* #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — the column IS
    the table key, so this is a single O(log n) table-tree seek, no index and no
-   second fetch.  A NULL or non-integer probe matches nothing, as it does on the
-   index path (see [index_lookup_values]). *)
+   second fetch.  A NULL, a non-numeric or a fractional probe matches nothing,
+   and an integral REAL addresses the rowid it names — the same answer
+   [index_lookup_values] gives for an indexed column, via the shared
+   [rowid_lookup_key] (#738). *)
 and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.table_meta) =
   let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
-  match v with
-  | Row.V_int n ->
+  match rowid_lookup_key v with
+  | Some n ->
     (* #262: read through the active txn so a primary-key point lookup sees the
        row when it was written earlier in the same open transaction. *)
     let* rh = rh_begin store mode in
@@ -11514,7 +12156,7 @@ and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.tab
        incr_examined s_opt;
        let row = decode_with_virtual clock params table_meta vbytes in
        Lwt.return (Lwt_stream.of_list [ row ]))
-  | _ -> Lwt.return (Lwt_stream.of_list [])
+  | None -> Lwt.return (Lwt_stream.of_list [])
 
 (* Probe the right index for one left row [lrow], appending matched (or a
    null-padded row for LEFT JOIN) combinations to [out]. *)
@@ -11920,7 +12562,7 @@ and agg_sum (vals : Row.value list) : Row.value =
            | Row.V_null -> acc
            | Row.V_int n -> acc +. Int64.to_float n
            | Row.V_real f -> acc +. f
-           | _ -> failwith "SUM on non-numeric value")
+           | v -> agg_non_numeric_failure "SUM" v)
         0.0
         vals
     in
@@ -11932,7 +12574,7 @@ and agg_sum (vals : Row.value list) : Row.value =
            match v with
            | Row.V_null -> acc
            | Row.V_int n -> Int64.add acc n
-           | _ -> failwith "SUM on non-numeric value")
+           | v -> agg_non_numeric_failure "SUM" v)
         0L
         vals
     in
@@ -11956,10 +12598,12 @@ and agg_sum (vals : Row.value list) : Row.value =
    afterwards.  A NULL is "seen" like any other value, so it survives the dedup
    as ONE entry and is then dropped by each aggregate's own NULL handling —
    which is why [COUNT(DISTINCT x)] skips NULLs exactly as [COUNT(x)] does. *)
-and distinct_filter () : Row.value -> bool =
+and distinct_filter ?(collation = Ast.Collate_binary) () : Row.value -> bool =
   let seen = Hashtbl.create 64 in
   fun v ->
-    let k = row_key [| v |] in
+    (* #722: the dedup KEY carries the argument's collation; the value the
+       aggregate then accumulates is the raw one. *)
+    let k = row_key [| collate_key collation v |] in
     if Hashtbl.mem seen k
     then false
     else (
@@ -11967,7 +12611,12 @@ and distinct_filter () : Row.value -> bool =
       true)
 
 (* Evaluate one aggregate [spec] over the argument values of a group. *)
-and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.value =
+and aggregate_over_values
+      ?(collation = Ast.Collate_binary)
+      (func : Ast.agg_func)
+      (vals : Row.value list)
+  : Row.value
+  =
   match func with
   | Ast.Agg_count ->
     let n =
@@ -11989,18 +12638,20 @@ and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.va
            | Row.V_null -> s, n
            | Row.V_int x -> s +. Int64.to_float x, n + 1
            | Row.V_real f -> s +. f, n + 1
-           | _ -> failwith "AVG on non-numeric value")
+           | v -> agg_non_numeric_failure "AVG" v)
         (0.0, 0)
         vals
     in
     if n = 0 then Row.V_null else Row.V_real (sum /. float_of_int n)
+  (* #722: MIN/MAX compare under the argument's collation but return the RAW
+     winning value, so [MIN(x COLLATE NOCASE)] answers 'HELLO', not 'hello'. *)
   | Ast.Agg_min ->
     List.fold_left
       (fun acc v ->
          match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
-         | v, cur -> if compare_values v cur < 0 then v else cur)
+         | v, cur -> if compare_collated collation v cur < 0 then v else cur)
       Row.V_null
       vals
   | Ast.Agg_max ->
@@ -12009,7 +12660,7 @@ and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.va
          match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
-         | v, cur -> if compare_values v cur > 0 then v else cur)
+         | v, cur -> if compare_collated collation v cur > 0 then v else cur)
       Row.V_null
       vals
   | Ast.Agg_group_concat sep ->
@@ -12044,11 +12695,14 @@ and aggregate_one clock params (spec : Plan.agg_spec) (group_rows : Row.t list)
      | Ast.Agg_group_concat _ -> failwith "GROUP_CONCAT requires a column argument"
      | _ -> failwith "non-COUNT aggregate must have a column argument")
   | Some get ->
+    let collation = agg_spec_collation spec in
     let vals = List.map get group_rows in
     let vals =
-      if spec.Plan.distinct then List.filter (distinct_filter ()) vals else vals
+      if spec.Plan.distinct
+      then List.filter (distinct_filter ~collation ()) vals
+      else vals
     in
-    aggregate_over_values spec.Plan.func vals
+    aggregate_over_values ~collation spec.Plan.func vals
 
 (* Partition [rows] into (group_key, group_rows) by [group_cols] (stable). *)
 and aggregate_build_groups group_cols rows : (Row.value list * Row.t list) list =
@@ -12134,7 +12788,8 @@ and make_agg_acc clock params (spec : Plan.agg_spec)
        Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
      | _ -> None)
   | Some get ->
-    let update_v, finalize = make_agg_acc_over_values spec.Plan.func in
+    let collation = agg_spec_collation spec in
+    let update_v, finalize = make_agg_acc_over_values ~collation spec.Plan.func in
     (* #491: DISTINCT keeps the #247 fast path rather than falling back to the
        general path — a no-GROUP-BY distinct count is exactly TPC-C
        StockLevel's shape.  The filter wraps the GETTER's result, not the row,
@@ -12144,7 +12799,7 @@ and make_agg_acc clock params (spec : Plan.agg_spec)
     let update =
       if spec.Plan.distinct
       then (
-        let keep = distinct_filter () in
+        let keep = distinct_filter ~collation () in
         fun (row : Row.t) ->
           let v = get row in
           if keep v then update_v v)
@@ -12159,7 +12814,7 @@ and make_agg_acc clock params (spec : Plan.agg_spec)
    what makes "these two MUST stay byte-identical" checkable by reading them
    side by side instead of by trusting a comment.  It is also what lets #491's
    DISTINCT filter sit between the getter and the accumulator. *)
-and make_agg_acc_over_values (func : Ast.agg_func)
+and make_agg_acc_over_values ?(collation = Ast.Collate_binary) (func : Ast.agg_func)
   : (Row.value -> unit) * (unit -> Row.value)
   =
   match func with
@@ -12188,7 +12843,7 @@ and make_agg_acc_over_values (func : Ast.agg_func)
           any_nn := true;
           any_real := true;
           sf := !sf +. f
-        | _ -> failwith "SUM on non-numeric value")
+        | v -> agg_non_numeric_failure "SUM" v)
     , fun () ->
         if not !any_nn
         then Row.V_null
@@ -12207,15 +12862,17 @@ and make_agg_acc_over_values (func : Ast.agg_func)
         | Row.V_real f ->
           sf := !sf +. f;
           incr n
-        | _ -> failwith "AVG on non-numeric value")
+        | v -> agg_non_numeric_failure "AVG" v)
     , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
+  (* #722: same collation rule as [aggregate_over_values] — these two MUST
+     stay byte-identical. *)
   | Ast.Agg_min ->
     let best = ref Row.V_null in
     ( (fun v ->
         match v, !best with
         | Row.V_null, _ -> ()
         | v, Row.V_null -> best := v
-        | v, cur -> if compare_values v cur < 0 then best := v)
+        | v, cur -> if compare_collated collation v cur < 0 then best := v)
     , fun () -> !best )
   | Ast.Agg_max ->
     let best = ref Row.V_null in
@@ -12223,7 +12880,7 @@ and make_agg_acc_over_values (func : Ast.agg_func)
         match v, !best with
         | Row.V_null, _ -> ()
         | v, Row.V_null -> best := v
-        | v, cur -> if compare_values v cur > 0 then best := v)
+        | v, cur -> if compare_collated collation v cur > 0 then best := v)
     , fun () -> !best )
   | Ast.Agg_group_concat sep ->
     let separator = Option.value sep ~default:"," in
@@ -12266,6 +12923,19 @@ and aggregate_fast_path
   if not (agg_fastpath_enabled ())
   then Lwt.return None
   else if group_cols <> [] || having <> None || agg_windows <> []
+  then Lwt.return None
+  else if
+    (* #664: an aggregate ARGUMENT may now carry a subquery.  This loop is
+       pure and [eval_expr] answers [Row.V_null] for an unresolved
+       [P_subquery], so accumulating over one here would silently sum NULLs —
+       the same reason the projection test below gives up.  [stream_aggregate]
+       resolves it; give the query up to it. *)
+    List.exists
+      (fun (s : Plan.agg_spec) ->
+         match s.Plan.arg_expr with
+         | Some e -> plan_expr_has_subquery e
+         | None -> false)
+      aggs
   then Lwt.return None
   else if
     not
@@ -12846,6 +13516,31 @@ and stream_aggregate
           | other -> Lwt.return other)
         proj
     in
+    (* #664: an aggregate's ARGUMENT is an expression too (#488), so it can
+       carry a subquery, and until #664 [Sema.bind_agg_arg] refused the shape
+       outright because nothing here resolved it — a surviving [P_subquery]
+       reads [Row.V_null], so [SUM(qty * (SELECT 2))] would have answered NULL
+       and [COUNT(price * (SELECT 1))] 0, with no error.  An uncorrelated one
+       resolves once, here, exactly as [having] and [proj] do just above. *)
+    let* aggs =
+      Lwt_list.map_s
+        (fun (spec : Plan.agg_spec) ->
+           match spec.Plan.arg_expr with
+           | None -> Lwt.return spec
+           | Some e ->
+             let+ e' = pre_eval_subquery clock store params cat e in
+             { spec with Plan.arg_expr = Some e' })
+        aggs
+    in
+    (* An ARGUMENT's subquery that survives that is correlated against the
+       INPUT row — the argument is evaluated once per scanned row, before any
+       grouping — so it resolves the way [stream_expr_project] resolves a
+       correlated projection, and NOT the way [resolve] below resolves
+       [having]/[proj] against the aggregate output row.  Two different rules
+       for two different rows; see [agg_arg_subquery_refusal]. *)
+    let* rows, aggs =
+      resolve_correlated_agg_args clock params store mode cat ~s_opt child rows aggs
+    in
     (* What survives is correlated. Its only possible source in the aggregate
        output row is a grouped column; [binding_of_group_cols] maps those back
        to their table and column, and anything else is refused rather than
@@ -12946,6 +13641,162 @@ and stream_aggregate
           with_windows
     in
     Lwt.return (Lwt_stream.of_list final_rows)
+
+(* #664: resolve the subqueries that survive [pre_eval_subquery] in an
+   aggregate ARGUMENT.  The identity on both inputs unless one actually
+   survived — which is the uncommon case, so the ordinary aggregate pays one
+   [List.exists] over the spec list and nothing else.
+
+   Such a subquery is correlated against the INPUT row, so its correlation
+   source is the child's own scan metas and the resolution runs per input row:
+   [stream_expr_project]'s treatment of a correlated projection, not
+   [stream_aggregate]'s per-group one.
+
+   The resolved ARGUMENT VALUE is parked in a hidden trailing slot appended to
+   its row, and the spec's [arg_expr] is rewritten to read that slot.  Doing it
+   once up front rather than inside the accumulator is what keeps the subquery
+   evaluated exactly once per row: #491's DISTINCT filter and [aggregate_one]
+   both read the argument through [agg_arg_getter], and a [P_subquery] left in
+   place would have had to be resolved separately by each.
+
+   Widening the row is safe because everything that indexes an input row here
+   indexes a PREFIX of it — [group_cols] are child ordinals — and the aggregate
+   OUTPUT row is built as [group_key @ agg_vals], so no hidden slot can escape
+   into a result. *)
+and resolve_correlated_agg_args
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      ~s_opt
+      child
+      (rows : Row.t list)
+      (aggs : Plan.agg_spec list)
+  : (Row.t list * Plan.agg_spec list) Lwt.t
+  =
+  if not (List.exists agg_arg_is_correlated aggs)
+  then Lwt.return (rows, aggs)
+  else (
+    match get_outer_scan_metas child with
+    (* Checked before the empty-[rows] shortcut below: an unresolvable
+       correlation must be refused on an empty table too, or the refusal would
+       depend on the data. *)
+    | None -> Lwt.fail_with (agg_arg_subquery_refusal ())
+    | Some metas ->
+      widen_rows_for_agg_args clock params store mode cat ~s_opt ~metas rows aggs)
+
+and agg_arg_is_correlated (s : Plan.agg_spec) : bool =
+  match s.Plan.arg_expr with
+  | Some e -> plan_expr_has_subquery e
+  | None -> false
+
+and widen_rows_for_agg_args
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      ~s_opt
+      ~(metas : outer_input list)
+      (rows : Row.t list)
+      (aggs : Plan.agg_spec list)
+  : (Row.t list * Plan.agg_spec list) Lwt.t
+  =
+  match rows with
+  (* No row ever reaches [agg_arg_getter], so there is no argument to
+     evaluate and nothing to widen.  The specs keep their [P_subquery], which
+     is unreachable rather than wrong. *)
+  | [] -> Lwt.return (rows, aggs)
+  | first :: _ ->
+    (* Rows from one child are uniform in width, as everywhere else here. *)
+    let width = Array.length first in
+    let corr =
+      List.filter_map
+        (fun (s : Plan.agg_spec) ->
+           if agg_arg_is_correlated s then s.Plan.arg_expr else None)
+        aggs
+    in
+    (* #493: the same parameterize-and-cache treatment [stream_expr_project]
+       gets, and for the same reason — the cardinality here is the INPUT rows,
+       which is that issue's hot path.  ([stream_aggregate]'s own [resolve]
+       passes [cache:None] because it runs per GROUP, which is bounded much
+       lower.) *)
+    let parameterized = not (List.exists plan_expr_subqueries_use_param corr) in
+    let cache = if parameterized then Some (Hashtbl.create 4) else None in
+    let base = Array.length params in
+    let* rows' =
+      Lwt_list.map_s
+        (fun (row : Row.t) ->
+           let bnd =
+             if parameterized
+             then param_binding_of_metas ~base ~row_len:(Array.length row) metas
+             else binding_of_metas metas row
+           in
+           let row_params = if parameterized then Array.append params row else params in
+           let+ vals =
+             Lwt_list.map_s
+               (resolve_agg_arg_for_row
+                  clock
+                  params
+                  store
+                  mode
+                  cat
+                  ~s_opt
+                  ~cache
+                  ~bnd
+                  ~row_params
+                  row)
+               corr
+           in
+           Array.append row (Array.of_list vals))
+        rows
+    in
+    Lwt.return (rows', rewrite_agg_arg_slots width aggs)
+
+(* One correlated argument, one input row: substitute the outer references from
+   that row, resolve, and evaluate to the value the accumulator will consume.
+   A subquery that survives the substitution named an outer column no input
+   carries, or an ambiguous one; refuse rather than let [eval_expr] answer NULL
+   for it, exactly as [stream_expr_project] does. *)
+and resolve_agg_arg_for_row
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      ~s_opt
+      ~cache
+      ~bnd
+      ~row_params
+      (row : Row.t)
+      (e : Plan.expr)
+  : Row.value Lwt.t
+  =
+  let e_subst = substitute_outer_in_plan_expr ~cat bnd e in
+  let* resolved =
+    with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+      pre_eval_subquery clock store row_params cat e_subst)
+  in
+  if plan_expr_has_subquery resolved
+  then Lwt.fail_with (agg_arg_subquery_refusal ())
+  else Lwt.return (eval_expr clock params row resolved)
+
+(* The specs' half of [widen_rows_for_agg_args]: each correlated argument reads
+   the hidden slot its value was appended to.  Iterates [aggs] in the same
+   order, under the same predicate, as the [corr] list the values were computed
+   from — that correspondence is what makes the slot numbers line up, so the
+   two must not be given separate filters. *)
+and rewrite_agg_arg_slots (width : int) (aggs : Plan.agg_spec list) : Plan.agg_spec list =
+  let slot = ref (width - 1) in
+  List.map
+    (fun (s : Plan.agg_spec) ->
+       if not (agg_arg_is_correlated s)
+       then s
+       else (
+         incr slot;
+         { s with Plan.arg_expr = Some (Plan.P_col !slot) }))
+    aggs
 
 and read_fts_content_rows store mode (fts_meta : Cat.fts_table_meta)
   : (int64 * string list) list Lwt.t
@@ -13385,13 +14236,28 @@ and stream_pragma_not_null_check store mode cat =
    names, through the ordinary delete path so index entries and ON DELETE
    cascades are honoured.  Reports the same (table, column, count) shape as the
    check; a row violating two NOT NULL columns is counted under both but
-   deleted once, so the counts are per-column violations, not a total. *)
-and stream_pragma_not_null_repair store mode cat =
-  let cat_val =
-    match cat with
-    | None -> failwith "Exec.to_stream: Op_pragma_not_null_repair requires catalog"
-    | Some c -> c
-  in
+   deleted once, so the counts are per-column violations, not a total.
+
+   #588: this is the shared CORE, reached from both entry points —
+   [stream_pragma_not_null_repair] below (the query path, which streams the
+   report rows) and [execute_with_count]'s [Op_pragma_not_null_repair] arm (the
+   write path, which reports the rows deleted as the statement's change count),
+   the latter through [not_null_repair_run_ref].  Splitting it is what keeps the
+   two from being able to disagree about what the repair does. *)
+and not_null_repair_run store mode (cat_val : Cat.t) =
+  (* #588: a read-only ambient snapshot ([Db.query_as_of], or any [In_ro_txn])
+     used to reach [acquire_txn] and fail with "write attempted under a
+     read-only transaction (In_ro_txn)" — a storage-layer message about an
+     internal mode, from a statement whose problem is that it is destructive.
+     Refuse at the statement level instead, and name the read-only half that
+     DOES work against a snapshot. *)
+  (match mode with
+   | In_ro_txn _ ->
+     failwith
+       "PRAGMA not_null_repair deletes rows and cannot run against a read-only snapshot \
+        or transaction; survey it with PRAGMA not_null_check, and repair it on a \
+        writable connection"
+   | Auto | In_txn _ -> ());
   let* tables = Cat.list_tables cat_val in
   (* Reuse the ambient write txn when there is one: opening our own would block
      on the write lock the caller already holds. *)
@@ -13412,10 +14278,24 @@ and stream_pragma_not_null_repair store mode cat =
            tables
        in
        let* () = release_txn ~cat:cat_val tx owned in
-       Lwt.return (Lwt_stream.of_list (List.concat per_table)))
+       (* #630: [per_table] is one entry per TABLE holding that table's report
+          rows — O(tables), not O(violations) and not O(table).  The victim
+          buffer it was derived from is already gone. *)
+       let rows = List.concat_map fst per_table in
+       let deleted = List.fold_left (fun acc (_, n) -> acc + n) 0 per_table in
+       Lwt.return (rows, deleted))
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
+
+and stream_pragma_not_null_repair store mode cat =
+  let cat_val =
+    match cat with
+    | None -> failwith "Exec.to_stream: Op_pragma_not_null_repair requires catalog"
+    | Some c -> c
+  in
+  let* rows, _deleted = not_null_repair_run store mode cat_val in
+  Lwt.return (Lwt_stream.of_list rows)
 
 (* #563: delete one table's NOT NULL violators, returning its report rows.
 
@@ -13434,17 +14314,27 @@ and stream_pragma_not_null_repair store mode cat =
    Both cases are pinned in [test_not_null_567.ml] ("clean table works" and
    "report sees a columnstore violation").
 
-   {b Known residual (#588).}  A 0-count row is still weaker than a
-   statement-level error naming the table, which is what this ought to be and
-   what a caller can act on without knowing the convention.  That error is not
-   expressible from this path at all, for the reason above; #588 tracks fixing
-   the [Db.query_impl] guard, and closing it should turn this branch back into
-   a raise. *)
+   {b Why the 0-count row survived #588, which made the raise expressible.}
+   #627 fixed [Db.query_impl]'s guard ([Lwt.catch] around the whole call, not
+   [| exception Failure msg ->] on it), and #588 put the repair on the write
+   path too, whose [Lwt.catch] always converted a [Failure] — so a raise here
+   WOULD now surface as [Error (Runtime msg)] on both entry points.  It is
+   still not taken, for a reason #588 did not weigh: the raise happens partway
+   through [Lwt_list.map_s] over the tables, and [not_null_repair_run] rolls the
+   whole repair back.  A database holding one unrepairable columnstore would
+   therefore become unrepairable ENTIRELY — there is no per-table spelling of
+   this PRAGMA to fall back on — which trades a convention an operator can act
+   on for a refusal they cannot.  Anything that reopens this owes a per-table
+   repair first, or a pre-pass that refuses before deleting anything.
+
+   Returns the report rows paired with the number of rows actually DELETED
+   (#588): the write path reports that as the statement's change count, and it
+   is the deduplicated row count, not the sum of the per-column counts. *)
 and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~victims =
   if counts = []
-  then Lwt.return []
+  then Lwt.return ([], 0)
   else if Cat.is_columnar meta
-  then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) counts)
+  then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) counts, 0)
   else (
     let indexes = Cat.indexes_for_table cat_val ~table:meta.Cat.name in
     let* child_refs =
@@ -13477,7 +14367,7 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~
         victims
     in
     mark_dirty meta.Cat.name;
-    Lwt.return (not_null_report_rows meta ~counted:Fun.id counts))
+    Lwt.return (not_null_report_rows meta ~counted:Fun.id counts, List.length victims))
 
 and stream_sqlite_master store cat =
   let cat_val =
@@ -13608,10 +14498,13 @@ and stream_union clock params store mode cat all left right =
   else
     let* rows = Lwt_stream.to_list combined in
     let seen = Hashtbl.create 64 in
+    (* #722: as for DISTINCT, the compound's column collations come from the
+       LEFT arm's projection. *)
+    let key_of = collated_row_keyer (output_collations left) in
     let deduped =
       List.filter
         (fun row ->
-           let k = row_key row in
+           let k = key_of row in
            if Hashtbl.mem seen k
            then false
            else (
@@ -13625,14 +14518,15 @@ and stream_intersect clock params store mode cat left right =
   let* ls = to_stream clock params store ~mode ~cat left in
   let* rs = to_stream clock params store ~mode ~cat right in
   let* right_list = Lwt_stream.to_list rs in
+  let key_of = collated_row_keyer (output_collations left) in
   let right_set = Hashtbl.create (max 1 (List.length right_list)) in
-  List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+  List.iter (fun r -> Hashtbl.replace right_set (key_of r) ()) right_list;
   let* left_list = Lwt_stream.to_list ls in
   let seen = Hashtbl.create 64 in
   let result =
     List.filter
       (fun row ->
-         let k = row_key row in
+         let k = key_of row in
          if (not (Hashtbl.mem right_set k)) || Hashtbl.mem seen k
          then false
          else (
@@ -13646,14 +14540,15 @@ and stream_except clock params store mode cat left right =
   let* ls = to_stream clock params store ~mode ~cat left in
   let* rs = to_stream clock params store ~mode ~cat right in
   let* right_list = Lwt_stream.to_list rs in
+  let key_of = collated_row_keyer (output_collations left) in
   let right_set = Hashtbl.create (max 1 (List.length right_list)) in
-  List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+  List.iter (fun r -> Hashtbl.replace right_set (key_of r) ()) right_list;
   let* left_list = Lwt_stream.to_list ls in
   let seen = Hashtbl.create 64 in
   let result =
     List.filter
       (fun row ->
-         let k = row_key row in
+         let k = key_of row in
          if Hashtbl.mem right_set k || Hashtbl.mem seen k
          then false
          else (
@@ -14012,10 +14907,14 @@ and to_stream
   | Plan.Op_distinct { child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let seen = Hashtbl.create 64 in
+    (* #722: dedup under each output column's collation, so
+       [SELECT DISTINCT x COLLATE NOCASE] still folds 'HELLO' and 'Hello' into
+       one row — while emitting the stored value rather than a lower-cased one. *)
+    let key_of = collated_row_keyer (output_collations child) in
     Lwt.return
       (Lwt_stream.filter
          (fun row ->
-            let k = row_key row in
+            let k = key_of row in
             if Hashtbl.mem seen k
             then false
             else (
@@ -14142,6 +15041,47 @@ and to_stream
          [ [| Row.V_int (Int64.of_int h.S.total_failures)
             ; Row.V_int (Int64.of_int h.S.consecutive_failures)
             ; last
+           |]
+         ])
+  (* #637: (status, frames_walked, header_frames, detail).  The detail column
+     carries the caveat in words, because the status alone is easy to over-read:
+     [no_evidence] is a statement about the frames THIS OPEN replayed, never a
+     clean bill of health for the database. *)
+  | Plan.Op_pragma_wal_replay_check ->
+    let c = S.wal_replay_check store in
+    let status, detail =
+      match c.S.status with
+      | S.Wal_replay_stale_generation { frame_idx; previous_txn_id; frame_txn_id } ->
+        ( "stale_generation"
+        , Printf.sprintf
+            "WAL recovery walked into an older generation at frame %d: a header page \
+             carries txn_id %Ld, not above the %Ld already seen.  This database was \
+             written by a pre-#636 binary, whose checkpoint left the checkpointed \
+             generation verifying on disk, so recovery has replayed stale pages over \
+             newer ones.  Committed rows may be missing.  Restore from a backup taken \
+             before the affected checkpoint, or dump what is readable (PRAGMA \
+             integrity_check first) and reload."
+            frame_idx
+            frame_txn_id
+            previous_txn_id )
+      | S.Wal_replay_no_evidence ->
+        ( "no_evidence"
+        , "The frames WAL recovery replayed at this open showed no generation \
+           regression.  This is not a clean bill of health: a pre-#636 stale replay from \
+           an EARLIER open is already in the main file, leaves a structurally valid \
+           database, and is not detectable here or by PRAGMA integrity_check." )
+      | S.Wal_replay_not_examined ->
+        ( "not_examined"
+        , "Nothing to examine: no WAL, or fewer than two header-page frames were \
+           recovered, so there was no txn_id sequence to compare.  This is not a \
+           statement either way about the database." )
+    in
+    Lwt.return
+      (Lwt_stream.of_list
+         [ [| Row.V_text status
+            ; Row.V_int (Int64.of_int c.S.frames_walked)
+            ; Row.V_int (Int64.of_int c.S.header_frames)
+            ; Row.V_text detail
            |]
          ])
   | Plan.Op_pragma_get_wal_batch_commits ->
@@ -14296,6 +15236,9 @@ and to_stream
    Op_insert_select.  This runs once at module initialization time, after both
    functions are fully defined in the let-rec block above. *)
 let () = to_stream_ref := to_stream
+
+(* #588: see [not_null_repair_run_ref]. *)
+let () = not_null_repair_run_ref := not_null_repair_run
 
 (* ------------------------------------------------------------------ *)
 (* Public query entry point                                             *)

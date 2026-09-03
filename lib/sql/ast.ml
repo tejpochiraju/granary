@@ -315,6 +315,10 @@ and stmt =
       ; columns : string list (** empty = all non-generated columns *)
       ; on_conflict : conflict_action option
       ; select : stmt
+      ; upsert_update : upsert_update option
+        (** #653: [ON CONFLICT (cols) DO UPDATE SET ...], the same clause the
+            VALUES form carries.  It must never be parsed and then dropped —
+            that is #639 in a new place — so every layer below carries it. *)
       }
   | S_select of
       { distinct : bool
@@ -479,6 +483,11 @@ and pragma_kind =
        failure is never raised to a caller, so without this (and the
        Checkpoint_failed event) a repeatedly-failing checkpoint is invisible
        while the WAL grows without bound. *)
+  | Pragma_wal_replay_check
+    (* #637: PRAGMA wal_replay_check — report whether recovery's WAL walk at
+       open ran into frames belonging to an older generation, the signature of
+       the pre-#636 stale replay.  Read-only; one row of
+       (status, frames_walked, header_frames, detail). *)
   | Pragma_wal_autocheckpoint (* PRAGMA wal_autocheckpoint — read threshold *)
   | Pragma_wal_autocheckpoint_set of int64
     (* PRAGMA wal_autocheckpoint = N — set per-connection threshold (0 disables) *)
@@ -611,10 +620,14 @@ let func_to_sql = function
 (* #572 / #577: identifier quoting is one rule, shared by every emitter of SQL
    text in the engine.  It lives in [granary.encoding] rather than here because
    [Granary_catalog.rewrite_ident_in_sql] needs it too and sits BELOW the
-   parser — see [Sql_ident] for why that mattered. *)
-let sql_keywords = Granary_encoding.Sql_ident.sql_keywords
-let is_sql_keyword = Granary_encoding.Sql_ident.is_sql_keyword
-let ident_needs_quoting = Granary_encoding.Sql_ident.ident_needs_quoting
+   parser — see [Sql_ident] for why that mattered.
+
+   #619: only [quote_ident] is aliased.  [sql_keywords], [is_sql_keyword] and
+   [ident_needs_quoting] used to be aliased here too and had no consumer in
+   [lib/] at all — their only caller was the [lexer.mll] drift guard in
+   [test_ident_quoting_572.ml], so a dead-code pruning pass would have deleted
+   the guard's handle and silently unbound the keyword list from the lexer.
+   The guard now reaches [Granary_encoding.Sql_ident] directly. *)
 let quote_ident = Granary_encoding.Sql_ident.quote_ident
 
 (* A single-quoted SQL string literal, with embedded quotes doubled. *)

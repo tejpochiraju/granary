@@ -361,7 +361,7 @@ let test_recycled_frame_index_on_borrow_path () =
    [t.wal_epoch] is by then already the NEW epoch, no later purge would ever
    remove it. Permanently poisoned, silently wrong for every reader after.
 
-   [Store.checkpoint_unlocked]'s reader gate is [ro_readers_below]
+   [Store.ckpt_install]'s reader gate is [ro_readers_below]
    ([m < target]), so a reader at the WAL head is not gated and genuinely runs
    concurrently with [Wal.reset]. This is the exact hazard [Wal.cache_frame]
    already carries [~expected_epoch] for (reviews #209/#210); the pager now

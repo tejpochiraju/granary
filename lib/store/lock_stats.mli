@@ -73,13 +73,35 @@ type site =
           only decidable at release, whereas the site is what a WAITER reads to
           fill [blocked_by] while the hold is still in flight.  A split
           therefore has to reclassify a hold retroactively, which is a design
-          change rather than a label change.  Tracked with #719. *)
-  | Checkpoint (** an explicit [Store.checkpoint]. *)
+          change rather than a label change.
+
+          {b This is NOT what #719 fixed and is still open.}  #719 took the
+          checkpoint's migration out of the critical section; it left [Txn]
+          exactly as it is, so a read-only [BEGIN] still takes the exclusive
+          lock and still lands in this bucket. *)
+  | Checkpoint
+  (** an explicit [Store.checkpoint].
+
+          {b #719: this hold is the checkpoint's INSTALL phase, not the whole
+          checkpoint.}  The page migration and its main-file fsync now run with
+          the lock free; what is held here is the catch-up on frames committed
+          during that migration, the reader/replication gate, and
+          [Wal.reset].  A checkpoint's total duration is therefore no longer
+          readable off this row — only the part of it that excludes writers,
+          which is the part this module exists to measure. *)
   | Autocheckpoint
   (** the post-commit background fiber [maybe_autockpt_after_commit]
           dispatches through [Lwt.async].  Nobody awaits it, so it is a genuine
           second writer even at one terminal — the candidate #716 named for
-          [BEGIN]'s 3.228 ms and could not confirm. *)
+          [BEGIN]'s 3.228 ms and #719 confirmed: in the #718 artifact it held
+          the lock for 25.1% of the interval and was the blocker for 99.99% of
+          all writer-lock wait in the run.
+
+          {b Same #719 caveat as {!Checkpoint}}: since that fix the hold covers
+          the install phase only.  It is still one acquisition per checkpoint —
+          the split moved work OUT of the critical section rather than dividing
+          the critical section in two — so nothing here had to grow a
+          constructor. *)
   | Commit_sink (** [Store.set_commit_sink]'s registration barrier. *)
 
 (** Every {!site}, in report order.  Fixed rather than derived so a CSV written

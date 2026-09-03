@@ -32,12 +32,36 @@
     - the same, after close and REOPEN. A corrupted [generated_as] is only
       re-parsed on a later open, so an in-session assertion misses it entirely
       (noted on the issue);
-    - [sqlite_master] DDL and [Db.dump] output replay into a fresh database. *)
+    - [sqlite_master] DDL and [Db.dump] output replay into a fresh database.
+
+    {2 Soft and hard reserved words — pick a HARD one, or the case is inert}
+
+    A reserved word here is not automatically a load-bearing test input. The
+    corruption this file guards against writes the new name into a bare
+    position, so a case only goes red if the resulting text FAILS to re-parse.
+    Measured against a pre-fix catalog: of the 197 words in
+    {!Granary_encoding.Sql_ident.sql_keywords}, {b 126 are "soft"} — the
+    grammar still accepts them bare in the position they land in, so the
+    corrupted text re-parses and the test passes {i against the bug} — and only
+    71 are "hard".
+
+    [key] is soft. [order], [select] and [group] are hard, which is why every
+    case below is written with one of those three. #617 was exactly this trap:
+    [build_everything] renamed the GENERATED table's column to ["key"], so that
+    surface contributed nothing to the sensitivity of
+    [sqlite_master_ddl_replays] or [dump_round_trips] — both stayed red pre-fix
+    only through the CHECK and partial-index surfaces, and a future change that
+    broke GENERATED alone would have left both green.
+
+    The QCheck property at the bottom is the exception, and deliberately so: it
+    draws [~count:60] over all 197 words, so P(a green run against the bug) is
+    about [0.64 ** 60] — around [2e-12]. *)
 
 open Lwt.Syntax
 open Granary_sql
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
+module Sql_ident = Granary_encoding.Sql_ident
 
 let run = Lwt_main.run
 
@@ -175,7 +199,7 @@ let rewrite_delimits_reserved_words () =
 let one_rule_across_the_libraries () =
   let names =
     [ "a"; "plain"; ""; "my col"; "1col"; "a\"b"; "order"; "KEY"; "Select"; "log2" ]
-    @ Ast.sql_keywords
+    @ Sql_ident.sql_keywords
   in
   List.iter
     (fun s ->
@@ -183,7 +207,7 @@ let one_rule_across_the_libraries () =
        Alcotest.(check string)
          (Printf.sprintf "Sql_ident.quote_ident %S" s)
          want
-         (Granary_encoding.Sql_ident.quote_ident s);
+         (Sql_ident.quote_ident s);
        Alcotest.(check string)
          (Printf.sprintf "Exec.quote_ident %S" s)
          want
@@ -215,7 +239,7 @@ let check_every_keyword () =
     (fun k ->
        (* the table's own columns are [a] and [b]; nothing in the list collides *)
        check_survives_rename_to (String.lowercase_ascii k))
-    Ast.sql_keywords
+    Sql_ident.sql_keywords
 ;;
 
 let check_survives_reopen () =
@@ -343,7 +367,20 @@ let build_everything db =
   exec db "CREATE INDEX ei ON p (a + 1)";
   List.iter
     (fun (t, w) -> exec db (Printf.sprintf "ALTER TABLE %s RENAME COLUMN a TO %s" t w))
-    [ "r", "\"order\""; "g", "\"key\""; "p", "\"group\"" ]
+    [ "r", "\"order\""; "g", "\"select\""; "p", "\"group\"" ]
+;;
+
+(* Replay a DDL list into a fresh database and hand it to [f].  Tables before
+   indexes — [all_ddl] sorts by name, which interleaves them — and [order] is
+   an optional pre-sort for the cases where one table references another. *)
+let replay_ddl ?(order = fun l -> l) ddl f =
+  let is_index s =
+    lower_contains s "create index" || lower_contains s "create unique index"
+  in
+  let tables, indexes = List.partition (fun s -> not (is_index s)) ddl in
+  with_db (fun db ->
+    List.iter (fun s -> expect_ok db "replayed DDL" s) (order tables @ indexes);
+    f db)
 ;;
 
 let sqlite_master_ddl_replays () =
@@ -352,15 +389,10 @@ let sqlite_master_ddl_replays () =
       build_everything db;
       all_ddl db)
   in
-  (* tables before indexes — [all_ddl] sorts by name, which interleaves them *)
-  let tables, indexes =
-    List.partition (fun s -> not (lower_contains s "create index")) ddl
-  in
-  with_db (fun db ->
-    List.iter (fun s -> expect_ok db "replayed DDL" s) (tables @ indexes);
+  replay_ddl ddl (fun db ->
     expect_ok db "replayed CHECK" "INSERT INTO r VALUES (1, 1)";
     expect_constraint_violation db "replayed CHECK" "INSERT INTO r VALUES (0, 1)";
-    expect_ok db "replayed GENERATED" "INSERT INTO g (\"key\") VALUES (7)";
+    expect_ok db "replayed GENERATED" "INSERT INTO g (\"select\") VALUES (7)";
     Alcotest.(check int64) "generated value" 8L (one_int db "SELECT d FROM g"))
 ;;
 
@@ -369,7 +401,7 @@ let dump_round_trips () =
     with_db (fun db ->
       build_everything db;
       exec db "INSERT INTO r VALUES (1, 1)";
-      exec db "INSERT INTO g (\"key\") VALUES (7)";
+      exec db "INSERT INTO g (\"select\") VALUES (7)";
       exec db "INSERT INTO p VALUES (1, 5)";
       match run (Db.dump_to_string db ()) with
       | Ok s -> s
@@ -380,7 +412,7 @@ let dump_round_trips () =
     (fun needle ->
        if not (lower_contains script needle)
        then Alcotest.failf "dump lost the delimiters around %s:\n%s" needle script)
-    [ "\"order\""; "\"key\""; "\"group\"" ];
+    [ "\"order\""; "\"select\""; "\"group\"" ];
   with_db (fun db ->
     String.split_on_char '\n' script
     |> List.iter (fun line ->
@@ -424,7 +456,7 @@ let ordinary_rename_stays_bare () =
 let arb_keyword =
   QCheck.make
     ~print:(Printf.sprintf "%S")
-    QCheck.Gen.(oneof_list (List.map String.lowercase_ascii Ast.sql_keywords))
+    QCheck.Gen.(oneof_list (List.map String.lowercase_ascii Sql_ident.sql_keywords))
 ;;
 
 let prop_check_rename =
@@ -435,6 +467,209 @@ let prop_check_rename =
     (fun k ->
        check_survives_rename_to k;
        true)
+;;
+
+(* ── #618: four stored-SQL surfaces PR #610 verified only by hand ──── *)
+
+(* All four route through [Exec.quote_ident] and so were correct by
+   construction — which is exactly the kind of coverage that quietly stops
+   being true.  Each closes and REOPENS, because a reopen is the only thing
+   that re-parses stored text; each asserts the constraint still FIRES, because
+   "the DDL re-parses" and "the DDL still means what it said" are different
+   claims and only the second is worth having; and each replays its own
+   [sqlite_master] DDL into a fresh database.
+
+   Every case is written with a HARD reserved word — see the header.  With a
+   soft one the corrupted text re-parses and the case passes against the bug. *)
+
+(* Surface 1: a FOREIGN KEY's parent-column list ([Exec] renders it at the
+   [FOREIGN KEY (...) REFERENCES t(...)] clause, one [quote_ident] per side). *)
+let fk_parent_cols_survive_reopen () =
+  with_file_db "fk" (fun open_it ->
+    let seed db =
+      exec db "PRAGMA foreign_keys = 1";
+      exec db "CREATE TABLE par (\"order\" INTEGER NOT NULL PRIMARY KEY, v INTEGER)";
+      exec db "CREATE TABLE ch (x INTEGER, FOREIGN KEY (x) REFERENCES par(\"order\"))"
+    in
+    let db = open_it () in
+    seed db;
+    exec db "INSERT INTO par VALUES (1, 10)";
+    expect_ok db "FK satisfied" "INSERT INTO ch VALUES (1)";
+    expect_constraint_violation db "FK live" "INSERT INTO ch VALUES (99)";
+    let before = all_ddl db in
+    close db;
+    let db = open_it () in
+    Fun.protect
+      ~finally:(fun () -> close db)
+      (fun () ->
+         exec db "PRAGMA foreign_keys = 1";
+         Alcotest.(check (list string)) "DDL is durable" before (all_ddl db);
+         expect_ok db "FK satisfied after reopen" "INSERT INTO ch VALUES (1)";
+         expect_constraint_violation
+           db
+           "FK live after reopen"
+           "INSERT INTO ch VALUES (98)");
+    (* and the emitted DDL is SQL: parent before child, or the FK dangles *)
+    replay_ddl
+      ~order:
+        (List.sort (fun a b ->
+           compare (lower_contains b "table par") (lower_contains a "table par")))
+      before
+      (fun db ->
+         exec db "PRAGMA foreign_keys = 1";
+         exec db "INSERT INTO par VALUES (1, 10)";
+         expect_ok db "replayed FK satisfied" "INSERT INTO ch VALUES (1)";
+         expect_constraint_violation db "replayed FK live" "INSERT INTO ch VALUES (99)"))
+;;
+
+(* Surface 2: the index a table-level UNIQUE constraint creates behind the
+   caller's back — its column list is emitted from the catalog, not echoed. *)
+let table_level_unique_survives_reopen () =
+  with_file_db "uniq" (fun open_it ->
+    let db = open_it () in
+    exec db "CREATE TABLE tc (\"group\" INTEGER, b INTEGER, UNIQUE (\"group\", b))";
+    exec db "INSERT INTO tc VALUES (1, 2)";
+    expect_constraint_violation db "UNIQUE live" "INSERT INTO tc VALUES (1, 2)";
+    expect_ok db "a different key is fine" "INSERT INTO tc VALUES (1, 3)";
+    let before = all_ddl db in
+    close db;
+    let db = open_it () in
+    Fun.protect
+      ~finally:(fun () -> close db)
+      (fun () ->
+         Alcotest.(check (list string)) "DDL is durable" before (all_ddl db);
+         expect_constraint_violation
+           db
+           "UNIQUE live after reopen"
+           "INSERT INTO tc VALUES (1, 2)";
+         expect_ok db "a different key after reopen" "INSERT INTO tc VALUES (1, 4)";
+         Alcotest.(check int64) "rows landed" 3L (one_int db "SELECT COUNT(*) FROM tc"));
+    replay_ddl before (fun db ->
+      exec db "INSERT INTO tc VALUES (1, 2)";
+      expect_constraint_violation db "replayed UNIQUE live" "INSERT INTO tc VALUES (1, 2)"))
+;;
+
+(* Surface 3: WITHOUT ROWID.  Two tables, because the PRIMARY KEY reaches the
+   emitted DDL by two different routes: inline on the column ([wr], the issue's
+   own shape) and as a table-level [PRIMARY KEY (...)] clause ([wr2]).  The
+   trailing WITHOUT ROWID has to survive with both, and so does the backing
+   [__pk_] index's column list. *)
+(* #618: hoisted to the top level so the four surface tests stay inside
+   merlint's nesting budget — a [List.iter] over an [if ... then failf], inside a
+   [Fun.protect], inside [with_file_db], reaches depth 5. *)
+let expect_every_ddl_contains ~msg needles sqls =
+  let missing sql = List.find_opt (fun n -> not (lower_contains sql n)) needles in
+  List.iter
+    (fun sql ->
+       match missing sql with
+       | Some _ -> Alcotest.failf "%s: %s" msg sql
+       | None -> ())
+    sqls
+;;
+
+let without_rowid_survives_reopen () =
+  with_file_db "wr" (fun open_it ->
+    let create db =
+      exec
+        db
+        "CREATE TABLE wr (\"select\" INTEGER NOT NULL PRIMARY KEY, \"order\" INTEGER) \
+         WITHOUT ROWID";
+      exec
+        db
+        "CREATE TABLE wr2 (\"select\" INTEGER NOT NULL, \"order\" INTEGER, PRIMARY KEY \
+         (\"select\")) WITHOUT ROWID"
+    in
+    let seed db =
+      exec db "INSERT INTO wr VALUES (1, 10)";
+      exec db "INSERT INTO wr2 VALUES (1, 10)"
+    in
+    let pk_is_live db where =
+      expect_constraint_violation db (where ^ " wr PK") "INSERT INTO wr VALUES (1, 11)";
+      expect_constraint_violation db (where ^ " wr2 PK") "INSERT INTO wr2 VALUES (1, 11)"
+    in
+    let db = open_it () in
+    create db;
+    seed db;
+    pk_is_live db "before reopen";
+    let before = all_ddl db in
+    close db;
+    let db = open_it () in
+    Fun.protect
+      ~finally:(fun () -> close db)
+      (fun () ->
+         Alcotest.(check (list string)) "DDL is durable" before (all_ddl db);
+         let tables, indexes =
+           List.partition (fun sql -> lower_contains sql "create table") before
+         in
+         (* both CREATE TABLEs keep their delimiters and their WITHOUT ROWID *)
+         expect_every_ddl_contains
+           ~msg:"a reserved name lost its delimiters"
+           [ "\"select\""; "\"order\"" ]
+           tables;
+         expect_every_ddl_contains
+           ~msg:"the WITHOUT ROWID clause was lost"
+           [ "without rowid" ]
+           tables;
+         (* and so do the two backing __pk_ indexes' column lists *)
+         Alcotest.(check int) "two PK indexes" 2 (List.length indexes);
+         expect_every_ddl_contains
+           ~msg:"the PK index lost its delimiters"
+           [ "\"select\"" ]
+           indexes;
+         pk_is_live db "after reopen";
+         expect_ok db "a different key after reopen" "INSERT INTO wr VALUES (2, 20)";
+         Alcotest.(check int64)
+           "seek by the reserved key column"
+           10L
+           (one_int db "SELECT \"order\" FROM wr WHERE \"select\" = 1"));
+    (* A PRIMARY KEY's backing index is re-created by the CREATE TABLE, so
+       replaying its own [sqlite_master] row on top would collide; the point
+       here is the table DDL, and the index rows' delimiters are checked
+       above. *)
+    replay_ddl
+      (List.filter (fun sql -> not (lower_contains sql "index __pk_")) before)
+      (fun db ->
+         seed db;
+         pk_is_live db "replayed"))
+;;
+
+(* Surface 4: ALTER TABLE ... RENAME TO a reserved word.  The new name has to
+   be delimited in the table's own DDL AND in every dependent index's. *)
+let rename_table_to_reserved_survives_reopen () =
+  with_file_db "rename_to" (fun open_it ->
+    let db = open_it () in
+    exec db "CREATE TABLE tr (a INTEGER, b INTEGER CHECK (a > 0))";
+    exec db "CREATE INDEX tri ON tr ((a + 1))";
+    exec db "ALTER TABLE tr RENAME TO \"order\"";
+    expect_ok db "renamed table" "INSERT INTO \"order\" VALUES (1, 1)";
+    expect_constraint_violation db "CHECK live" "INSERT INTO \"order\" VALUES (0, 1)";
+    let before = all_ddl db in
+    close db;
+    let db = open_it () in
+    Fun.protect
+      ~finally:(fun () -> close db)
+      (fun () ->
+         Alcotest.(check (list string)) "DDL is durable" before (all_ddl db);
+         (* both the table's DDL and the index's must name it delimited *)
+         expect_every_ddl_contains
+           ~msg:"the renamed table lost its delimiters"
+           [ "\"order\"" ]
+           before;
+         expect_ok db "renamed table after reopen" "INSERT INTO \"order\" VALUES (2, 1)";
+         expect_constraint_violation
+           db
+           "CHECK live after reopen"
+           "INSERT INTO \"order\" VALUES (0, 1)";
+         Alcotest.(check int64)
+           "rows landed"
+           2L
+           (one_int db "SELECT COUNT(*) FROM \"order\""));
+    replay_ddl before (fun db ->
+      expect_ok db "replayed rename" "INSERT INTO \"order\" VALUES (1, 1)";
+      expect_constraint_violation
+        db
+        "replayed CHECK live"
+        "INSERT INTO \"order\" VALUES (0, 1)"))
 ;;
 
 let () =
@@ -470,6 +705,21 @@ let () =
     ; ( "emitted SQL"
       , [ Alcotest.test_case "sqlite_master replays" `Quick sqlite_master_ddl_replays
         ; Alcotest.test_case "Db.dump round-trips" `Quick dump_round_trips
+        ] )
+    ; ( "stored SQL surfaces (#618)"
+      , [ Alcotest.test_case
+            "FOREIGN KEY parent columns, reopen"
+            `Quick
+            fk_parent_cols_survive_reopen
+        ; Alcotest.test_case
+            "table-level UNIQUE index, reopen"
+            `Quick
+            table_level_unique_survives_reopen
+        ; Alcotest.test_case "WITHOUT ROWID, reopen" `Quick without_rowid_survives_reopen
+        ; Alcotest.test_case
+            "ALTER TABLE RENAME TO a keyword, reopen"
+            `Quick
+            rename_table_to_reserved_survives_reopen
         ] )
     ; ( "no regressions"
       , [ Alcotest.test_case "rename away from a keyword" `Quick rename_away_from_reserved

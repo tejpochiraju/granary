@@ -746,7 +746,10 @@ let test_unloadable_view_is_not_live stored_sql () =
     (match run (Granary_unix.Store.open_file ~path ()) with
      | Error e -> Alcotest.failf "store open: %a" Granary_store.Store.pp_error e
      | Ok store ->
-       run (Cat.persist_reactive_view store ~name:"cnt" ~sql:stored_sql);
+       (* #476: the catalog writes now return a [result] instead of raising. *)
+       (match run (Cat.persist_reactive_view store ~name:"cnt" ~sql:stored_sql) with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "persist_reactive_view: %s" e);
        run (Granary_store.Store.close store));
     let db = unwrap (run (Granary_unix.open_file ~path ())) in
     Fun.protect
@@ -799,7 +802,9 @@ let test_drop_removes_unloadable_view () =
     (match run (Granary_unix.Store.open_file ~path ()) with
      | Error e -> Alcotest.failf "store open: %a" Granary_store.Store.pp_error e
      | Ok store ->
-       run (Cat.persist_reactive_view store ~name:"cnt" ~sql:"NOT SQL AT ALL");
+       (match run (Cat.persist_reactive_view store ~name:"cnt" ~sql:"NOT SQL AT ALL") with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "persist_reactive_view: %s" e);
        run (Granary_store.Store.close store));
     let db = unwrap (run (Granary_unix.open_file ~path ())) in
     Alcotest.(check (list string))
@@ -818,7 +823,11 @@ let test_drop_removes_unloadable_view () =
     (match run (Granary_unix.Store.open_file ~path ()) with
      | Error e -> Alcotest.failf "store open: %a" Granary_store.Store.pp_error e
      | Ok store ->
-       let pairs = run (Cat.load_all_reactive_views store) in
+       let pairs =
+         match run (Cat.load_all_reactive_views store) with
+         | Ok pairs -> pairs
+         | Error e -> Alcotest.failf "load_all_reactive_views: %s" e
+       in
        Alcotest.(check (list string))
          "no reactive-view catalog rows remain"
          []

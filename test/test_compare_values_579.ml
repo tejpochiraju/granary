@@ -26,7 +26,9 @@
 
     Meanwhile [cmp_result] — the WHERE-predicate comparator — has always
     promoted [int]/[real] through [Float.compare].  The engine held two answers
-    for the same pair and the {e ordering} one was the wrong one.
+    for the same pair and the {e ordering} one was the wrong one.  (Since
+    #733/#734 [cmp_result] delegates to this function and there is one answer;
+    see "What this claimed, and what closed it" below.)
 
     {1 The rule now}
 
@@ -37,21 +39,25 @@
       SQLite's documented order {e and} the order of
       [Index_key.encode_value]'s tag bytes.
 
-    {1 What this does NOT claim}
+    {1 What this claimed, and what closed it}
 
-    The total order is [compare_values]'s, not the engine's.  [cmp_result], the
-    WHERE-predicate comparator, still differs in two ways, and both are filed
-    rather than fixed here:
+    When this fix landed, the total order was [compare_values]'s and not the
+    engine's: [cmp_result], the WHERE-predicate comparator, still differed in
+    two ways, and both were filed rather than fixed here.
 
-    - it promotes int-vs-real through [Int64.to_float], so above 2^53 a
-      predicate still answers equal for a pair this ordering separates (#733);
-    - it answers false for {e every} cross-class comparison, so [WHERE] says
-      [5 < 'abc'] is false while [ORDER BY] now sorts [5] before ['abc']
-      (#734).
+    - it promoted int-vs-real through [Int64.to_float], so above 2^53 a
+      predicate answered equal for a pair this ordering separates (#733);
+    - it answered false for {e every} cross-class comparison, so [WHERE] said
+      [5 < 'abc'] was false while [ORDER BY] sorted [5] before ['abc'] (#734).
 
-    So [the_filter_and_the_sort_now_agree] below is named for the numeric class
-    and is pinned only there; [the_filter_and_the_sort_still_disagree_across_classes]
-    pins the boundary of that claim so it is not mistaken for a general one.
+    Both are now FIXED: [cmp_result] is [compare_values] plus three-valued NULL
+    handling.  [the_filter_and_the_sort_now_agree] below was therefore named for
+    the numeric class and is now true generally, and
+    [the_filter_and_the_sort_agree_across_classes_too] — which used to assert
+    the opposite, under the name [..._still_disagree_...] — pins the closure.
+    The residual is narrower than it was: [=] and [<>] keep their own arms and
+    are still false across the two NUMERIC types (#738), pinned in
+    {!test/test_cmp_result_733.ml}.
 
     {1 Oracle}
 
@@ -280,7 +286,8 @@ let nan_sorts_below_every_number_including_integers () =
 (* The reason this is a fix and not a re-decision: [cmp_result], the
    WHERE-predicate comparator, has ALWAYS promoted int/real numerically. Before
    #579 a filter and a sort over the same column disagreed. This pins that they
-   now answer the same question the same way.
+   now answer the same question the same way — and since #733 it is literally
+   the same function, not two that happen to agree at these magnitudes.
 
    sqlite3: 1 / 1.5 for the filtered form. *)
 let the_filter_and_the_sort_now_agree () =
@@ -335,15 +342,16 @@ let above_two_pow_53_is_still_ordered () =
 (* The boundary of "the filter and the sort agree"                      *)
 (* ------------------------------------------------------------------ *)
 
-(* [the_filter_and_the_sort_now_agree] is true WITHIN the numeric class and
-   nowhere else.  [cmp_result] ends in [| _ -> Row.V_int 0L], so every
-   cross-class predicate is false, while [compare_values] now orders by class.
-   Pinned so the narrower claim is not read as a general one — the residual is
-   #734.
+(* This case used to assert the opposite, under the name
+   [the_filter_and_the_sort_still_disagree_across_classes]: [cmp_result] ended
+   in [| _ -> Row.V_int 0L], so every cross-class predicate was false while
+   [compare_values] ordered by class.  #734 made [cmp_result] delegate here, so
+   the boundary this pinned no longer exists and the case pins its closure
+   instead — the row it asserts changed from [0|0|0] to [1|0|0].
 
-   sqlite3 answers 1 for [5 < 'abc'], so granary's predicate is the wrong half
-   of the disagreement, not its ordering. *)
-let the_filter_and_the_sort_still_disagree_across_classes () =
+   sqlite3 answers 1 / 0 / 0, which is what said [cmp_result] was the wrong half
+   of that disagreement rather than the ordering. *)
+let the_filter_and_the_sort_agree_across_classes_too () =
   with_db (fun db ->
     exec db "CREATE TABLE m (k INTEGER)";
     exec db "INSERT INTO m VALUES (1),(2)";
@@ -353,8 +361,8 @@ let the_filter_and_the_sort_still_disagree_across_classes () =
       [ [ "5" ]; [ "abc" ] ]
       (rows_of db (Printf.sprintf "SELECT %s AS v FROM m ORDER BY v ASC" mixed));
     check_rows
-      ~label:"but the predicate answers false in both directions (#734)"
-      [ [ "0"; "0"; "0" ] ]
+      ~label:"and the predicate now says the same (#734)"
+      [ [ "1"; "0"; "0" ] ]
       (rows_of db "SELECT 5 < 'abc', 5 > 'abc', 5 = 'abc'"))
 ;;
 
@@ -516,11 +524,11 @@ let () =
             `Quick
             above_two_pow_53_is_still_ordered
         ] )
-    ; ( "the_boundary_of_the_claim"
+    ; ( "the_boundary_of_the_claim_and_its_closure"
       , [ Alcotest.test_case
-            "the_filter_and_the_sort_still_disagree_across_classes"
+            "the_filter_and_the_sort_agree_across_classes_too"
             `Quick
-            the_filter_and_the_sort_still_disagree_across_classes
+            the_filter_and_the_sort_agree_across_classes_too
         ; Alcotest.test_case
             "cross_class_equality_is_no_longer_true"
             `Quick

@@ -818,7 +818,15 @@ txn     autocheckpoint        60   2515.353
   the sweep above reports is not a scheduling artifact; it is saturation.
 - **A quarter of that saturation is not the workload.** The autocheckpoint's
   25.1% is WAL maintenance holding the one lock every transaction needs, at a
-  1000-frame threshold nothing in the harness overrides. Filed as **#719**.
+  1000-frame threshold nothing in the harness overrides. Filed as **#719**, and
+  **fixed**: the page migration and its fsync now run with the writer lock free,
+  and the lock is taken once at the end to catch up on whatever was committed
+  meanwhile and truncate the WAL. The threshold was deliberately left alone —
+  raising it makes the holds fewer and longer, which is the same 25% differently
+  spelled. **This table has not been re-measured since**, so the residual
+  `autocheckpoint` hold is a prediction (a catch-up of a few pages, one fsync,
+  and `Wal.reset`) rather than a number; re-running the profile is what turns it
+  into one.
 - **#717 converted, and the per-call figure is the safe way to see it.**
   `ROLLBACK` went from 358.9164 ms/call (4 calls, 25.72% of `new_order`, the
   run's p99 and max) to **0.485 ms/call** (3 calls, 0.03%) — 740x on a

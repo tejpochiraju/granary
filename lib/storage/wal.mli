@@ -98,6 +98,46 @@ val open_
 (** Total committed frames currently in the WAL. *)
 val committed_frames : t -> int
 
+(** #637: what recovery's forward walk observed about generation boundaries when
+    this handle was opened.
+
+    Every commit writes exactly one header page (page 0 or 1, alternating) with
+    [txn_id = previous + 1], in the same batch as its commit-flagged frame.  So
+    within one generation the header-page frames recovery walks past carry
+    STRICTLY INCREASING [txn_id]s, and a decrease means the walk ran off the end
+    of the newest generation into the physical remains of an older one — the
+    pre-#636 corruption, where [reset] never rotated the [(salt, seed)] marker,
+    so every frame of the checkpointed generation still verified and recovery
+    replayed it over newer data.
+
+    [frames_walked] is how many frames the walk consumed and [header_frames] how
+    many of those carried a readable header [txn_id] — i.e. how much material
+    the test actually had.  Both are reported because
+    [stale_generation = None] with [header_frames < 2] means "nothing to compare",
+    which is not the same claim as "compared and clean".
+
+    Only a regression at or below the last commit frame is reported.  A frame
+    checksum does not cover the frame's INDEX, so leftovers from an earlier,
+    longer write verify wherever they sit — including the tail of a batch torn
+    by a crash and never committed.  Such a tail is walked but never applied, so
+    reporting it would be a false alarm; the stale frames #637 is about were
+    applied, and so sit within the committed prefix. *)
+type replay_check =
+  { frames_walked : int
+  ; header_frames : int
+  ; stale_generation : (int * int64 * int64) option
+    (** [(frame_idx, previous_txn_id, frame_txn_id)] of the first header frame
+        whose [txn_id] failed to increase. *)
+  }
+
+(** The {!replay_check} recorded when this handle was opened.  Set once by
+    recovery and never changed again — not by {!reset}, because it is a
+    statement about the file that was opened and stays true after a checkpoint
+    rotates the marker.  A WAL created fresh (no header on the device, or a
+    device too small to hold one) reports all-zero with no regression: there was
+    nothing to walk. *)
+val replay_check : t -> replay_check
+
 (** Byte length of the WAL device as this handle understands it: reads past it
     are refused.  Grows as frames are appended and — since #612, and only when
     {!open_} was given a [resize] callback — drops back to [header_size_bytes]
@@ -245,3 +285,23 @@ val salt : t -> int64
 
 (** Return the WAL's seed (assigned at open). *)
 val seed : t -> int64
+
+(** Override where a freshly created WAL's [(salt, seed)] generation marker is
+    drawn from (#613).
+
+    The default draws 16 bytes from {!Mirage_crypto_rng} and returns [None]
+    when that generator is absent or unseeded, in which case the WAL falls back
+    to OCaml's default [Random] state — which is IDENTICAL in every freshly
+    started process, so every WAL created by such a process shares one marker.
+    A Unix application gets a properly seeded generator from
+    [Granary_unix.install]; a unikernel gets one from the Mirage runtime.
+
+    Set this to supply your own entropy, or to make the marker reproducible for
+    a fault-injection test. Returning [None] selects the degraded [Random]
+    fallback described above. Process-global; call
+    {!reset_initial_marker_source} to restore the default. *)
+val set_initial_marker_source : (unit -> (int64 * int64) option) -> unit
+
+(** Restore the default generation-marker source installed by this module
+    (#613). *)
+val reset_initial_marker_source : unit -> unit

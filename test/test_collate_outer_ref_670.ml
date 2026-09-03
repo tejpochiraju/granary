@@ -150,42 +150,52 @@ let a_collate_nested_under_another_node_is_descended_through () =
    VALUES it produces, not merely by the absence of a refusal: three outer rows,
    three different correlated values, each matching its own [i.fk = o.k].
 
-   {b This is also where granary diverges from sqlite3, on the collation and
-   not on the correlation.}  sqlite3 answers
+   {b #722 CHANGED THIS ANSWER DELIBERATELY.}  When this file was written the
+   expected row for [b] was [b|world], because granary evaluated
+   [P_collate (_, NOCASE)] as [String.lowercase_ascii] on the value itself
+   ([Exec.eval_expr]) — so a COLLATE in a PROJECTION rewrote what came back.
+   The comment here said the divergence was "pinned as granary's current answer
+   rather than sqlite3's, so that fixing #722 shows up as a deliberate change to
+   this line".  This is that change.
+
+   Since #722 a COLLATE is a comparison attribute and never rewrites a value:
+   the collation is read off the operand expressions by
+   [Exec.expr_collation] and applied at the comparison sites
+   ([Exec.collate_key]), so a projected collated column returns what is stored.
+   sqlite3 answers
 
      a|hello
      b|WORLD
      c|yyy
 
-   because a collation is a property of a COMPARISON and never rewrites the
-   value.  granary evaluates [P_collate (_, NOCASE)] as
-   [String.lowercase_ascii] on the value itself ([Exec.eval_expr]), so a
-   COLLATE in a PROJECTION changes what comes back: [WORLD] is returned as
-   [world].  That is pre-existing, has nothing to do with #670 — the plain
-   uncorrelated shape below does the same on unmodified code — and is tracked
-   as #722.  Pinned here as granary's current answer rather than sqlite3's, so
-   that fixing #722 shows up as a deliberate change to this line. *)
+   and so does granary now.  The correlation half of this case — that each
+   outer row gets its OWN [i.v], which is what #670 fixed — is unchanged and is
+   still what the three distinct values assert. *)
 let the_substituted_reference_is_the_outer_rows () =
   with_db (fun db ->
     seed db;
     check_rows
-      ~label:"each outer row gets its own correlated value (#722: b is folded)"
-      [ [ "a"; "hello" ]; [ "b"; "world" ]; [ "c"; "yyy" ] ]
+      ~label:"each outer row gets its own correlated value (#722: values are raw)"
+      [ [ "a"; "hello" ]; [ "b"; "WORLD" ]; [ "c"; "yyy" ] ]
       (rows_of db "SELECT k, (SELECT v FROM i WHERE i.fk = o.k) COLLATE NOCASE FROM o"))
 ;;
 
-(* #722, isolated: no subquery, no correlation, nothing #670 touches — so this
-   is what the engine did before this branch and what it still does.  It is
-   here to keep the divergence above from being read as something the fix
-   introduced.
+(* #722, isolated: no subquery, no correlation, nothing #670 touches.
+
+   {b This answer changed deliberately under #722.}  It used to assert
+   [a|hello / b|world / c|zzz] — the folded values — and existed to record that
+   the folding was pre-existing rather than something #670 introduced.  It now
+   asserts the sqlite3 answer, which is the point of #722: a COLLATE in a
+   projection is a comparison attribute with nothing to compare, so it is the
+   identity on the value.
 
    sqlite3: a|HELLO / b|world / c|zzz  (the stored values, unchanged). *)
-let collate_in_a_projection_folds_the_value_pre_existing_722 () =
+let collate_in_a_projection_returns_the_stored_value_722 () =
   with_db (fun db ->
     seed db;
     check_rows
-      ~label:"granary folds; sqlite3 would return HELLO and zzz unchanged"
-      [ [ "a"; "hello" ]; [ "b"; "world" ]; [ "c"; "zzz" ] ]
+      ~label:"#722: the projection returns the stored value, as sqlite3 does"
+      [ [ "a"; "HELLO" ]; [ "b"; "world" ]; [ "c"; "zzz" ] ]
       (rows_of db "SELECT k, x COLLATE NOCASE FROM o"))
 ;;
 
@@ -231,54 +241,40 @@ let a_collate_inside_a_correlated_exists_body () =
           COLLATE NOCASE)"))
 ;;
 
-(* A refusal surfaces either as a [Db.error] or as an exception, and either
-   while the plan is built or while the stream is pulled.  All four are the
-   same outcome: the query did not answer. *)
-let refusal_of db sql =
-  try
-    match run (Db.query db sql) with
-    | Error e -> Format.asprintf "%a" Db.pp_error e
-    | Ok stream ->
-      ignore (run (Lwt_stream.to_list stream));
-      ""
-  with
-  | Failure m -> m
-  | e -> Printexc.to_string e
-;;
+(* #721, the boundary this fix used to stop at — {b now resolved}.
 
-(* #721, the boundary this fix stops at.  [substitute_outer_in_expr] is now
-   exhaustive, and three constructors that carry sub-expressions —
-   [E_agg], [E_agg_distinct], [E_window] — are listed with an explicit [-> e]
-   rather than descended into.  Each is a separate error-to-answer change
-   needing its own oracle-checked test.
+   When this file was written, [substitute_outer_in_expr] was exhaustive but
+   three constructors that carry sub-expressions ([E_agg], [E_agg_distinct],
+   [E_window]) were listed with an explicit [-> e] rather than descended into,
+   and this case asserted that the query below was REFUSED.  The comment it
+   carried set the rule for that moment: "if a later change resolves it, this
+   assertion fails and whoever made it must replace the case rather than delete
+   it".  #721 is that change, and this is the replacement — the same query, the
+   same fixture, asserting the answer instead of the refusal.
 
-   [E_fts_snippet] was originally counted as a fourth and is NOT one: it is a
-   record of a table name, a column index, three string tags and a token count,
-   with no [expr] field ([Ast.E_fts_snippet], ast.ml:247), so it is a true leaf
-   and there is no spelling in which an outer reference could sit inside it.
+   ([E_fts_snippet] was once counted as a fourth constructor and is not one: it
+   is a record of a table name, a column index, three string tags and a token
+   count with no [expr] field ([Ast.E_fts_snippet], ast.ml:247), so it is a
+   true leaf.)
 
-   This pins that the omission is REACHABLE, which is what makes #721 a real
-   issue rather than a theoretical one: an outer reference inside an aggregate
-   ARGUMENT is refused for exactly the reason #670 was.  sqlite3 answers [a]
-   for this query.  If a later change resolves it, this assertion fails and
-   whoever made it must replace the case rather than delete it — the same
-   discipline #627 records for its refusal categories. *)
-let an_outer_reference_inside_an_aggregate_argument_is_still_refused_721 () =
+   sqlite3 answers [a] for this query, which is what it answers now.  The full
+   #721 coverage — all three constructors, each with a control whose value
+   differs — lives in [test/test_outer_ref_721.ml]; this case stays here so
+   that #670's own file keeps recording where its scope ended and what closed
+   it. *)
+let an_outer_reference_inside_an_aggregate_argument_is_answered_721 () =
   with_db (fun db ->
     exec db "CREATE TABLE oa (k TEXT, n INTEGER)";
     exec db "CREATE TABLE ia (fk TEXT, v INTEGER)";
     exec db "INSERT INTO oa VALUES ('a',1)";
     exec db "INSERT INTO ia VALUES ('a',5)";
-    let msg =
-      refusal_of
-        db
-        "SELECT k FROM oa WHERE EXISTS (SELECT 1 FROM ia WHERE ia.fk = oa.k GROUP BY \
-         ia.fk HAVING SUM(ia.v + oa.n) > 0)"
-    in
-    Alcotest.(check bool)
-      (Printf.sprintf "#721: still refused, not answered (got %S)" msg)
-      true
-      (msg <> ""))
+    check_rows
+      ~label:"#721: answered, not refused"
+      [ [ "a" ] ]
+      (rows_of
+         db
+         "SELECT k FROM oa WHERE EXISTS (SELECT 1 FROM ia WHERE ia.fk = oa.k GROUP BY \
+          ia.fk HAVING SUM(ia.v + oa.n) > 0)"))
 ;;
 
 let () =
@@ -312,17 +308,17 @@ let () =
             `Quick
             an_uncorrelated_subquery_under_collate_is_unchanged
         ] )
-    ; ( "divergence_722"
+    ; ( "resolved_by_722"
       , [ Alcotest.test_case
-            "collate_in_a_projection_folds_the_value_pre_existing_722"
+            "collate_in_a_projection_returns_the_stored_value_722"
             `Quick
-            collate_in_a_projection_folds_the_value_pre_existing_722
+            collate_in_a_projection_returns_the_stored_value_722
         ] )
-    ; ( "boundary_721"
+    ; ( "resolved_by_721"
       , [ Alcotest.test_case
-            "an_outer_reference_inside_an_aggregate_argument_is_still_refused_721"
+            "an_outer_reference_inside_an_aggregate_argument_is_answered_721"
             `Quick
-            an_outer_reference_inside_an_aggregate_argument_is_still_refused_721
+            an_outer_reference_inside_an_aggregate_argument_is_answered_721
         ] )
     ]
 ;;

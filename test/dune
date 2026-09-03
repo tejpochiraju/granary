@@ -1412,6 +1412,7 @@
  (libraries
   granary
   granary.sql
+  granary.encoding
   alcotest
   qcheck-core
   qcheck-alcotest
@@ -1772,4 +1773,296 @@
 (test
  (name test_compound_order_by_662)
  (modules test_compound_order_by_662)
+ (libraries granary alcotest lwt.unix))
+
+; #613: a freshly created WAL draws its (salt, seed) generation marker from a
+; real entropy source, not from an un-self-init'd Random whose state is the same
+; in every process.
+
+(test
+ (name test_wal_salt_613)
+ (modules test_wal_salt_613)
+ (libraries
+  granary.storage
+  alcotest
+  lwt.unix
+  cstruct
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+; #487: a syntax failure carries its position (line, column, byte offset) and
+; the offending token, through every entry point that can report one. The
+; multi-line cases matter: the lexer never calls Lexing.new_line, so a
+; single-line-only test would pass against a hardcoded line 1.
+
+(test
+ (name test_parse_error_487)
+ (modules test_parse_error_487)
+ (libraries granary alcotest lwt.unix))
+
+; #583: Db.dump's #548 NOT NULL refusal points at PRAGMA not_null_check for the
+; scope and PRAGMA not_null_repair for the repair, keeping the hand-written
+; UPDATE/DELETE as the manual escape hatch.
+
+(test
+ (name test_dump_not_null_check_583)
+ (modules test_dump_not_null_check_583)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
+; #588: PRAGMA not_null_repair is destructive, so Db.execute performs it; the
+; report half stays on the query path, and a read-only snapshot gets a
+; statement-level refusal instead of the storage layer's In_ro_txn message.
+
+(test
+ (name test_not_null_repair_588)
+ (modules test_not_null_repair_588)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
+; #475: the internal [DROP TABLE _rv_<name>] guard is keyed on the table the
+; driver is currently dropping, not on a "the driver is busy" flag. The flag
+; stayed set across every await of a refresh, so a user drop interleaving into
+; that window destroyed an unrelated live view's materialisation.
+
+(test
+ (name test_reactive_view_drop_guard_475)
+ (modules test_reactive_view_drop_guard_475)
+ (libraries granary alcotest lwt.unix))
+
+; #474: the reactive-view driver's own SQL is pinned to the schema the view
+; lives on, instead of re-entering routing and following active_database.
+
+(test
+ (name test_reactive_view_schema_pin_474)
+ (modules test_reactive_view_schema_pin_474)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #476: the reactive-view catalog entry points return a result instead of
+; raising, so a store fault reaches Db.execute's caller as Error.
+
+(test
+ (name test_reactive_view_catalog_error_476)
+ (modules test_reactive_view_catalog_error_476)
+ (libraries granary granary.store granary.catalog alcotest lwt.unix))
+
+; #496/#497: a view is resolved at EVERY FROM position — a JOIN's right-hand
+; side and a subquery's own FROM included, at any nesting depth — not only as
+; the statement's leading FROM table. One root cause, two issues; #496 was the
+; silent one because a subquery is re-bound at execution time with no view
+; table at all.
+
+(test
+ (name test_view_resolution_496)
+ (modules test_view_resolution_496)
+ (libraries granary granary.encoding alcotest lwt.unix))
+
+; #665: #568's SUM/AVG numeric check now reaches #488's EXPRESSION argument —
+; the third spelling, which had no column ordinal and so escaped it entirely.
+; Pins the bind-time refusal, the empty-table half a runtime check cannot have,
+; and the deliberate boundary where a statically indeterminate argument still
+; fails at runtime.
+
+(test
+ (name test_agg_numeric_665)
+ (modules test_agg_numeric_665)
+ (libraries granary alcotest lwt.unix))
+
+; #664: a subquery inside an aggregate ARGUMENT is evaluated, not refused.
+; #488 made the argument an expression, so subqueries became bindable there and
+; nothing resolved them; #658 contained that with a bind-time refusal and this
+; replaces it. Uncorrelated ones resolve once per statement; correlated ones
+; resolve per INPUT row (not per group, as #558's projection/HAVING path does),
+; and the #247 fast path gives such a query up.
+
+(test
+ (name test_agg_arg_subquery_664)
+ (modules test_agg_arg_subquery_664)
+ (libraries granary granary.encoding alcotest lwt.unix unix))
+
+; #661: ALTER TABLE ADD COLUMN NOT NULL GENERATED ... VIRTUAL is no longer
+; refused for lacking a DEFAULT it cannot need — a VIRTUAL generated column has
+; no stored cell, so the short-decode NULL the rule guards against cannot occur.
+; STORED and plain columns keep the refusal. Also pins the decision NOT to
+; validate the expression over existing rows during the ALTER, and the residual
+; that follows from it.
+
+(test
+ (name test_alter_add_generated_661)
+ (modules test_alter_add_generated_661)
+ (libraries granary alcotest lwt.unix))
+
+; #733/#734: Exec.cmp_result is Exec.compare_values plus three-valued NULL
+; handling — exact int-vs-real above 2^53, and the NULL < number < TEXT < BLOB
+; class order — so a WHERE clause and an ORDER BY cannot disagree. Includes the
+; index-path cases, since range_bound_key's widening was written against the
+; inexact predicate this removes.
+
+(test
+ (name test_cmp_result_733)
+ (modules test_cmp_result_733)
+ (libraries granary alcotest lwt.unix))
+
+; #721: substitute_outer_in_expr descends into E_agg / E_agg_distinct /
+; E_window, so a correlated outer reference used as an aggregate or window
+; argument is substituted rather than surviving into Sema.bind and being
+; refused. Every case carries a control whose value differs, so none can pass
+; on a build that ignores the outer term.
+
+(test
+ (name test_outer_ref_721)
+ (modules test_outer_ref_721)
+ (libraries granary alcotest lwt.unix))
+
+; #732: substitute_outer_in_stmt rewrites a subquery's own projection and the
+; FROM-less S_const_select, and its statement match is exhaustive. ORDER BY and
+; GROUP BY stay refused on purpose — sqlite3 refuses them too, and an ORDER BY
+; key can name an output alias the inner scope does not know about.
+
+(test
+ (name test_outer_ref_732)
+ (modules test_outer_ref_732)
+ (libraries granary alcotest lwt.unix))
+
+; #666: a rolled-back statement's #417 row-level deltas are reverted with the
+; store, so an OR IGNORE skip whose BEFORE INSERT trigger wrote cannot leave a
+; phantom row in a materialised reactive view. The #240 dirty NAMES are
+; deliberately not reverted — over-invalidation is the safe direction.
+
+(test
+ (name test_rollback_deltas_666)
+ (modules test_rollback_deltas_666)
+ (libraries granary alcotest lwt.unix))
+
+; #719: the checkpoint's page migration no longer runs under the writer lock —
+; only the final catch-up + Wal.reset does. File-backed and WAL-mode (the Mem
+; backend has no WAL), and the first two cases hook the main file's write_page
+; so the migration can be parked and the interleaving forced rather than raced.
+
+(test
+ (name test_autocheckpoint_lock_719)
+ (modules test_autocheckpoint_lock_719)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  cstruct
+  alcotest
+  lwt.unix
+  unix))
+
+; #737: a statement that returns Error no longer takes its reactive views down
+; with it. Reads the _rv_<name> materialisation back against the authoritative
+; query over the base table, and uses a bogus row written into _rv_av as the
+; seam that tells "no resync scheduled" from "a resync that changed nothing".
+
+(test
+ (name test_change_feed_error_737)
+ (modules test_change_feed_error_737)
+ (libraries granary alcotest lwt.unix))
+
+; #722: COLLATE is a comparison attribute, not a value transformation. The
+; P_collate arm of eval_expr used to lower-case the VALUE, so a projected,
+; CAST-wrapped or concatenated collated column returned something the table
+; never stored. Every fixture pairs 'HELLO' with 'Hello' so a BINARY build and
+; a NOCASE one answer differently, and every case carries an uncollated
+; control.
+
+(test
+ (name test_collate_722)
+ (modules test_collate_722)
+ (libraries granary alcotest lwt.unix))
+
+; #740: PRAGMA wal_checkpoint inside an explicit transaction self-deadlocked
+; (Rwlock is not re-entrant); it is now refused up front. File-backed and
+; WAL-mode — the Mem backend has no WAL, so there is no second acquisition to
+; deadlock on and an in-memory version would pass while proving nothing.
+
+(test
+ (name test_wal_checkpoint_txn_740)
+ (modules test_wal_checkpoint_txn_740)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #739: a follower's RO snapshot could register below a checkpoint's target and
+; observe a migrated page. File-backed and WAL-mode (the Mem backend has no WAL,
+; so there is no snapshot horizon and no migration to observe), with the
+; migration parked through a hooked main-file write_page so the interleaving is
+; forced rather than raced.
+
+(test
+ (name test_follower_snapshot_739)
+ (modules test_follower_snapshot_739)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  cstruct
+  alcotest
+  lwt.unix
+  unix))
+
+; #653: INSERT ... SELECT ... ON CONFLICT (cols) DO UPDATE SET ... — the clause
+; had no grammar at all, so the statement was a parse error. It is threaded
+; through grammar/AST/Sema/Plan to the one Exec call site that already drove the
+; source stream through execute_insert per row, so the VALUES form's #639/#599/
+; #667 behaviour applies by construction rather than by a second implementation.
+
+(test
+ (name test_insert_select_upsert_653)
+ (modules test_insert_select_upsert_653)
+ (libraries granary alcotest lwt.unix))
+
+; #741: excluded.<col> nested inside a DO UPDATE assignment RHS resolved to the
+; TARGET row, silently. In-memory is sufficient — the defect is entirely in the
+; binder's scope handling, not in storage.
+
+(test
+ (name test_nested_excluded_741)
+ (modules test_nested_excluded_741)
+ (libraries granary granary.encoding alcotest lwt.unix))
+
+; #637: a database already corrupted by the pre-#636 WAL replay is neither
+; detected nor repaired on upgrade. PRAGMA wal_replay_check is the detector.
+; The fabricated-corruption cases drive the real Wal.open_/recover_index over an
+; in-memory byte device (the corrupt shape cannot be produced by the fixed
+; code); the PRAGMA cases are file-backed and WAL-mode, because the Mem backend
+; has no WAL and would pass vacuously.
+
+(test
+ (name test_wal_replay_check_637)
+ (modules test_wal_replay_check_637)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  cstruct
+  alcotest
+  lwt.unix
+  unix))
+
+; #738: [=] and [<>] compare the numeric class exactly, and the three index
+; equality sites (index_lookup_values, stream_rowid_lookup, seek_candidates'
+; Seek_rowid arm) move with them. In-memory is enough — this is planner and
+; comparator behaviour, with no WAL or durability dimension.
+
+(test
+ (name test_cmp_eq_738)
+ (modules test_cmp_eq_738)
  (libraries granary alcotest lwt.unix))

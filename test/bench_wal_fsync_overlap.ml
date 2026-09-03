@@ -71,7 +71,11 @@
     - {b median, not minimum} (#538): the probes are repeated and reduced with
       the MEDIAN, not the most optimistic draw.  A divisor is not a verdict —
       see the comment in [calibrate_read_ops] for why min is right in [measure]
-      and wrong in calibration.
+      and wrong in calibration.  Since #623 the fold is a symmetric TRIMMED MEAN
+      over seven paired reps rather than a median over three: same centre, same
+      rejection of a lucky idle draw, lower sampling variance.  On three draws
+      the two folds are the same number, so this narrows the spread without
+      re-deciding anything #538 or #590 decided.
     - {b compose, then reduce} (#590): the per-op cost is the MEDIAN OF THE
       PER-REP MARGINALS.  #569 instead took [max (marginal, average)] over
       independently-medianed probe sizes, which is biased high by construction
@@ -605,6 +609,54 @@ let median = function
     a.(Array.length a / 2)
 ;;
 
+(* Symmetric trimmed mean: drop the single lowest and single highest draw, then
+   average what is left (#623).  [infinity] on the empty list for the same
+   reason [median] does.
+
+   {b This is a strict GENERALISATION of [median], not a replacement for it.}
+   On three draws the trim leaves exactly the middle one, so [trimmed_mean l =
+   median l] for every list of three or fewer — which is what the calibration
+   used before #623, and why every pinned [per_op_estimate] case still reads the
+   same number.  It only starts to differ once there are more draws to average,
+   which is the point: see [probe_reps].
+
+   {b Why this fold and not the median, on the same draws.}  Both are estimators
+   of the same quantity and neither is biased, but the trimmed mean averages the
+   middle [n-2] draws where the median keeps one, so its sampling variance is
+   lower — under a normal parent, 0.15 sigma^2 at the seven draws [probe_reps]
+   now takes, against 0.21 for the median of the same seven and 0.45 for the
+   median of the three this replaces.  Variance is exactly what #623 is about:
+   [read_ops] is [target / per_op], so the spread of the divisor IS the spread
+   of the chosen workload.
+
+   {b And why it does not move the estimate DOWN on a loaded box}, which is the
+   direction that matters — a low per-op cost oversizes [read_ops], the
+   direction [calibrate_read_ops] calls unsafe and #538's root cause.  The
+   quantity being reduced is a per-rep MARGINAL, [p + (e2 - e1) / n], where
+   [e1] and [e2] are the two probes' one-sided scheduling delays.  A difference
+   of two like-distributed one-sided noises is symmetric, so the marginal's
+   noise is symmetric even though each probe's is not, and a symmetric trim of a
+   symmetric distribution has the same centre as its median.  Load widens
+   [e1] and [e2] together and so widens that symmetric noise; it does not tilt
+   it.  Where the parent IS right-skewed the trimmed mean sits ABOVE the median
+   (it keeps the upper middle draws the median discards), which is the safe
+   side.  Neither case moves it down.  Pinned by
+   [trimmed_mean_is_the_median_generalised] and
+   [trimmed_mean_does_not_err_low_against_the_median]. *)
+let trimmed_mean = function
+  | [] -> infinity
+  | ([ _ ] | [ _; _ ]) as l -> median l
+  | l ->
+    let a = Array.of_list l in
+    Array.sort compare a;
+    let n = Array.length a in
+    let total = ref 0.0 in
+    for i = 1 to n - 2 do
+      total := !total +. a.(i)
+    done;
+    !total /. float_of_int (n - 2)
+;;
+
 (* Per-op reader cost from PAIRED probes (#590).  Pure, so
    [statistics_tests] can feed it synthetic probe numbers.
 
@@ -658,14 +710,29 @@ let median = function
      error at its source;
    - the run-wide resize safety net in [test_fsync_overlap], which exists
      precisely for a calibration blowout that survives the first two.
-   Measured on a quiet 12-core host, the chosen [read_ops] still spans ~3x
-   run-to-run (3324-10906 over three runs), so the residual spread is real and
-   this is the direction to watch if the gate starts flaking. *)
+   Measured on a quiet 12-core host, the chosen [read_ops] still spanned ~3x
+   run-to-run (3324-10906 over three runs).  That residual is #623, and it is
+   addressed at the SAME place the rest of this is — in the reduction, not by
+   loosening a gate: seven paired reps instead of three, folded with a trimmed
+   mean instead of a median.  See [probe_reps] for the arithmetic and
+   [trimmed_mean] for why the fold does not move the estimate down. *)
 let per_op_estimate ~probe_ops pairs =
   let n = float_of_int probe_ops in
-  let marginal = median (List.map (fun (t1, t2) -> (t2 -. t1) /. n) pairs) in
-  if marginal > 0.0
-  then marginal
+  let marginals = List.map (fun (t1, t2) -> (t2 -. t1) /. n) pairs in
+  let est = trimmed_mean marginals in
+  (* Two conditions, not one, and the second is the ORIGINAL guard kept
+     verbatim (#623).  The documented trigger for the fallback is "a MAJORITY of
+     reps were swamped by jitter", and on three draws the median IS that
+     majority test.  Once there are more draws the trimmed mean can come out
+     positive while the median does not (three of five swamped, and the fourth
+     large enough to outweigh them), so testing the estimate alone would quietly
+     widen the guard.  Requiring both keeps it at least as conservative as it
+     was, and every failure of either sends the estimate to the fallback — which
+     reads HIGH and therefore undersizes the workload, the safe direction.  On
+     three draws the two conditions coincide exactly, so nothing about the
+     pinned boundary cases moved. *)
+  if est > 0.0 && median marginals > 0.0
+  then est
   else median (List.map (fun (_, t2) -> t2 /. (2.0 *. n)) pairs)
 ;;
 
@@ -722,11 +789,75 @@ let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio ~delay =
 
      Since #590 the median is taken over the composed PER-REP marginals rather
      than over each probe size independently — same fold, applied after the
-     composition instead of before it.  See [per_op_estimate]. *)
-  let probe_reps = 3 in
+     composition instead of before it.  See [per_op_estimate].
+
+     {b Since #623 there are SEVEN reps and the fold is a trimmed mean.}  #590
+     left a residual it put on the record rather than leaving to be
+     rediscovered: three reps reduced by a median still let the chosen
+     [read_ops] span ~3.3x run to run on a quiet 12-core box (3324-10906), wider
+     than #590's own "narrowed to ~2x" claim.  That is a SPREAD, not a bias —
+     #608 removed the bias — and its consequence is loud (an oversized workload
+     fails the gate) rather than silent, which is why it was filed to be watched
+     instead of blocking that PR.
+
+     Both halves of the narrowing are #623's own suggested remedies, taken
+     together rather than one or the other, because neither alone reaches ~2x:
+
+     - {b more paired reps}, 3 -> 7.  The estimator's sampling variance falls
+       like 1/reps, and the probes are cheap relative to the measurement they
+       size: a rep is one 1000-op probe plus one 2000-op probe, ~0.5 s together
+       against the ~10 s the two configs then spend, so four extra reps cost
+       ~2 s on a run that already takes ~10 s and up to ~30 s when it retries.
+     - {b a trimmed mean rather than a median} — see [trimmed_mean] for why
+       that lowers variance further without moving the centre, and in
+       particular without moving it DOWN, which is the direction that oversizes
+       the workload.
+
+     Order-statistic arithmetic for the pair: sigma falls to ~0.59 of the
+     median-of-3's, so a 3.3x multiplicative spread predicts ~3.3^0.59 = 2.0x.
+     That is a prediction about the ESTIMATOR's contribution and no more.  Part
+     of the observed spread is genuine load tracking between calibration and
+     measurement — the per-op cost really is different on a busy box, and
+     [reader_ratio]'s comment above turns on exactly that — and no estimator
+     should remove it.
+
+     {b Why the spread is worth narrowing at all, given it fails LOUDLY.}
+     Because the resize safety net in [measure] cannot rescue every oversize:
+     its trigger cannot be lowered below 1.667 without letting a resize walk a
+     real serialisation regression down to passing, so a draw landing in
+     [(1.15, 1.667]] fails the gate and gets no resize, and a retry cannot help
+     because the calibration is deterministic across a run's trials.  Narrowing
+     the divisor's spread narrows the chance of landing in that band, which is
+     the only thing that can.  And the OTHER tail fails too, by a different
+     route: an UNDERsized workload drives the secondary ceiling [1 + T_r/T_w]
+     towards the 1.2 floor, which [speedup_unreachable] reports INCONCLUSIVE —
+     a per-config pass, but a run whose every config lands there measured
+     nothing and fails.  So this is not a one-sided "fails loudly, therefore
+     harmless" situation.
+
+     {b What this change was NOT observed to do, recorded so nobody re-runs the
+     experiment.}  Measured on THIS box — 12-core, shared with another agent,
+     1-minute load average 2.3-4.6 across the sweep — 10 interleaved
+     old/new pairs of the calibration alone gave max/min 2.46x for the median
+     of 3 and 2.69x for the trimmed mean of 7, i.e. no narrowing, well inside
+     what 10 draws per arm can resolve.  That is not evidence the arithmetic
+     above is wrong; it is evidence that on a box under varying load the
+     ESTIMATOR is not the dominant variance term.  The dominant term is the one
+     [reader_ratio]'s comment already names — the per-op cost genuinely differs
+     between calibration and measurement — and no fold can or should remove it.
+     Closing #623 needs the quiet box #623 asks for.
+
+     The untried lever, if that measurement is ever taken and still shows a
+     wide spread, is [probe_ops]: the marginal's signal is [n * p] against a
+     fixed cost of comparable size, so raising the probe sizes improves the
+     difference's signal-to-noise linearly where more reps only improve it as
+     the square root.  It was not taken here because it costs proportionally
+     more probe time and, on the evidence above, there was nothing to show for
+     it. *)
+  let probe_reps = 7 in
   (* One rep = BOTH sizes, timed back to back (#590).  The marginal difference
-     is then taken WITHIN a rep, and the median is taken over the composed
-     per-rep estimates rather than over each size independently — see
+     is then taken WITHIN a rep, and the fold is applied to the composed
+     per-rep estimates rather than to each size independently — see
      [per_op_estimate] for why that ordering is the whole point. *)
   let probe ~read_ops = probe_reader_phase ~n_seed ~n_readers ~read_ops ~delay in
   let pair () =
@@ -1781,6 +1912,135 @@ let per_op_falls_back_when_the_median_rep_is_swamped () =
     (per_op_estimate ~probe_ops:1000 one_of_three)
 ;;
 
+(* #623, part 1 of 3: the new fold is the old one generalised.  [trimmed_mean]
+   drops one draw from each end, so on three draws it leaves exactly the middle
+   one and IS [median].  That identity is what makes #623 a variance change
+   rather than a re-decision of #538's and #590's fold — and it is why every
+   pinned [per_op_estimate] case above, all of which feed three pairs, still
+   reads the number it always did.  Delete this and the two folds could drift
+   apart on the small-sample path with nothing to say so. *)
+let trimmed_mean_is_the_median_generalised () =
+  let same label l = Alcotest.(check (float 1e-12)) label (median l) (trimmed_mean l) in
+  same "empty" [];
+  same "one draw" [ 3.0e-4 ];
+  same "two draws" [ 3.0e-4; 5.0e-4 ];
+  same "three draws, sorted" [ 1.0e-4; 3.0e-4; 9.0e-4 ];
+  same "three draws, unsorted" [ 9.0e-4; 1.0e-4; 3.0e-4 ];
+  (* Four is where they part company: the median takes the upper middle, the
+     trim averages both middles. *)
+  Alcotest.(check (float 1e-12))
+    "four draws: the mean of the two middles"
+    3.5e-4
+    (trimmed_mean [ 1.0e-4; 3.0e-4; 4.0e-4; 9.0e-4 ]);
+  Alcotest.(check (float 1e-12))
+    "four draws: the median takes the upper middle"
+    4.0e-4
+    (median [ 1.0e-4; 3.0e-4; 4.0e-4; 9.0e-4 ])
+;;
+
+(* #623, part 2 of 3: the fold must not err LOW.  A per-op estimate that is too
+   low oversizes [read_ops] — the direction [calibrate_read_ops] calls unsafe
+   and #538's root cause — so a variance reduction that bought its narrowness by
+   shifting the centre downward would be a regression dressed as a fix.
+
+   Two parents, and they bracket what a loaded box does to the marginals:
+   symmetric noise (which is what a difference of two one-sided delays actually
+   has) leaves the two folds on the same centre, and right-skewed noise puts the
+   trimmed mean ABOVE the median.  Neither is below.  Both halves are needed:
+   the symmetric case alone would not notice a fold that drifted down under
+   skew, and the skewed case alone would not notice one that drifted down when
+   the box is quiet. *)
+let trimmed_mean_does_not_err_low_against_the_median () =
+  (* Symmetric about 3.0e-4. *)
+  let symmetric = [ 1.0e-4; 2.0e-4; 3.0e-4; 4.0e-4; 5.0e-4 ] in
+  Alcotest.(check (float 1e-12))
+    "symmetric parent: same centre as the median"
+    (median symmetric)
+    (trimmed_mean symmetric);
+  (* Right-skewed: one long upper tail, which is what load adds. *)
+  let skewed = [ 2.0e-4; 2.5e-4; 3.0e-4; 6.0e-4; 20.0e-4 ] in
+  Alcotest.(check bool)
+    "right-skewed parent: at or above the median, never below"
+    true
+    (trimmed_mean skewed >= median skewed);
+  Alcotest.(check (float 1e-12))
+    "and the extreme draw is still discarded"
+    ((2.5e-4 +. 3.0e-4 +. 6.0e-4) /. 3.0)
+    (trimmed_mean skewed);
+  (* The same statement at the estimator level, where it is what actually
+     reaches [read_ops]: seven reps whose marginals are the skewed set above
+     plus two more, and the estimate stays at or above what the median says. *)
+  let pairs = List.map (fun m -> 0.5, 0.5 +. (m *. 1000.0)) skewed in
+  let marginals = List.map (fun (t1, t2) -> (t2 -. t1) /. 1000.0) pairs in
+  Alcotest.(check bool)
+    "per_op_estimate inherits it"
+    true
+    (per_op_estimate ~probe_ops:1000 pairs >= median marginals)
+;;
+
+(* #623, part 3 of 3, and the load-bearing one: the pair of changes actually
+   NARROWS the spread of the chosen workload.
+
+   [read_ops] is [target_seconds / per_op], so the run-to-run spread of the
+   divisor IS the run-to-run spread of the workload — the 3324-10906 (~3.3x)
+   band #623 was filed about.  This measures that spread directly and
+   deterministically, with no clock and no box involved: a fixed LCG supplies
+   iid symmetric noise around a known true per-op cost, and each simulated
+   "run" is reduced both the old way (median of 3 reps) and the new way
+   (trimmed mean of 7).  Asserting on the RATIO of the two spreads rather than
+   on either absolute number is what keeps it independent of the noise scale
+   chosen here.
+
+   A wall-clock measurement could not stand in for this.  #623 asks for a
+   quiet box and this repo's own guidance says sibling agents make that
+   unavailable; the estimator's variance, unlike a false-failure rate, is a
+   property of the arithmetic and is therefore measurable anywhere. *)
+let trimmed_mean_narrows_the_calibration_spread () =
+  let seed = ref 20260903 in
+  (* Uniform on [-1, 1); an LCG so the sample is identical on every machine and
+     every run.  Symmetric, per [trimmed_mean]'s header: the marginal is a
+     difference of two one-sided delays. *)
+  let noise () =
+    seed := ((1103515245 * !seed) + 12345) land 0x3FFFFFFF;
+    (float_of_int !seed /. 536870912.0) -. 1.0
+  in
+  let p = 3.0e-4 in
+  let draw () = p +. (0.6 *. p *. noise ()) in
+  let runs = 500 in
+  (* An explicit loop, not [List.init]: the generator is STATEFUL, so a fold
+     whose application order the stdlib leaves unspecified would make the
+     printed numbers depend on the compiler.  Both folds sort their input, so
+     the order within one simulated run is irrelevant to the result — but the
+     reproducibility of the number this prints is not. *)
+  let rec repeat n f acc = if n = 0 then acc else repeat (n - 1) f (f () :: acc) in
+  let spread_of f =
+    let xs = repeat runs f [] in
+    let lo = List.fold_left Float.min infinity xs
+    and hi = List.fold_left Float.max neg_infinity xs in
+    hi /. lo
+  in
+  (* Drawn from one stream, so the two estimators see the same noise process;
+     the OLD one is measured first so it cannot be handed a tamer tail. *)
+  let old_spread = spread_of (fun () -> median (repeat 3 draw [])) in
+  let new_spread = spread_of (fun () -> trimmed_mean (repeat 7 draw [])) in
+  Printf.printf
+    "  [#623] simulated per_op spread: median-of-3 %.3fx -> trimmed-mean-of-7 %.3fx\n%!"
+    old_spread
+    new_spread;
+  Alcotest.(check bool)
+    "the old fold's spread is the wider one"
+    true
+    (new_spread < old_spread);
+  (* The prediction in [probe_reps] is sigma ~0.59x, i.e. a multiplicative
+     spread of [s] becoming about [s ** 0.59].  Assert something weaker and
+     unambiguous — a third of the excess over 1.0 removed — so this pins the
+     direction and the order of magnitude without pinning an LCG's tail. *)
+  Alcotest.(check bool)
+    "and by a wide margin, not a rounding"
+    true
+    (new_spread -. 1.0 < 0.67 *. (old_spread -. 1.0))
+;;
+
 (* {b The median itself, pinned.}  Mutation testing found that changing
    [v_overlap]'s reduction from MEDIAN to MIN survived the whole suite — the one
    reduction choice this revision exists to make was pinned by nothing.  Every
@@ -1924,6 +2184,18 @@ let statistics_tests =
       "per-op fallback fires on the median rep (#590)"
       `Quick
       per_op_falls_back_when_the_median_rep_is_swamped
+  ; Alcotest.test_case
+      "trimmed mean generalises the median (#623)"
+      `Quick
+      trimmed_mean_is_the_median_generalised
+  ; Alcotest.test_case
+      "trimmed mean never errs low (#623)"
+      `Quick
+      trimmed_mean_does_not_err_low_against_the_median
+  ; Alcotest.test_case
+      "trimmed mean narrows the calibration spread (#623)"
+      `Quick
+      trimmed_mean_narrows_the_calibration_spread
   ]
 ;;
 
