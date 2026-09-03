@@ -119,6 +119,30 @@ type bt_state =
         for a tree carry its tag in the reserved header bytes; untagged trees
         (default) carry 0. *)
   ; mutable current_header : Header.t
+  ; ro_root_cache : (tree_id, int64) Hashtbl.t
+    (** #416: [tree_id -> data-tree root page], memoized ACROSS RO snapshots
+        for one committed generation.  Without it every [ro_begin] starts with
+        an empty [rs_snap_trees] and the first {!bt_get_tree_ro} for a tree
+        pays a whole asynchronous descent of the meta tree — measured at ~245
+        of the ~1420 minor-heap words a warm point lookup allocates, because a
+        point lookup opens a snapshot, resolves one tree and closes it again.
+
+        The generation is the pair below.  Its soundness is the same invariant
+        [rs_snap_trees] already rests on: a snapshot resolves each tree once
+        and reuses that root for its whole life, however many commits happen
+        meanwhile — so the root is a function of the committed state the
+        snapshot reads, and two snapshots at the SAME committed state observe
+        the same roots by definition.  What this cache adds is only that the
+        state is identified by [(txn_id, meta root page)] rather than by
+        snapshot identity.  [commit] advances [txn_id] monotonically and never
+        reuses a value; [rollback] leaves both the id and the root page alone
+        AND reverts the meta tree to that root (#382), so a rolled-back txn
+        cannot leave a stale entry behind. *)
+  ; mutable ro_root_gen_txn : int64
+    (** Committed [txn_id] {!ro_root_cache} describes; [-1] when empty. *)
+  ; mutable ro_root_gen_meta : int64
+    (** Meta root page {!ro_root_cache} describes; checked alongside the txn id
+        so an as-of snapshot at an unrelated header can never match. *)
   ; schema_version : int64
   ; mutable txn_freelist_snapshot : Freelist.t option
   ; (* Snapshot of freelist taken at rw_begin; restored on rollback. None when no RW txn is active. *)
@@ -700,6 +724,17 @@ let backup_floor_below (st : bt_state) ~target =
   st.backup_shipped_frames <> max_int && st.backup_shipped_frames < target
 ;;
 
+(* #416: is {!ro_root_cache} currently describing the committed state [snap]
+   reads?  Both halves of the generation are checked: the txn id alone would
+   already be enough for the [ro_begin] path (a committed id is never reused),
+   but [ro_begin_as_of] resolves a snapshot from a HISTORY record, and pinning
+   the meta root too means an entry can only ever be served to a snapshot whose
+   meta tree is byte-identical to the one it was derived from. *)
+let ro_root_cache_current (st : bt_state) (snap : ro_snapshot) =
+  Int64.equal st.ro_root_gen_txn snap.rs_snap_txn_id
+  && Int64.equal st.ro_root_gen_meta snap.rs_snap_meta_root
+;;
+
 (* Lookup-or-build the Btree handle for a tree_id using a snapshot's
    pinned meta root page rather than the live meta tree. *)
 let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
@@ -708,45 +743,50 @@ let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
   (* #385/#174: see bt_get_tree — meta reads stay unattributed (tree = -1);
      [tid] is stamped only after the handle is resolved. *)
   st.current_tree <- None;
+  let snap_frames = if snap.rs_snap_frames = 0 then None else Some snap.rs_snap_frames in
+  let make_tree root_page =
+    Btree.create
+      ?snapshot_frames:snap_frames
+      ~pin_set:snap.rs_pinned
+      st.pager
+      ~root_page
+  in
   let* r =
     match Hashtbl.find_opt snap.rs_snap_trees tid with
     | Some bt -> Lwt.return_ok bt
     | None ->
-      let snap_frames =
-        if snap.rs_snap_frames = 0 then None else Some snap.rs_snap_frames
-      in
-      let snap_meta =
-        Btree.create
-          ?snapshot_frames:snap_frames
-          ~pin_set:snap.rs_pinned
-          st.pager
-          ~root_page:snap.rs_snap_meta_root
-      in
-      let key = encode_tree_id tid in
-      let* r = Btree.get snap_meta key in
-      (match r with
-       | Error e -> Lwt.return_error (map_btree_err e)
-       | Ok None ->
-         let bt =
-           Btree.create
-             ?snapshot_frames:snap_frames
-             ~pin_set:snap.rs_pinned
-             st.pager
-             ~root_page:0L
-         in
+      (* #416: reset the memo when the generation moved on, so at most one
+         committed state is described at a time and a stale entry cannot
+         outlive the state it was derived from. *)
+      if not (ro_root_cache_current st snap)
+      then (
+        Hashtbl.reset st.ro_root_cache;
+        st.ro_root_gen_txn <- snap.rs_snap_txn_id;
+        st.ro_root_gen_meta <- snap.rs_snap_meta_root);
+      (match Hashtbl.find_opt st.ro_root_cache tid with
+       | Some root_page ->
+         let bt = make_tree root_page in
          Hashtbl.replace snap.rs_snap_trees tid bt;
          Lwt.return_ok bt
-       | Ok (Some v) ->
-         let root_page = decode_root_page v in
-         let bt =
-           Btree.create
-             ?snapshot_frames:snap_frames
-             ~pin_set:snap.rs_pinned
-             st.pager
-             ~root_page
-         in
-         Hashtbl.replace snap.rs_snap_trees tid bt;
-         Lwt.return_ok bt)
+       | None ->
+         let snap_meta = make_tree snap.rs_snap_meta_root in
+         let key = encode_tree_id tid in
+         let* r = Btree.get snap_meta key in
+         (match r with
+          | Error e -> Lwt.return_error (map_btree_err e)
+          | Ok v ->
+            let root_page =
+              match v with
+              | None -> 0L
+              | Some v -> decode_root_page v
+            in
+            let bt = make_tree root_page in
+            Hashtbl.replace snap.rs_snap_trees tid bt;
+            (* The descent above awaited, so another fiber may have moved the
+               generation on meanwhile; publish only if it is still ours. *)
+            if ro_root_cache_current st snap
+            then Hashtbl.replace st.ro_root_cache tid root_page;
+            Lwt.return_ok bt))
   in
   st.current_tree <- Some tid;
   Lwt.return r
@@ -832,6 +872,9 @@ let make_btree_store
     ; current_tree = None
     ; tree_tags = Hashtbl.create 16
     ; current_header = h
+    ; ro_root_cache = Hashtbl.create 16
+    ; ro_root_gen_txn = -1L
+    ; ro_root_gen_meta = -1L
     ; schema_version = h.schema_version
     ; txn_freelist_snapshot = None
     ; active_readers = Hashtbl.create 4
