@@ -372,3 +372,16 @@ val eval_expr
     answers still differ from this order — an equality conjunct is consumed by
     the index access path, so both levels have to move together (#738). *)
 val compare_values : Granary_encoding.Row.value -> Granary_encoding.Row.value -> int
+
+(** #689 selectivity threshold for the doc-length fetch behind an FTS [rank]
+    projection: the single cursor walk over the doc-length region is taken when
+    that region holds at most this many entries per match, otherwise one doc
+    length is point-fetched per match.  Defaults to [5]; see
+    {!set_fts_doclen_scan_ratio}. *)
+val fts_doclen_scan_ratio : unit -> int
+
+(** [set_fts_doclen_scan_ratio n] overrides {!fts_doclen_scan_ratio}.  [0]
+    disables the cursor walk entirely.  Exists only so a test can force either
+    strategy over the same data and prove the two agree — the choice is a cost
+    estimate, never a correctness one, and production code never calls this. *)
+val set_fts_doclen_scan_ratio : int -> unit

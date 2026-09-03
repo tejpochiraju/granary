@@ -2785,6 +2785,14 @@ let fts_term_key term rowid =
 
 let fts_stats_key = Bytes.of_string "\x00\x00"
 
+(* #689: doc-length keys share this two-byte tag, so they form ONE contiguous
+   region of the FTS index tree holding exactly one entry per indexed document.
+   [fts_stats_key] ("\x00\x00") sorts below it and every posting key
+   (term ++ "\x00" ++ rowid, over a non-empty tokenizer term) sorts above it,
+   which is what lets [fts_doclen_by_scan] walk the region with a single
+   cursor. *)
+let fts_doclen_prefix = "\x00\x01"
+
 let fts_doclen_key rowid =
   let rb = Bytes.create 8 in
   let v = Int64.logxor rowid Int64.min_int in
@@ -2794,7 +2802,26 @@ let fts_doclen_key rowid =
       i
       (Int64.to_int (Int64.logand (Int64.shift_right_logical v ((7 - i) * 8)) 0xFFL))
   done;
-  Bytes.cat (Bytes.of_string "\x00\x01") rb
+  Bytes.cat (Bytes.of_string fts_doclen_prefix) rb
+;;
+
+(* Inverse of [fts_doclen_key]: the rowid a doc-length key names, or [None] when
+   [k] is not one.  The body of the key is exactly {!Rowid.encode}'s
+   order-preserving biased big-endian int64, so {!Rowid.decode} inverts it. *)
+let fts_doclen_key_rowid k =
+  if Bytes.length k = 2 + 8 && String.equal (Bytes.sub_string k 0 2) fts_doclen_prefix
+  then Some (Rowid.decode (Bytes.sub k 2 8))
+  else None
+;;
+
+(* Value of a doc-length entry; a missing entry counts as length 1, which is
+   what BM25's length normalization has always been given for an index whose
+   doc-length row is absent. *)
+let fts_decode_doclen = function
+  | None -> 1
+  | Some b ->
+    let n, _ = Varint.decode_uint64 b 0 in
+    Int64.to_int n
 ;;
 
 (** Value: varint pairs (col, pos)* — all positions for one (term, rowid). *)
@@ -10897,6 +10924,101 @@ let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) 
   | _ -> op
 ;;
 
+(* One [S.get] per match against the doc-length region.  #689's starting point,
+   and still the right strategy for a SELECTIVE match set — see
+   [fts_doclen_scan_ratio]. *)
+let fts_doclen_by_get tx (fts_meta : Cat.fts_table_meta) matches =
+  Lwt_list.map_s
+    (fun (rowid, positions) ->
+       let* v = S.get tx fts_meta.Cat.fts_index_tree (fts_doclen_key rowid) in
+       Lwt.return (rowid, positions, fts_decode_doclen v))
+    matches
+;;
+
+(* #689 option 2: ONE cursor walk across the doc-length region between the
+   lowest and highest matched rowid, instead of one root-to-leaf [S.get] descent
+   per match.  Produces exactly the same [(rowid, positions, doc_length)] triples
+   as {!fts_doclen_by_get} — same keys, same value decoder, same "absent means
+   1" default — so the two are interchangeable and the caller picks on cost
+   alone.  The walk stops at the first key that is not a doc-length key (the
+   region is contiguous, see [fts_doclen_prefix]) or that is past [hi]. *)
+let fts_doclen_by_scan tx (fts_meta : Cat.fts_table_meta) ~lo ~hi matches =
+  let n = List.length matches in
+  let want : (int64, unit) Hashtbl.t = Hashtbl.create n in
+  List.iter (fun (r, _) -> Hashtbl.replace want r ()) matches;
+  let found : (int64, int) Hashtbl.t = Hashtbl.create n in
+  let* cur = S.seek_ge tx fts_meta.Cat.fts_index_tree (fts_doclen_key lo) in
+  let rec walk () =
+    let* e = S.seek_next cur in
+    match e with
+    | None -> Lwt.return_unit
+    | Some (k, v) -> step k v
+  and step k v =
+    match fts_doclen_key_rowid k with
+    | Some r when Int64.compare r hi <= 0 ->
+      if Hashtbl.mem want r then Hashtbl.replace found r (fts_decode_doclen (Some v));
+      walk ()
+    | _ -> Lwt.return_unit
+  in
+  let* () = walk () in
+  S.seek_close cur;
+  Lwt.return
+    (List.map
+       (fun (rowid, positions) ->
+          rowid, positions, Option.value ~default:1 (Hashtbl.find_opt found rowid))
+       matches)
+;;
+
+(** #689 selectivity threshold: take the cursor walk when the doc-length region
+    it would cross holds at most this many entries per match.
+
+    Measured on this repo's B-tree backend (4 000-document FTS table, one term
+    matching every document, [Gc.minor_words] delta around the query): a point
+    [S.get] for one doc length costs ~573 minor words, a [seek_next] step ~112 —
+    so the walk wins while it crosses fewer than ~5.1 entries per match.  5 is
+    the conservative integer below that.  Both sides of the trade are real: at
+    3 matches out of 4 000 documents an ungated walk cost 642 663 minor words
+    against 19 325 for the point gets (33x worse), and at 4 000 matches out of
+    4 000 the walk cost 2 555 506 against 4 399 003 (1.7x better).
+
+    {!set_fts_doclen_scan_ratio} exists so a test can force EITHER path over the
+    SAME data and prove they agree; production never calls it.  [0] disables the
+    walk entirely. *)
+let fts_doclen_scan_ratio_ref = ref 5
+
+let fts_doclen_scan_ratio () = !fts_doclen_scan_ratio_ref
+let set_fts_doclen_scan_ratio n = fts_doclen_scan_ratio_ref := n
+
+(* Fetch every match's doc length, picking the cheaper strategy.  The estimate
+   costs no I/O: [total_docs] is already in hand from [read_fts_stats] and the
+   rowid bounds are a fold over an in-memory list.  [span] is an UPPER bound on
+   the entries a walk would cross — the region holds one entry per document, and
+   every entry between [lo] and [hi] has a distinct rowid in that range — so the
+   walk is chosen only when even its worst case is cheaper. *)
+let fts_doc_lengths tx (fts_meta : Cat.fts_table_meta) ~total_docs matches =
+  let n = List.length matches in
+  if n = 0
+  then Lwt.return []
+  else (
+    let lo, hi =
+      List.fold_left
+        (fun (lo, hi) (r, _) -> Int64.min lo r, Int64.max hi r)
+        (Int64.max_int, Int64.min_int)
+        matches
+    in
+    let by_rowid =
+      let d = Int64.sub hi lo in
+      if Int64.compare d 0L < 0 || Int64.compare d (Int64.of_int max_int) >= 0
+      then max_int
+      else Int64.to_int d + 1
+    in
+    let span = if total_docs > 0 then min by_rowid total_docs else by_rowid in
+    let ratio = !fts_doclen_scan_ratio_ref in
+    if ratio > 0 && span <= ratio * n
+    then fts_doclen_by_scan tx fts_meta ~lo ~hi matches
+    else fts_doclen_by_get tx fts_meta matches)
+;;
+
 (* BM25-score FTS [matches] against [query] when rank is requested; otherwise
    tag each with score 0.0.  Each term's own per-doc term-frequency is used.
    Standalone (not in the [to_stream] rec group) so it stays polymorphic in the
@@ -10907,42 +11029,39 @@ let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_r
   else
     let* total_docs, total_tokens = read_fts_stats tx fts_meta.Cat.fts_index_tree in
     let query_terms = fts_query_terms query in
+    (* #689: the score fold below asks each term's posting list for ONE rowid's
+       term frequency, once per match.  Over an association list that is a linear
+       probe, making the fold O(matches x postings x terms) — quadratic in the
+       match count, with no allocation to show for it, and the dominant cost of
+       this whole function by a wide margin (measured: a 4 000-match single-term
+       rank query went 218 ms -> 9.6 ms on the in-memory backend when this became
+       a hashtable, a 22.7x drop, while the per-match [S.get] #689 was filed about
+       accounted for ~0.9 ms of the 218).  The table is built from the reversed
+       list with [Hashtbl.replace] so the FIRST entry for a rowid wins, exactly as
+       [List.assoc_opt] did; posting lists carry one entry per rowid by
+       construction, so this only matters if that ever stops being true. *)
     let* term_data =
       Lwt_list.map_s
         (fun term ->
            let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
-           Lwt.return (List.length pl, pl))
+           let by_rowid : (int64, (int * int) list) Hashtbl.t =
+             Hashtbl.create (List.length pl)
+           in
+           List.iter (fun (r, ps) -> Hashtbl.replace by_rowid r ps) (List.rev pl);
+           Lwt.return (List.length pl, by_rowid))
         query_terms
     in
-    (* #687 review finding 1: this is a per-match [S.get] against
-       [fts_index_tree], paid for every match in [matches] before LIMIT/OFFSET
-       can slice anything — structurally different from the content-tree
-       fetch #687 fixed. That fetch was avoidable because content isn't
-       needed to compute a score; [doc_length] IS needed here (BM25 uses it
-       to normalize term frequency), and this branch only runs when
-       [include_rank] is true, i.e. exactly when the caller wants results
-       sorted by rank — which needs every score before any window can be
-       chosen. So this loop cannot be truncated to [offset, offset+limit)
-       without changing what the sort itself is fed. The one thing that
-       *would* remove the per-match round trip — storing [doc_length] inline
-       with each posting-list entry instead of behind a second [S.get] per
-       match — is an index-format change, out of scope for a LIMIT/OFFSET
-       fix; tracked as a follow-up (#689). *)
-    let* doc_lengths =
-      Lwt_list.map_s
-        (fun (rowid, positions) ->
-           let dlen_key = fts_doclen_key rowid in
-           let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
-           let dl =
-             match v with
-             | None -> 1
-             | Some b ->
-               let n, _ = Varint.decode_uint64 b 0 in
-               Int64.to_int n
-           in
-           Lwt.return (rowid, positions, dl))
-        matches
-    in
+    (* #687 review finding 1: every match needs its own [doc_length] — BM25 uses
+       it to normalize term frequency — and this branch runs exactly when the
+       caller wants results sorted by rank, which needs every score before any
+       LIMIT/OFFSET window can be chosen.  So unlike #687's content fetch this
+       cannot be truncated to [offset, offset+limit); what #689 removes instead
+       is the per-match ROUND TRIP, by walking the doc-length region with one
+       cursor when the match set is dense enough for that to pay.  Storing
+       [doc_length] inline with each posting entry would remove the second key
+       region altogether, but that is an on-disk format change with a migration
+       story of its own and is NOT what this does. *)
+    let* doc_lengths = fts_doc_lengths tx fts_meta ~total_docs matches in
     let scored =
       List.map
         (fun (rowid, positions, dl) ->
@@ -10950,7 +11069,7 @@ let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_r
              List.fold_left
                (fun acc (n_docs, term_pl) ->
                   let tf =
-                    match List.assoc_opt rowid term_pl with
+                    match Hashtbl.find_opt term_pl rowid with
                     | None -> 0
                     | Some pos -> List.length pos
                   in

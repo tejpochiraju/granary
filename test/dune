@@ -2130,3 +2130,14 @@
  (name test_bool_literal_744)
  (modules test_bool_literal_744)
  (libraries granary granary.encoding alcotest lwt.unix))
+
+(test
+ (name test_fts_doclen_689)
+ (modules test_fts_doclen_689)
+ (libraries
+  granary
+  granary.sql
+  granary.unix
+  granary.encoding
+  alcotest
+  lwt.unix))
