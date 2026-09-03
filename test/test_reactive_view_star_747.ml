@@ -124,8 +124,12 @@ let a_star_in_a_compound_arm_is_refused_by_the_compound_rule () =
     exec db "CREATE TABLE u (a INTEGER)";
     exec db "INSERT INTO t VALUES (1)";
     exec db "INSERT INTO u VALUES (2)";
-    let left = exec_err db "CREATE REACTIVE VIEW v AS SELECT * FROM t UNION SELECT a FROM u" in
-    let right = exec_err db "CREATE REACTIVE VIEW v AS SELECT a FROM t UNION SELECT * FROM u" in
+    let left =
+      exec_err db "CREATE REACTIVE VIEW v AS SELECT * FROM t UNION SELECT a FROM u"
+    in
+    let right =
+      exec_err db "CREATE REACTIVE VIEW v AS SELECT a FROM t UNION SELECT * FROM u"
+    in
     List.iter
       (fun (label, msg) ->
          Alcotest.(check bool)

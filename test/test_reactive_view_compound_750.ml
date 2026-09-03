@@ -93,9 +93,9 @@ let the_repro_is_refused_at_create () =
       "the repro"
       (exec_err db "CREATE REACTIVE VIEW cv AS SELECT a FROM t UNION SELECT b FROM u");
     (* Nothing was registered: no materialisation was left behind. *)
-    (match run (Db.query db "SELECT * FROM _rv_cv") with
-     | Ok _ -> Alcotest.fail "a materialisation was left behind for the refused view"
-     | Error _ -> ()))
+    match run (Db.query db "SELECT * FROM _rv_cv") with
+    | Ok _ -> Alcotest.fail "a materialisation was left behind for the refused view"
+    | Error _ -> ())
 ;;
 
 (* THE CONTROL. The same seed, the same INSERT, a supported view shape — and it
@@ -106,7 +106,10 @@ let the_control_a_supported_view_still_tracks_writes () =
   with_db (fun db ->
     seed db;
     exec db "CREATE REACTIVE VIEW sv AS SELECT a FROM t";
-    Alcotest.(check (list int)) "materialised at creation" [ 1 ] (ints db "SELECT a FROM _rv_sv");
+    Alcotest.(check (list int))
+      "materialised at creation"
+      [ 1 ]
+      (ints db "SELECT a FROM _rv_sv");
     exec db "INSERT INTO t VALUES (99)";
     Alcotest.(check (list int))
       "and tracked the insert — the thing the compound view did not do"
@@ -232,11 +235,17 @@ let a_from_less_select_is_the_only_other_shape_and_is_sound () =
     exec db "CREATE TABLE t (a INTEGER)";
     exec db "INSERT INTO t VALUES (1)";
     exec db "CREATE REACTIVE VIEW k AS SELECT 1";
-    Alcotest.(check (list int)) "a constant view materialises" [ 1 ] (ints db "SELECT * FROM _rv_k");
+    Alcotest.(check (list int))
+      "a constant view materialises"
+      [ 1 ]
+      (ints db "SELECT * FROM _rv_k");
     (* A write to an unrelated table cannot change it, so having no base table
        costs nothing here. *)
     exec db "INSERT INTO t VALUES (99)";
-    Alcotest.(check (list int)) "and stays what it is" [ 1 ] (ints db "SELECT * FROM _rv_k");
+    Alcotest.(check (list int))
+      "and stays what it is"
+      [ 1 ]
+      (ints db "SELECT * FROM _rv_k");
     (* The one spelling that still reaches [Db.rv_create]'s arity-zero guard:
        a FROM-less star projects nothing at all, so there is no column list to
        determine and no table to determine it from. *)
