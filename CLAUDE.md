@@ -338,14 +338,14 @@ EOF
   `o <= NaN` returns none. Two mechanisms have to agree for that to be sound:
   - `Exec.cmp_result` promotes cross-type numeric operands with `Float.compare`,
     whose total order puts NaN below `neg_infinity`.
-  - `Index_key.encode_value` writes NaN as the single `0x00` NULL/NaN byte,
-    which also sorts below every other key.
+  - `Index_key.encode_value` gives NaN its own single-byte tag `0x01` — below
+    INTEGER's `0x02` and REAL's `0x03`, above NULL's `0x00` — so it also sorts
+    below every other number, and *distinctly from* NULL.
 
   **They agree that NaN sorts below every number, and that — not blanket
-  agreement — is what keeps this from being a rows-lost bug.** (They do *not*
-  agree about NaN vs NULL; see below. That costs no rows on the read path,
-  because a seek over the shared `0x00` prefix still runs the residual
-  predicate.) A seek and its residual predicate can never disagree about where
+  agreement — is what keeps this from being a rows-lost bug.** They now also
+  agree about NaN vs NULL: `0x01` was #578's fix, and before it NaN and NULL
+  shared `0x00` and were byte-identical. A seek and its residual predicate can never disagree about where
   NaN sits relative to a number, so no future change may move one of the two
   without the other, or an index seek will start skipping rows the predicate
   would have kept. Option A (fold NaN to NULL at the value-ingress points,
@@ -374,26 +374,103 @@ EOF
     containing NaN returns NaN and `MAX` only does when NaN is the sole
     non-NULL value.
 
-  **Index-keyed uniqueness is the one that does NOT agree, and it is a real
-  bug — #578, not part of this decision.** The UNIQUE NULL exemption
-  (`any_null_val`) tests the *value*, so a NaN is correctly not exempted; but
-  the conflict probe then compares *encoded bytes*, where NaN's key is
-  byte-identical to NULL's. So `INSERT NULL` then `INSERT NaN` raises a spurious
-  `UNIQUE constraint failed`, while the reverse order succeeds. Do not "fix"
-  that by making the exemption byte-based — that would silently exempt NaN from
-  uniqueness altogether. **Option C should not be treated as fully settled while
-  that stands**: an order-dependent `UNIQUE` on any nullable REAL column is a
-  live defect, and if it is fixed by giving NaN its own tag byte, the "NaN is a
-  value in a total order" position gets stronger rather than weaker.
+  **Index-keyed uniqueness used to be the one that did NOT agree — #578, since
+  FIXED (`d296baf`).** The UNIQUE NULL exemption (`any_null_val`) tests the
+  *value*, so a NaN is correctly not exempted; the conflict probe then compares
+  *encoded bytes*, and while NaN's key was byte-identical to NULL's,
+  `INSERT NULL` then `INSERT NaN` raised a spurious `UNIQUE constraint failed`
+  while the reverse order succeeded. The fix was the one this paragraph
+  predicted would be the good one: NaN got its own tag byte (`0x01`,
+  `lib/encoding/index_key.ml:117-126`). Note what was NOT done, and must not
+  be: making the exemption byte-based would have silently exempted NaN from
+  uniqueness altogether. **Option C is correspondingly stronger, not weaker** —
+  the value level and the key level now agree about NaN's position exactly,
+  rather than only about "both below every number".
 
-  One further comparator defect surfaced in the same survey and is *not*
-  NaN-specific: `Exec.compare_values` returns `0` for any int-vs-real pair (its
-  `| _, _ -> 0` catch-all), while `Exec.cmp_result` promotes through
-  `Float.compare`. Strict column typing hides this for stored columns, but
-  `ORDER BY` over a mixed *computed* column returns rows unsorted. Tracked as
-  #579. There are four independent value comparators in the tree
-  (`compare_values`, `cmp_result`, `row_key`'s string rendering, and
-  `Reactive_view.value_compare`) and they do not all agree.
+  **#579 (fixed): `Exec.compare_values` is now a TOTAL order.** It used to end
+  in `| _, _ -> 0  (* cross-type: shouldn't happen *)`, and it does happen:
+  strict column typing keeps a *stored* column single-typed, but a *computed*
+  one is unconstrained per row, so `CASE WHEN i = 0 THEN f ELSE i END` mixes
+  INTEGERs and REALs freely. Every such pair compared **equal**, making the
+  relation **non-transitive** (`1 = 2.5`, `2.5 = 3`, but `1 < 3`) — and
+  `List.sort` on a non-transitive comparator has no defined result, so
+  `ORDER BY` over such a column returned rows in scan order, unsorted, with no
+  error. The same comparator is behind GROUP BY (which sorts and then groups
+  adjacent runs, so *which* rows landed in *which* group was input-order-
+  dependent), window PARTITION BY, and MIN/MAX (which became first-wins).
+
+  Two rules: within the numeric class compare **exactly** via `cmp_int_real`;
+  across classes order NULL < number < TEXT < BLOB via `value_class_rank`. That
+  order is SQLite's documented storage-class order *and* the order of
+  `Index_key.encode_value`'s tag bytes, so the value level and the index level
+  cannot disagree about which **class** sorts first. They still disagree about
+  INTEGER vs REAL *within* the numeric class — the encoding gives them separate
+  tags (`0x02`, `0x03`) and so puts every integer before every real — but that
+  is pre-existing.
+
+  **The exactness is the part that is easy to get wrong, and the first
+  revision of the fix did.** Promoting through `Int64.to_float` rounds, so
+  above 2^53 two distinct int64s promote to the same float and the comparator
+  is *still* non-transitive — `9007199254740993 ≡ 9007199254740992.0` and
+  `9007199254740992.0 ≡ 9007199254740992` while `9007199254740993 >
+  9007199254740992`. That is #579's own defect one magnitude up, and the
+  issue's repro reproduces verbatim with large values. `cmp_int_real` compares
+  without converting (sign and range first, then `Int64.compare` against the
+  truncated float, then the fraction as tiebreak), which is also what SQLite
+  does (`sqlite3IntFloatCompare`). **`compare_values` is a total order for
+  every input, with no magnitude caveat** — but that claim is about that
+  function, not about the engine.
+
+  **`cmp_result`, the WHERE-predicate comparator, is NOT the same function and
+  differs in two filed ways.** Do not restate the rule as "the two comparators
+  now agree":
+  - it promotes int-vs-real through `Int64.to_float`, so above 2^53 a
+    *predicate* still answers equal for a pair the *ordering* separates
+    (**#733**);
+  - it ends in `| _ -> Row.V_int 0L`, so every cross-class predicate is false —
+    it applies no class order at all. After #579, `ORDER BY` says `5 < 'abc'`
+    while `WHERE` says that is false. sqlite3 answers `1`, so `cmp_result` is
+    the wrong half (**#734**). This WHERE/sort disagreement is *new* in the
+    cross-class direction and was traded for removing the cross-numeric one.
+
+  **Why #579 did not disturb the index path, which is the thing to check before
+  touching this again.** `range_bound_key`'s `pred`/`succ` widening exists to
+  compensate for an *inexact* residual predicate, and its doc comment is
+  written against exactly that. It is unaffected because the residual runs
+  through `cmp_result`, which handles int-vs-real in its own arm and never
+  reaches `compare_values` for that pair. If #733 makes `cmp_result` exact, the
+  widening and `test_range_bound_517`'s above-2^53 cases are owed the same
+  change: an exact predicate is *narrower* than the seek, which is safe only
+  for as long as a residual actually runs over the seek's output.
+
+  **Unremarked improvement, recorded so nobody finds it by bisect.**
+  `compare_values` is not only an ordering function: nine call sites read
+  `compare_values a b = 0` as "equal"/"unchanged", and the old catch-all made
+  every cross-class pair satisfy that. So `SELECT 1 IN ('abc')` answered `1`
+  and `CASE 1 WHEN 'abc' …` matched. Two of the nine are FK correctness:
+  `check_fk_parent_update_restrict`'s `unchanged` fast path and its deferred
+  twin skipped the child probe entirely when a parent key moved between storage
+  classes, and `fk_child_has_ref*`'s match tests counted a child row of a
+  different class as a live reference. All now behave correctly.
+
+  **DISTINCT is deliberately not routed through it** and still dedups on
+  `row_key`'s string rendering, where `1` and `1.0` are different keys. So
+  DISTINCT and GROUP BY still disagree about whether an int and a numerically
+  equal real are one key. That is the residual: there are still four
+  independent value comparators in the tree (`compare_values`, `cmp_result`,
+  `row_key`'s string rendering, and `Reactive_view.value_compare` — the last of
+  which orders all ints before all reals) and they do not all agree. Folding
+  them into one is what #579's own "Note" asks for and is not what that fix
+  did. Pinned by `test/test_compare_values_579.ml`. Two of its cases carry the
+  weight: `the_falsifying_triple_is_ordered_exactly` pins the three >2^53
+  comparisons directly, and the QCheck `compare_values is transitive over
+  random triples` property fuzzes for the same class of defect. **That
+  generator is weighted, not uniform, and the weights are load-bearing** — a
+  uniform draw over its branches needs ~4x10^5 cases to reach a falsifying
+  triple, and 20 000 uniform cases pass against the promoting comparator.
+  Verified by mutation: with promotion restored, four cases in that file fail,
+  including both properties. An assertion on a single fixed input order catches
+  none of it.
 
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does

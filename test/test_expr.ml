@@ -382,10 +382,15 @@ let eval_arith_real_int () =
 ;;
 
 let eval_compare_values_cross_type () =
-  (* compare_values cross-type (non-null): int vs text → 0 (line 35 of exec.ml) *)
-  (* We can test this via Eq which uses compare_values internally, or via a sort *)
-  (* Actually compare_values is also called in sort — use a direct approach via eval_binop *)
-  (* For cross-type cmp_result: text vs int → 0 *)
+  (* What this pins is [cmp_result]'s cross-CLASS catch-all: every comparison
+     between a text and an int is false, in both directions. That is still the
+     behaviour (#734 tracks whether it should be — sqlite3 answers 1 for
+     [5 < 'abc']).
+
+     It is NOT [compare_values]: since #579 that function orders cross-class
+     pairs by storage class rather than answering 0, and [cmp_result] never
+     reaches it for a cross-class pair anyway. The name in this test dates from
+     when the two were assumed to be one comparator. *)
   let row = [| Row.V_text "x"; Row.V_int 5L |] in
   let e = Plan.P_binop (Plan.Gt, Plan.P_col 0, Plan.P_col 1) in
   Alcotest.(check bool)

@@ -498,10 +498,17 @@ let null_between_bound_matches_nothing () =
       (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND NULL"))
 ;;
 
-(* #522: a [BETWEEN] end need not share the column's type. Evaluated through
-   [compare_values] alone — which answers 0 for any cross-type pair — such an
-   end compared equal in BOTH directions, so the predicate was true for every
-   row while the equivalent inequalities were right all along. Each case pins
+(* #522: a [BETWEEN] end need not share the column's type. Evaluated through a
+   comparator that answered 0 for any cross-type pair, such an end compared
+   equal in BOTH directions, so the predicate was true for every row while the
+   equivalent inequalities were right all along.
+
+   Both halves of that sentence are HISTORY now, and in different ways.
+   [compare_values] stopped answering 0 for cross-type pairs in #579 — it
+   orders by storage class. The predicate path is [cmp_result], which still
+   ends in a catch-all answering false for every cross-CLASS pair (#734), so
+   what these cases pin is unchanged; the attribution to [compare_values] was
+   the imprecise part. Each case pins
    the [BETWEEN] against both other spellings of the same test: the inequality
    pair it must equal, and the unoptimizable foil that takes no seek path, so
    neither the evaluator nor the seek can drift on its own. *)
@@ -859,9 +866,18 @@ let real_bound_narrows_an_integer_column () =
    where a float ULP exceeds 1 and [Int64.to_float] stops being injective.
 
    The residual predicate does NOT compare an integer column against a real
-   bound exactly — [compare_values] promotes the integer with [Int64.to_float]
-   — so it admits every key whose ROUNDED value satisfies the bound, including
-   keys strictly on the wrong side of it.  A seek built with plain
+   bound exactly — [cmp_result] promotes the integer with [Int64.to_float] —
+   so it admits every key whose ROUNDED value satisfies the bound, including
+   keys strictly on the wrong side of it.
+
+   Naming [cmp_result] here is load-bearing since #579, not pedantry.
+   [compare_values] now compares int-vs-real EXACTLY ([cmp_int_real]), and
+   [cmp_result] handles that pair in its own arm without ever reaching
+   [compare_values] — which is exactly why #579 did not disturb the widening
+   below. If #733 makes [cmp_result] exact too, this widening and these cases
+   have to be revisited in the same change: an exact predicate is NARROWER than
+   the seek, which is the safe direction only for as long as a residual
+   actually runs over the seek's output.  A seek built with plain
    [ceil]/[floor] sorts past exactly those keys and drops their rows, which is
    a regression against the declined-bound scan.  The promotion therefore
    widens by one float step first, and these cases are what pin that: each has

@@ -341,3 +341,18 @@ val eval_expr
   -> Granary_encoding.Row.t
   -> Plan.expr
   -> Granary_encoding.Row.value
+
+(** [compare_values a b] is a TOTAL order over values: NULL < number < TEXT <
+    BLOB across storage classes, and within the numeric class an EXACT
+    comparison that never promotes an int64 to a float (#579).  NaN is a value
+    and sorts below every number, per #536.
+
+    Exposed for {!test/test_compare_values_579.ml}, which pins transitivity and
+    sort-order-independence as QCheck properties.  Testing it through SQL alone
+    cannot reach the magnitudes that matter: the defect it guards is invisible
+    below 2^53 and invisible to any fixture that happens to be sorted.
+
+    This is [compare_values]'s order only. [cmp_result], the WHERE-predicate
+    comparator, still promotes inexactly above 2^53 (#733) and answers false
+    for every cross-class comparison (#734). *)
+val compare_values : Granary_encoding.Row.value -> Granary_encoding.Row.value -> int

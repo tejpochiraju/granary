@@ -1746,3 +1746,12 @@
  (name test_collate_outer_ref_670)
  (modules test_collate_outer_ref_670)
  (libraries granary alcotest lwt.unix))
+
+; #579: compare_values is a total order. A computed column can mix storage
+; classes freely, and the old cross-type catch-all returned 0 — a
+; non-transitive relation, so List.sort had no defined result.
+
+(test
+ (name test_compare_values_579)
+ (modules test_compare_values_579)
+ (libraries granary alcotest qcheck-alcotest lwt.unix))

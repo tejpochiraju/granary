@@ -217,6 +217,119 @@ let row_value_to_index_value : Row.value -> Index_key.value = function
   | Row.V_blob b -> Index_key.IK_blob b
 ;;
 
+(* #579: the STORAGE CLASS a value belongs to, for cross-class ordering.
+   INTEGER and REAL share a class because they are compared numerically, not by
+   representation — see [compare_values].
+
+   The ranks match [Index_key.encode_value]'s tag bytes (NULL [0x00], NaN
+   [0x01], INTEGER [0x02] / REAL [0x03], TEXT [0x04], BLOB [0x05]) and
+   SQLite's documented storage-class order, so a value-level comparison and an
+   index-key comparison cannot disagree about which CLASS sorts first.  They
+   still disagree about INTEGER vs REAL *within* the numeric class, because the
+   encoding gives them separate tags and therefore puts every integer before
+   every real — but that disagreement is pre-existing and already true of
+   [cmp_result], the predicate comparator, which promotes numerically.
+
+   Within the numeric class, making [compare_values] promote reduces the number
+   of distinct answers in the engine rather than adding one.  Across classes it
+   does NOT: [cmp_result] answers false for every cross-class predicate, so
+   this change trades a cross-numeric disagreement for a cross-class one.  See
+   #734, and the note on [compare_values] itself. *)
+let value_class_rank (v : Row.value) : int =
+  match v with
+  | Row.V_null -> 0
+  | Row.V_int _ | Row.V_real _ -> 1
+  | Row.V_text _ -> 2
+  | Row.V_blob _ -> 3
+;;
+
+(* 2^63 as a float.  Every float [>= this] is out of int64 range; [-.this] is
+   exactly [Int64.min_int] and therefore IS in range.  Duplicated from
+   [two_pow_63] below, which is defined much later in this file for
+   [range_bound_key]. *)
+let two_pow_63_cmp = 9.2233720368547758e18
+
+(* #579: compare an int64 with a float EXACTLY, without promoting the int64 to
+   a float.
+
+   [Int64.to_float] rounds to nearest, so above 2^53 two distinct int64s can
+   promote to the same float — and a comparator that answers 0 for both pairs
+   is non-transitive:
+
+     9007199254740993L  vs 9007199254740992.0  ->  0   (promoted: equal)
+     9007199254740992.0 vs 9007199254740992L   ->  0   (promoted: equal)
+     9007199254740993L  vs 9007199254740992L   ->  1   (exact)
+
+   which is the same defect #579 is about, one magnitude up: [List.sort] on a
+   non-transitive comparator has no defined result.  Comparing exactly is also
+   what SQLite does ([sqlite3IntFloatCompare]).
+
+   NaN is ordered by #536's decided rule — below every number — rather than by
+   [Float.compare]'s accident, so the two agree by construction.  Infinities
+   and out-of-range floats are decided by sign before any conversion. *)
+let cmp_int_real (x : int64) (y : float) : int =
+  if Float.is_nan y
+  then 1 (* #536: NaN sorts below every number, so [x] is greater. *)
+  else if y >= two_pow_63_cmp
+  then -1 (* includes [infinity] *)
+  else if y < -.two_pow_63_cmp
+  then 1 (* includes [neg_infinity] *)
+  else (
+    (* [y] is finite and within int64 range, so [Float.trunc] is exact and
+       [Int64.of_float] of it is lossless. *)
+    let ty = Float.trunc y in
+    let c = Int64.compare x (Int64.of_float ty) in
+    if c <> 0
+    then c
+    else if y > ty
+    then -1 (* [y] has a positive fraction: x < y *)
+    else if y < ty
+    then 1 (* [y] has a negative fraction: x > y *)
+    else 0)
+;;
+
+(* #579: a TOTAL order over values, which is what every caller needs and what
+   this did not used to be.
+
+   It used to end in [| _, _ -> 0  (* cross-type: shouldn't happen *)], and it
+   does happen: strict column typing keeps a STORED column single-typed, but a
+   COMPUTED one is unconstrained per row, so
+   [SELECT CASE WHEN i = 0 THEN f ELSE i END AS v FROM n ORDER BY v] mixes
+   INTEGERs and REALs in one column.  Every such pair compared EQUAL, which made
+   the relation non-transitive ([1 = 2.5], [2.5 = 3], but [1 < 3]) — and
+   [List.sort] on a non-transitive comparator has no defined result, so the rows
+   came back in scan order, entirely unsorted, with no error.
+
+   The blast radius is every ordering the engine does: ORDER BY (through
+   [compare_with_nulls]), GROUP BY (which sorts and then groups adjacent runs,
+   so WHICH rows land in WHICH group became input-order-dependent), window
+   PARTITION BY, and MIN/MAX (which became first-wins).
+
+   Two rules:
+
+   - within the numeric class, compare EXACTLY through {!cmp_int_real}, which
+     also puts NaN below every number (#536's decided order, where
+     [NULL < NaN < every number] — NULL is a lower CLASS, so both halves hold);
+   - across classes, order by {!value_class_rank}.
+
+   Only the FIRST of those is a rule [cmp_result] already applied, and it
+   applies it in a weaker form.  Do not read this comment as saying the two
+   comparators now agree — they do not, in two separate ways, and both are
+   filed:
+
+   - [cmp_result] promotes int-vs-real through [Int64.to_float], so above 2^53
+     it still answers equal for pairs this function now separates.  #733.
+   - [cmp_result] ends in [| _ -> Row.V_int 0L], i.e. EVERY cross-class
+     predicate is false — it applies no class order at all.  So after this
+     change [ORDER BY] says [5 < 'abc'] while [WHERE] says that is false.
+     That WHERE/sort disagreement is NEW in the cross-class direction, traded
+     for removing the cross-numeric one this issue is about.  #734.
+
+   DISTINCT is deliberately NOT routed through this: it dedups on [row_key]'s
+   string rendering, where [1] and [1.0] are different keys.  So DISTINCT and
+   GROUP BY still disagree about whether an int and a numerically equal real are
+   one key.  That is a real inconsistency and it is #579's "Note" — four
+   comparators that should be one — not something this change decides. *)
 let compare_values (a : Row.value) (b : Row.value) : int =
   match a, b with
   | Row.V_null, Row.V_null -> 0
@@ -227,7 +340,20 @@ let compare_values (a : Row.value) (b : Row.value) : int =
   | Row.V_real x, Row.V_real y -> Float.compare x y
   | Row.V_text x, Row.V_text y -> String.compare x y
   | Row.V_blob x, Row.V_blob y -> Bytes.compare x y
-  | _, _ -> 0 (* cross-type: shouldn't happen *)
+  (* #579: numeric promotion, but EXACT — see {!cmp_int_real}.  [cmp_result]
+     promotes through [Int64.to_float] instead and is therefore still inexact
+     above 2^53; that residual is #733, and it is why the claim below is about
+     this function rather than about the engine. *)
+  | Row.V_int x, Row.V_real y -> cmp_int_real x y
+  | Row.V_real x, Row.V_int y -> -cmp_int_real y x
+  (* #579: everything left is a genuine cross-CLASS pair (number/text/blob in
+     some order).  Ordered by class rather than compared equal.
+
+     With the exact numeric arm above, this function IS a total order — every
+     pair of values is related, antisymmetrically and transitively — for every
+     input, with no magnitude caveat.  That claim is about THIS function only;
+     see the note above for the two ways [cmp_result] still differs. *)
+  | _, _ -> Int.compare (value_class_rank a) (value_class_rank b)
 ;;
 
 let compare_with_nulls
