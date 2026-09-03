@@ -10,7 +10,21 @@ It is **advisory**. Unlike merlint and ocamlformat it does **not** gate CI; see
 
 ## Running it
 
-The tool is baked into the `granary-dev` image (see `Containerfile`).
+**Use `scripts/dead-code.sh`.** It self-wraps podman, runs both steps in the
+right order, prints the report and compares the finding count against the
+baseline recorded below:
+
+```sh
+sh scripts/dead-code.sh              # full sweep: @check, then analyse
+sh scripts/dead-code.sh --no-build   # analyse an existing _build
+```
+
+It always exits 0 on a successful analysis — it is advisory, for the reason in
+"Why it is not a gate" below. It exits 2 only if the analyzer itself fails or
+`_build` is missing.
+
+The two steps it runs, if you need them by hand (the tool is baked into the
+`granary-dev` image — see `Containerfile`):
 
 ```sh
 # 1. Build with @check — a plain `dune build` emits only ONE test .cmt, which
@@ -82,6 +96,14 @@ Note that the 2026-07-31 baseline above was taken before #619 removed the three
 `Granary_sql.Ast` aliases (`sql_keywords`, `is_sql_keyword`,
 `ident_needs_quoting`) that used to forward to these, so a rerun should report
 up to three fewer unused exports.
+
+**Measured 2026-09-03 (#160), the first actual rerun: 55 findings, one fewer
+than the 56 above — not three.** The prediction was an upper bound and only one
+of the three removals actually moved the count; the other two were already
+being counted against a different owner. `scripts/dead-code.sh` carries 56 as
+its `BASELINE` so this one-finding gap is reported rather than absorbed. Do not
+"fix" a below-baseline result by lowering the number silently — say which
+finding went away, the way this paragraph does.
 
 ## Why it is not a gate
 
