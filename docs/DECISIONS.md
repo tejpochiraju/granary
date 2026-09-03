@@ -2702,7 +2702,7 @@ why the meta root is checked alongside the txn id and why the memo has to reset
 **backwards** as well as forwards — alternating an as-of read with a live one is
 the case a single-generation memo has to keep re-deriving, and it is pinned.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - **A memo hit skips the meta descent, so the meta pages are no longer pinned
   into `rs_pinned` on that path.** That is fine and is not what pins are for
@@ -2713,6 +2713,16 @@ Two consequences worth knowing:
 - **Interleaving snapshots at different generations degrades to the old cost,
   never to a wrong answer** — each transition resets the memo. That is the
   accepted trade for a bounded, single-generation table.
+- **The memo hangs off `Store.t`, so every catalog and worker handle over one
+  store shares it** — deliberately, and for the same reason as #633's rowid
+  counters: a tree id is an identity within one store. It is unsynchronised,
+  which is sound under Lwt's cooperative single-domain scheduling because the
+  generation check, the reset and the lookup that follows it sit in ONE
+  synchronous block with no await between them, and the publish after the
+  meta descent re-checks. Nothing in `lib/` spawns a domain (`Parallel` has no
+  call sites there), and the per-store `active_readers` / `trees` / `tree_tags`
+  hashtables already rest on the same assumption. **Anything that runs reads on
+  a second domain owes this table a lock**, along with those three.
 
 The measured effect, and the other half of #416's re-measurement, are recorded
 in `test/test_point_lookup_alloc_416.ml`'s header: a warm
@@ -2728,6 +2738,12 @@ still dominant and still unaddressed: ~420 words in the data-tree descent
 (async multi-level Lwt bind chains, needing the synchronous cache-resident fast
 path) and ~160 in `ro_begin`/`ro_end`. The issue's "well under 500
 words/lookup" target is open.
+
+One stale thing in #416 itself, so nobody hunts for it: its acceptance criteria
+ask to re-run `test/bench_multicore_read_headroom.ml`. **That file does not
+exist in the tree** (nor does any other `Domain.spawn` site outside
+`lib/parallel`, which has no callers), so that criterion cannot be met as
+written.
 
 `test/test_ro_root_memo_416.ml` pins the invalidation (commit, DDL, rollback,
 as-of/live alternation) and the fused projection; both halves were
