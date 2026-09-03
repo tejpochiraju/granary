@@ -110,7 +110,7 @@ Two further things about that test are worth knowing before editing it:
   two-pipe handshake — the child holds the lock until the parent says it is done
   probing — so no timing assumption survives.
 
-Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
+Six gates are **not** wall-clock and therefore **not** neutralized anywhere:
 
 | test | guards | gate | knob |
 |---|---|---|---|
@@ -120,6 +120,7 @@ Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
 | `test_agg_retention_423` | #423 the net-zero SUM-group retention in `Aggregate` growing per UPDATE rather than per distinct group, or costing more than one map node plus one record | marginal live heap < 16 words per retained group when the group count doubles, and quadrupling the churn over ONE key adds < 16 words total | `GRANARY_MEM_MAX_WORDS_PER_GROUP` |
 | `test_view_callback_746` | #746 `Db.register_view_callback` going back to an O(n^2) list append | doubling the registrations must not more than double the words allocated (< 2.5; linear is 2.0, the old `@` append measured 4.0) | `GRANARY_MEM_MAX_CALLBACK_SLOPE` |
 | `test_autoinc_mirror_316` | #316 the #314 per-row AUTOINCREMENT catalog-mirror write growing beyond its measured cost | an autocommit AUTOINCREMENT insert allocates < 3.0x a plain rowid one (measured 1.20 at 3 columns, 1.27 at 30), and < 1.5x inside an explicit transaction (measured 1.001) | `GRANARY_MIRROR_MAX_RATIO` |
+| `test_point_lookup_alloc_416` | #416 the warm point-lookup read path re-growing its per-lookup allocation — specifically the `Op_project` `Lwt_stream.map` layer and the per-snapshot meta-tree root resolution | a warm `Op_rowid_lookup` re-execution allocates < 1050 words (measured 950.9, deterministic to the decimal across runs) | `GRANARY_MEM_MAX_WORDS_PER_LOOKUP` |
 
 The first two are complements, not duplicates: #600's doubles the violations along
 with the table and so cannot tell a retaining scan from a retaining victim
@@ -550,6 +551,10 @@ things that were tried and rejected) is usually the point.
   optimised (#316).** The durable cost is two dirtied WAL pages, identical at
   3 and 30 columns — not the blob size the issue suspected. 19-27% over a plain
   rowid insert, confined to autocommit; closed as measured-and-acceptable.
+- **A tree's root is a function of the committed state, not of the snapshot,
+  so it can be memoized across RO snapshots at one committed generation
+  (#416).** Fused `Op_project` into the rowid point lookup too; together a
+  warm point lookup drops from 1419.9 to 950.9 words, −33%.
 - **One `Db.t` holds one explicit transaction; a colliding `BEGIN` poisons the
   handle and `ROLLBACK` is the sole exit (#555).** `#584` and `#598` name
   residual gaps (a post-recovery contamination window; an ATTACH schema switch

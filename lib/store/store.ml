@@ -745,11 +745,7 @@ let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
   st.current_tree <- None;
   let snap_frames = if snap.rs_snap_frames = 0 then None else Some snap.rs_snap_frames in
   let make_tree root_page =
-    Btree.create
-      ?snapshot_frames:snap_frames
-      ~pin_set:snap.rs_pinned
-      st.pager
-      ~root_page
+    Btree.create ?snapshot_frames:snap_frames ~pin_set:snap.rs_pinned st.pager ~root_page
   in
   let* r =
     match Hashtbl.find_opt snap.rs_snap_trees tid with

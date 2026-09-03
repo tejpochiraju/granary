@@ -2190,3 +2190,13 @@
  (name test_join_key_743)
  (modules test_join_key_743)
  (libraries granary alcotest lwt.unix))
+
+; #416: the RO tree-root memo must never serve a root from a different
+; committed generation (commits, DDL, rollback, as-of/live alternation), and
+; the Op_project fusion into a rowid point lookup must project exactly what
+; the Lwt_stream.map wrapper it replaced would have.
+
+(test
+ (name test_ro_root_memo_416)
+ (modules test_ro_root_memo_416)
+ (libraries granary granary.unix granary.store alcotest lwt lwt.unix unix))

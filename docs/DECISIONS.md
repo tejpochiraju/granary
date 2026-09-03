@@ -2679,6 +2679,61 @@ written. And `fts_execute_query`'s `FQ_and` intersection is still
 ~4x per doubling). That is the same defect class in a different function and is
 tracked separately.
 
+### A tree's root is a function of the committed state, not of the snapshot (#416)
+
+`Store.bt_state` memoizes `tree_id -> data-tree root page` **across** RO
+snapshots, tagged with the committed generation it describes — the pair
+`(header txn_id, meta root page)`. A generation mismatch resets the whole memo
+before anything is served from it, so at most one committed state is ever
+described, and the publish after the meta descent re-checks the generation
+because that descent awaited.
+
+**The soundness argument is the one `rs_snap_trees` already rested on, not a
+new one.** A snapshot resolves each tree once and reuses that root for its
+whole life however many commits happen meanwhile, so a tree's root is already
+treated as a function of the committed state the snapshot reads. Two snapshots
+at the *same* committed state therefore observe the same roots by definition;
+all this change does is identify that state by `(txn_id, meta root)` rather
+than by snapshot identity. `commit` advances `txn_id` monotonically and never
+reuses a value, and `rollback` leaves both the id and the root page alone while
+reverting the meta tree to that root (#382), so an aborted txn cannot strand an
+entry. `ro_begin_as_of` resolves its snapshot from a *history record*, which is
+why the meta root is checked alongside the txn id and why the memo has to reset
+**backwards** as well as forwards — alternating an as-of read with a live one is
+the case a single-generation memo has to keep re-deriving, and it is pinned.
+
+Two consequences worth knowing:
+
+- **A memo hit skips the meta descent, so the meta pages are no longer pinned
+  into `rs_pinned` on that path.** That is fine and is not what pins are for
+  here: the checkpoint's RO gate is `active_reader_frames` (registered at
+  `ro_begin`), not the pin set, and a page nobody reads needs no pin. Anything
+  that makes a pin load-bearing for *correctness* rather than for cache
+  retention owes this path a second look.
+- **Interleaving snapshots at different generations degrades to the old cost,
+  never to a wrong answer** — each transition resets the memo. That is the
+  accepted trade for a bounded, single-generation table.
+
+The measured effect, and the other half of #416's re-measurement, are recorded
+in `test/test_point_lookup_alloc_416.ml`'s header: a warm
+`SELECT payload FROM t WHERE id = ?` went 1419.9 -> 950.9 words/lookup, of which
+~214 is this memo and ~231 is fusing `Op_project` into `Op_rowid_lookup`
+(`Lwt_stream.map` builds a whole second stream over a one-row one, and its
+source is the *async* `Lwt_stream.from`; `project_row` is a pure ordinal
+selection, so applying it to the at-most-one row is observationally identical).
+**#416's own 2026-06-19 attribution is stale on both points** — it priced the
+meta descent as "≈0, the meta tree is tiny/hot" and never costed the
+`Lwt_stream.map` layer at all. The terms it *did* identify as dominant are
+still dominant and still unaddressed: ~420 words in the data-tree descent
+(async multi-level Lwt bind chains, needing the synchronous cache-resident fast
+path) and ~160 in `ro_begin`/`ro_end`. The issue's "well under 500
+words/lookup" target is open.
+
+`test/test_ro_root_memo_416.ml` pins the invalidation (commit, DDL, rollback,
+as-of/live alternation) and the fused projection; both halves were
+mutation-checked — disabling the generation test fails five of its six cases,
+dropping the ordinals fails five as well.
+
 ### One `Db.t`, one explicit transaction (#555)
 
 A `Db.t` carries a single explicit-transaction slot and every statement resolves
