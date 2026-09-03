@@ -1453,10 +1453,59 @@ EOF
   load-bearing while the runtime path was unreachable; the path is reachable
   now, and the check stays as the earlier, better-located error.
 
-  `INSERT ... SELECT ... ON CONFLICT DO UPDATE` has no grammar at all
-  (`S_insert_select` carries no `upsert_update`) and must stay a **parse
-  error** rather than a silently-dropped clause — that would be #639 again in
-  a new place.
+  **`INSERT ... SELECT ... ON CONFLICT DO UPDATE` is implemented (#653, 2026-09-03).**
+  It used to have no grammar at all and was therefore a **parse error**, which
+  was the right failure mode while the clause had nowhere to go — a
+  silently-dropped DO UPDATE would have been #639 again in a new place. The
+  requirement was always "implement it fully or keep refusing it"; it is
+  implemented now, and the shape of the implementation is the part to preserve.
+
+  **It is a threading change, not a second upsert.** `execute_insert_select_op`
+  already drove the source stream one row at a time through the *same*
+  `execute_insert` the VALUES form uses; the only thing missing below the
+  grammar was that it did not take `~upsert_update` and so could not pass one.
+  The clause is threaded grammar → `Ast.S_insert_select` → `Sema.BS_insert_select`
+  → `Plan.Op_insert_select` → that one call site. So #639's target-resolution
+  pass, the rowid-alias `S.get` pre-probe, #599/#639's NOT NULL ordering, #667's
+  pre-write uniqueness probe and `last_insert_rowid()` not moving for a DO UPDATE
+  all apply to the SELECT form **by construction rather than by two
+  implementations agreeing**. Anyone tempted to specialise the SELECT path is
+  re-creating exactly the divergence this entry is two pages about. Binding goes
+  through one shared `Sema.bind_upsert_clause` for the same reason — the
+  conflict-target validation and the DO UPDATE assignment rules (#547's NOT NULL
+  check, #629's generated-column refusal) now live once instead of twice.
+
+  Two divergences from sqlite3, both deliberate:
+
+  - **No `WHERE` is needed between the SELECT and the `ON CONFLICT`.** sqlite3
+    cannot parse `INSERT INTO t SELECT k, v FROM src ON CONFLICT(k) DO UPDATE …`
+    — its manual prescribes a `WHERE true` to separate the upsert's `ON` from a
+    join's. Granary's `join_clause` requires the `JOIN` keyword before its `ON`,
+    so once the join list is complete no `ON` can be shifted into it and a
+    trailing one can only begin the upsert. Adding `opt_upsert` to the three
+    SELECT arms left menhir's conflict counts unchanged (35 states / 290
+    conflicts, before and after). `no_where_is_needed_before_on_conflict` pins
+    the permissive spelling *and* the join spelling together — the second is
+    what makes the first safe rather than lucky.
+  - **`ON CONFLICT ... DO UPDATE` on a `USING COLUMNSTORE` table is refused, in
+    both spellings** — this *closes* a hole rather than opening one. The
+    columnar write arms hand the row straight to `Col_store.insert_rows` and
+    probe for no conflict at all, so before #653 the VALUES form accepted the
+    clause, ignored it, and inserted a duplicate key: #639's exact failure mode
+    reached through the storage engine instead of through a modifier. Same
+    reasoning as #660's refusal of a GENERATED column on the same table kind.
+
+  Unchanged and out of scope, all three true of the VALUES form too, so none is
+  a SELECT-form regression: `DO NOTHING` and `DO UPDATE ... WHERE ...` have no
+  grammar in this engine; a **nested** `excluded.<col>` (one buried inside a
+  larger expression, e.g. `excluded.v + 1`) binds to the *target* row's column
+  because `Sema.bind_expr`'s `E_tbl_col` arm drops the qualifier and only
+  `bind_upsert_rhs_expr`'s top-level match recognises `excluded` — a silent
+  wrong answer (sqlite3 says `1010`, granary says `1005`), tracked as **#741**;
+  and a DO UPDATE burns the rowid `execute_insert` allocated before it resolved
+  the conflict, so a mixed upsert/insert statement lands the inserted row at id
+  3 where sqlite3 says 2 (**#742**, the accepted "too HIGH merely skips ids"
+  direction #632 names). Pinned by `test/test_insert_select_upsert_653.ml`.
 
 - **A skipped `INSERT` leaves nothing behind in the STORE and the CATALOG,
   including its BEFORE INSERT trigger's nested DML, in an explicit transaction

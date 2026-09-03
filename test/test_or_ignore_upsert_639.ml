@@ -811,32 +811,54 @@ let multi_row_values_mixes_skip_update_and_insert () =
 
 (* The INSERT ... SELECT form. Two separate facts:
 
-   1. It has no upsert spelling at all — [S_insert_select] carries no
-      [upsert_update] and the grammar offers no [opt_upsert] on those
-      alternatives — so the combination is REFUSED at parse time rather than
-      silently dropped. That is the only acceptable answer while the feature is
-      missing; a silently-ignored DO UPDATE would be #639 again in a new place.
+   1. It now HAS an upsert spelling (#653), and #639's rule holds across it: the
+      explicit target beats [OR IGNORE] for the index it names. While the
+      feature was missing the combination was a parse error, which was the only
+      acceptable answer then — a silently-ignored DO UPDATE would have been #639
+      again in a new place. The implementation threads the clause through to the
+      same [execute_insert] the VALUES form uses rather than reimplementing it,
+      which is why the rule transfers rather than having to be re-asserted.
    2. The projection form's [OR IGNORE] skip is unchanged. [Sema] does not
       inspect a projection, so this route reaches the runtime check with no
       static opinion — the third of #599's three spellings, and the one that was
       always silent. *)
-let insert_select_refuses_the_upsert_and_keeps_the_skip () =
+let insert_select_runs_the_upsert_and_keeps_the_skip () =
   with_db (fun db ->
     seed_alias db;
     exec db "CREATE TABLE src (k INTEGER, v INTEGER)";
     exec db "INSERT INTO src VALUES (1, 10)";
     exec db "INSERT INTO src VALUES (2, NULL)";
     exec db "INSERT INTO src VALUES (3, 30)";
+    (* #653: this statement used to be a parse error, and that was the right
+       failure mode while the clause had nowhere to go. It is implemented now —
+       threaded through to the same [execute_insert] the VALUES form uses — so
+       the assertion is inverted: it must be ACCEPTED and must actually take
+       effect. What has not changed is the rule that makes both answers the same
+       rule: the explicit target beats [OR IGNORE] for the index it names, so the
+       conflicting row is updated rather than skipped, while the projected NULL
+       still follows the modifier and skips. Full coverage of the SELECT form
+       lives in [test_insert_select_upsert_653.ml]; this case stays here to keep
+       #639's own rule pinned across both spellings. *)
     (match
-       run
-         (Db.execute
-            db
-            "INSERT OR IGNORE INTO t SELECT k, v FROM src ON CONFLICT(k) DO UPDATE SET v \
-             = 99")
+       run_stmt
+         db
+         "INSERT OR IGNORE INTO t SELECT k, v FROM src ON CONFLICT(k) DO UPDATE SET v = \
+          99"
+         []
      with
-     | Ok () ->
-       Alcotest.fail "INSERT ... SELECT ... ON CONFLICT DO UPDATE was silently accepted"
-     | Error _ -> ());
+     | Ok n -> Alcotest.(check int) "the upsert and the clean row wrote" 2 n
+     | Error e ->
+       Alcotest.failf
+         "INSERT ... SELECT ... ON CONFLICT DO UPDATE raised: %a"
+         Db.pp_error
+         e);
+    expect_rows
+      db
+      ~msg:"the target beat OR IGNORE; the NULL row still skipped"
+      [ "1|99"; "3|30" ]
+      "SELECT * FROM t ORDER BY k";
+    exec db "DELETE FROM t";
+    exec db "INSERT INTO t VALUES (1, 5)";
     (* Without the clause: the projected NULL skips, the conflicting row skips
        (no upsert to run), the clean row lands. *)
     (match run_stmt db "INSERT OR IGNORE INTO t SELECT k, v FROM src" [] with
@@ -1158,9 +1180,9 @@ let () =
             `Quick
             multi_row_values_mixes_skip_update_and_insert
         ; Alcotest.test_case
-            "INSERT ... SELECT refuses the upsert and keeps the skip"
+            "INSERT ... SELECT runs the upsert and keeps the skip"
             `Quick
-            insert_select_refuses_the_upsert_and_keeps_the_skip
+            insert_select_runs_the_upsert_and_keeps_the_skip
         ] )
     ; ( "631-skipped-row-triggers"
       , [ Alcotest.test_case
