@@ -73,8 +73,18 @@ module Make (S : SPEC) = struct
          (* Prune ONLY when both totals are zero.  A SUM group whose weights
             cancel to [mult = 0] but [aggv <> 0] is deliberately kept: dropping it
             would lose [aggv] and corrupt the value if the group later revives.
-            (For COUNT this never arises — [aggv = mult].)  On a high-churn SUM
-            view such net-zero groups accumulate; bound it in Phase 3 if needed. *)
+
+            #423 decided to ACCEPT this retention and document its ceiling rather
+            than compact or age it out.  The ceiling: a retained group costs 9
+            major-heap words plus the caller's group key, and the number of
+            retained groups is bounded by the number of DISTINCT groups the
+            operator has ever been shown — never by the number of updates.  It
+            also cannot arise at all unless some element of the group carries a
+            NEGATIVE cumulative weight (all-nonnegative weights summing to zero
+            forces every weight to zero, hence [aggv = 0]), nor unless the
+            measure takes two different values inside the one group — so COUNT,
+            and any constant measure, never retain.  See [aggregate.mli] and
+            [docs/IVM_MEMORY.md]. *)
          t.groups
          <- (if new_acc.mult = 0 && new_acc.aggv = 0
              then GMap.remove g t.groups
@@ -85,4 +95,5 @@ module Make (S : SPEC) = struct
   ;;
 
   let output t = t.out
+  let retained_groups t = GMap.cardinal t.groups
 end

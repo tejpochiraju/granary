@@ -225,4 +225,5 @@ module Agg_engine = struct
   ;;
 
   let snapshot st = Agg.output st |> ZOut.to_list |> List.map fst
+  let retained_groups st = Agg.retained_groups st
 end
