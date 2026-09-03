@@ -1790,3 +1790,20 @@
   alcotest
   lwt.unix
   unix))
+
+; #588: PRAGMA not_null_repair is destructive, so Db.execute performs it; the
+; report half stays on the query path, and a read-only snapshot gets a
+; statement-level refusal instead of the storage layer's In_ro_txn message.
+
+(test
+ (name test_not_null_repair_588)
+ (modules test_not_null_repair_588)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))

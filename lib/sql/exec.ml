@@ -7716,6 +7716,19 @@ let to_stream_ref
     failwith "to_stream_ref not yet initialised")
 ;;
 
+(** #588: forward reference to [not_null_repair_run], the shared core of
+    [PRAGMA not_null_repair].  It lives in the same mutually-recursive block as
+    [to_stream], and [execute_with_count] — defined above it — needs it so the
+    repair is reachable through the WRITE api ([Db.execute]) and not only
+    through [Db.query].  Returns the report rows and the number of rows actually
+    deleted; the write path reports the latter as the statement's change count,
+    the query path streams the former. *)
+let not_null_repair_run_ref
+  : (S.t -> txn_mode -> Cat.t -> (Row.t list * int) Lwt.t) ref
+  =
+  ref (fun _store _mode _cat -> failwith "not_null_repair_run_ref not yet initialised")
+;;
+
 (* Op_create_table: register the table, its UNIQUE indexes, and FK constraints. *)
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
@@ -8814,6 +8827,19 @@ let execute_with_count
     Lwt.return 0
   | Plan.Op_vacuum ->
     Lwt.fail_with "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
+  (* #588: [PRAGMA not_null_repair] DELETEs rows, so it belongs on the WRITE
+     path.  It used to be reachable only through [Exec.query] / [Db.query]: the
+     natural call for a statement that mutates and returns no interesting rows
+     — [Db.execute] — answered "use Exec.query for read operations" and deleted
+     nothing, so a caller had to route a destructive operation through the read
+     api to make it happen.  Both entry points now perform the repair, and they
+     differ only in what they hand back: [Db.execute] reports the number of rows
+     deleted as the statement's change count, [Db.query] streams the per-column
+     (table, column, count) report.  Its read-only half, [PRAGMA
+     not_null_check], stays on the query path alone. *)
+  | Plan.Op_pragma_not_null_repair ->
+    let* _rows, deleted = !not_null_repair_run_ref store mode cat in
+    Lwt.return deleted
   | Plan.Op_attach _
   | Plan.Op_detach _
   | Plan.Op_database_list
@@ -8839,7 +8865,6 @@ let execute_with_count
   | Plan.Op_pragma_get_user_version
   | Plan.Op_pragma_integrity_check
   | Plan.Op_pragma_not_null_check
-  | Plan.Op_pragma_not_null_repair
   | Plan.Op_pragma_get_fk
   | Plan.Op_pragma_get_recursive_triggers
   | Plan.Op_pragma_get_defer_fk
@@ -13385,13 +13410,28 @@ and stream_pragma_not_null_check store mode cat =
    names, through the ordinary delete path so index entries and ON DELETE
    cascades are honoured.  Reports the same (table, column, count) shape as the
    check; a row violating two NOT NULL columns is counted under both but
-   deleted once, so the counts are per-column violations, not a total. *)
-and stream_pragma_not_null_repair store mode cat =
-  let cat_val =
-    match cat with
-    | None -> failwith "Exec.to_stream: Op_pragma_not_null_repair requires catalog"
-    | Some c -> c
-  in
+   deleted once, so the counts are per-column violations, not a total.
+
+   #588: this is the shared CORE, reached from both entry points —
+   [stream_pragma_not_null_repair] below (the query path, which streams the
+   report rows) and [execute_with_count]'s [Op_pragma_not_null_repair] arm (the
+   write path, which reports the rows deleted as the statement's change count),
+   the latter through [not_null_repair_run_ref].  Splitting it is what keeps the
+   two from being able to disagree about what the repair does. *)
+and not_null_repair_run store mode (cat_val : Cat.t) =
+  (* #588: a read-only ambient snapshot ([Db.query_as_of], or any [In_ro_txn])
+     used to reach [acquire_txn] and fail with "write attempted under a
+     read-only transaction (In_ro_txn)" — a storage-layer message about an
+     internal mode, from a statement whose problem is that it is destructive.
+     Refuse at the statement level instead, and name the read-only half that
+     DOES work against a snapshot. *)
+  (match mode with
+   | In_ro_txn _ ->
+     failwith
+       "PRAGMA not_null_repair deletes rows and cannot run against a read-only \
+        snapshot or transaction; survey it with PRAGMA not_null_check, and repair \
+        it on a writable connection"
+   | Auto | In_txn _ -> ());
   let* tables = Cat.list_tables cat_val in
   (* Reuse the ambient write txn when there is one: opening our own would block
      on the write lock the caller already holds. *)
@@ -13412,10 +13452,24 @@ and stream_pragma_not_null_repair store mode cat =
            tables
        in
        let* () = release_txn ~cat:cat_val tx owned in
-       Lwt.return (Lwt_stream.of_list (List.concat per_table)))
+       (* #630: [per_table] is one entry per TABLE holding that table's report
+          rows — O(tables), not O(violations) and not O(table).  The victim
+          buffer it was derived from is already gone. *)
+       let rows = List.concat_map fst per_table in
+       let deleted = List.fold_left (fun acc (_, n) -> acc + n) 0 per_table in
+       Lwt.return (rows, deleted))
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
+
+and stream_pragma_not_null_repair store mode cat =
+  let cat_val =
+    match cat with
+    | None -> failwith "Exec.to_stream: Op_pragma_not_null_repair requires catalog"
+    | Some c -> c
+  in
+  let* rows, _deleted = not_null_repair_run store mode cat_val in
+  Lwt.return (Lwt_stream.of_list rows)
 
 (* #563: delete one table's NOT NULL violators, returning its report rows.
 
@@ -13434,17 +13488,27 @@ and stream_pragma_not_null_repair store mode cat =
    Both cases are pinned in [test_not_null_567.ml] ("clean table works" and
    "report sees a columnstore violation").
 
-   {b Known residual (#588).}  A 0-count row is still weaker than a
-   statement-level error naming the table, which is what this ought to be and
-   what a caller can act on without knowing the convention.  That error is not
-   expressible from this path at all, for the reason above; #588 tracks fixing
-   the [Db.query_impl] guard, and closing it should turn this branch back into
-   a raise. *)
+   {b Why the 0-count row survived #588, which made the raise expressible.}
+   #627 fixed [Db.query_impl]'s guard ([Lwt.catch] around the whole call, not
+   [| exception Failure msg ->] on it), and #588 put the repair on the write
+   path too, whose [Lwt.catch] always converted a [Failure] — so a raise here
+   WOULD now surface as [Error (Runtime msg)] on both entry points.  It is
+   still not taken, for a reason #588 did not weigh: the raise happens partway
+   through [Lwt_list.map_s] over the tables, and [not_null_repair_run] rolls the
+   whole repair back.  A database holding one unrepairable columnstore would
+   therefore become unrepairable ENTIRELY — there is no per-table spelling of
+   this PRAGMA to fall back on — which trades a convention an operator can act
+   on for a refusal they cannot.  Anything that reopens this owes a per-table
+   repair first, or a pre-pass that refuses before deleting anything.
+
+   Returns the report rows paired with the number of rows actually DELETED
+   (#588): the write path reports that as the statement's change count, and it
+   is the deduplicated row count, not the sum of the per-column counts. *)
 and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~victims =
   if counts = []
-  then Lwt.return []
+  then Lwt.return ([], 0)
   else if Cat.is_columnar meta
-  then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) counts)
+  then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) counts, 0)
   else (
     let indexes = Cat.indexes_for_table cat_val ~table:meta.Cat.name in
     let* child_refs =
@@ -13477,7 +13541,7 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~
         victims
     in
     mark_dirty meta.Cat.name;
-    Lwt.return (not_null_report_rows meta ~counted:Fun.id counts))
+    Lwt.return (not_null_report_rows meta ~counted:Fun.id counts, List.length victims))
 
 and stream_sqlite_master store cat =
   let cat_val =
@@ -14296,6 +14360,9 @@ and to_stream
    Op_insert_select.  This runs once at module initialization time, after both
    functions are fully defined in the let-rec block above. *)
 let () = to_stream_ref := to_stream
+
+(* #588: see [not_null_repair_run_ref]. *)
+let () = not_null_repair_run_ref := not_null_repair_run
 
 (* ------------------------------------------------------------------ *)
 (* Public query entry point                                             *)

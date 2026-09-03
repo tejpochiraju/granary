@@ -729,6 +729,47 @@ EOF
   **not** follow — it reports on cells already on disk whose only repair is to
   rewrite them, which is meaningless for a column never read from disk. Pinned by
   `test/test_not_null_629.ml`.
+- **`PRAGMA not_null_repair` is a write; `PRAGMA not_null_check` is a read
+  (#588, fixed 2026-09-03).** The repair DELETEs rows but was dispatched as a
+  query, so `Db.execute db "PRAGMA not_null_repair"` answered
+  `Exec.execute: use Exec.query for read operations` and deleted **nothing** —
+  the natural call for a mutating statement silently did nothing but error,
+  while the read API was the one that actually destroyed data. Both entry
+  points now perform it and they differ in what they hand back: `Db.execute`
+  reports the **rows deleted** as the statement's change count (deduplicated —
+  a row violating two NOT NULL columns is counted under both in the report and
+  deleted once), `Db.query` streams the per-column `(table, column, count)`
+  report. Removing the query path was rejected: it is the only way to *see* the
+  report, which is #563's whole point. `not_null_check` stays on the query path
+  alone, so the two PRAGMAs differ in call shape the way they differ in effect.
+
+  The mechanics: `Exec.execute_with_count` gained an `Op_pragma_not_null_repair`
+  arm reaching the shared core `not_null_repair_run` through
+  `not_null_repair_run_ref`, the same forward-reference idiom `to_stream_ref`
+  already uses for `Op_insert_select` (the core lives in the recursive block
+  below `execute_with_count`). `repair_not_null_table` returns
+  `(report rows, rows deleted)` rather than just the rows.
+
+  **The read-only half of the issue.** A repair reached under `query_as_of` (or
+  any `In_ro_txn`) used to fail with `write attempted under a read-only
+  transaction (In_ro_txn)` — a storage-layer message about an internal mode,
+  from a statement whose problem is that it is destructive. `not_null_repair_run`
+  now refuses at the statement level and names `PRAGMA not_null_check`, which
+  *does* work against a snapshot and is deliberately still served there.
+
+  **What was NOT done, and why.** #588 asks, as a consequence, that
+  `repair_not_null_table`'s columnstore arm "go back to being a raise" — a
+  columnstore is append-only, so its violations cannot be deleted, and the arm
+  reports a count-`0` row by convention instead. The raise is now *expressible*
+  (#627 fixed `Db.query_impl`'s guard, and the write path always converted a
+  `Failure`), but it is still not taken: the raise would happen partway through
+  the per-table `Lwt_list.map_s` and `not_null_repair_run` rolls the whole
+  repair back, so one unrepairable columnstore would make the entire database
+  unrepairable — and there is no per-table spelling of this PRAGMA to fall back
+  on. That trades a convention an operator can act on for a refusal they
+  cannot. Anything reopening this owes a per-table repair first, or a pre-pass
+  that refuses *before* deleting anything. Pinned by
+  `test/test_not_null_repair_588.ml`.
 - **`Db.dump`'s #548 NOT NULL refusal points at the PRAGMAs (#583, fixed
   2026-09-03).** The refusal is raised from inside the row stream, so it names
   the violation it *stopped on*, not the scope. Hand-writing the repairing
