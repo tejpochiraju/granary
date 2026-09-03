@@ -362,7 +362,7 @@ When your work is ready:
 
 ```sh
 git push origin <branch-name>
-~/.local/bin/forgejo pr create IoTReadyNext/granary \
+~/bin/forgejo pr create IoTReadyNext/granary \
   --title="feat(#NNN): short description" \
   --head=<branch-name> \
   --base=main \
@@ -384,7 +384,7 @@ EOF
 "File an issue" means Forgejo (`IoTReadyNext/granary`), not GitHub or any third-party URL.
 
 ```sh
-~/.local/bin/forgejo issue create IoTReadyNext/granary --title="..." --body="..."
+~/bin/forgejo issue create IoTReadyNext/granary --title="..." --body="..."
 ```
 
 ### Testing standards
@@ -2549,12 +2549,34 @@ bin/          — CLI entry point
 
 ## Forgejo CLI reference
 
-Binary: `~/.local/bin/forgejo`. Repo slug: `IoTReadyNext/granary`.
+Binary: `~/bin/forgejo` — **not** `~/.local/bin/forgejo`, which does not exist
+and which this file claimed until 2026-09-03. Repo slug: `IoTReadyNext/granary`.
+
+**`forgejo issue list` silently caps at 50 results and honours no limit flag**
+(`--limit` is not parsed, and `forgejo issue list --help` answers `API error
+(404): GetUserByName`). It prints 50 rows and no indication that more exist, so
+any count taken from it is a floor, not a total. On 2026-09-03 the real backlog
+was 59 open issues and the nine oldest — #405, #378, #362, #316, #266, #160,
+#156, #131, #86 — were invisible to every `issue list` invocation, which is how
+a whole sweep came to be planned against a number that was wrong.
+
+**To count or enumerate issues, page the API directly** (`type=issues` excludes
+PRs, which share the number space):
+
+```sh
+set -a; . ~/.config/forgejo-cli/config; set +a
+curl -sS -H "Authorization: token $FORGEJO_TOKEN" \
+  "$FORGEJO_URL/api/v1/repos/IoTReadyNext/granary/issues?state=open&type=issues&limit=50&page=1"
+```
+
+Increment `page` until a request returns an empty array. `issue view <N>` is
+unaffected and answers correctly for an issue the list omits — which is the
+symptom to watch for: an issue that `view` says is open but `list` never shows.
 
 Common commands:
 
 ```sh
-forgejo issue list IoTReadyNext/granary
+forgejo issue list IoTReadyNext/granary   # capped at 50 — see above
 forgejo issue view IoTReadyNext/granary <N>
 forgejo issue close IoTReadyNext/granary <N>
 forgejo pr list IoTReadyNext/granary
