@@ -746,6 +746,58 @@ EOF
   - `Op_nested_loop_join` cannot carry a subquery in its probe through the
     planner, but it is a public constructor, so `stream_nested_loop_join`
     refuses one explicitly rather than encoding it as NULL.
+  - **The two walkers are now exhaustive over the clauses and nodes an outer
+    reference can sit in (#721 and #732, fixed 2026-09-03).** Both were the
+    same shape as #670 in a new place — a walker not descending somewhere that
+    carries expressions, turning a runnable query into a refusal — and both are
+    error-to-answer changes, never answer-to-answer:
+    - `substitute_outer_in_expr` descends into `E_agg`, `E_agg_distinct` and
+      `E_window` (the latter's `args`, `partition_by` and `order_by`;
+      `frame_spec` carries no `expr`). #670 had listed them with an explicit
+      `-> e` to make the omission visible. `E_fts_snippet` is a true leaf and
+      was never one of them. #488 is what made this reachable at all: an
+      aggregate's argument became a general expression, so `SUM(i.v + o.n)` is
+      a legal spelling.
+    - `substitute_outer_in_stmt` rewrites a SELECT's `proj` and the FROM-less
+      `S_const_select` that `(SELECT o.n * 10)` parses to, and its statement
+      match is exhaustive rather than `| _ -> s`. `inner_scope_of` answers
+      `no_inner_scope` for `S_const_select` — it owns no input, so it can
+      shadow nothing — rather than the "owns everything" default every other
+      non-SELECT gets.
+    - `E_window`'s only legal home is a projection, so #721's window arms are
+      unreachable without #732's clause walk; the two land together for that
+      reason.
+    - A projection in the parser's `Cols` shape (the polymorphic-variant
+      `` `Cols ``) is a `string list` and cannot hold a substituted literal, so
+      `substitute_outer_proj` **promotes it to `` `Exprs ``** — but only when a
+      name actually resolves. That condition is what keeps the
+      detector honest: `stmt_has_free_column_ref` runs this same function with
+      a probe binding that resolves nothing, so it inspects without reshaping.
+    - **`order` and `group_by` are deliberately NOT rewritten, and that is a
+      decision.** `group_by` and `limit`/`offset` are structurally incapable of
+      holding a substituted value (`Ast.group_by_item` is
+      `string * string option`; the limits are `int option`). `order` could be,
+      and is not, for two reasons: sqlite3 *also* refuses a correlated
+      reference in a subquery's ORDER BY (`no such column: o.n`,
+      oracle-checked on 3.45.1), so rewriting it would create a divergence
+      rather than remove one; and an ORDER BY key may name an **output alias**
+      (#489/#663), which `inner_scope_of`'s `has_col` knows nothing about — so
+      a subquery whose alias collided with an outer column name would have its
+      sort key rewritten to a constant and silently return unsorted rows. That
+      is the "plausible wrong answer" class this area exists to prevent, and it
+      is worse than the refusal it would replace. Pinned as refusals in
+      `test/test_outer_ref_732.ml`.
+    - Widening the substituter widened the detector by construction, which is
+      the intended direction: a statement can only move from "evaluate eagerly"
+      to "treat as correlated". The shape that shows it is a free reference
+      appearing **only** in the inner projection — `EXISTS (SELECT o.n FROM i)`
+      used to bind cleanly, be evaluated before any outer row existed, and be
+      refused.
+    - #670's own file kept a boundary case asserting the aggregate spelling was
+      *refused*, with instructions to replace rather than delete it if a later
+      change resolved it. #721 is that change and the case now asserts the
+      answer. Full coverage lives in `test/test_outer_ref_721.ml` and
+      `test/test_outer_ref_732.ml`.
 - **A view is resolved at EVERY FROM position, and each subquery carries its own
   expansion (#496/#497, fixed 2026-09-03).** A view reference is desugared into
   a CTE wrapped around the statement that names it. That rewrite used to be

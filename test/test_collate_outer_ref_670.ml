@@ -231,54 +231,40 @@ let a_collate_inside_a_correlated_exists_body () =
           COLLATE NOCASE)"))
 ;;
 
-(* A refusal surfaces either as a [Db.error] or as an exception, and either
-   while the plan is built or while the stream is pulled.  All four are the
-   same outcome: the query did not answer. *)
-let refusal_of db sql =
-  try
-    match run (Db.query db sql) with
-    | Error e -> Format.asprintf "%a" Db.pp_error e
-    | Ok stream ->
-      ignore (run (Lwt_stream.to_list stream));
-      ""
-  with
-  | Failure m -> m
-  | e -> Printexc.to_string e
-;;
+(* #721, the boundary this fix used to stop at — {b now resolved}.
 
-(* #721, the boundary this fix stops at.  [substitute_outer_in_expr] is now
-   exhaustive, and three constructors that carry sub-expressions —
-   [E_agg], [E_agg_distinct], [E_window] — are listed with an explicit [-> e]
-   rather than descended into.  Each is a separate error-to-answer change
-   needing its own oracle-checked test.
+   When this file was written, [substitute_outer_in_expr] was exhaustive but
+   three constructors that carry sub-expressions ([E_agg], [E_agg_distinct],
+   [E_window]) were listed with an explicit [-> e] rather than descended into,
+   and this case asserted that the query below was REFUSED.  The comment it
+   carried set the rule for that moment: "if a later change resolves it, this
+   assertion fails and whoever made it must replace the case rather than delete
+   it".  #721 is that change, and this is the replacement — the same query, the
+   same fixture, asserting the answer instead of the refusal.
 
-   [E_fts_snippet] was originally counted as a fourth and is NOT one: it is a
-   record of a table name, a column index, three string tags and a token count,
-   with no [expr] field ([Ast.E_fts_snippet], ast.ml:247), so it is a true leaf
-   and there is no spelling in which an outer reference could sit inside it.
+   ([E_fts_snippet] was once counted as a fourth constructor and is not one: it
+   is a record of a table name, a column index, three string tags and a token
+   count with no [expr] field ([Ast.E_fts_snippet], ast.ml:247), so it is a
+   true leaf.)
 
-   This pins that the omission is REACHABLE, which is what makes #721 a real
-   issue rather than a theoretical one: an outer reference inside an aggregate
-   ARGUMENT is refused for exactly the reason #670 was.  sqlite3 answers [a]
-   for this query.  If a later change resolves it, this assertion fails and
-   whoever made it must replace the case rather than delete it — the same
-   discipline #627 records for its refusal categories. *)
-let an_outer_reference_inside_an_aggregate_argument_is_still_refused_721 () =
+   sqlite3 answers [a] for this query, which is what it answers now.  The full
+   #721 coverage — all three constructors, each with a control whose value
+   differs — lives in [test/test_outer_ref_721.ml]; this case stays here so
+   that #670's own file keeps recording where its scope ended and what closed
+   it. *)
+let an_outer_reference_inside_an_aggregate_argument_is_answered_721 () =
   with_db (fun db ->
     exec db "CREATE TABLE oa (k TEXT, n INTEGER)";
     exec db "CREATE TABLE ia (fk TEXT, v INTEGER)";
     exec db "INSERT INTO oa VALUES ('a',1)";
     exec db "INSERT INTO ia VALUES ('a',5)";
-    let msg =
-      refusal_of
-        db
-        "SELECT k FROM oa WHERE EXISTS (SELECT 1 FROM ia WHERE ia.fk = oa.k GROUP BY \
-         ia.fk HAVING SUM(ia.v + oa.n) > 0)"
-    in
-    Alcotest.(check bool)
-      (Printf.sprintf "#721: still refused, not answered (got %S)" msg)
-      true
-      (msg <> ""))
+    check_rows
+      ~label:"#721: answered, not refused"
+      [ [ "a" ] ]
+      (rows_of
+         db
+         "SELECT k FROM oa WHERE EXISTS (SELECT 1 FROM ia WHERE ia.fk = oa.k GROUP BY \
+          ia.fk HAVING SUM(ia.v + oa.n) > 0)"))
 ;;
 
 let () =
@@ -318,11 +304,11 @@ let () =
             `Quick
             collate_in_a_projection_folds_the_value_pre_existing_722
         ] )
-    ; ( "boundary_721"
+    ; ( "resolved_by_721"
       , [ Alcotest.test_case
-            "an_outer_reference_inside_an_aggregate_argument_is_still_refused_721"
+            "an_outer_reference_inside_an_aggregate_argument_is_answered_721"
             `Quick
-            an_outer_reference_inside_an_aggregate_argument_is_still_refused_721
+            an_outer_reference_inside_an_aggregate_argument_is_answered_721
         ] )
     ]
 ;;

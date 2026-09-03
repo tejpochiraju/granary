@@ -10049,8 +10049,15 @@ let no_inner_scope : inner_scope =
     subquery owns it" — which reduces to the pre-#592 behaviour of rewriting
     only qualified references. Anything else would rewrite on a guess.
 
-    A non-SELECT has no clauses this module rewrites, so both halves default to
-    "shadowed" there. *)
+    #732: a FROM-LESS SELECT ([S_const_select], the shape of
+    [(SELECT o.n * 10)]) owns nothing — it has no inputs at all — so it is
+    {!no_inner_scope}, and every column reference in it is by construction the
+    enclosing query's. That is not the same as the default below: "owns
+    everything" would shadow the outer reference the substitution exists to
+    resolve, and this is now a statement form whose clauses {i are} rewritten.
+
+    Every other non-SELECT has no clauses this module rewrites, so both halves
+    default to "shadowed" there. *)
 let inner_scope_of (cat_opt : Cat.t option) (s : Ast.stmt) : inner_scope =
   match s with
   | Ast.S_select r ->
@@ -10082,6 +10089,7 @@ let inner_scope_of (cat_opt : Cat.t option) (s : Ast.stmt) : inner_scope =
         fun name -> List.exists (String.equal name) cols)
     in
     { has_col; has_table }
+  | Ast.S_const_select _ -> no_inner_scope
   | _ -> { has_col = (fun _ -> true); has_table = (fun _ -> true) }
 ;;
 
@@ -10152,19 +10160,73 @@ let rec substitute_outer_in_expr
      at the top of this match handle the ones it does not.  Listed rather than
      left to a catch-all so those guards cannot be edited into a silent hole. *)
   | Ast.E_col _ | Ast.E_tbl_col _ -> e
-  (* These three DO carry sub-expressions and are deliberately NOT descended
-     into.  Descending would be an error-to-answer change of its own — each is
-     a distinct spelling in which a correlated reference could newly resolve,
-     and each needs its own oracle-checked test, which #670 is not the place
-     for.  Listed explicitly rather than caught by [| _ ->] so that the choice
-     is visible: an exhaustive match is also what makes a NEW constructor a
-     compile error here instead of the silent refusal #670 is about.
-     Tracked as #721. *)
-  | Ast.E_agg _ | Ast.E_agg_distinct _ | Ast.E_window _ -> e
+  (* #721: these three carry sub-expressions and are now descended into.  #670
+     listed them explicitly with [-> e] to make the omission visible; each was
+     a spelling in which a correlated reference sat somewhere this walker never
+     looked, so the reference survived, [Sema.bind] failed on it, and the
+     statement came back as a refusal.
 
-(** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST
-    stmt.  [enclosing] is the union of the scopes of every subquery between this
-    one and the row [bnd] describes; it is {!no_inner_scope} at the top. *)
+     [E_agg] is the one that is reachable on its own, in a correlated
+     subquery's HAVING —
+     [EXISTS (SELECT 1 FROM i WHERE i.fk = o.k GROUP BY i.fk
+              HAVING SUM(i.v + o.n) > 0)] — and #488, which made an aggregate's
+     argument a general expression rather than a bare column, is what widened
+     that surface.  [E_agg_distinct] is the same node with DISTINCT.
+     [E_window] cannot appear in WHERE or HAVING at all, so its only spelling
+     is a subquery's PROJECTION, which is #732's half of this fix; the two
+     arrive together for that reason.
+
+     [window_spec.frame] carries no [expr] — [frame_bound]'s offsets are [int]
+     ([Ast.frame_bound], ast.ml:158) — so [partition_by] and [order_by] are the
+     whole of it. *)
+  | Ast.E_agg (f, a) -> Ast.E_agg (f, Option.map go a)
+  | Ast.E_agg_distinct (f, a) -> Ast.E_agg_distinct (f, go a)
+  | Ast.E_window { func; args; window } ->
+    let go_key (k : Ast.order_key) = { k with Ast.expr = go k.Ast.expr } in
+    Ast.E_window
+      { func
+      ; args = List.map go args
+      ; window =
+          { window with
+            Ast.partition_by = List.map go window.Ast.partition_by
+          ; Ast.order_by = List.map go_key window.Ast.order_by
+          }
+      }
+
+(** Apply substitute_outer_in_expr to every clause of an AST stmt that can carry
+    an outer reference.  [enclosing] is the union of the scopes of every
+    subquery between this one and the row [bnd] describes; it is
+    {!no_inner_scope} at the top.
+
+    #732: this used to rewrite only WHERE / HAVING / [joins.*.on] and end in a
+    [| _ -> s] catch-all, so an outer reference in the subquery's own
+    PROJECTION was never substituted and the statement was refused with #626's
+    message — for [SELECT k, (SELECT i.m + o.n FROM i WHERE i.fk = o.k) FROM o],
+    which sqlite3 answers.  See {!substitute_outer_proj} for the projection and
+    the arms below for the rest.
+
+    Two clauses of [S_select] are still passed through, and neither is a hole:
+    [limit] / [offset] are [int option] and [group_by] is a
+    [(string * string option) list] ([Ast.group_by_item]) — neither can hold a
+    substituted literal, so there is no spelling in which an outer reference
+    reaches them.  (sqlite3 rejects [GROUP BY <outer col>] in a subquery with
+    "no such column" in any case.)
+
+    [order] is passed through {b deliberately}, and this is the one judgement
+    call in #732:
+    - sqlite3 refuses a correlated reference in a subquery's ORDER BY outright
+      ([SELECT k, (SELECT i.v FROM i WHERE i.fk = o.k ORDER BY o.n LIMIT 1)
+       FROM o] → "no such column: o.n", oracle-checked on 3.45.1), so granary's
+      refusal already agrees with it and rewriting the clause would {i create} a
+      divergence rather than remove one;
+    - an ORDER BY key may name an OUTPUT ALIAS rather than an input column
+      (#489/#663), and an alias is not in [inner_scope_of]'s [has_col].  So a
+      subquery whose alias happens to share a name with an outer column would
+      have that key rewritten to a literal — an ORDER BY over a constant, i.e.
+      a silently unsorted result.  That is precisely the "plausible wrong
+      answer" class this whole area exists to avoid, and it is a worse outcome
+      than the refusal it would replace.
+    [S_compound]'s [order] is passed through for the same two reasons. *)
 and substitute_outer_in_stmt
       ~(cat : Cat.t option)
       ~(enclosing : inner_scope)
@@ -10179,7 +10241,8 @@ and substitute_outer_in_stmt
   | Ast.S_select r ->
     Ast.S_select
       { r with
-        where = Option.map go_e r.where
+        proj = substitute_outer_proj go_e r.proj
+      ; where = Option.map go_e r.where
       ; having = Option.map go_e r.having
       ; joins = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins
       }
@@ -10187,23 +10250,81 @@ and substitute_outer_in_stmt
     Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
   | Ast.S_with_cte { name; def; query; recursive } ->
     Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
-  (* #732: the one remaining catch-all in this function group, and it is the
-     next instance of exactly the defect #670 is about — a walker not
-     descending into a place that carries expressions, turning a runnable query
-     into a refusal.  Two holes, not one:
+  (* #732: a FROM-less subquery — [SELECT k, (SELECT o.n * 10) FROM o], which
+     sqlite3 answers — parses to [S_const_select] and so fell to the catch-all
+     with everything else.  [inner_scope_of] gives it {!no_inner_scope} (it owns
+     no input, so it can shadow nothing), which is what makes [scope] here
+     exactly the union of the enclosing subqueries' scopes and every remaining
+     column reference the outer row's. *)
+  | Ast.S_const_select { exprs } ->
+    Ast.S_const_select { exprs = List.map (fun (e, a) -> go_e e, a) exprs }
+  (* #732: exhaustive, not [| _ -> s].  None of these can appear as the body of
+     an [E_subquery] / [E_exists] / [E_in_select] or of the [Plan] equivalents —
+     the grammar admits only a SELECT there — so listing them changes nothing
+     today.  It is listed rather than caught so that a NEW statement form that
+     CAN appear there is a compile error here instead of the silent refusal
+     #670, #721 and this issue are all instances of. *)
+  | Ast.S_create_table _
+  | Ast.S_insert _
+  | Ast.S_insert_select _
+  | Ast.S_create_index _
+  | Ast.S_update _
+  | Ast.S_delete _
+  | Ast.S_drop_table _
+  | Ast.S_drop_index _
+  | Ast.S_alter_table _
+  | Ast.S_begin
+  | Ast.S_commit
+  | Ast.S_rollback
+  | Ast.S_savepoint _
+  | Ast.S_release _
+  | Ast.S_rollback_to _
+  | Ast.S_create_fts_table _
+  | Ast.S_pragma _
+  | Ast.S_create_view _
+  | Ast.S_create_reactive_view _
+  | Ast.S_drop_view _
+  | Ast.S_drop_reactive_view _
+  | Ast.S_create_trigger _
+  | Ast.S_drop_trigger _
+  | Ast.S_explain _
+  | Ast.S_vacuum
+  | Ast.S_attach _
+  | Ast.S_detach _ -> s
 
-     - the [S_select] arm above rewrites only [where] / [having] / [joins.*.on];
-       [columns], [group_by] and [order] are passed through by [{ r with ... }],
-       so an outer reference in the subquery's own PROJECTION is never
-       substituted and the statement is refused (#626's message);
-     - this arm passes every other statement form through untouched.
+(** #732: rewrite a SELECT's projection.
 
-     Left as-is deliberately.  Widening it is an error-to-answer change for
-     each newly reachable spelling and needs its own oracle-checked tests, so
-     it is #732's work rather than #670's.  Note that widening the substituter
-     also widens the detector for free: [stmt_has_free_column_ref] below RUNS
-     this function with a recording probe rather than duplicating its walk. *)
-  | _ -> s
+    [`Cols] is a [string list], so it cannot hold the literal a substitution
+    produces — but it is exactly the shape an {b unqualified} outer reference
+    parses to ([SELECT k, (SELECT n FROM i WHERE i.fk = o.k) FROM o] when [i]
+    has no [n]; the parser emits [`Cols] only when every item is a bare
+    [E_col], parser.mly:897).  So a name the binding resolves promotes the whole
+    projection to [`Exprs].
+
+    The promotion is conditional on a substitution actually happening, which
+    keeps two things true: an unchanged projection keeps the AST shape the rest
+    of the engine sees today, and the probe binding
+    {!stmt_has_free_column_ref} runs with — which resolves nothing — never
+    reshapes the statement it is only supposed to inspect. *)
+and substitute_outer_proj
+      (go_e : Ast.expr -> Ast.expr)
+      (proj :
+        [ `All | `Cols of string list | `Exprs of (Ast.expr * string option) list ])
+  : [ `All | `Cols of string list | `Exprs of (Ast.expr * string option) list ]
+  =
+  match proj with
+  | `All -> proj
+  | `Exprs items -> `Exprs (List.map (fun (e, a) -> go_e e, a) items)
+  | `Cols names ->
+    let subst = List.map (fun n -> n, go_e (Ast.E_col n)) names in
+    let substituted (n, e') =
+      match e' with
+      | Ast.E_col m -> not (String.equal m n)
+      | _ -> true
+    in
+    if List.exists substituted subst
+    then `Exprs (List.map (fun (n, e') -> e', Some n) subst)
+    else proj
 
 (** Substitute outer column refs in any embedded Ast.stmt nodes inside a
     Plan.expr (correlated subqueries / EXISTS / IN). *)
@@ -10293,7 +10414,20 @@ and substitute_outer_in_plan_expr
     before, and when a statement it flags turns out to have no resolvable outer
     source, the refusal it eventually raises is the one that was raised before.
     [inner_scope_of] answers "owned" for everything it cannot resolve, so an
-    unresolvable FROM never manufactures a free reference. *)
+    unresolvable FROM never manufactures a free reference.
+
+    #721/#732 widened {!substitute_outer_in_stmt} — into aggregate and window
+    arguments, into a SELECT's projection, and into a FROM-less
+    [S_const_select] — and this detector therefore widened with it, by
+    construction rather than by a matching edit. That is the intended
+    consequence and it is bounded by the paragraph above: the statements it
+    newly flags are exactly the ones whose outer reference the substituter can
+    now resolve, and any it flags without resolving reach the same refusal as
+    before.
+
+    The probe is also why the [`Cols] promotion in {!substitute_outer_proj} is
+    conditional: a probe binding resolves nothing, so no name changes, so the
+    projection keeps its shape and this function inspects without rewriting. *)
 let stmt_has_free_column_ref (cat : Cat.t option) (s : Ast.stmt) : bool =
   let seen = ref false in
   let probe : outer_binding =
