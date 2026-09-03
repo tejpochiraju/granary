@@ -4216,8 +4216,9 @@ let rv_create top ~sql ~name query refresh =
                  (Error
                     (Runtime
                        (Printf.sprintf
-                          "reactive view '%s': cannot determine columns (empty result \
-                           and SELECT *); use an explicit projection"
+                          "reactive view '%s': cannot determine the output columns from \
+                           an empty result; a reactive view needs a projection whose \
+                           column list is known statically"
                           name)))
              else (
                let out_cols =

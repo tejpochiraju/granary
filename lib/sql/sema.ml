@@ -1869,6 +1869,51 @@ let reject_reactive_derived_table (query : Ast.stmt) =
   | _ -> Ok ()
 ;;
 
+(* #747: a reactive view is MAINTAINED, so its output shape has to be a
+   property of the statement rather than of the data that happened to be
+   present when it was created.  [SELECT *] is not: [Db.rv_create] derived the
+   arity from the first row of the initial result and froze it, so a star view
+   over a non-empty table was accepted and then (a) never grew a column added
+   later by [ALTER TABLE ... ADD COLUMN], silently dropping it from what the
+   view yields, and (b) fired on every write to the base table, including
+   writes that were idempotent for the columns it actually projects.  Only the
+   EMPTY case was refused, which made the guard read as "star is refused" while
+   really being "star is refused when we cannot guess a shape".
+
+   The refusal is now unconditional and static.  A plain [CREATE VIEW] is
+   deliberately unaffected: it is not maintained, its body is re-bound on every
+   use, and so it picks up an added column the way a bare [SELECT *] does.
+
+   The walk follows the statement's OUTPUT projection only -- through a
+   compound's arms and through a CTE wrapper's body -- and deliberately not
+   into a CTE definition or a subquery.  A star there does not determine the
+   view's own arity: [SELECT a FROM (SELECT * FROM t) d] still yields exactly
+   one column whatever [t] grows.  (The [S_with_cte] arm is unreachable today,
+   since [reject_reactive_derived_table] runs first and refuses that root
+   outright; it is written out so that lifting #486 does not silently reopen
+   this hole.)  A qualified star [t.*] is not in the grammar at all, so there is
+   no spelling of it to cover. *)
+let rec reactive_projects_star (query : Ast.stmt) =
+  match query with
+  | Ast.S_select { proj = `All; _ } -> true
+  | Ast.S_compound { left; right; _ } ->
+    reactive_projects_star left || reactive_projects_star right
+  | Ast.S_with_cte { query; _ } -> reactive_projects_star query
+  | _ -> false
+;;
+
+let reject_reactive_star (query : Ast.stmt) =
+  if reactive_projects_star query
+  then
+    Error
+      (Unsupported
+         "CREATE REACTIVE VIEW requires an explicit projection (#747): a reactive view \
+          is maintained, so its column list must be fixed by the statement; SELECT * \
+          would freeze the shape at creation time and silently drop any column added \
+          later by ALTER TABLE")
+  else Ok ()
+;;
+
 let bind_create
       cat
       ~name
@@ -5725,7 +5770,8 @@ and bind_expanded ~views ~named_params ~param_counter cat stmt =
   | Ast.S_create_reactive_view { name; query; refresh } ->
     (match
        Result.bind (reject_reserved_name name) (fun () ->
-         reject_reactive_derived_table query)
+         Result.bind (reject_reactive_derived_table query) (fun () ->
+           reject_reactive_star query))
      with
      | Error e -> Lwt.return (Error e)
      | Ok () ->
