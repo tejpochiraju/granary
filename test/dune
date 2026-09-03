@@ -1791,3 +1791,11 @@
  (name test_reactive_view_schema_pin_474)
  (modules test_reactive_view_schema_pin_474)
  (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #476: the reactive-view catalog entry points return a result instead of
+; raising, so a store fault reaches Db.execute's caller as Error.
+
+(test
+ (name test_reactive_view_catalog_error_476)
+ (modules test_reactive_view_catalog_error_476)
+ (libraries granary granary.store granary.catalog alcotest lwt.unix))

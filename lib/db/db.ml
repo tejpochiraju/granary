@@ -3979,7 +3979,12 @@ let rv_create top ~sql ~name query refresh =
             }
           in
           Hashtbl.replace top.reactive_views name entry;
-          Cat.persist_reactive_view top.store ~name ~sql
+          (* #476: the catalog write reports a store fault as [Error msg]; lift
+             it into [Db]'s own error type rather than letting it raise. *)
+          let* pr = Cat.persist_reactive_view top.store ~name ~sql in
+          match pr with
+          | Error msg -> Lwt.return (Error (Runtime msg))
+          | Ok () -> Lwt.return (Ok ())
         in
         match choice with
         | `Delta (group_ord, measure) ->
@@ -4009,13 +4014,10 @@ let rv_create top ~sql ~name query refresh =
                 (match ir with
                  | Error _ as e -> Lwt.return e
                  | Ok () ->
-                   let* () =
-                     register
-                       ~provisional:false
-                       (RV_delta { group_ord; measure; engine })
-                       out_cols
-                   in
-                   Lwt.return (Ok ()))))
+                   register
+                     ~provisional:false
+                     (RV_delta { group_ord; measure; engine })
+                     out_cols)))
         | `Full ->
           let* nr = rv_query_ast top query in
           (match nr with
@@ -4061,9 +4063,7 @@ let rv_create top ~sql ~name query refresh =
                  in
                  (match ir with
                   | Error _ as e -> Lwt.return e
-                  | Ok () ->
-                    let* () = register ~provisional RV_full out_cols in
-                    Lwt.return (Ok ()))))))
+                  | Ok () -> register ~provisional RV_full out_cols)))))
 ;;
 
 (* #469: erase a reactive view's persistent state: catalog row first, then the
@@ -4088,13 +4088,19 @@ let rv_create top ~sql ~name query refresh =
    mirrors [rv_create], which registers registry+catalog last and so fails
    toward an orphan table too. *)
 let rv_erase_persistent top ~name =
-  let* () = Cat.remove_reactive_view top.store ~name in
-  (* #475: as in [rv_refresh_full] — the guard bypass covers this one statement
-     and this one table name. *)
-  rv_dropping_internal top (rv_table_name name) (fun () ->
-    rv_execute
-      top
-      (Printf.sprintf "DROP TABLE IF EXISTS %s" (rv_quote (rv_table_name name))))
+  (* #476: [Cat.remove_reactive_view] reports a store fault as [Error msg]
+     instead of raising, so the catalog half of the erase already speaks
+     [Db.execute]'s contract and needs no exception wrapper. *)
+  let* rr = Cat.remove_reactive_view top.store ~name in
+  match rr with
+  | Error msg -> Lwt.return (Error (Runtime msg))
+  | Ok () ->
+    (* #475: as in [rv_refresh_full] — the guard bypass covers this one
+       statement and this one table name. *)
+    rv_dropping_internal top (rv_table_name name) (fun () ->
+      rv_execute
+        top
+        (Printf.sprintf "DROP TABLE IF EXISTS %s" (rv_quote (rv_table_name name))))
 ;;
 
 (* #469 review: the registry is the authority for *live* views, but #437
@@ -4105,12 +4111,17 @@ let rv_erase_persistent top ~name =
    warning.  Fall back to the catalog before erroring, so [DROP REACTIVE VIEW]
    really is the single removal path. *)
 let rv_drop_unloadable top ~name ~if_exists =
-  let* pairs = Cat.load_all_reactive_views top.store in
-  if List.mem_assoc name pairs
-  then rv_erase_persistent top ~name
-  else if if_exists
-  then Lwt.return (Ok ())
-  else Lwt.return (Error (Runtime (Printf.sprintf "no such reactive view: %s" name)))
+  (* #476: as in [rv_erase_persistent] — a store fault reading the registry is
+     an [Error], not a raise. *)
+  let* lr = Cat.load_all_reactive_views top.store in
+  match lr with
+  | Error msg -> Lwt.return (Error (Runtime msg))
+  | Ok pairs ->
+    if List.mem_assoc name pairs
+    then rv_erase_persistent top ~name
+    else if if_exists
+    then Lwt.return (Ok ())
+    else Lwt.return (Error (Runtime (Printf.sprintf "no such reactive view: %s" name)))
 ;;
 
 (* #469: retire a reactive view — erase its persistent state via
@@ -4126,9 +4137,9 @@ let rv_drop_unloadable top ~name ~if_exists =
    its callbacks, still in [reactive_view_names] — so the caller's error is the
    truth and a retry is meaningful.  The persistent state may be partially
    erased (catalog row gone, [_rv_] table left), which is exactly the state the
-   crash-window reasoning above already covers: an inert orphan table.  Note
-   that a catalog failure *raises* rather than returning [Error] (#476), so the
-   persistent work is wrapped in [Lwt.catch].
+   crash-window reasoning above already covers: an inert orphan table.  (Since
+   #476 a catalog failure returns [Error] rather than raising, so the persistent
+   work needs no exception wrapper of its own.)
 
    That in-memory survival is only process-scoped, though: if the failure landed
    after [Cat.remove_reactive_view] succeeded, the catalog row is already gone
@@ -4138,13 +4149,14 @@ let rv_drop_unloadable top ~name ~if_exists =
    rebuild it from.  An errored drop therefore still becomes an effective drop
    across a restart; the error means "retry now", not "nothing happened".
 
-   #477 re-review: both branches below go through one [Lwt.catch] so
-   [DROP REACTIVE VIEW] has a single calling convention — it returns [Error] for
-   a store/catalog fault whether or not the view is live.  The unloadable branch
-   needs the cover just as much: [rv_drop_unloadable] raises from
-   [Cat.load_all_reactive_views] as well as from [rv_erase_persistent].  The
-   [Lwt.catch] stays INSIDE [rv_guard] so the re-entrancy depth (#475) is
-   restored on every path. *)
+   #477 re-review / #476: both branches below have a single calling convention —
+   they return [Error] for a store/catalog fault whether or not the view is
+   live.  That used to be imposed here by an [Lwt.catch] wrapping both, because
+   [Cat.remove_reactive_view] and [Cat.load_all_reactive_views] raised; #476
+   made those return a [result], so the conversion happens at the source and the
+   wrapper is gone.  Non-[Failure] exceptions escaping [Db.execute]'s own
+   [DROP TABLE] still propagate, which is [Db.execute]'s contract everywhere
+   else. *)
 let rv_drop top ~name ~if_exists =
   (* #473: [Cat.remove_reactive_view] below always writes through its own
      fresh writer transaction ([borrow_or_autocommit ?txn:None] ->
@@ -4169,19 +4181,9 @@ let rv_drop top ~name ~if_exists =
     let live = Hashtbl.mem top.reactive_views name in
     let* r =
       rv_guard top (fun () ->
-        Lwt.catch
-          (fun () ->
-             if live
-             then rv_erase_persistent top ~name
-             else rv_drop_unloadable top ~name ~if_exists)
-          (function
-            (* Deliberately narrower than the [Op_vacuum] arm above, which
-               converts every exception: cancellation and the two resource
-               exhaustions are not drop failures, and turning [Lwt.Canceled]
-               into an [Error] would report a spurious failed drop. *)
-            | (Lwt.Canceled | Stack_overflow | Out_of_memory) as e -> Lwt.fail e
-            | Failure msg -> Lwt.return (Error (Runtime msg))
-            | e -> Lwt.return (Error (Runtime (Printexc.to_string e)))))
+        if live
+        then rv_erase_persistent top ~name
+        else rv_drop_unloadable top ~name ~if_exists)
     in
     match r with
     | Error _ as e -> Lwt.return e
@@ -4210,7 +4212,18 @@ let rv_drop top ~name ~if_exists =
    between a base commit and its view flush would otherwise leave the persisted
    table stale forever (and future deltas would stack on a wrong base). *)
 let rv_load top =
-  let* pairs = Cat.load_all_reactive_views top.store in
+  (* #476: a store fault reading the registry is an [Error] rather than a raise
+     at the catalog level now.  There is no result channel here — [rv_load] runs
+     inside [Db.open_*] and returns [unit Lwt.t] — so re-raise, preserving the
+     pre-#476 behaviour exactly.  Opening a database whose reactive-view
+     registry could not be read must NOT succeed silently: the views would stop
+     being maintained on every subsequent base-table write, with no error. *)
+  let* lr = Cat.load_all_reactive_views top.store in
+  let* pairs =
+    match lr with
+    | Ok pairs -> Lwt.return pairs
+    | Error msg -> Lwt.fail (Failure msg)
+  in
   rv_guard top (fun () ->
     let* () =
       Lwt_list.iter_s
