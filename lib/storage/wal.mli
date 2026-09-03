@@ -98,6 +98,39 @@ val open_
 (** Total committed frames currently in the WAL. *)
 val committed_frames : t -> int
 
+(** #637: what recovery's forward walk observed about generation boundaries when
+    this handle was opened.
+
+    Every commit writes exactly one header page (page 0 or 1, alternating) with
+    [txn_id = previous + 1], in the same batch as its commit-flagged frame.  So
+    within one generation the header-page frames recovery walks past carry
+    STRICTLY INCREASING [txn_id]s, and a decrease means the walk ran off the end
+    of the newest generation into the physical remains of an older one — the
+    pre-#636 corruption, where [reset] never rotated the [(salt, seed)] marker,
+    so every frame of the checkpointed generation still verified and recovery
+    replayed it over newer data.
+
+    [frames_walked] is how many frames the walk consumed and [header_frames] how
+    many of those carried a readable header [txn_id] — i.e. how much material
+    the test actually had.  Both are reported because
+    [stale_generation = None] with [header_frames < 2] means "nothing to compare",
+    which is not the same claim as "compared and clean". *)
+type replay_check =
+  { frames_walked : int
+  ; header_frames : int
+  ; stale_generation : (int * int64 * int64) option
+    (** [(frame_idx, previous_txn_id, frame_txn_id)] of the first header frame
+        whose [txn_id] failed to increase. *)
+  }
+
+(** The {!replay_check} recorded when this handle was opened.  Set once by
+    recovery and never changed again — not by {!reset}, because it is a
+    statement about the file that was opened and stays true after a checkpoint
+    rotates the marker.  A WAL created fresh (no header on the device, or a
+    device too small to hold one) reports all-zero with no regression: there was
+    nothing to walk. *)
+val replay_check : t -> replay_check
+
 (** Byte length of the WAL device as this handle understands it: reads past it
     are refused.  Grows as frames are appended and — since #612, and only when
     {!open_} was given a [resize] callback — drops back to [header_size_bytes]

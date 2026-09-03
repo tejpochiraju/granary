@@ -461,6 +461,66 @@ type checkpoint_health =
     has no WAL. *)
 val checkpoint_health : t -> checkpoint_health
 
+(** #637: what recovery's WAL walk observed about generation boundaries at
+    open, lifted from {!Granary_storage.Wal.replay_check}.
+
+    {b What it detects.}  Before #636, [Wal.reset] cleared only in-memory state:
+    every frame of the checkpointed generation stayed on disk under an unchanged
+    [(salt, seed)] marker and therefore still verified, so the next open replayed
+    it — over newer data when the successor generation was shorter.  Each commit
+    writes exactly one header page with [txn_id = previous + 1], so a header
+    [txn_id] that fails to increase as recovery walks forward means the walk has
+    left the newest generation and entered the remains of an older one.  That is
+    the signature, and it is present in both of #636's outcomes.
+
+    {b What it does NOT detect, and why the status has three values rather than
+    two.}
+    - Damage that a PREVIOUS open already replayed into the main file.  The
+      row-loss variant leaves a structurally valid database, so no integrity
+      check finds it either, and once the WAL has been rotated by a post-#636
+      checkpoint the evidence is gone.  This is a report on {i this open's} WAL,
+      not a verdict on the file.
+    - A stale remainder that is a fragment of a single old commit batch carrying
+      no header-page frame.  Recovery can consume such a fragment, and if it
+      contains a commit-flagged frame the fragment is applied — undetected.  Any
+      stale remainder spanning a whole old commit does contain a header frame.
+    - A database that will not open at all (#636's other outcome) never reaches
+      this, but it is loud by construction.
+
+    So [Wal_replay_no_evidence] means "walked, compared, and nothing regressed",
+    never "verified clean"; and a walk with fewer than two header frames to
+    compare reports {!Wal_replay_not_examined} rather than pretending to the
+    former.  [frames_walked] and [header_frames] are reported so a reader can
+    see how much material the test had. *)
+type wal_replay_status =
+  | Wal_replay_not_examined
+    (** No WAL, or fewer than two header frames were walked: the check had
+        nothing to compare.  Not a claim either way. *)
+  | Wal_replay_no_evidence
+    (** The frames recovery walked at this open showed no generation
+        regression.  Not a clean bill of health for the database. *)
+  | Wal_replay_stale_generation of
+      { frame_idx : int
+      ; previous_txn_id : int64
+      ; frame_txn_id : int64
+      }
+    (** Recovery walked into frames belonging to an older generation: at
+        [frame_idx] a header page carried [frame_txn_id], no greater than the
+        [previous_txn_id] already seen.  A database written by a pre-#636 binary
+        has replayed stale data over newer data. *)
+
+(** #637: {!wal_replay_status} plus how much material the check had. *)
+type wal_replay_check =
+  { status : wal_replay_status
+  ; frames_walked : int
+  ; header_frames : int
+  }
+
+(** The stale-generation report for this store (#637).  Reports
+    {!Wal_replay_not_examined} on the in-memory backend and outside WAL mode.
+    Surfaced to SQL as [PRAGMA wal_replay_check]. *)
+val wal_replay_check : t -> wal_replay_check
+
 (** Clear the sticky checkpoint-failure signal ([last_error] and
     [consecutive_failures]); [total_failures] is left alone.  For an operator
     who has acknowledged the condition.  No-op on the in-memory backend. *)

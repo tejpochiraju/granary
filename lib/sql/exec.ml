@@ -7617,6 +7617,7 @@ let op_name = function
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_pragma_wal_checkpoint -> "Pragma(wal_checkpoint)"
   | Plan.Op_pragma_checkpoint_status -> "Pragma(checkpoint_status)"
+  | Plan.Op_pragma_wal_replay_check -> "Pragma(wal_replay_check)"
   | Plan.Op_pragma_get_wal_autocheckpoint -> "Pragma(get_wal_autocheckpoint)"
   | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
     Printf.sprintf "Pragma(set_wal_autocheckpoint=%Ld)" n
@@ -9051,6 +9052,7 @@ let execute_with_count
   | Plan.Op_sqlite_sequence
   | Plan.Op_pragma_get_synchronous
   | Plan.Op_pragma_checkpoint_status
+  | Plan.Op_pragma_wal_replay_check
   | Plan.Op_pragma_get_wal_batch_commits
   | Plan.Op_pragma_get_wal_batch_interval_ms ->
     failwith "Exec.execute: use Exec.query for read operations"
@@ -14740,6 +14742,47 @@ and to_stream
          [ [| Row.V_int (Int64.of_int h.S.total_failures)
             ; Row.V_int (Int64.of_int h.S.consecutive_failures)
             ; last
+           |]
+         ])
+  (* #637: (status, frames_walked, header_frames, detail).  The detail column
+     carries the caveat in words, because the status alone is easy to over-read:
+     [no_evidence] is a statement about the frames THIS OPEN replayed, never a
+     clean bill of health for the database. *)
+  | Plan.Op_pragma_wal_replay_check ->
+    let c = S.wal_replay_check store in
+    let status, detail =
+      match c.S.status with
+      | S.Wal_replay_stale_generation { frame_idx; previous_txn_id; frame_txn_id } ->
+        ( "stale_generation"
+        , Printf.sprintf
+            "WAL recovery walked into an older generation at frame %d: a header page \
+             carries txn_id %Ld, not above the %Ld already seen.  This database was \
+             written by a pre-#636 binary, whose checkpoint left the checkpointed \
+             generation verifying on disk, so recovery has replayed stale pages over \
+             newer ones.  Committed rows may be missing.  Restore from a backup taken \
+             before the affected checkpoint, or dump what is readable (PRAGMA \
+             integrity_check first) and reload."
+            frame_idx
+            frame_txn_id
+            previous_txn_id )
+      | S.Wal_replay_no_evidence ->
+        ( "no_evidence"
+        , "The frames WAL recovery replayed at this open showed no generation \
+           regression.  This is not a clean bill of health: a pre-#636 stale replay \
+           from an EARLIER open is already in the main file, leaves a structurally \
+           valid database, and is not detectable here or by PRAGMA integrity_check." )
+      | S.Wal_replay_not_examined ->
+        ( "not_examined"
+        , "Nothing to examine: no WAL, or fewer than two header-page frames were \
+           recovered, so there was no txn_id sequence to compare.  This is not a \
+           statement either way about the database." )
+    in
+    Lwt.return
+      (Lwt_stream.of_list
+         [ [| Row.V_text status
+            ; Row.V_int (Int64.of_int c.S.frames_walked)
+            ; Row.V_int (Int64.of_int c.S.header_frames)
+            ; Row.V_text detail
            |]
          ])
   | Plan.Op_pragma_get_wal_batch_commits ->

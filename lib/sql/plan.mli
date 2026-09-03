@@ -429,6 +429,7 @@ type op =
   | Op_pragma_wal_checkpoint
   (** Migrate WAL contents to main DB and reset; no-op outside WAL mode. *)
   | Op_pragma_checkpoint_status
+  | Op_pragma_wal_replay_check
   (** #638 read the checkpoint-failure signal: one row of
       (total_failures, consecutive_failures, last_error). *)
   | Op_pragma_get_wal_autocheckpoint (** Read per-connection auto-checkpoint threshold. *)

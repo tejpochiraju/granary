@@ -479,6 +479,11 @@ and pragma_kind =
        failure is never raised to a caller, so without this (and the
        Checkpoint_failed event) a repeatedly-failing checkpoint is invisible
        while the WAL grows without bound. *)
+  | Pragma_wal_replay_check
+    (* #637: PRAGMA wal_replay_check — report whether recovery's WAL walk at
+       open ran into frames belonging to an older generation, the signature of
+       the pre-#636 stale replay.  Read-only; one row of
+       (status, frames_walked, header_frames, detail). *)
   | Pragma_wal_autocheckpoint (* PRAGMA wal_autocheckpoint — read threshold *)
   | Pragma_wal_autocheckpoint_set of int64
     (* PRAGMA wal_autocheckpoint = N — set per-connection threshold (0 disables) *)
