@@ -192,7 +192,18 @@ val close : t -> unit Lwt.t
     in-memory backend. *)
 val set_tree_tag : t -> tree_id -> int32 -> unit
 
-(** Begin a read-only transaction. Multiple RO txns may run concurrently. *)
+(** Begin a read-only transaction. Multiple RO txns may run concurrently.
+
+    Fails when the store is closing, and — on a FOLLOWER only — when the
+    snapshot's frame horizon would sit below content a checkpoint has already
+    copied into the main file (#739).  A snapshot resolves any page whose every
+    WAL frame is at or above its horizon from the main file, so such a snapshot
+    would observe data past this follower's last-applied commit; the horizon of
+    a non-follower is [Wal.committed_frames] and is at or above that boundary by
+    construction, so this can never fire there.  {!checkpoint} refuses to start
+    in follower mode, so the only way to reach the refusal is switching follower
+    mode on while a checkpoint is already migrating; it clears when that
+    checkpoint completes. *)
 val ro_begin : t -> ro txn Lwt.t
 
 (** [history_pin t ~txn_id] (#266) sets the retention floor: pages reachable from
@@ -227,7 +238,10 @@ val history_enabled : t -> bool
     As-of reads serve {b only} what an active retention floor protects: with no
     floor set (via {!history_pin}) every target resolves to [History_pruned],
     because uncapped commits recycle superseded pages and a snapshot would read
-    garbage.  The floor is not retroactive — see {!history_pin}. *)
+    garbage.  The floor is not retroactive — see {!history_pin}.
+
+    Subject to {!ro_begin}'s #739 refusal too: a retained historical root is
+    still resolved through the snapshot's frame horizon. *)
 val ro_begin_as_of : t -> History.target -> ro txn Lwt.t
 
 (** Raised by {!ro_begin_as_of} to carry an as-of {!error}. *)
@@ -414,7 +428,17 @@ val wal_mode : t -> bool
     a checkpoint is copying pages no longer waits for it.
 
     Checkpoints still serialise against {e each other} (including the background
-    autocheckpoint) for the whole of their duration. *)
+    autocheckpoint) for the whole of their duration.
+
+    {b #739: rejected while the store is in follower mode.}  A follower's WAL
+    belongs to the replication apply loop, and {!ro_begin} caps every snapshot at
+    {!follower_ack_position} so a reader never observes a frame past the last
+    applied commit.  A checkpoint copies frames into the main file and then
+    retires the overlay, where that cap cannot reach them — so it would make the
+    guarantee permanently unenforceable rather than merely racy.  The
+    autocheckpoint path was already unreachable there ({!rw_begin} refuses writes,
+    so no commit dispatches one).  [Standby] is unaffected: it migrates through
+    [Replication.checkpoint_wal_to_main], not this function. *)
 val checkpoint : t -> unit Lwt.t
 
 (** #638: the checkpoint-failure signal.  [last_error] is the message of the
@@ -822,8 +846,14 @@ val set_event_callback : t -> (Event.t -> unit) option -> unit
 (** Enable or disable follower mode.  When [true], {!rw_begin} rejects
     write transactions on the B+-tree backend with an exception, keeping
     the standby's WAL from diverging from the master's stream while the
-    follower loop is applying incoming frames.  No-op on the in-memory
-    backend (Mem stores have no standby semantics). *)
+    follower loop is applying incoming frames, and {!checkpoint} is rejected
+    too (#739).  No-op on the in-memory backend (Mem stores have no standby
+    semantics).
+
+    Switching it on while a checkpoint is already in flight does not stop that
+    checkpoint — it is past the refusal — so until it completes {!ro_begin} may
+    refuse a snapshot whose horizon sits below what that checkpoint has already
+    migrated, rather than serving one that would read the migrated pages. *)
 val set_follower : t -> bool -> unit
 
 (** True iff follower mode is active (write transactions are rejected). *)
