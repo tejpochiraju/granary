@@ -1965,3 +1965,13 @@
   alcotest
   lwt.unix
   unix))
+
+; #737: a statement that returns Error no longer takes its reactive views down
+; with it. Reads the _rv_<name> materialisation back against the authoritative
+; query over the base table, and uses a bogus row written into _rv_av as the
+; seam that tells "no resync scheduled" from "a resync that changed nothing".
+
+(test
+ (name test_change_feed_error_737)
+ (modules test_change_feed_error_737)
+ (libraries granary alcotest lwt.unix))
