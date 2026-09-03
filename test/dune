@@ -1773,3 +1773,24 @@
  (name test_compound_order_by_662)
  (modules test_compound_order_by_662)
  (libraries granary alcotest lwt.unix))
+
+; #721: substitute_outer_in_expr descends into E_agg / E_agg_distinct /
+; E_window, so a correlated outer reference used as an aggregate or window
+; argument is substituted rather than surviving into Sema.bind and being
+; refused. Every case carries a control whose value differs, so none can pass
+; on a build that ignores the outer term.
+
+(test
+ (name test_outer_ref_721)
+ (modules test_outer_ref_721)
+ (libraries granary alcotest lwt.unix))
+
+; #732: substitute_outer_in_stmt rewrites a subquery's own projection and the
+; FROM-less S_const_select, and its statement match is exhaustive. ORDER BY and
+; GROUP BY stay refused on purpose — sqlite3 refuses them too, and an ORDER BY
+; key can name an output alias the inner scope does not know about.
+
+(test
+ (name test_outer_ref_732)
+ (modules test_outer_ref_732)
+ (libraries granary alcotest lwt.unix))
