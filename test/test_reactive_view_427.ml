@@ -201,7 +201,7 @@ let test_callbacks () =
          fired := changes :: !fired;
          Lwt.return_unit)
      with
-     | Ok () -> ()
+     | Ok (_ : Db.view_callback) -> ()
      | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "one commit fired one batch" 1 (List.length !fired);
@@ -239,6 +239,16 @@ let tmp_counter = ref 0
 let tmp_path () =
   incr tmp_counter;
   Printf.sprintf "/tmp/granary_rv437_%d_%d.db" (Unix.getpid ()) !tmp_counter
+;;
+
+(* #746: [register_view_callback] returns an opaque handle now, and a handle has
+   no useful equality, so these assertions compare the result with the handle
+   discarded.  [unregister_view_callback] has its own file,
+   test_view_callback_746.ml. *)
+let attach db ~view_name cb =
+  Result.map
+    (fun (_ : Db.view_callback) -> ())
+    (Db.register_view_callback db ~view_name cb)
 ;;
 
 (* Prints the actual error on failure, unlike comparing against [= Ok ()]. *)
@@ -300,17 +310,17 @@ let test_register_reports_unknown_view () =
       register_result
       "registering against a live view succeeds"
       (Ok ())
-      (Db.register_view_callback db ~view_name:"cnt" cb);
+      (attach db ~view_name:"cnt" cb);
     Alcotest.check
       register_result
       "a typo'd view name is reported, not silently dropped"
       (Error (`Unknown_view "cnnt"))
-      (Db.register_view_callback db ~view_name:"cnnt" cb);
+      (attach db ~view_name:"cnnt" cb);
     Alcotest.check
       register_result
       "a plain table name is reported too"
       (Error (`Unknown_view "t"))
-      (Db.register_view_callback db ~view_name:"t" cb))
+      (attach db ~view_name:"t" cb))
 ;;
 
 (* #469: DROP REACTIVE VIEW is the supported removal path. *)
@@ -351,7 +361,7 @@ let test_drop_stops_callbacks () =
          incr fired;
          Lwt.return_unit)
      with
-     | Ok () -> ()
+     | Ok (_ : Db.view_callback) -> ()
      | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "callback fires while live" 1 !fired;
@@ -362,7 +372,7 @@ let test_drop_stops_callbacks () =
       register_result
       "re-registering reports the view as unknown"
       (Error (`Unknown_view "cnt"))
-      (Db.register_view_callback db ~view_name:"cnt" (fun _ -> Lwt.return_unit)))
+      (attach db ~view_name:"cnt" (fun _ -> Lwt.return_unit)))
 ;;
 
 let test_drop_if_exists () =
@@ -718,7 +728,7 @@ let test_names_survive_reopen () =
            register_result
            "and a callback attaches to it"
            (Ok ())
-           (Db.register_view_callback db ~view_name:"cnt" cb)))
+           (attach db ~view_name:"cnt" cb)))
 ;;
 
 (* The motivating "dead hook reported healthy" state (#437 comment): a persisted
@@ -775,7 +785,7 @@ let test_unloadable_view_is_not_live stored_sql () =
            register_result
            "…and registering reports it unknown rather than attaching nothing"
            (Error (`Unknown_view "cnt"))
-           (Db.register_view_callback db ~view_name:"cnt" (fun _ -> Lwt.return_unit))))
+           (attach db ~view_name:"cnt" (fun _ -> Lwt.return_unit))))
 ;;
 
 (* #469 review: a view left out of the registry by #437 (stored SQL that no

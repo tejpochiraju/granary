@@ -118,6 +118,7 @@ Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
 | `test_not_null_repair_630` | #630 `PRAGMA not_null_repair`'s **scan** draining the tree via `cursor_open` | same gate, but with the violation count held FIXED at 5 while the table doubles, so only the scan can move it | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
 | `test_correlated_exists_493` | #493 a correlated `EXISTS` leaking one RO snapshot per outer row | peak live RO snapshots does not grow when the outer rows go 100 → 400 | `GRANARY_MAX_LIVE_READERS` |
 | `test_agg_retention_423` | #423 the net-zero SUM-group retention in `Aggregate` growing per UPDATE rather than per distinct group, or costing more than one map node plus one record | marginal live heap < 16 words per retained group when the group count doubles, and quadrupling the churn over ONE key adds < 16 words total | `GRANARY_MEM_MAX_WORDS_PER_GROUP` |
+| `test_view_callback_746` | #746 `Db.register_view_callback` going back to an O(n^2) list append | doubling the registrations must not more than double the words allocated (< 2.5; linear is 2.0, the old `@` append measured 4.0) | `GRANARY_MEM_MAX_CALLBACK_SLOPE` |
 
 The first two are complements, not duplicates: #600's doubles the violations along
 with the table and so cannot tell a retaining scan from a retaining victim
@@ -2353,6 +2354,78 @@ embedding can watch its own ceiling instead of inferring it; comparing against
 `snapshot`'s length gives the net-zero count directly. Pinned by
 `test/test_agg_retention_423.ml`, whose allocation gate is armed by default —
 see the non-wall-clock gate table above.
+
+### A reactive-view callback can be detached, and registering one is O(1) (#746)
+
+`Db.register_view_callback` returns an opaque `Db.view_callback` handle, and
+`Db.unregister_view_callback : t -> view_callback -> bool` detaches the one
+callback it names. Two gaps, one shape — nothing ever removed a callback, and
+the append was `e.rv_callbacks <- e.rv_callbacks @ [ cb ]`, which copies the
+whole list per registration.
+
+**Neither was a correctness bug, and the commit message should not claim
+otherwise.** #469 had already given a *view* a removal path
+(`DROP REACTIVE VIEW`, which discards every callback on it), and the downstream
+consumer that filed this works around the missing per-callback one with a
+generation-token trampoline that measures correct — 1 notification on 1 change,
+every time. What it cost was **sustainability**: every re-wire leaked a dead
+closure that was still invoked on every change and had to decide for itself
+that it was stale, and *n* leaked closures are *n* invocations per change, so
+the quadratic append compounded it directly. Hot-reload is the workload that
+turns both into a ceiling on how often an app may edit its hooks.
+
+**Callback order is contractual as of #746, and that is a decision the O(1)
+rewrite forced.** Nothing had ever documented it, but registration order,
+sequentially awaited, was the observable behaviour of `@` plus `Lwt_list.iter_s`.
+The list is now held **newest-first** (prepend, O(1)) and reversed at the one
+firing site, so the order survives; the reverse is O(n) on a path that is about
+to invoke n callbacks, i.e. free. `callbacks_fire_in_registration_order` is what
+catches a future change that drops the reverse.
+
+**Mid-flush removal is a per-batch SNAPSHOT** — the question the issue flags,
+because `rv_flush_inner` snapshots the *view* list but read `entry.rv_callbacks`
+live. `rv_apply_and_notify` binds `cbs` once, where it computes `want_cb`, so
+`want_cb` and the fired set cannot disagree; `rv_callbacks` is an immutable list
+and both register and unregister *replace the field* rather than mutating cells,
+so an in-flight iteration is unaffected by construction. Concretely: a callback
+that unregisters itself always completes the invocation it is in and is silent
+from the next batch; a callback removed by an **earlier** callback in the same
+batch still runs for that batch; a registration made from inside a callback
+starts firing from the next batch, so it cannot make the current batch loop.
+A tombstone (skip immediately) and a refusal were both rejected — the snapshot
+is the only one of the three that needs no new state and no new error, and it is
+what the immutable list gives for free.
+
+**A growable vector was rejected for the same reason.** It buys O(1) removal
+where the list is O(n) filter, and costs the snapshot: iterating a mutable
+vector while a callback mutates it is exactly the undefined behaviour #746
+exists to remove. Removal is also the *rare* operation once it exists at all —
+the whole point is that the registry no longer grows without bound.
+
+**Handle identity.** Ids come from one process-global counter (`rv_cb_seq`), not
+a per-entry one, and the handle carries the view name — so there is no
+view-name argument to get wrong, and a handle presented to a different `Db.t`
+over the same store matches nothing rather than removing an unrelated callback.
+`unregister_view_callback` is idempotent and answers `false` for an already-
+removed handle, a dropped view, or a foreign one.
+
+**API break, deliberately.** `register_view_callback` returned
+`(unit, [ `Unknown_view of string ]) result` and now returns
+`(view_callback, …) result`. Adding a second registration function was
+rejected: it would leave the un-removable one as the shorter, default name
+forever. The migration is one line at each call site — `| Ok () ->` becomes
+`| Ok _ ->`, or bind the handle. In-tree, `test_reactive_view_427` gained an
+`attach` helper that maps the handle away so its `register_result` testable is
+unchanged.
+
+Measured in-repo before and after, by allocation rather than wall clock
+(`Gc.minor_words` over a fixed code path is deterministic, so a loaded box
+cannot move it): registering *n* callbacks cost 376 750 words at n=500 rising
+to 96 028 000 at n=8000 — **4.00x per doubling, at every step** — and now costs
+a flat 13 words per registration, i.e. exactly 2.00x. That is the gate in
+`test_view_callback_746`, armed by default (see the non-wall-clock table above)
+because the ceiling is backed by a measurement rather than predicted; verified
+by mutation, where restoring the `@` append reports slope 7.98 and fails.
 
 ### The writer lock is measured, and every acquisition goes through one door (#718)
 

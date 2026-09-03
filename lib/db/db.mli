@@ -703,6 +703,19 @@ val execute_change_count_with_dirty
     must fold deltas in order rather than assume one per rowid (#418). *)
 val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
 
+(** #746: an opaque handle for one registered reactive-view callback, returned
+    by {!register_view_callback} and consumed by {!unregister_view_callback}.
+
+    It carries the view it was registered against, so there is no view-name
+    argument to get wrong at removal time, and it is minted from a
+    process-global counter, so a handle presented to a different {!t} over the
+    same store matches nothing rather than removing an unrelated callback. *)
+type view_callback
+
+(** Render a handle as [view#id].  For logging and test failure messages; the
+    id is an opaque serial number with no meaning beyond identity. *)
+val pp_view_callback : Format.formatter -> view_callback -> unit
+
 (** #427: register [cb] to fire after every commit that changes reactive view
     [view_name]'s materialisation.  [cb] receives the native {!row_change} diffs
     applied to [_rv_<view_name>] (Deleted/Inserted pairs; a changed aggregate row
@@ -725,12 +738,55 @@ val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
 
     Callbacks are held by the registry entry, so [DROP REACTIVE VIEW] discards
     them: a callback registered against a dropped view stops firing, and
-    re-registering reports [`Unknown_view]. *)
+    re-registering reports [`Unknown_view].
+
+    {b #746: registration is O(1) and returns a handle.}  It used to append with
+    [@], copying the whole list per registration, so [n] registrations cost
+    O(n^2) — measured at 4.00x allocation per doubling of [n], and 3.4s for
+    20 000 registrations downstream.  The list is now held newest-first and
+    reversed at the firing site.
+
+    {b Callbacks fire in registration order, sequentially, and that is
+    contractual.}  It was already the observable behaviour and preserving it
+    across the O(1) rewrite is free, so a caller may rely on a callback
+    registered earlier running (and completing — the firing site awaits each in
+    turn) before one registered later on the same view.  Ordering between
+    {e different} views in one flush is not specified.
+
+    {b The returned handle is the only way to detach one callback.} Before #746
+    nothing removed a single callback: [DROP REACTIVE VIEW] was the only
+    removal path (#469), so a caller re-wiring callbacks from data — a hook
+    table, a config reload — leaked a dead closure per re-wire that was still
+    invoked on every change and had to decide for itself that it was stale. *)
 val register_view_callback
   :  t
   -> view_name:string
   -> (row_change list -> unit Lwt.t)
-  -> (unit, [ `Unknown_view of string ]) result
+  -> (view_callback, [ `Unknown_view of string ]) result
+
+(** #746: detach the callback [h] names.  Returns [true] if it was still
+    registered and has now been removed, [false] if it was not — because it was
+    already unregistered, because its view was dropped (which discards every
+    callback on it), or because [h] came from a different {!t}.  Idempotent:
+    unregistering twice is not an error, it just answers [false] the second
+    time.
+
+    {b Mid-flush semantics (#746).}  The set of callbacks a notification fires
+    is snapshotted when that view's notification batch begins.  So a callback
+    that unregisters itself — or another callback on the same view — from
+    inside its own invocation:
+
+    - always completes the invocation it is in;
+    - does not affect who else is invoked in {e that} batch: a callback removed
+      by an earlier callback in the same batch still runs for that batch;
+    - is not invoked again from the batch after it, in this flush or any later
+      one.
+
+    That is a snapshot, not a tombstone and not a refusal: removal is always
+    accepted and never raises, and the visible effect is simply deferred to the
+    next batch.  A registration made from inside a callback behaves the same
+    way — it starts firing from the next batch. *)
+val unregister_view_callback : t -> view_callback -> bool
 
 (** #437: the names of the live reactive views, sorted.  Read from the in-memory
     registry, so — unlike probing the catalog for [_rv_<name>] — a user table

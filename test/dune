@@ -2140,3 +2140,13 @@
  (name test_reactive_view_star_747)
  (modules test_reactive_view_star_747)
  (libraries granary alcotest lwt.unix))
+
+; #746: per-callback removal for reactive views plus the O(1) registration.
+; In-memory is enough: the registry is process state, not durable state.  The
+; allocation gate here is deterministic (Gc.minor_words over a fixed code
+; path), so it is armed by default; GRANARY_MEM_MAX_CALLBACK_SLOPE raises it.
+
+(test
+ (name test_view_callback_746)
+ (modules test_view_callback_746)
+ (libraries granary alcotest lwt.unix))

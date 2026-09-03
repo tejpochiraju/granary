@@ -21,6 +21,15 @@ type rv_mode =
       ; engine : Reactive_view.Agg_engine.state
       }
 
+(* #746: the opaque handle {!register_view_callback} returns and
+   {!unregister_view_callback} consumes.  It carries the view it was registered
+   against, so a caller cannot present a handle together with the wrong view
+   name — there is no view-name argument to get wrong. *)
+type view_callback =
+  { vcb_view : string
+  ; vcb_id : int
+  }
+
 type rv_entry =
   { rv_name : string
   ; rv_query : Sql.Ast.stmt
@@ -31,7 +40,18 @@ type rv_entry =
     (** #427: a full-refresh view materialised while empty gets an all-TEXT
         placeholder schema; on the first non-empty refresh the [_rv_…] table is
         re-created with column types inferred from the data. *)
-  ; mutable rv_callbacks : (Sql.Exec.row_change list -> unit Lwt.t) list
+  ; mutable rv_callbacks : (int * (Sql.Exec.row_change list -> unit Lwt.t)) list
+    (** #746: held NEWEST-FIRST so {!register_view_callback} is O(1) — it used
+        to be [rv_callbacks <- rv_callbacks @ [ cb ]], which copies the whole
+        list per registration and made [n] registrations cost O(n^2) (measured:
+        4.00x allocation per doubling of [n]).  The firing sites reverse it, so
+        callbacks are still invoked in registration order.
+
+        Each entry carries the id of the {!view_callback} handle that
+        {!register_view_callback} returned, which is what
+        {!unregister_view_callback} removes by.  Ids come from one
+        process-global counter, so a handle can never name a callback it did
+        not mint, even across [Db.t] handles over the same store. *)
   }
 
 (* #634: the shared invalidation generation for every [Db.t] sitting over ONE
@@ -3780,7 +3800,16 @@ let rv_apply_and_notify top entry out_delta =
     let tbl = rv_quote (rv_table_name entry.rv_name) in
     let cols = entry.rv_out_cols in
     let ncols = List.length cols in
-    let want_cb = entry.rv_callbacks <> [] in
+    (* #746: the callback set for this notification is SNAPSHOTTED here, when
+       the batch begins.  [rv_callbacks] is an immutable list and
+       {!register_view_callback} / {!unregister_view_callback} replace the
+       field rather than mutating the cells, so a registration or removal made
+       from inside a callback — including one that unregisters itself — cannot
+       change the set already being fired; it takes effect from the next batch.
+       [want_cb] and the fired set are read from this one binding so they can
+       never disagree. *)
+    let cbs = List.rev entry.rv_callbacks in
+    let want_cb = cbs <> [] in
     let changes = ref [] in
     let dels = List.filter_map (fun (r, w) -> if w < 0 then Some r else None) out_delta in
     let inss = List.filter_map (fun (r, w) -> if w > 0 then Some r else None) out_delta in
@@ -3844,7 +3873,7 @@ let rv_apply_and_notify top entry out_delta =
             if want_cb && !changes <> []
             then (
               let batch = List.rev !changes in
-              let* () = Lwt_list.iter_s (fun cb -> cb batch) entry.rv_callbacks in
+              let* () = Lwt_list.iter_s (fun (_, cb) -> cb batch) cbs in
               Lwt.return (Ok ()))
             else Lwt.return (Ok ()))))
 ;;
@@ -4484,13 +4513,47 @@ let reactive_view_names top =
 
 let is_reactive_view top name = Hashtbl.mem top.reactive_views name
 
+(* #746: one process-global counter, so no two live handles ever share an id —
+   not across views, and not across [Db.t] handles over one store.  A handle
+   presented to the wrong handle's registry therefore simply finds nothing
+   rather than removing an unrelated callback. *)
+let rv_cb_seq = ref 0
+
 let register_view_callback top ~view_name cb =
   match Hashtbl.find_opt top.reactive_views view_name with
   | Some e ->
-    e.rv_callbacks <- e.rv_callbacks @ [ cb ];
-    Ok ()
+    incr rv_cb_seq;
+    let id = !rv_cb_seq in
+    (* O(1): prepend.  The firing site reverses, so registration order is
+       preserved — see {!rv_apply_and_notify}. *)
+    e.rv_callbacks <- (id, cb) :: e.rv_callbacks;
+    Ok { vcb_view = view_name; vcb_id = id }
   | None -> Error (`Unknown_view view_name)
 ;;
+
+let unregister_view_callback top h =
+  match Hashtbl.find_opt top.reactive_views h.vcb_view with
+  | None -> false
+  | Some e ->
+    let removed = ref false in
+    (* [List.filter] builds a NEW list; any snapshot an in-flight notification
+       is iterating keeps pointing at the old one, which is what makes removal
+       from inside a callback well defined (#746). *)
+    let kept =
+      List.filter
+        (fun (id, _) ->
+           if id = h.vcb_id
+           then (
+             removed := true;
+             false)
+           else true)
+        e.rv_callbacks
+    in
+    if !removed then e.rv_callbacks <- kept;
+    !removed
+;;
+
+let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
 
 let () =
   rv_create_hook := rv_create;
