@@ -18,13 +18,99 @@
   (* When a compound (UNION/UNION ALL/INTERSECT/EXCEPT) is built, any
      trailing ORDER BY / LIMIT / OFFSET that the grammar swallowed into
      the right-arm SELECT actually binds to the *combined* result.
-     Strip it from the right arm and surface it at the compound level. *)
-  let lift_compound_tail (right : Ast.stmt) =
+     Strip it from the right arm and surface it at the compound level.
+
+     #486: the [S_with_cte] arm is what keeps that true once a SELECT can carry
+     a derived table: [wrap_derived_ctes] puts the CTE wrapper OUTSIDE the
+     [S_select], so the trailing clauses are no longer at the root of the right
+     arm.  Without it [SELECT ... UNION SELECT ... FROM (...) t ORDER BY x]
+     would sort only the right arm. *)
+  let rec lift_compound_tail (right : Ast.stmt) =
     match right with
     | Ast.S_select s when s.order <> [] || s.limit <> None || s.offset <> None ->
       let right' = Ast.S_select { s with order = []; limit = None; offset = None } in
       (right', s.order, s.limit, s.offset)
+    | Ast.S_with_cte r ->
+      let (q', order, limit, offset) = lift_compound_tail r.query in
+      if order = [] && limit = None && offset = None
+      then (right, [], None, None)
+      else (Ast.S_with_cte { r with query = q' }, order, limit, offset)
     | _ -> (right, [], None, None)
+
+  (* ---------------------------------------------------------------- *)
+  (* #486: FROM lists and derived tables                               *)
+  (* ---------------------------------------------------------------- *)
+
+  (* The ON predicate a comma-separated FROM item (and a CROSS JOIN) is given.
+     An implicit join has no ON clause of its own -- its restriction lives in
+     WHERE -- so the join is a cartesian product at this level.  Spelling that
+     as the literal [1] rather than adding a third [Ast.join_kind] keeps every
+     existing consumer of [Ast.join_clause] correct by construction; the
+     planner recognises it (see [Planner.on_is_trivially_true]) and pulls an
+     equi-join key out of the WHERE clause so the product is never actually
+     built. *)
+  let cross_join_on = Ast.E_lit (Ast.L_int 1L)
+
+  (* A derived table is desugared into a non-recursive CTE wrapped around the
+     SELECT that names it -- the same shape [Sema.expand_views] already builds
+     for a view named in FROM position, so no downstream layer learns a new
+     kind of FROM item.
+
+     Its scope identifier is its alias, per CLAUDE.md's #635 rule: the alias
+     becomes the CTE's NAME, and the FROM item carries no alias of its own, so
+     all three levels ([Sema.from_ident], [Exec.inner_scope_of],
+     [Exec.scan_ident]) answer the alias without a special case.
+
+     An UNALIASED derived table is legal (sqlite3 accepts it) and is named
+     after its byte offset in the statement: unique within a statement, stable
+     across re-parses of the same text, and not something a caller would write
+     by accident.  It is nonetheless a plain identifier, so a table literally
+     called [__derived_12] would be shadowed for that statement. *)
+  let derived_name ~ofs = function
+    | Some a -> a
+    | None -> Printf.sprintf "__derived_%d" ofs
+
+  (* Resolve one FROM item into (scope identifier, alias to carry, CTEs owed). *)
+  let resolve_from_item item alias =
+    match item with
+    | `Table t -> (t, alias, [])
+    | `Derived (s, ofs) ->
+      let name = derived_name ~ofs alias in
+      (name, None, [ (name, s) ])
+
+  let resolve_join (kind, item, alias, on) =
+    let (t, al, ctes) = resolve_from_item item alias in
+    ({ Ast.kind; Ast.table = t; Ast.alias = al; Ast.on }, ctes)
+
+  (* Flatten [t1 joins1, t2 joins2, ...] into the single leading table plus one
+     flat join list, in left-to-right column order.  Each comma contributes an
+     [Inner] join with the trivially-true ON above. *)
+  let flatten_from elems =
+    match elems with
+    | [] -> assert false
+    | (item0, alias0, joins0) :: rest ->
+      let (table, tbl_alias, ctes0) = resolve_from_item item0 alias0 in
+      let head_joins = List.map resolve_join joins0 in
+      let rest_joins =
+        List.concat_map
+          (fun (item, alias, joins) ->
+             resolve_join (Ast.Inner, item, alias, cross_join_on)
+             :: List.map resolve_join joins)
+          rest
+      in
+      let all = head_joins @ rest_joins in
+      (table, tbl_alias, List.map fst all, ctes0 @ List.concat_map snd all)
+
+  (* Wrap [inner] in one non-recursive CTE per derived table, the first one
+     outermost.  They are independent of one another, and binding a
+     non-recursive CTE's definition happens before its name is registered, so
+     nesting cannot let one derived table see another. *)
+  let wrap_derived_ctes ctes inner =
+    List.fold_left
+      (fun acc (name, def) ->
+         Ast.S_with_cte { name; def; query = acc; recursive = false })
+      inner
+      (List.rev ctes)
 
   (* #491: DISTINCT inside an aggregate's argument list.  For the aggregates
      that take exactly one value — COUNT, SUM, AVG, MIN, MAX — the arguments
@@ -84,7 +170,7 @@
 %token DROP
 %token BEGIN COMMIT ROLLBACK SAVEPOINT RELEASE
 %token ABORT IGNORE FAIL
-%token JOIN INNER LEFT OUTER
+%token JOIN INNER LEFT OUTER CROSS
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
@@ -191,6 +277,7 @@ any_ident:
   | FOLLOWING     { "following" }
   | IGNORE        { "ignore" }
   | INDEX         { "index" }
+  | CROSS         { "cross" }
   | INNER         { "inner" }
   | INTO          { "into" }
   | IS            { "is" }
@@ -851,10 +938,11 @@ compound_select:
 select:
   | SELECT distinct = boption(DISTINCT) proj = projection ft = from_tail
     { match ft with
-      | Some (table, tbl_alias, js, wh, gb, hv, ob, limit, offset) ->
-        S_select { distinct; proj; table; table_alias = tbl_alias; joins = js; where = wh;
-                   group_by = gb; having = hv;
-                   order = ob; limit; offset }
+      | Some (table, tbl_alias, js, wh, gb, hv, ob, limit, offset, ctes) ->
+        wrap_derived_ctes ctes
+          (S_select { distinct; proj; table; table_alias = tbl_alias; joins = js; where = wh;
+                      group_by = gb; having = hv;
+                      order = ob; limit; offset })
       | None ->
         let exprs = match proj with
           | `Exprs es -> es
@@ -864,12 +952,27 @@ select:
         S_const_select { exprs } }
 
 from_tail:
-  | FROM table = any_ident tbl_alias = optional_table_alias
-      js = join_clauses wh = where_opt
+  | FROM elems = from_element_list wh = where_opt
       gb = group_by_clause hv = having_clause ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
-      Some (table, tbl_alias, js, wh, gb, hv, ob, limit, offset) }
+      let (table, tbl_alias, js, ctes) = flatten_from elems in
+      Some (table, tbl_alias, js, wh, gb, hv, ob, limit, offset, ctes) }
   |   { None }
+
+(* #486: a comma-separated FROM list.  Each element carries its own JOIN chain,
+   so [FROM a JOIN b ON ..., c JOIN d ON ...] flattens in source order and the
+   column offsets stay a, b, c, d. *)
+from_element_list:
+  | e = from_element                                { [ e ] }
+  | e = from_element COMMA rest = from_element_list { e :: rest }
+
+from_element:
+  | it = from_item a = optional_table_alias js = join_clauses { (it, a, js) }
+
+(* #486: a FROM item is a table name or a parenthesised derived table. *)
+from_item:
+  | n = any_ident                      { `Table n }
+  | LPAREN s = compound_select RPAREN  { `Derived (s, $startofs) }
 
 (* Optional alias on a FROM table or JOIN target. SQL allows either
    `AS name` or just `name`. The bare form uses plain IDENT (not
@@ -883,15 +986,23 @@ join_clauses:
   |                                  { [] }
   | j = join_clause rest = join_clauses { j :: rest }
 
+(* #486: a join's right-hand side is a [from_item], so a derived table can sit
+   there too.  The clause yields an unresolved quadruple rather than an
+   [Ast.join_clause]: [flatten_from] turns it into one, minting the CTE a
+   derived table owes. *)
 join_clause:
-  | INNER JOIN t = any_ident alias = optional_table_alias ON e = expr
-    { { kind = Inner; table = t; alias; on = e } }
-  | LEFT JOIN t = any_ident alias = optional_table_alias ON e = expr
-    { { kind = Left;  table = t; alias; on = e } }
-  | LEFT OUTER JOIN t = any_ident alias = optional_table_alias ON e = expr
-    { { kind = Left;  table = t; alias; on = e } }
-  | JOIN t = any_ident alias = optional_table_alias ON e = expr
-    { { kind = Inner; table = t; alias; on = e } }
+  | INNER JOIN t = from_item alias = optional_table_alias ON e = expr
+    { (Inner, t, alias, e) }
+  | LEFT JOIN t = from_item alias = optional_table_alias ON e = expr
+    { (Left,  t, alias, e) }
+  | LEFT OUTER JOIN t = from_item alias = optional_table_alias ON e = expr
+    { (Left,  t, alias, e) }
+  | JOIN t = from_item alias = optional_table_alias ON e = expr
+    { (Inner, t, alias, e) }
+  (* CROSS JOIN takes no ON clause; it is the comma spelled out, and gets the
+     same trivially-true predicate. *)
+  | CROSS JOIN t = from_item alias = optional_table_alias
+    { (Inner, t, alias, cross_join_on) }
 
 update:
   | UPDATE table = any_ident SET

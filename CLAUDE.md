@@ -1024,6 +1024,112 @@ EOF
       change resolved it. #721 is that change and the case now asserts the
       answer. Full coverage lives in `test/test_outer_ref_721.ml` and
       `test/test_outer_ref_732.ml`.
+- **A comma in FROM is an INNER join on the literal `1`; a derived table is a
+  CTE (#486, decided 2026-09-03).** `SELECT * FROM a, b WHERE a.x = b.y` and
+  `SELECT * FROM (SELECT x FROM a) AS t` did not parse at all, and between them
+  they account for ~18 of the 20 TPC-H queries #482 could not run. Both are
+  closed **in the parser**, with no new `Ast` node and no new kind of FROM item
+  for the layers below to learn.
+
+  **The comma.** An implicit join has no ON clause of its own — its restriction
+  lives in WHERE — so at the join itself the pairing is unrestricted. That is
+  spelled as the literal `1` (`Parser.cross_join_on`) rather than as a third
+  `Ast.join_kind`, which keeps every existing consumer of `Ast.join_clause`
+  correct by construction. `CROSS JOIN` is the same production with the keyword
+  spelled out, and comes out free. A hand-written `JOIN b ON 1` is
+  indistinguishable from the sugar and is treated identically — right, because
+  both say the same thing.
+
+  **`FROM a, b WHERE a.x = b.y` must not become a cartesian product, and that
+  is a planner change, not a parser one.** `general_on_join` would have built
+  the whole product and filtered it above — O(N*M) on exactly the queries this
+  exists for. `Planner.on_is_trivially_true` recognises the literal and
+  `Planner.where_join_key` hands the join **one WHERE equality that spans its
+  two sides**, so the implicit spelling plans to the same keyed hash join (or
+  nested-loop probe) the explicit one does. It cannot change the answer: the ON
+  is true for every pair and `chain_joins` applies the whole WHERE above the
+  join anyway, so joining on a conjunct of that same WHERE emits a subset of
+  the same product and every pair removed is one the filter above would have
+  removed — NULL keys included, since `a.x = b.y` is unknown, hence false, on
+  them. The chosen conjunct **stays** in the WHERE clause and is evaluated
+  twice; that is deliberate, and removes any need to reason about which
+  conjuncts the join consumed.
+
+  **It is INNER-only and must stay so.** For a `Left` join the ON predicate
+  *is* the match test (#552), so narrowing it would suppress null-extended rows
+  that must be emitted. `where_join_key` is never consulted there.
+
+  With nothing to borrow, the join stays the cartesian product it genuinely is
+  — and `general_on_join` no longer wraps it in an `Op_filter` evaluating the
+  constant `1` once per row. `plan_join_on_literal` in `test/test_planner.ml`
+  used to pin that filter and now pins its absence; `plan_join_general_on`
+  beside it still pins the filter for an ON that is not trivially true, which
+  is the arm the literal case used to stand in for.
+
+  **The derived table.** `(SELECT …) AS t` desugars into a non-recursive CTE
+  wrapped around the SELECT that names it — the shape `Sema.expand_views`
+  already builds for a view named in FROM position (#496/#497), so nothing
+  downstream is new. **The alias becomes the CTE's NAME and the FROM item
+  carries no alias of its own**, which is the whole of the #635 scope story
+  here: a derived table has no underlying name for an alias to replace, so all
+  three levels (`Sema.from_ident`, `Exec.inner_scope_of`, `Exec.scan_ident` /
+  `get_outer_scan_metas`) answer the alias with no special case. Do not give
+  the FROM item both a name and an alias — that is the drift the #635 rule
+  exists to prevent.
+
+  An **unaliased** derived table is legal (sqlite3 accepts it) and is named
+  `__derived_<byte offset in the statement>`: unique within a statement, stable
+  across re-parses of the same text. It is nonetheless a plain identifier, so a
+  table literally called `__derived_12` would be shadowed for that statement.
+
+  Three things had to move with it, and each was a silent failure before:
+  - `lift_compound_tail` recurses through `S_with_cte`. The wrapper sits
+    OUTSIDE the `S_select`, so a compound's trailing ORDER BY is no longer at
+    the root of its right arm; without the recursion
+    `SELECT … UNION SELECT … FROM (…) t ORDER BY x` sorted only the right arm.
+  - `Ast.rename_view_columns` grew an `S_with_cte` arm. Its absence was
+    deliberate and correctly reasoned at the time — no view body could be an
+    `S_with_cte` — and stopped being true here. The prerequisite its comment
+    named, a matching arm in `Sema.col_names_of_ast_stmt`, has existed since
+    #491. An explicit `WITH` view body is still a syntax error; only the
+    desugaring reaches this.
+  - **`CREATE REACTIVE VIEW` over a derived table is REFUSED**
+    (`Sema.reject_reactive_derived_table`). `Reactive_view.base_tables_of`
+    reads the base tables off the `S_select` at the root of the body and
+    answers `[]` for anything else, so the view would be registered with
+    nothing to invalidate it and would serve its first snapshot forever, with
+    no error. A plain `CREATE VIEW` is unaffected — its body is re-bound on
+    every use. Lifting the refusal means teaching `base_tables_of` to look
+    through the wrapper **and** to collect the CTE definition's own tables;
+    both halves, or the same silence returns.
+
+  **Accepted limitation, and it is not new: a subquery correlated to a derived
+  table is refused.** `Exec.get_outer_scan_metas` resolves an outer input from
+  the *plan*, and a CTE scan is materialized into `Op_pragma_rows` before the
+  filter runs — an op carrying no `Cat.table_meta` and so no scope identifier.
+  A plain `WITH c AS (…) SELECT … WHERE EXISTS (… c.y …)` is refused
+  identically on the tree *before* #486, and
+  `a_subquery_correlated_to_a_derived_table_is_refused` in
+  `test/test_from_list_derived_486.ml` asserts the two refusals are the *same
+  message* so the pairing cannot drift. sqlite3 answers it. The refusal is loud
+  rather than a wrong answer, which is what keeps it a limitation; if
+  `Op_pragma_rows` ever learns its source, that test should start passing as an
+  answer and must be rewritten, not deleted.
+
+  **Two smaller divergences from sqlite3, both deliberate.** A column-alias
+  list on a derived table (`AS t(c1, c2)`) is a syntax error — so it is in the
+  sqlite3 in the dev image, oracle-checked, and TPC-H Q13's spec spelling needs
+  the same rewrite there. Nested parentheses in FROM (`FROM ((SELECT 1))`) are
+  a syntax error where sqlite3 accepts them; distinguishing `(a)` from
+  `(SELECT …)` at an arbitrary paren depth is not worth a FROM-position
+  conflict.
+
+  **Grammar cost.** The FROM productions add **zero** menhir conflicts. The
+  count moved 290 → 292 solely because `CROSS` joined `any_ident`, putting it
+  in the token set of two pre-existing `CREATE TABLE … DEFAULT <keyword>`
+  conflict states; the state count is unchanged at 35. Like sqlite3, `CROSS` is
+  reserved in bare-alias position (`FROM a cross` is a syntax error in both)
+  but usable as a table name and after `AS`.
 - **A view is resolved at EVERY FROM position, and each subquery carries its own
   expansion (#496/#497, fixed 2026-09-03).** A view reference is desugared into
   a CTE wrapped around the statement that names it. That rewrite used to be
