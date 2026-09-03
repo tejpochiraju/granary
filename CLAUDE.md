@@ -991,6 +991,78 @@ EOF
   survive in a borrowed transaction, and statement atomicity on error is a
   different problem.
 
+- **`ALTER TABLE ... RENAME` refuses three shapes sqlite3 handles, and one of
+  the three is a genuine over-refusal (#673/#645, recorded 2026-09-03).** #673's
+  option 1: the divergence is *recorded*, not removed. Oracle-checked against
+  sqlite3 3.45.1 on 2026-08-07, after #645's refusal reached `main` via PR #671.
+
+  | case | sqlite3 3.45.1 | granary |
+  |---|---|---|
+  | `RENAME COLUMN` with a dependent view | remaps the stored view SQL (`CREATE VIEW v AS SELECT z FROM t`) | refuses, naming the view |
+  | `RENAME TO` with a trigger on the table | remaps the stored trigger SQL (`... ON "t2" ...`) | refuses, naming the trigger |
+  | `RENAME COLUMN a` on `t` while an **unrelated** view says `FROM other AS t` | renames, and correctly leaves the view alone — that `a` is `other.a` | **refuses** |
+
+  **Rows 1 and 2 are defensible conservatism; row 3 is the genuine
+  over-refusal.** In the first two the dependency is real — something would
+  break if the rename went through unremapped — so granary trades a feature for
+  a loud error naming the object, with a documented way out: drop the view or
+  trigger, rename, recreate it. In row 3 *nothing depends on anything*: the
+  token `t` is an alias for a different table, and the rename is refused over a
+  name collision.
+
+  **Row 3 is also the argument for the refusal, which is why it is not to be
+  "fixed" by loosening the detector.** SQLite's rewrite is *scoped* — it knows
+  that `a` belongs to `other` — and that is exactly what granary cannot do here.
+  Views, reactive views and triggers are persisted as raw `CREATE ...` SQL
+  **text** keyed by name (`_sys_views`, `_sys_reactive_views`,
+  `_sys_triggers`), and the catalog sits *below* the parser in the dependency
+  graph (`granary.sql` depends on `granary.catalog`, not the reverse), so there
+  is no AST to walk and re-render and there cannot be one. A lexical rewrite
+  over that text would rewrite `other`'s column inside the view and turn a
+  working view into a quietly wrong one — a silent wrong answer traded for a
+  loud break, which is the failure mode #609 was filed about.
+
+  **`Catalog.sql_mentions_ident` is deliberately position-blind — and
+  case-insensitive and bracket-aware for the same reason.** It is a *detector*
+  guarding a refusal, not a rewriter, and its failure modes are asymmetric: a
+  false positive costs a rename and says exactly why, a false negative silently
+  leaves a view or trigger naming a column that no longer exists.
+  `rewrite_ident_in_sql`'s `is_column_ref_at` excludes a word followed by `.`,
+  which is precisely where a *table* name stands (`v0.a`), so a detector
+  inheriting that filter would miss every qualified reference — the common
+  spelling inside a view body. Position-blind makes it **role-blind** too, and
+  row 3 is that bill: an identifier-shaped token counts wherever it stands, so a
+  table alias — or a `COUNT` call where a column is named `count` — is
+  indistinguishable from a reference. String literals and `--` comments are
+  skipped, so a name inside either is not a reference. (`lexer.mll` has no
+  block-comment rule, so a slash-star sequence is not a comment in this dialect
+  and is not treated as one.)
+
+  **Closing it properly** is #673's option 2 and #645's option (a): a
+  parser-side rewriter that resolves names against the schema, so a rewrite can
+  be scoped the way SQLite's is. That closes all three rows, not just the third.
+  More string surgery in the catalog cannot close any of them at any level of
+  cleverness — the information needed is not in the text.
+
+  Two further things a reader who hits a refusal should know:
+  - The **column** gate closes over *reachability*, not over the table name
+    alone: a definition blocks when it spells the column AND spells something
+    reachable from the table — the table itself, or a view that (transitively)
+    names it. That is what catches a chain through a `SELECT *` view, whose
+    stored text names the table but never the column; requiring both names in
+    the same text let that chain through and left the downstream view silently
+    dead, #609's own symptom. The **table** gate needs no closure: anything
+    reaching the table indirectly does so through a definition that names it
+    directly, and that one blocks.
+  - `rename_table`'s refusal is a **compatibility break**, in those words: a
+    table with any trigger declared `ON` it, or named by any view, cannot be
+    renamed at all until that object is dropped, where before the rename
+    succeeded and left the object broken.
+
+  Pinned by `test/test_rename_deps_609.ml`, whose `alias_collision_over_refuses`
+  holds row 3 — in its qualified spelling, `CREATE VIEW v2 AS SELECT t.a FROM
+  other AS t` — as known behaviour pinned rather than endorsed. Change it as a
+  decision, not to make a fix pass.
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
 ### A failing autocheckpoint is surfaced, never raised (#638)
