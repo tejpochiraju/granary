@@ -1482,27 +1482,75 @@ EOF
   `Db`'s `ROLLBACK` and `ROLLBACK TO` handlers needed nothing: #427 already
   clears `rv_pending` on the former and sets `rv_resync` on the latter.
 
-  **Known residual, opposite direction, not fixed here.**
-  `Db.drive_reactive` drops the whole accumulator on an `Error` result. In
-  autocommit that is right — the statement's transaction was rolled back. In a
-  **borrowed** transaction a raising statement's partial writes *survive*, so
-  their deltas are dropped while the rows remain: a materialised view that is
-  missing rows rather than inventing them. It is unobservable through today's
-  public surfaces (`execute_with_changes` / `execute_with_dirty` return the
-  `Error` and never read the accumulator), and fixing it means deciding what
-  `Error` should mean for #427's feed, which is a different question from
-  #666's. Tracked as #737.
+  **The opposite direction — #737, fixed 2026-09-03.** `Db.drive_reactive`
+  used to drop the whole accumulator on an `Error` result, which left a
+  materialised view **missing rows** rather than inventing them. It now
+  schedules a **resync** of the reactive views instead — `rv_resync <- true`,
+  the same answer `ROLLBACK TO` has always given for the same reason (#427) —
+  and still absorbs nothing on failure.
 
-  **#737's fix owes marks to more sites than #666 took.** The autocommit
-  exception handlers of `execute_update_op`, `execute_delete_op`, the FTS
-  arms and the two columnar `Op_insert` arms all `S.rollback` the statement's
-  own transaction and leave their deltas behind — today that is harmless
-  *because* `drive_reactive` drops the accumulator on `Error`. Stop dropping
-  it and every one of those becomes a phantom-row site. `execute_insert`'s
-  exception path already restores (it is the one #666 touched); the others do
-  not. The `n = 0` early-outs in `execute_update_op` / `execute_delete_op` are
-  **not** among them: they roll back before any row is processed or any
-  trigger fires, so no delta can exist yet.
+  **Two of #737's premises, as filed, were wrong, and correcting them is what
+  chose the fix.** Both were established by running the repro, not by reading:
+
+  - **Autocommit is NOT the safe half.** The issue (and this file) said
+    dropping the accumulator there is right because the statement's
+    transaction was rolled back. A statement is not one transaction: a
+    multi-row `VALUES` list and `INSERT … SELECT` run one `execute_insert` —
+    and one **COMMIT** — per row, so a failure on row k leaves rows 1..k−1
+    durably committed with their deltas discarded. `INSERT INTO base VALUES
+    (1,'g'),(2,'g'),(1,'g')` in autocommit left two rows in the base table and
+    an empty `_rv_av`.
+  - **Absorbing the accumulator on `Error` is not sufficient**, so the
+    obvious mirror of #666 does not close it. `execute_insert` records its
+    `Inserted` delta only *after* `execute_insert_write` returns, and the
+    AFTER INSERT trigger fires **inside** it — so a raising AFTER trigger in a
+    borrowed transaction leaves the row in the store with **no delta recorded
+    anywhere**. Absorbing would still have left the view missing that row. The
+    delta log is not a faithful description of what a raising statement left
+    behind, in either transaction mode, and no amount of marking makes it one.
+
+  So **#737 owes no new marks at all** — the sentence that used to stand here
+  claiming it owed them to `execute_update_op`, `execute_delete_op`, the FTS
+  arms and the two columnar `Op_insert` arms was written against the absorbing
+  fix. Under a resync the accumulator is discarded on `Error` exactly as
+  before, so a handler that leaves stale deltas behind stays harmless.
+  `execute_insert`'s mark (#666's) is kept because it also serves the
+  non-raising SKIP path.
+
+  **The trigger is narrowed, and the narrowing is the only part with a cost
+  argument.** `Db.rv_note_failed_statement` sets `rv_resync` when either:
+
+  - the statement ran inside an **explicit transaction** — #631 keeps a raising
+    statement's partial effects there deliberately, so *any* error may have
+    left rows behind, including the no-delta shape above; or
+  - the accumulator's #240 **name set** names a reactive base table — in
+    autocommit that is what says the statement got as far as committing
+    something. The over-approximate half of the accumulator is used on
+    purpose: it errs towards a superfluous rebuild, never a missed one.
+
+  With neither — the common `try INSERT, catch UNIQUE` in autocommit, and every
+  parse or sema error — nothing is scheduled and the error path costs what it
+  always did. An unconditional resync would have made every failed statement
+  rebuild every view.
+
+  `drive_reactive`'s flush gate moved above the `Error` early-return so a
+  resync scheduled in autocommit is applied immediately rather than waiting for
+  the next successful statement; the failing statement's **own** error is still
+  what the caller gets back, never the flush's.
+
+  **`ROLLBACK` deliberately does not clear `rv_resync`.** A rebuild from the
+  base tables is correct whatever the transaction did, so a needless one after
+  an aborted transaction is a bounded cost, and clearing it would be one more
+  thing to get right.
+
+  Pinned by `test/test_change_feed_error_737.ml`, whose controls need a seam:
+  a resync of an already-correct view is invisible, so they write a bogus row
+  straight into `_rv_av` first — a resync rebuilds from the base table and
+  removes it, an incremental flush leaves it. Verified by mutation against all
+  three candidate designs: the old drop fails 7 of its 12 cases, an
+  unconditional resync fails the two narrowing controls, and absorbing instead
+  of resyncing fails 4 — including the raising-AFTER-trigger case, which is the
+  one that decides between the two fixes.
 
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 

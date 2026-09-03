@@ -317,6 +317,42 @@ let rv_absorb_changes t acc =
       (Sql.Exec.dirty_changes acc)
 ;;
 
+(* #737: a statement that returned [Error] may still have left writes behind,
+   and its delta log cannot be trusted to describe them — so the views are
+   marked for a resync from the base tables instead, which is the same answer
+   [rollback_to_savepoint] already gives for the same reason (#427).
+
+   Absorbing the accumulator on [Error] was the other candidate and it is NOT
+   sufficient, which is the finding to keep: [execute_insert] records its
+   [Inserted] delta only AFTER [execute_insert_write] returns, and the AFTER
+   INSERT trigger fires inside it, so a raising AFTER trigger in a borrowed
+   transaction leaves the row in the store with no delta recorded anywhere.
+   Absorbing would still have left the materialisation missing that row.
+   Dropping the deltas and rebuilding is exact whatever the write path did.
+
+   Two conditions, and both are needed:
+
+   - [explicit_txn] — in a BORROWED transaction #631 keeps a raising
+     statement's partial effects deliberately, so ANY error may have left rows
+     behind, including the no-delta shape above.
+   - [dirty_elements] — in AUTOCOMMIT a statement is not one transaction. A
+     multi-row [VALUES] list and [INSERT ... SELECT] run one [execute_insert]
+     (and one COMMIT) per row, so a failure on row k leaves rows 1..k-1
+     durably committed; the accumulator is what says the statement got that
+     far. Using the #240 NAME set rather than {!dirty_changes} is deliberate:
+     it is the over-approximate half (#666), so it errs towards a superfluous
+     rebuild rather than a missed one.
+
+   With neither — the common `try INSERT, catch UNIQUE` in autocommit, where
+   the per-row transaction was rolled back and nothing was recorded — no
+   resync is scheduled and the error path costs what it always did. *)
+let rv_note_failed_statement t acc =
+  if
+    Option.is_some t.explicit_txn
+    || List.exists (fun tbl -> rv_is_base_table t tbl) (Sql.Exec.dirty_elements acc)
+  then t.rv_resync <- true
+;;
+
 (* Drop all accumulated pending changes (on ROLLBACK). *)
 let rv_clear_pending t = Hashtbl.reset t.rv_pending
 
@@ -2448,17 +2484,17 @@ let drive_reactive top ~core =
     in
     (match result with
      | Ok _ -> rv_absorb_changes top acc
-     | Error _ -> ());
-    match result with
-    | Error _ -> Lwt.return result
-    | Ok _ ->
-      if top.explicit_txn = None && (Hashtbl.length top.rv_pending > 0 || top.rv_resync)
-      then
-        let* fr = !rv_flush_hook top in
-        match fr with
-        | Ok () -> Lwt.return result
-        | Error e -> Lwt.return (Error e)
-      else Lwt.return result
+     | Error _ -> rv_note_failed_statement top acc);
+    if top.explicit_txn = None && (Hashtbl.length top.rv_pending > 0 || top.rv_resync)
+    then
+      let* fr = !rv_flush_hook top in
+      match fr, result with
+      (* #737: the failing statement's own error is the informative one, so a
+         flush scheduled by it does not replace it. On [Ok] the flush's error
+         is still the result, unchanged. *)
+      | Error e, Ok _ -> Lwt.return (Error e)
+      | _, _ -> Lwt.return result
+    else Lwt.return result
 ;;
 
 let execute top sql = drive_reactive top ~core:(fun () -> execute_core top sql)

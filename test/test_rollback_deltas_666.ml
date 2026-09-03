@@ -39,12 +39,16 @@
     the delta test it deliberately disagrees with — the two halves of one
     accumulator answering differently is the point, not an inconsistency.
 
-    {b The opposite direction is open, not fixed here.} [Db.drive_reactive]
-    drops the whole accumulator when a statement returns [Error]. In autocommit
-    that is right (the transaction was rolled back); in a borrowed transaction a
-    raising statement's partial writes survive, so their deltas are dropped
-    while the rows remain — a view MISSING rows rather than inventing them. It
-    is unobservable through today's public surfaces and is tracked as #737.
+    {b The opposite direction was open when this file was written and is now
+    fixed — #737, [test/test_change_feed_error_737.ml].} [Db.drive_reactive]
+    dropped the whole accumulator when a statement returned [Error], leaving a
+    view MISSING rows rather than inventing them: in a borrowed transaction a
+    raising statement's partial writes survive, and in autocommit a multi-row
+    INSERT commits per row, so both halves could leave rows behind whose deltas
+    were discarded. It is {b not} fixed by absorbing the accumulator instead —
+    a row can survive with no delta recorded for it at all — so the [Error] arm
+    schedules a resync of the affected views and this file's own deltas are
+    untouched by that change.
 
     {b The control cases matter as much as the defect.} A restore that fired too
     widely would eat every trigger's deltas, which is the same wrong answer with

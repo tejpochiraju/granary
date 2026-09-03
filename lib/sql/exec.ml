@@ -5081,9 +5081,16 @@ let execute_insert
           #666: the deltas follow the STORE, so they are dropped exactly when
           the store is — in autocommit, where [S.rollback] below undoes the
           whole per-row transaction.  In a borrowed transaction the partial
-          effects survive, so their deltas must survive with them; a consumer
-          that then loses them is a different defect in the opposite direction
-          (see [Db.drive_reactive]'s [Error] arm). *)
+          effects survive, so their deltas must survive with them.
+
+          #737 (fixed): the consumer that used to lose them —
+          [Db.drive_reactive]'s [Error] arm — no longer absorbs the
+          accumulator at all on failure; it schedules a resync of the affected
+          reactive views instead.  So no OTHER exception handler in this module
+          owes itself a mark: whatever a raising statement left in the delta
+          log is discarded, and the views are rebuilt from the base tables.
+          A mark here is still correct and is kept, because it also serves the
+          non-raising SKIP path through [stmt_savepoint_finish]. *)
        let* () = stmt_savepoint_release ~cat tx sp in
        if owned then changes_restore mark;
        let* () = if owned then S.rollback tx else Lwt.return_unit in
