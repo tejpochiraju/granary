@@ -425,15 +425,17 @@ let classify_range_bound (ty : Row.ty) = function
   | _ -> `Unknown
 ;;
 
-(** Order two [`Orderable] bounds for the same column.  [Float.compare] is the
-    same total order {!Granary_sql.Exec.compare_values} applies in the residual
-    predicate and {!Granary_encoding.Index_key.encode_value} encodes, so the
-    fold can never pick a bound the predicate and the key order disagree
-    about.  #527: a mixed int/real pair is ordered through [Int64.to_float],
-    which above 2^53 can name the wrong one "tightest".  That is a perf
-    question, not a soundness one — the fold only ever picks between candidates
-    that are each individually a sound bound, and no conjunct is marked
-    consumed, so a wrong pick loses a narrowing and never a row. *)
+(** Order two [`Orderable] bounds for the same column.  Within a single numeric
+    type [Float.compare] / [Int64.compare] agree with
+    {!Granary_sql.Exec.compare_values} (the residual predicate's order since
+    #733) and with {!Granary_encoding.Index_key.encode_value}, so the fold can
+    never pick a bound the predicate and the key order disagree about.  #527: a
+    mixed int/real pair is ordered here through [Int64.to_float], which above
+    2^53 can name the wrong one "tightest" — and since #733 the predicate no
+    longer promotes that way, so the two genuinely differ there.  That is a
+    perf question, not a soundness one — the fold only ever picks between
+    candidates that are each individually a sound bound, and no conjunct is
+    marked consumed, so a wrong pick loses a narrowing and never a row. *)
 let compare_range_bounds a b =
   match a, b with
   | Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_int y) -> Some (Int64.compare x y)

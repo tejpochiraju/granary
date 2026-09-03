@@ -1900,3 +1900,14 @@
  (name test_alter_add_generated_661)
  (modules test_alter_add_generated_661)
  (libraries granary alcotest lwt.unix))
+
+; #733/#734: Exec.cmp_result is Exec.compare_values plus three-valued NULL
+; handling — exact int-vs-real above 2^53, and the NULL < number < TEXT < BLOB
+; class order — so a WHERE clause and an ORDER BY cannot disagree. Includes the
+; index-path cases, since range_bound_key's widening was written against the
+; inexact predicate this removes.
+
+(test
+ (name test_cmp_result_733)
+ (modules test_cmp_result_733)
+ (libraries granary alcotest lwt.unix))

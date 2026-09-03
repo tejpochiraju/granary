@@ -352,7 +352,9 @@ val eval_expr
     cannot reach the magnitudes that matter: the defect it guards is invisible
     below 2^53 and invisible to any fixture that happens to be sorted.
 
-    This is [compare_values]'s order only. [cmp_result], the WHERE-predicate
-    comparator, still promotes inexactly above 2^53 (#733) and answers false
-    for every cross-class comparison (#734). *)
+    Since #733/#734 this is also the WHERE-predicate order for [<], [<=], [>]
+    and [>=]: [cmp_result] delegates here, adding only three-valued NULL
+    handling.  [=] and [<>] keep their own arms, and their cross-NUMERIC
+    answers still differ from this order — an equality conjunct is consumed by
+    the index access path, so both levels have to move together (#738). *)
 val compare_values : Granary_encoding.Row.value -> Granary_encoding.Row.value -> int
