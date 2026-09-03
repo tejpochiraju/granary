@@ -2175,6 +2175,7 @@
   lwt.unix))
 
 ; #316: measurement of the per-row AUTOINCREMENT catalog-mirror write.
+
 (test
  (name test_autoinc_mirror_316)
  (modules test_autoinc_mirror_316)

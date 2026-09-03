@@ -33,7 +33,51 @@
 
     Autocheckpoint is disabled for the measured window so the WAL only grows;
     otherwise a checkpoint would truncate it mid-measurement and the byte
-    figure would be noise. *)
+    figure would be noise.
+
+    WHAT IT MEASURED (2026-09-03, 400 rows per point, byte-identical across
+    repeated runs — every figure below is a count, so a loaded box does not
+    move it):
+
+    {v
+      autocommit           minor_words/row   wal_bytes/row   mirror blob
+      width  3  plain           11 679.4        43 157.0          69 B
+      width  3  AUTOINC         13 988.0        51 397.0          71 B
+      width 30  plain           16 920.4        44 506.3         386 B
+      width 30  AUTOINC         21 401.6        52 746.3         388 B
+
+      explicit txn (400 rows in one BEGIN/COMMIT)
+      width 30  plain            7 311.9           164.8         386 B
+      width 30  AUTOINC          7 318.0           175.1         388 B
+    v}
+
+    Three conclusions, and the recommendation on #316 rests on all three:
+
+    - The WAL delta is +8 240 bytes/row — EXACTLY two 4 120-byte frames — and
+      it is IDENTICAL at 3 and at 30 columns.  So the durable half of the cost
+      is the two pages the mirror [S.put] dirties, not the size of the blob it
+      serialises.  #316's proposed optimisation 1 (encode the counter as a
+      small standalone record) attacks the blob and would leave this untouched:
+      a put of 8 bytes dirties the same pages as a put of 388.
+
+    - The allocation delta does grow with the width, 2 308.6 -> 4 481.2
+      words/row, but only 1.94x for a 10x wider schema and a 5.5x bigger blob.
+      The re-encode is a minority of it; the 4 KB page and frame machinery
+      around the put is the rest.
+
+    - Inside an EXPLICIT transaction the whole thing costs +6.1 words/row and
+      +10.3 bytes/row — ONE extra WAL frame for the entire 400-row
+      transaction, because #347 already coalesces the counter write to COMMIT.
+      That is #316's optimisation 2, already in place wherever it means
+      anything; in autocommit "commit time" IS per row, so there is nothing
+      left for it to coalesce.
+
+    Net: 19-27% over a plain rowid insert, and only on the autocommit
+    single-row path, which already spends ~43 KB of WAL per row on
+    per-statement transaction machinery before AUTOINCREMENT is mentioned.
+    Only optimisation 3 (refresh every N bumps) would remove the 8 240 bytes,
+    and it buys ~16% of an un-batched insert in exchange for a durability
+    semantics change.  Measured and not worth it. *)
 
 open Lwt.Syntax
 module Store = Granary_store.Store
@@ -172,9 +216,12 @@ let measure ~label ~width ~n ~autoinc ~explicit =
     for _ = 1 to n do
       exec db stmt
     done;
+    (* The COMMIT is INSIDE the measured window for the explicit case: it is
+       where #347 puts the deferred counter write, so leaving it out would
+       flatter the deferral by measuring the part it moved the work out of. *)
+    if explicit then exec db "COMMIT";
     let w1 = Gc.minor_words () in
     let wal1 = file_size (path ^ "-wal") in
-    if explicit then exec db "COMMIT";
     let mirror = mirror_bytes store in
     let nrows = List.hd (rows db "SELECT COUNT(id) FROM t") in
     Alcotest.(check string) "every row landed" (string_of_int (n + 1)) nrows;
@@ -223,11 +270,14 @@ let max_ratio =
 let autocommit_cost () =
   List.iter
     (fun width ->
-       let plain = measure ~label:"plain" ~width ~n:n_rows ~autoinc:false ~explicit:false in
+       let plain =
+         measure ~label:"plain" ~width ~n:n_rows ~autoinc:false ~explicit:false
+       in
        let ai = measure ~label:"autoinc" ~width ~n:n_rows ~autoinc:true ~explicit:false in
        let ratio = ai.words_per_row /. plain.words_per_row in
        Printf.printf
-         "#316 width=%2d autocommit alloc ratio AUTOINC/plain = %.3f  (wal ratio %.3f)\n%!"
+         "#316 width=%2d autocommit alloc ratio AUTOINC/plain = %.3f  (wal ratio %.3f)\n\
+          %!"
          width
          ratio
          (ai.wal_bytes_per_row /. plain.wal_bytes_per_row);
@@ -249,7 +299,9 @@ let autocommit_cost () =
 let overhead_vs_schema_width () =
   let p3 = measure ~label:"w3plain" ~width:3 ~n:n_rows ~autoinc:false ~explicit:false in
   let a3 = measure ~label:"w3ai" ~width:3 ~n:n_rows ~autoinc:true ~explicit:false in
-  let p30 = measure ~label:"w30plain" ~width:30 ~n:n_rows ~autoinc:false ~explicit:false in
+  let p30 =
+    measure ~label:"w30plain" ~width:30 ~n:n_rows ~autoinc:false ~explicit:false
+  in
   let a30 = measure ~label:"w30ai" ~width:30 ~n:n_rows ~autoinc:true ~explicit:false in
   let d3 = a3.words_per_row -. p3.words_per_row in
   let d30 = a30.words_per_row -. p30.words_per_row in
@@ -278,7 +330,9 @@ let overhead_vs_schema_width () =
    future change that reinstates a per-row write in the explicit path is
    caught. *)
 let explicit_txn_pays_once () =
-  let plain = measure ~label:"explplain" ~width:30 ~n:n_rows ~autoinc:false ~explicit:true in
+  let plain =
+    measure ~label:"explplain" ~width:30 ~n:n_rows ~autoinc:false ~explicit:true
+  in
   let ai = measure ~label:"explai" ~width:30 ~n:n_rows ~autoinc:true ~explicit:true in
   let ratio = ai.words_per_row /. plain.words_per_row in
   Printf.printf "#316 width=30 explicit-txn alloc ratio AUTOINC/plain = %.3f\n%!" ratio;
