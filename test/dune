@@ -2016,3 +2016,13 @@
   alcotest
   lwt.unix
   unix))
+
+; #738: [=] and [<>] compare the numeric class exactly, and the three index
+; equality sites (index_lookup_values, stream_rowid_lookup, seek_candidates'
+; Seek_rowid arm) move with them. In-memory is enough — this is planner and
+; comparator behaviour, with no WAL or durability dimension.
+
+(test
+ (name test_cmp_eq_738)
+ (modules test_cmp_eq_738)
+ (libraries granary alcotest lwt.unix))
