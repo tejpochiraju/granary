@@ -1174,7 +1174,8 @@ EOF
   **What it covers, and what it deliberately does not.** The walk
   (`Sema.reactive_projects_star`) follows the statement's **output**
   projection: an `S_select` whose `proj` is `` `All ``, either arm of an
-  `S_compound`, and an `S_with_cte`'s body. It does **not** descend into a CTE
+  `S_compound`, and an `S_with_cte`'s body — the last two latent, since #750 and
+  #486 refuse those roots first. It does **not** descend into a CTE
   *definition* or a subquery, because a star there does not determine the
   view's own arity — `SELECT a FROM (SELECT * FROM t) d` yields exactly one
   column whatever `t` grows, and `WHERE EXISTS (SELECT * FROM u)` is a row
@@ -1201,11 +1202,78 @@ EOF
     mentions emptiness or `SELECT *`, because emptiness stopped being the
     criterion. With the star refused it is unreachable for an `S_select` root
     (`Reactive_view.out_cols_of_proj` answers `Some` for both non-star
-    projections); it remains reachable for an `S_compound` root, whose
-    `proj_of` answers `None`. Such a view is already inert for a different
-    reason — `base_tables_of` answers `[]` for a compound, so nothing ever
-    invalidates it — which is #486's shape in a second place and is not fixed
-    here.
+    projections), and #750 closed the `S_compound` root. **Exactly one spelling
+    still reaches it**, and it is worth knowing because it is not a compound: a
+    FROM-less `SELECT *` parses to `S_const_select { exprs = [] }`, which is
+    neither an `S_select` (so the star check never sees it) nor backed by a
+    table (so nothing could widen it). Verified against the engine's CLI.
+- **A compound-root reactive view (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) is
+  refused (#750, decided 2026-09-03).** Another behaviour break, and the one
+  with the worst pre-fix symptom of the three: the view was **created without
+  error, materialised correctly once, and then served that first snapshot
+  forever**. No error at any point.
+
+  `Reactive_view.base_tables_of` reads the base tables off the `S_select` at the
+  root of the body and answers `[]` for everything else, so a compound view
+  registered with **no base tables** and no write to either arm's table ever
+  marked it dirty. Reproduced, not merely reasoned about:
+
+  ```sql
+  CREATE REACTIVE VIEW cv AS SELECT a FROM t UNION SELECT b FROM u;
+  SELECT * FROM _rv_cv;   -- 1, 2
+  INSERT INTO t VALUES (99);
+  SELECT * FROM _rv_cv;   -- 1, 2      *** 99 silently missing ***
+  ```
+
+  **This was the third instance of one pattern, and naming the pattern is the
+  point**: a `Reactive_view` helper matches `S_select` and answers a
+  benign-looking default for every other constructor. #486 found it in
+  `base_tables_of` (derived table), #747 in `proj_of` (`SELECT *`), and this is
+  `base_tables_of` again. All three are closed the same way — refuse the shape
+  at bind time, because a maintained view needs a statically determinable one.
+  A **fourth** instance is the thing to look for if a new root constructor ever
+  becomes reachable as a view body.
+
+  **Supporting it properly is a separate decision, not an omission.** It needs
+  `base_tables_of` to union both arms **and** a correct incremental rule per set
+  operation, and neither `UNION` (distinct) nor `EXCEPT` is an additive merge
+  over Z-sets — whether a row leaves the result when one arm loses it depends on
+  the other arm's multiplicity. Doing the first half alone would replace a stale
+  view with a **wrong** one, which is worse.
+
+  **Precedence: body-shape refusals run before projection ones.** The chain in
+  `Sema`'s `S_create_reactive_view` arm is `reject_reserved_name` →
+  `reject_reactive_derived_table` (#486) → `reject_reactive_compound` (#750) →
+  `reject_reactive_star` (#747). A caller who hits an outer rule cannot fix it
+  by editing the inner one, so the outer message is the useful one:
+  `SELECT * FROM t UNION SELECT b FROM u` reports #750, not #747, and a derived
+  table inside a compound *arm* also reports #750 because the desugaring wraps
+  the arm and leaves `S_compound` at the root. Both directions of each boundary
+  are pinned, in `test/test_reactive_view_compound_750.ml` and in
+  `test/test_reactive_view_star_747.ml` — the #747 file's compound case was
+  **rewritten rather than deleted**, because it is the only thing pinning which
+  of the two messages a reader sees.
+
+  **`Db.rv_load` is still not gated, and that was verified rather than
+  assumed** — a database containing a compound reactive view was built against a
+  probe binary with the check disabled, then reopened against the fixed one. It
+  opens; the view is still there; `DROP REACTIVE VIEW` removes it. One detail
+  makes the pre-fix behaviour *harder* to diagnose than "always stale": `rv_load`
+  ends with a `rv_refresh_one ~resync:true` pass, so the materialisation
+  **self-heals at every open** and then goes stale again on the next write. A
+  user who restarts the process sees correct data and concludes the problem went
+  away.
+
+  **A plain `CREATE VIEW … AS SELECT … UNION SELECT …` is untouched**, for the
+  same reason as #747's plain-view carve-out: it is not maintained, its body is
+  re-bound on every use. Asserted, not assumed.
+
+  **What still reaches the `| _ -> []` / `| _ -> None` arm once compounds are
+  refused**: exactly one constructor, `S_const_select` — a FROM-less `SELECT`.
+  Both defaults are *correct* there rather than benign-looking, because such a
+  query is backed by no table: `[]` base tables is the truth and there is
+  nothing that can go stale. `CREATE REACTIVE VIEW k AS SELECT 1` is therefore
+  accepted and pinned as such.
 - **A view is resolved at EVERY FROM position, and each subquery carries its own
   expansion (#496/#497, fixed 2026-09-03).** A view reference is desugared into
   a CTE wrapped around the statement that names it. That rewrite used to be

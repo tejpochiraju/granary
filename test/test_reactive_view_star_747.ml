@@ -109,20 +109,30 @@ let both_halves_give_the_same_refusal () =
   Alcotest.(check string) "emptiness is no longer the criterion" empty_msg nonempty_msg
 ;;
 
-(* The refusal is about the view's own OUTPUT shape, so it follows a compound's
-   arms — either side is enough. *)
-let a_star_in_either_compound_arm_is_refused () =
+(* #750 SUPERSEDED THIS CASE, and the case is kept rather than deleted because
+   it is the only thing pinning which of the two refusals a reader sees.  The
+   star walk does follow both arms of a compound -- that arm is still there, so
+   that lifting #750 does not silently reopen #747 in a new place -- but a
+   compound ROOT is now refused outright by [Sema.reject_reactive_compound],
+   which runs FIRST.  Body-shape refusals precede projection ones: a caller who
+   hits the compound rule cannot fix it by removing the star.  The #750 side of
+   the same boundary is pinned by [the_compound_refusal_wins_over_the_star_one]
+   in [test_reactive_view_compound_750.ml]. *)
+let a_star_in_a_compound_arm_is_refused_by_the_compound_rule () =
   with_db (fun db ->
     exec db "CREATE TABLE t (a INTEGER)";
     exec db "CREATE TABLE u (a INTEGER)";
     exec db "INSERT INTO t VALUES (1)";
     exec db "INSERT INTO u VALUES (2)";
-    check_message
-      "left arm"
-      (exec_err db "CREATE REACTIVE VIEW v AS SELECT * FROM t UNION SELECT a FROM u");
-    check_message
-      "right arm"
-      (exec_err db "CREATE REACTIVE VIEW v AS SELECT a FROM t UNION SELECT * FROM u"))
+    let left = exec_err db "CREATE REACTIVE VIEW v AS SELECT * FROM t UNION SELECT a FROM u" in
+    let right = exec_err db "CREATE REACTIVE VIEW v AS SELECT a FROM t UNION SELECT * FROM u" in
+    List.iter
+      (fun (label, msg) ->
+         Alcotest.(check bool)
+           (Printf.sprintf "%s: the compound rule answers first (got %S)" label msg)
+           true
+           (contains ~needle:"#750" msg))
+      [ "left arm", left; "right arm", right ])
 ;;
 
 (* A star that does NOT determine the view's arity is not the target. A star
@@ -221,9 +231,9 @@ let () =
         ] )
     ; ( "which star spellings it covers"
       , [ Alcotest.test_case
-            "a star in either compound arm is refused"
+            "a star in a compound arm is refused by the compound rule"
             `Quick
-            a_star_in_either_compound_arm_is_refused
+            a_star_in_a_compound_arm_is_refused_by_the_compound_rule
         ; Alcotest.test_case
             "a star inside a subquery is not the target"
             `Quick
