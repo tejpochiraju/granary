@@ -212,6 +212,13 @@ type bound_stmt =
       ; agg_proj : agg_proj_item list
         (** When [aggs] is non-empty, this is the projection list over
             the aggregate output row (ignore [proj]).  Empty otherwise. *)
+      ; agg_out_aliases : string option list
+        (** #724: the explicit output aliases of an AGGREGATED projection, in
+            output order and positionally aligned with [agg_proj].  Empty when
+            the projection carries none.  [agg_proj] records only WHAT each
+            output column is and never what it is CALLED, so without this an
+            aggregated arm exposed no output names at all to a compound
+            ORDER BY. *)
       ; windows : window_sema list
       ; agg_windows : window_sema list
         (** Window functions computed AFTER aggregation, over the aggregated output rows. *)

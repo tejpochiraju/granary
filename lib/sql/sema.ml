@@ -256,6 +256,17 @@ type bound_stmt =
       ; aggs : agg_spec list
       ; having : bound_expr option
       ; agg_proj : agg_proj_item list
+      ; agg_out_aliases : string option list
+        (** #724: the explicit output aliases of an AGGREGATED projection, in
+            output order and positionally aligned with [agg_proj].  Empty when
+            the projection carries none (a [`All]/[`Cols] projection can carry
+            no alias at all).
+
+            [agg_proj] itself records only WHAT each output column is
+            ([AP_group_col]/[AP_agg_slot]/[AP_window_slot]/[AP_expr]) and never
+            what it is CALLED, which is why an aggregated arm used to expose no
+            output names to {!compound_out_cols_opt} and a compound ORDER BY
+            over one fell back to the pre-#662 binding. *)
       ; windows : window_sema list
       ; agg_windows : window_sema list
         (** Window functions computed AFTER aggregation, over aggregated output rows. *)
@@ -3803,6 +3814,7 @@ let bind_select_resolved
           ; aggs = all_aggs
           ; having = bound_having
           ; agg_proj = agg_proj_items
+          ; agg_out_aliases = out_aliases
           ; windows = proj_windows
           ; agg_windows = agg_wins
           ; agg_order_keys
@@ -4070,25 +4082,66 @@ let bind_order_keys
    [agg_proj]: a wrong width turns a valid ordinal into a hard rejection, which
    is a worse bug than the silent-ignore #489 was filed about.
 
-   Output ALIASES are not resolved here (#490 covers the plain-SELECT path
-   only); a compound arm's aliases are not carried this far.
+   #662: a NAME is resolved the same way — against the compound's OUTPUT
+   columns, yielding [BE_out_col].  It used to be bound against the leftmost
+   arm's [meta], which yields [BE_col <table ordinal>]; [plan_order_keys] turns
+   that into [P_col i] and [plan_compound] evaluates it against the set-op
+   OUTPUT row.  The two coincide only when the arm projects a leading prefix of
+   its table in order, which is why every pre-existing test — all on
+   single-column tables — passed over it.  Off that case it produced:
 
-   {b Everything that is NOT an ordinal is still bound against the leftmost
-   arm's [meta], and that rule is UNSOUND for anything but a leading-prefix
-   projection.}  It yields [BE_col <table ordinal>], which [plan_order_keys]
-   turns into [P_col i] — evaluated against the set-op OUTPUT row, not against
-   a table row.  So for [SELECT b, a FROM t UNION ALL SELECT b, a FROM u ORDER
-   BY a] the name [a] resolves to table index 0 and the sort silently uses the
-   output's column 0, which holds [b]; and a projection narrower than the table
-   indexes past the end of the output row and raises [Invalid_argument] from
-   [Exec]'s unchecked [row.(i)] mid-query.  This predates #489 — [bind_order_keys]
-   did exactly the same — and is tracked as #662; it is recorded here
-   because this function is now the home of the rule.  Do not extend the
-   non-ordinal path without fixing it. *)
+   - a silent WRONG ANSWER.  [SELECT b, a FROM t UNION ALL SELECT b, a FROM u
+     ORDER BY a] resolved [a] to table index 0 and sorted by output column 0,
+     which holds [b];
+   - a CRASH.  [SELECT b FROM t UNION ALL SELECT b FROM u ORDER BY b] resolved
+     [b] to table index 1 against a one-column output row, and [Exec]'s
+     unchecked [row.(i)] raised [Invalid_argument] mid-query rather than
+     returning a [Db.error].
+
+   The rule now matches sqlite3, oracle-checked:
+
+   - an ordinal is an output position (unchanged, #489);
+   - a bare name naming an output column — including an arm's ALIAS, which
+     used to fail with "unknown column" — is that output column;
+   - a QUALIFIED name resolves on its column part, so [ORDER BY t.a] works
+     wherever [ORDER BY a] does.  sqlite3 accepts that spelling too; it does
+     NOT accept a qualifier naming no arm, and this does — a recorded
+     divergence, see the comment on [by_name] below;
+   - a name matching no output NAME but matching an output EXPRESSION resolves
+     to that column, which is sqlite3's second resolution step and is what
+     makes [SELECT b AS z ... ORDER BY b] sort by [b] rather than refuse;
+   - anything else — a name no output column has or exposes, or any
+     expression — is an ERROR.  sqlite3 says "1st ORDER BY term does not match
+     any column in the result set"; this says the same thing in its own words.
+
+   COLLATE is peeled off before a term is classified and re-wrapped around the
+   resolved key, so it disqualifies neither a name nor an ordinal — sqlite3
+   does the same, via [sqlite3ExprSkipCollateAndLikely].
+
+   {b The one place it does not error is where it cannot tell.}  An AGGREGATED
+   arm carries no output names at all ([agg_proj_item] has neither name nor
+   alias — see {!compound_out_cols_opt}), so for that arm the old binding is
+   kept rather than turning a query that works today into a refusal on the
+   strength of a name list this function knows is incomplete.  That arm keeps
+   both original defects; it is a strictly smaller surface than before, and it
+   is tracked as #724 rather than left implicit.
+
+   {b That carve-out is the aggregated arm and ONLY the aggregated arm, which
+   is narrower than it first shipped.}  The parser emits [`Exprs] for a whole
+   projection list as soon as ONE item is aliased or is an expression, so
+   [SELECT b AS z, a FROM t] gave [a] no alias and the entire compound fell
+   back — keeping #662's silent wrong answer for a shape with no aggregate
+   anywhere in it, which is the commonest way to reach this code.
+   {!compound_out_cols_opt} now recovers an unaliased item's name from its
+   bound [BE_col], so that shape resolves.  Likewise a JOINED arm, whose right-
+   table columns used to be dropped from the name list entirely. *)
 let bind_compound_order_keys
       ~param_counter
       ~named_params
       ~n_out
+      ~(out_names : string option list)
+      ~(out_exprs : bound_expr option list)
+      ~(names_authoritative : bool)
       (meta : Cat.table_meta)
       oks
   =
@@ -4103,15 +4156,165 @@ let bind_compound_order_keys
               n_out))
     else Ok (BE_out_col (Int64.to_int n - 1))
   in
+  (* [String.equal], matching {!col_index} and every other identifier
+     comparison in this module. *)
+  let out_col_index name =
+    let rec go i = function
+      | [] -> None
+      | Some n :: _ when String.equal n name -> Some i
+      | _ :: rest -> go (i + 1) rest
+    in
+    go 0 out_names
+  in
+  (* True when every output column's name is known, i.e. when "not found" is
+     evidence of absence rather than of ignorance.
+
+     BOTH conjuncts are load-bearing, and the length one was missing at first.
+     [compound_out_names_opt]'s [`Cols] arm uses [filter_map] and DROPS any
+     projection ordinal past the end of [table_meta.columns] — which, for a
+     JOINED arm, is every right-table column, since [select_proj_lookup]
+     returns [base + i] in the combined row space while [table_meta] is the
+     leftmost FROM item's meta alone.  The surviving names then shift DOWN into
+     the dropped columns' positions.  Without the length check, a
+     [[Some "p"]] against [n_out = 2] read as authoritative and [ORDER BY p]
+     resolved to output index 0, which holds a different column — #662's
+     failure mode in a shape the new guard vouched for, which is worse than the
+     fallback, because the fallback at least does not claim to be right.
+     [compound_col_count] also has an [aggs <> []] branch that
+     [compound_out_names_opt] does not, so the two "one walker" siblings can
+     disagree about length on that arm too; the check catches that as well. *)
+  (* #724 adds the second disjunct.  [for_all is_some] alone treated an
+     aggregate slot's [None] — a column that HAS a name, just not one a bare
+     identifier can be — as ignorance, so every aggregated compound fell back
+     and [ORDER BY <non-grouped>] answered in an arbitrary order instead of
+     being refused.  [names_authoritative] is the narrower test: every [None]
+     is accounted for as unnameable rather than unknown.  The LENGTH conjunct
+     is untouched and still guards both. *)
+  let names_are_complete =
+    List.length out_names = n_out
+    && (List.for_all Option.is_some out_names || names_authoritative)
+  in
+  let not_in_result_set what =
+    Error
+      (Unsupported
+         (Printf.sprintf
+            "ORDER BY term %s does not match any column in the result set of the \
+             compound SELECT"
+            what))
+  in
+  (* sqlite3's SECOND step: a term that matches no output NAME may still match
+     an output EXPRESSION.  [SELECT b AS z ... ORDER BY b] is the shape — the
+     alias renamed the column, it did not hide the column underneath.
+     [resolveCompoundOrderBy] resolves the term in the arm's own scope and then
+     [sqlite3ExprCompare]s it against the result set; here the only structure
+     reachable for a bare or qualified name is [BE_col], so comparing those is
+     the whole of it.
+
+     Binding through [bind_expr] is also what makes a QUALIFIED term's
+     qualifier mean something: [ORDER BY zzz.a] fails to bind and is refused,
+     where discarding the qualifier would have accepted it — sqlite3 refuses it
+     too, resolving each arm's own FROM. *)
+  let by_out_expr ~qual name =
+    let ast =
+      match qual with
+      | Some q -> Ast.E_tbl_col (q, name)
+      | None -> Ast.E_col name
+    in
+    match bind_expr ~param_counter ~named_params meta ast with
+    | Error _ -> None
+    | Ok be ->
+      let rec go i = function
+        | [] -> None
+        | Some e :: _ when e = be -> Some i
+        | _ :: rest -> go (i + 1) rest
+      in
+      go 0 out_exprs
+  in
+  let by_name_unresolved ~qual name =
+    match () with
+    | () when names_are_complete ->
+      not_in_result_set
+        (Printf.sprintf
+           "'%s'"
+           (match qual with
+            | Some q -> q ^ "." ^ name
+            | None -> name))
+    | () ->
+      (* Aggregated arm: names unavailable, so fall back rather than refuse a
+         query that works today.  See the header and #724. *)
+      bind_expr
+        ~param_counter
+        ~named_params
+        meta
+        (match qual with
+         | Some q -> Ast.E_tbl_col (q, name)
+         | None -> Ast.E_col name)
+  in
+  (* Output NAME first, then output EXPRESSION, then the fallback.
+
+     {b Recorded divergence: the qualifier of a qualified term is not checked
+     against the arms.}  sqlite3 applies its name step ([resolveAsName]) only
+     to a BARE name and resolves a qualified term in each arm's own FROM, so it
+     refuses [ORDER BY zzz.a] ("1st ORDER BY term does not match any column in
+     the result set") where this answers, matching on [a] alone. Same for
+     [ORDER BY t.z] naming an arm's ALIAS through a table qualifier.
+
+     Trying the expression step first for qualified terms was implemented and
+     REJECTED, because it costs more than it buys: [bind_expr]'s [E_tbl_col]
+     arm deliberately ignores the qualifier and resolves against [meta] — the
+     LEFTMOST FROM item — so a qualified reference to a JOINED arm's right
+     table cannot bind at all. It turned [SELECT s, p FROM j1 JOIN j2 ...
+     ORDER BY j2.s], which sqlite3 answers and which works here, into an error.
+     Refusing a legitimate query is worse than accepting two malformed ones.
+
+     Closing this properly needs the arms' full scope (aliases and joined
+     metas) at this call site, which is [bind_expr_join]'s [tables] rather than
+     a single [meta] — a signature change, not a reordering. *)
+  let by_name ~qual name =
+    match out_col_index name with
+    | Some i -> Ok (BE_out_col i)
+    | None ->
+      (match by_out_expr ~qual name with
+       | Some i -> Ok (BE_out_col i)
+       | None -> by_name_unresolved ~qual name)
+  in
   List.fold_left
     (fun acc_r (ok : Ast.order_key) ->
        match acc_r with
        | Error _ as e -> e
        | Ok acc ->
          let key_r =
-           match ok.Ast.expr with
-           | Ast.E_lit (Ast.L_int n) -> ordinal n
-           | e -> bind_expr ~param_counter ~named_params meta e
+           (* COLLATE is peeled off before the term is classified and re-wrapped
+              around the resolved key, so it disqualifies neither a name nor an
+              ordinal.  sqlite3 does exactly this — [resolveCompoundOrderBy]
+              calls [sqlite3ExprSkipCollateAndLikely] before matching the term
+              against the result set — and without it
+              [... UNION ALL ... ORDER BY a COLLATE NOCASE] is a hard error
+              here while answering on main and in sqlite3.  Peeling also makes
+              [ORDER BY 1 COLLATE NOCASE] work rather than merely turning a
+              silent no-op into an error.
+
+              Nested [E_collate] is peeled to the innermost term and rebuilt
+              outward, so [a COLLATE X COLLATE Y] keeps both wrappers in
+              order. *)
+           let rec peel acc = function
+             | Ast.E_collate (x, c) -> peel (c :: acc) x
+             | e -> e, acc
+           in
+           let base, collations = peel [] ok.Ast.expr in
+           let resolved =
+             match base with
+             | Ast.E_lit (Ast.L_int n) -> ordinal n
+             | Ast.E_col name -> by_name ~qual:None name
+             | Ast.E_tbl_col (q, name) -> by_name ~qual:(Some q) name
+             | e ->
+               if names_are_complete
+               then not_in_result_set "expression"
+               else bind_expr ~param_counter ~named_params meta e
+           in
+           Result.map
+             (fun be -> List.fold_left (fun acc c -> BE_collate (acc, c)) be collations)
+             resolved
          in
          (match key_r with
           | Error e -> Error e
@@ -4607,37 +4810,202 @@ let rec leftmost_table_meta = function
   | _ -> None
 ;;
 
-let rec col_names_of_bound_stmt bs =
+(* #662: the output column names of [bs], with [None] where the name is not
+   RECOVERABLE rather than where it is merely absent.
+
+   {!col_names_of_bound_stmt} below is derived from this and substitutes a
+   generic [col_N] for every [None], which is right for its callers (they want
+   a label).  {!bind_compound_order_keys} needs the distinction instead: it
+   resolves an [ORDER BY <name>] against this list, and "no output column is
+   called that" and "I cannot tell what the output columns are called" have to
+   lead to different answers — an error in the first case, matching sqlite3,
+   and a fall back to the old binding in the second, so that a shape whose
+   names this function cannot recover does not regress from a working query
+   into a refusal.
+
+   Since #724 the AGGREGATED arm is no longer a blanket [None]: an explicit
+   alias and an [AP_group_col]'s underlying column both yield a name.  What
+   stays [None] there is an [AP_agg_slot]/[AP_window_slot], whose output column
+   sqlite3 names by a function-call rendering ([COUNT( * )]).  A bare identifier
+   in an ORDER BY cannot equal such a name, so those positions are
+   {e unnameable} rather than {e unknown} — see
+   {!compound_out_names_authoritative}, which is where that distinction is
+   turned into the refuse-or-fall-back decision.
+
+   One walker rather than two on purpose — see CLAUDE.md on what it costs when
+   a set of walkers over one node set drifts apart. *)
+let rec compound_out_cols_opt bs =
   let n = compound_col_count bs in
   match bs with
-  | BS_select { expr_proj; proj; table_meta; agg_proj; _ } ->
+  | BS_select
+      { expr_proj; proj; table_meta; agg_proj; agg_out_aliases; group_by; joins; _ } ->
+    (* JOIN-AWARE, and hoisted above BOTH projection arms on purpose.  A
+       projection ordinal is an index into the COMBINED row
+       ([select_proj_lookup] returns [right_col_offset + i] for a right-table
+       column), while [table_meta] is the leftmost FROM item's meta alone.
+       Resolving against [table_meta] only, every right-table column is past
+       its end.
+
+       The previous spelling used [filter_map] and DROPPED those, so a joined
+       arm produced a name list SHORTER than the output row, with the
+       surviving names shifted down into the dropped columns' positions —
+       [SELECT s, p FROM j1 JOIN j2 ...] gave [[Some "p"]] against two output
+       columns, so [ORDER BY p] resolved to output index 0, which holds [s].
+       A wrong answer, silently, which is #662's own failure mode.
+
+       Walking the joins instead resolves every ordinal, so the list is always
+       exactly as long as the projection and [None] means "genuinely no name"
+       rather than "past the end of the wrong table".  The length check in
+       [bind_compound_order_keys] stays regardless: it is what keeps a future
+       shortening from being trusted.
+
+       It has to serve the [expr_proj] arm too, and that is the half that
+       shipped missing.  [expr_proj] is reached as soon as ONE item is aliased,
+       so [SELECT p AS q, s FROM j1 JOIN j2 ...] leaves the unaliased
+       right-table [s] with [alias = None]; recovering its name through
+       [table_meta] alone answered [None], the whole compound fell back to the
+       pre-#662 binding, and [ORDER BY s] was refused with
+       "unknown column: j1.s" where sqlite3 answers.  One resolver for both
+       arms is what keeps the two from disagreeing again. *)
+    let col_name_at i =
+      if i < List.length table_meta.Cat.columns
+      then Some (List.nth table_meta.Cat.columns i).Row.name
+      else
+        List.find_map
+          (fun j ->
+             let n = List.length j.right_meta.Cat.columns in
+             if i >= j.right_col_offset && i < j.right_col_offset + n
+             then
+               Some (List.nth j.right_meta.Cat.columns (i - j.right_col_offset)).Row.name
+             else None)
+          joins
+    in
     if agg_proj <> []
     then
-      (* For aggregated queries, agg_proj contains the final projection order.
-         agg_proj has the actual number of output columns.
-         Return generic names — callers can override with AST aliases if needed. *)
-      List.mapi (fun i _ -> Printf.sprintf "col_%d" (i + 1)) agg_proj
+      (* #724: an AGGREGATED arm's output names, recovered rather than given up
+         on.  [agg_proj] records only what each output column IS, so the name
+         has to come from two other places: the explicit alias in
+         [agg_out_aliases], and — for an [AP_group_col] — the grouped column
+         itself, whose combined-row ordinal is [group_by]'s entry and whose name
+         is therefore [col_name_at]'s answer.
+
+         [AP_agg_slot] and [AP_window_slot] keep [None], and that is not a gap:
+         their output column is named by a function-call rendering
+         ([COUNT( * )]), which no BARE identifier in an ORDER BY can equal.
+         {!compound_out_names_authoritative} is what turns that argument into a
+         decision — see its comment for why "unnamed here" and "unknown" are
+         different, and why conflating them cost a silent wrong answer. *)
+      List.mapi
+        (fun i item ->
+           let name =
+             match List.nth_opt agg_out_aliases i with
+             | Some (Some _ as a) -> a
+             | _ ->
+               (match item with
+                | AP_group_col pos ->
+                  (match List.nth_opt group_by pos with
+                   | Some ci -> col_name_at ci
+                   | None -> None)
+                | AP_expr (BE_col ci) -> col_name_at ci
+                | AP_expr _ | AP_agg_slot _ | AP_window_slot _ -> None)
+           in
+           name, None)
+        agg_proj
     else if expr_proj <> []
     then
-      List.mapi
-        (fun i (_, alias_opt) ->
-           Option.value alias_opt ~default:(Printf.sprintf "col_%d" (i + 1)))
+      (* An UNALIASED item still has a name when it is a bare column reference,
+         and recovering it matters more than it looks.  The parser emits
+         [`Exprs] for the whole projection as soon as ONE item is aliased or is
+         an expression (parser.mly:896-905), so [SELECT b AS z, a FROM t] gives
+         [a] no alias — and if that read as "no name", the whole compound would
+         fall back to the pre-#662 table-meta binding and keep the silent wrong
+         answer for a projection that merely mixes an alias with a plain
+         column.  That is not a corner: it is the commonest way to reach this
+         arm.  [col_names_of_ast_stmt] already does the same recovery at the
+         AST level. *)
+      List.map
+        (fun (be, alias_opt) ->
+           let name =
+             match alias_opt with
+             | Some _ -> alias_opt
+             | None ->
+               (match be with
+                | BE_col i -> col_name_at i
+                | _ -> None)
+           in
+           name, Some be)
         expr_proj
-    else
-      List.filter_map
-        (fun i ->
-           if i < List.length table_meta.Cat.columns
-           then Some (List.nth table_meta.Cat.columns i).Row.name
-           else None)
-        proj
-  | BS_compound { left; _ } -> col_names_of_bound_stmt left
-  | BS_with_cte { query; recursive = _; _ } -> col_names_of_bound_stmt query
+    else List.map (fun i -> col_name_at i, Some (BE_col i)) proj
+  | BS_compound { left; _ } -> compound_out_cols_opt left
+  | BS_with_cte { query; recursive = _; _ } -> compound_out_cols_opt query
   | BS_const_select { exprs } ->
-    List.mapi
-      (fun i (_, alias_opt) ->
-         Option.value alias_opt ~default:(Printf.sprintf "col_%d" (i + 1)))
-      exprs
-  | _ -> List.init n (fun i -> Printf.sprintf "col_%d" (i + 1))
+    List.map (fun (be, alias_opt) -> alias_opt, Some be) exprs
+  | _ -> List.init n (fun _ -> None, None)
+;;
+
+let compound_out_names_opt bs = List.map fst (compound_out_cols_opt bs)
+
+(** #724: whether {!compound_out_names_opt}'s answer is strong enough that "no
+    output column is called that" may be reported as an ERROR rather than
+    quietly fallen back on.
+
+    The two conditions a [None] can mean are not the same thing:
+
+    - {e unknown} — this walker cannot tell what the column is called.  Refusing
+      on that would turn a working query into an error.
+    - {e unnameable} — the column has a name, and it is one no bare identifier
+      in an ORDER BY can be: an aggregate or window slot, which sqlite3 names by
+      rendering its call ([COUNT( * )]).  "Not found among the rest" is then real
+      evidence of absence.
+
+    Only the second remains after #724, and treating it as the first is what let
+    [SELECT nm, COUNT( * ) FROM g GROUP BY nm UNION ALL … ORDER BY val] fall
+    back to the pre-#662 binding and answer in an ARBITRARY order — the sort key
+    addressed the pre-aggregation row while the output row is post-aggregation,
+    so it sorted by nothing.  sqlite3 refuses that term outright, and so does
+    #663 for the non-compound spelling of the same query; falling back was the
+    one arm of the three that silently answered wrong.
+
+    A non-select arm ([_ -> List.init n …]) is genuinely unknown and answers
+    [false], which keeps its fallback. *)
+let compound_out_names_authoritative bs =
+  let names = compound_out_names_opt bs in
+  let rec unnameable_positions = function
+    | BS_select { agg_proj; _ } when agg_proj <> [] ->
+      List.map
+        (function
+          | AP_agg_slot _ | AP_window_slot _ -> true
+          | AP_group_col _ | AP_expr _ -> false)
+        agg_proj
+    | BS_compound { left; _ } -> unnameable_positions left
+    | BS_with_cte { query; _ } -> unnameable_positions query
+    | _ -> List.map (fun _ -> false) names
+  in
+  let unnameable = unnameable_positions bs in
+  List.length unnameable = List.length names
+  && List.for_all2 (fun n u -> Option.is_some n || u) names unnameable
+;;
+
+(** #662: the leftmost arm's output columns as BOUND EXPRESSIONS, positionally
+    aligned with {!compound_out_names_opt}.  [None] where the arm's shape does
+    not expose one (the aggregated arm, #724).
+
+    This is sqlite3's SECOND resolution step for a compound ORDER BY term.
+    [resolveCompoundOrderBy] first matches the term against the result column
+    NAMES ([resolveAsName]); failing that, it resolves the term in the arm's own
+    scope and compares it against the result-set EXPRESSIONS
+    ([sqlite3ExprCompare]).  That second step is what makes
+    [SELECT b AS z ... ORDER BY b] sort by [b] rather than reporting that [b] is
+    not in the result set — the alias renamed the column but did not hide the
+    expression underneath it. *)
+let compound_out_exprs_opt bs = List.map snd (compound_out_cols_opt bs)
+
+let col_names_of_bound_stmt bs =
+  List.mapi
+    (fun i -> function
+       | Some name -> name
+       | None -> Printf.sprintf "col_%d" (i + 1))
+    (compound_out_names_opt bs)
 ;;
 
 (** Extract output column names from an AST SELECT stmt (best-effort; used for CTEs). *)
@@ -5090,7 +5458,15 @@ and bind_compound
         else (
           match leftmost_table_meta l with
           | Some meta ->
-            bind_compound_order_keys ~param_counter ~named_params ~n_out:n_left meta order
+            bind_compound_order_keys
+              ~param_counter
+              ~named_params
+              ~n_out:n_left
+              ~out_names:(compound_out_names_opt l)
+              ~out_exprs:(compound_out_exprs_opt l)
+              ~names_authoritative:(compound_out_names_authoritative l)
+              meta
+              order
           | None ->
             (* No underlying table (e.g. const_select compound). *)
             Ok [])

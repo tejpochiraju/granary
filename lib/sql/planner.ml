@@ -3218,6 +3218,7 @@ let rec plan ?cat = function
       ; windows
       ; agg_windows
       ; agg_order_keys
+      ; agg_out_aliases = _
       } ->
     (match cat with
      | Some cat ->
