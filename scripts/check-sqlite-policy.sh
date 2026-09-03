@@ -61,9 +61,11 @@
 # the allowlist existed.  See #574; test/dune now points here.
 #
 # THIS SCRIPT SELF-TESTS ON EVERY RUN (see [self_test]).  A policy gate that has
-# never been observed to FAIL is a gate nobody knows works, and nothing else
-# covers this one — there is no shellcheck step in CI either (#591).  Pass
-# `--self-test` to run only the self-test, verbosely.
+# never been observed to FAIL is a gate nobody knows works.  Since #591 CI does
+# run shellcheck over scripts/, but that is a syntactic linter: it cannot tell a
+# working guard from one that greps for the wrong thing, so the self-test is
+# still the only thing covering what this script MEANS.  Pass `--self-test` to
+# run only the self-test, verbosely.
 
 set -eu
 
@@ -727,8 +729,10 @@ check_lint_coverage() {
 # Builds a throwaway tree, plants violations in it, and asserts that each guard
 # FAILS where it must and PASSES where it must.  Runs on every invocation,
 # because otherwise these two guards are only ever observed passing — and the
-# two defects above were both "reviewable-only": no test, and no shellcheck
-# step in CI (#591), would have surfaced either.
+# two defects above were both "reviewable-only": no test would have surfaced
+# either.  #591's shellcheck step would not have either; both defects are
+# semantic (an empty pattern file means "match everything" to grep), which is
+# exactly the class a syntactic linter cannot see.
 
 self_test() {
   verbose=$1

@@ -38,6 +38,8 @@ IMAGE="${GRANARY_DEV_IMAGE:-localhost/granary-dev:latest}"
 # rather than a subuid, so it can be deleted without `podman unshare` (an
 # existing _build keeps whatever owner it was created with).
 if ! command -v ocamlformat >/dev/null 2>&1; then
+  # The argument list is deliberately split back apart inside the container.
+  # shellcheck disable=SC2086
   exec podman run --rm --user 0 -v "$PWD":/work -w /work "$IMAGE" \
     sh -c "opam exec -- sh scripts/check-fmt.sh $*"
 fi
@@ -52,10 +54,17 @@ dirs=""
 for d in lib test bin bench; do
   [ -d "$d" ] && dirs="$dirs $d"
 done
+# $dirs is a space-separated list of roots and must reach find as several
+# arguments, so the split is deliberate.  It holds only the literal names above.
+# shellcheck disable=SC2086
 files=$(find $dirs -type f \( -name '*.ml' -o -name '*.mli' \) 2>/dev/null | sort)
 
 status=0
 count=0
+# One path per line out of find; splitting on whitespace is the point.  No
+# source path in this tree contains a space (nothing under lib/ test/ bin/
+# bench/ does, and ocamlformat would be handed a broken path loudly if one did).
+# shellcheck disable=SC2086
 for f in $files; do
   count=$((count + 1))
   if [ "$mode" = "fix" ]; then

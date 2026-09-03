@@ -46,5 +46,15 @@ RUN opam install -y sqlite3
 # fork carrying the 21-line 5.4 port. Drop the fork once upstream ships 5.4.
 RUN opam pin add -y -k git dead_code_analyzer "https://github.com/tejpochiraju/dead_code_analyzer.git#ae94d2f83e2ba9dcedcc96bf0bff568021b41aca" \
  && opam install -y dead_code_analyzer
+# shellcheck (#591): the shell lint gate CI's lint job runs over scripts/.  The
+# gate FAILS CLOSED when its linter is missing rather than skipping, so without
+# this layer `sh scripts/check-shell.sh` is unrunnable locally — and a gate you
+# cannot run locally is one you only meet in CI.  Appended last so the opam
+# layers above stay cache-valid.
+USER root
+RUN apt-get update \
+ && apt-get install -y shellcheck \
+ && rm -rf /var/lib/apt/lists/*
+USER opam
 WORKDIR /workspace
 ENTRYPOINT ["opam", "exec", "--"]

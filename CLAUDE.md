@@ -233,9 +233,9 @@ Why not the raw tools:
 
 The pre-commit hook runs format checks automatically on staged `.ml`/`.mli` files.
 
-### Before pushing: dune-file formatting + merlint
+### Before pushing: dune-file formatting + merlint + shellcheck
 
-The CI **lint** job runs `dune build @fmt` (dune-file formatting *and* ocamlformat) plus `merlint`. Formatting only your `.ml`/`.mli` is **not** enough — CI still fails on unformatted `dune` files or merlint findings.
+The CI **lint** job runs `dune build @fmt` (dune-file formatting *and* ocamlformat), `merlint`, and — since #591 — `shellcheck` over `scripts/*.sh`. Formatting only your `.ml`/`.mli` is **not** enough — CI still fails on unformatted `dune` files, merlint findings, or a shell finding.
 
 ```sh
 # formatting (both .ml/.mli and dune files) — see above
@@ -243,7 +243,14 @@ sh scripts/check-fmt.sh
 
 # merlint — run from the workspace root; expect 0 issues for your files
 podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev merlint
+
+# shell lint — only if you touched a script; self-wraps podman like check-fmt.sh
+sh scripts/check-shell.sh
 ```
+
+**Every script in `scripts/` is an enforcement gate or a dev tool, and the three `check-*.sh` ones now self-test on every run** (#591). That is the shape to copy: a gate that has never been observed to FAIL is a gate nobody knows works, so each plants a violation in a throwaway tree, asserts its own machinery rejects it, and refuses to report a verdict if that self-check is broken. `check-shell.sh` also **fails closed when `shellcheck` is missing** rather than skipping — a lint gate that silently passes with no linter installed reports green for a tree nobody checked, which is #549's honour system in a new place.
+
+What the shellcheck gate does *not* buy, so nobody over-reads a green run: it is a **syntactic** linter. The fail-open it was filed for (PR #582: an empty allowlist variable made `grep -vFf` match every line, so the script printed `Policy OK` over a planted violation) is a *semantic* bug and shellcheck cannot see it. The self-tests are what cover meaning; shellcheck covers the neighbouring mechanical class — unquoted expansions, unassigned references, misused test operators. Where a script splits a word deliberately it carries an inline `# shellcheck disable=SC…` **and a comment saying why**, which is a review artefact rather than a silent exemption.
 
 **If you touched a `dune` or `dune-project` file while working in a worktree**, `check-fmt.sh` will report `◐ … Dune files UNVERIFIED`. To actually verify them before pushing, run the real gate in the main checkout (it needs no worktree state — the dune files are what matter):
 

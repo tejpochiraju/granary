@@ -98,9 +98,13 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - name: Install system deps
+      - name: Install system deps + shellcheck (#591)
+        # Renamed away from the build-and-test job's identically-worded step so
+        # that check-workflow-parity.sh can name it: extract_step takes the
+        # FIRST step of a given name in a file, so two jobs sharing one name
+        # makes the lint job's copy unaddressable and its drift invisible.
         run: |
-          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev
+          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev shellcheck
 
       - name: Cache opam packages
         uses: actions/cache@v4
@@ -163,3 +167,13 @@ jobs:
 
       - name: Workflow mirror drift check (.forgejo vs .github)
         run: sh scripts/check-workflow-parity.sh
+
+      - name: Shell lint — shellcheck over scripts/ (#591)
+        # scripts/ holds enforcement gates, and an enforcement gate breaks by
+        # PERMITTING things: it fails green.  PR #582 shipped a demonstrated
+        # fail-open of that shape and it was caught only by hand, because there
+        # was no lint gate on shell at all.  The script self-tests on every run
+        # (planted violation must be rejected, clean script accepted) and fails
+        # closed when shellcheck is missing, so a green result means a tree that
+        # was actually checked.
+        run: sh scripts/check-shell.sh
