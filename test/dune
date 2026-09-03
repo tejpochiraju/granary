@@ -1856,3 +1856,13 @@
  (name test_reactive_view_catalog_error_476)
  (modules test_reactive_view_catalog_error_476)
  (libraries granary granary.store granary.catalog alcotest lwt.unix))
+; #496/#497: a view is resolved at EVERY FROM position — a JOIN's right-hand
+; side and a subquery's own FROM included, at any nesting depth — not only as
+; the statement's leading FROM table. One root cause, two issues; #496 was the
+; silent one because a subquery is re-bound at execution time with no view
+; table at all.
+
+(test
+ (name test_view_resolution_496)
+ (modules test_view_resolution_496)
+ (libraries granary granary.encoding alcotest lwt.unix))

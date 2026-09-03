@@ -697,6 +697,86 @@ EOF
   - `Op_nested_loop_join` cannot carry a subquery in its probe through the
     planner, but it is a public constructor, so `stream_nested_loop_join`
     refuses one explicitly rather than encoding it as NULL.
+- **A view is resolved at EVERY FROM position, and each subquery carries its own
+  expansion (#496/#497, fixed 2026-09-03).** A view reference is desugared into
+  a CTE wrapped around the statement that names it. That rewrite used to be
+  applied to a statement's *leading* FROM table and to nothing else, which is
+  one root cause with two faces:
+
+  - #497 — a view named by a `JOIN` was never expanded and failed as
+    `unknown table`. Same query, operands swapped, two answers, so view
+    usability depended on join order.
+  - #496 — a view named inside a **subquery's** FROM was neither expanded nor
+    reported. That is the dangerous one, and the mechanism is the point: a
+    subquery survives binding as an `Ast.stmt` and is re-bound at execution
+    time by `Exec.plan_subquery_cached`, which calls `Sema.bind` with **no view
+    table at all** (`Db.t` holds `t.views`; `Exec` never sees it). The bind
+    failed, the failure was memoized as "this subquery has no plan", and the
+    statement answered zero rows or was refused as an unresolvable
+    correlation — never as "unknown table".
+
+  `Sema.expand_views` now rewrites the whole statement: every FROM position of
+  every SELECT it contains, at any depth. Three properties carry the fix and
+  none of them is optional:
+
+  - **Each subquery carries its OWN `WITH` wrapper** rather than leaning on an
+    enclosing one. That is what fixes #496, because the execution-time re-bind
+    must see a *self-contained* statement. `WITH` inside a parenthesised
+    subquery has **no grammar** — `(WITH x AS (…) SELECT …)` is a parse
+    error — but the AST node does, and `bind_internal`, `Planner.plan`,
+    `Exec.to_stream` and `Exec.substitute_outer_in_stmt` all already handled
+    it. Wrapping only the outer statement was tried and cannot work: the
+    subquery is re-bound without the enclosing CTE registered.
+  - **A name is expanded only when nothing shadows it** — not bound by an
+    enclosing CTE (tracked syntactically in `scope`) and not a real table
+    (`Cat.find_table_cached`, which is also what makes a `CREATE TABLE` of the
+    same name keep winning). That second test is what makes the rewrite
+    **terminate**: `bind_with_cte` registers the CTE as an ephemeral meta
+    before binding its query, so re-entering the pass on the wrapper's own
+    query finds the name registered and declines to expand it again. The pass
+    is therefore idempotent, which is why it can sit at the top of
+    `bind_internal` and run on every recursive bind.
+  - **A cycle is refused, not expanded forever.** `CREATE VIEW` validates its
+    body, so the obvious cycles cannot be built — but one can: create `v1` over
+    `v2`, `DROP VIEW v2`, `CREATE TABLE v2`, then `CREATE VIEW v2 AS SELECT …
+    FROM v1` (which binds against the *table*), then `DROP TABLE v2`. Before
+    the guard that expands until the stack goes. `expand_views_wrap` carries the
+    chain of views currently being expanded and raises `Unsupported "view '…'
+    is defined in terms of itself"`.
+
+  Consequences worth knowing before editing this:
+
+  - **The scope identifier of an expanded view is the view's name, or its alias
+    when it has one** — the #635 rule, unchanged, because the expansion hands
+    the name straight to a CTE and the alias rides on the FROM item. So
+    `SELECT v.x FROM v JOIN t …` resolves, `FROM v AS a` resolves under `a`,
+    and `SELECT v.x FROM v AS a` is still the #635 refusal.
+  - A correlated subquery over a view works because `Exec.inner_scope_of`'s
+    `_` arm answers "the subquery owns everything" for the `S_with_cte` the
+    expansion produces, while `substitute_outer_in_stmt` still *descends*
+    into its `query` (it has had an `S_with_cte` arm since #670's neighbourhood)
+    and recomputes the scope from the inner SELECT there. If `inner_scope_of`
+    ever grows a real `S_with_cte` arm it must add the CTE name to `has_table`
+    and delegate columns to the inner query, or a qualified outer reference
+    stops being substituted.
+  - `bind_internal` is now a two-line wrapper that runs the pass and delegates
+    to `bind_expanded`. Putting the pass there rather than in the `S_select`
+    arm is what makes the UPDATE / DELETE / INSERT arms of
+    `expand_views_stmt` reachable — those binders are dispatched directly, so
+    a view named in one of their subqueries would otherwise never be seen.
+  - `CREATE VIEW`'s stored body is deliberately **not** rewritten
+    (`expand_views_stmt` passes `S_create_view` through untouched), so the
+    in-memory definition in `t.views` and the `sys_views` SQL it is re-parsed
+    from on open stay the same statement. The body is expanded on every *use*
+    instead. CREATE-time validation still expands it, because the arm binds the
+    SELECT through `bind_internal`.
+  - `col_names_of_ast_stmt`'s `S_with_cte` arm — added by #491 with a comment
+    saying no path reached it — is now live: a CTE whose `def` selects from a
+    view is handed to `derive_cte_meta` as an `S_with_cte`.
+
+  Pinned by `test/test_view_resolution_496.ml`, whose expected values were
+  oracle-checked against sqlite3.
+
 - **A GENERATED column's NOT NULL is enforced on its COMPUTED value, at both
   levels (#629).** This was the third instance of the same shape as #567 and
   #599 — a check running where it cannot see the truth — and the fix narrows

@@ -5033,12 +5033,15 @@ let rec col_names_of_ast_stmt = function
      [col_1], [col_2]. Every alias, hand-written or put there by a CREATE VIEW
      column list, was dropped on the floor.
 
-     No path reaches this arm today: the two callers pass a CTE's [def] or a
-     view's stored body, and both are [compound_select] in the grammar, which
-     does not include [with_cte]. It is here because it is what the twin
-     already does, and because it is the prerequisite for ever letting a view
-     body be a WITH — see the note at the bottom of [Ast.rename_view_columns],
-     which explains why that function deliberately has no matching arm. *)
+     #496 made this arm live. A CTE's [def] is still [compound_select] in the
+     GRAMMAR, but {!expand_views} now rewrites a view named in that def's FROM
+     into a [WITH] around it, so [derive_cte_meta] is handed an
+     [S_with_cte] whenever a CTE selects from a view. Before #496 no path
+     reached it: the two callers pass a CTE's [def] or a view's stored body,
+     and neither could be a [WITH] as written. It was here because it is what
+     the twin already does — see the note at the bottom of
+     [Ast.rename_view_columns], which explains why that function deliberately
+     has no matching arm (a view's STORED body is still never a [WITH]). *)
   | Ast.S_with_cte { query; _ } -> col_names_of_ast_stmt query
   | Ast.S_const_select { exprs } ->
     List.mapi
@@ -5139,7 +5142,226 @@ let derive_cte_meta ~name col_source_ast col_source : Cat.table_meta =
   }
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #496 / #497: view resolution at every FROM position                 *)
+(* ------------------------------------------------------------------ *)
+
+(* A view reference is desugared into a CTE wrapped around the statement that
+   names it.  Before #496/#497 that rewrite was applied to the LEADING [FROM]
+   table of a statement and to nothing else, so the same view was an answer in one
+   operand position and [unknown table] in another (#497), and a view named
+   inside a subquery's own FROM was neither expanded nor reported (#496) — the
+   subquery was re-bound at execution time by {!Granary_sql.Exec}, which has no
+   view table at all, so the bind failed and the subquery silently contributed
+   nothing.
+
+   The pass below rewrites a whole statement instead: every FROM position of
+   every SELECT it contains, at any nesting depth.  Three properties make that
+   sound rather than merely wider:
+
+   - Each subquery carries its OWN [WITH] wrapper rather than relying on an
+     enclosing one.  That is what fixes #496: [Exec.plan_subquery_cached] binds
+     a subquery's [Ast.stmt] standalone, so the statement has to be
+     self-contained.  ([WITH] inside a parenthesised subquery has no grammar,
+     but the AST node does, and every consumer — {!bind_internal},
+     {!Granary_sql.Planner.plan}, [Exec.to_stream],
+     [Exec.substitute_outer_in_stmt] — already handles it.)
+   - A name is expanded only when it is not shadowed: not bound by an enclosing
+     CTE ([scope]) and not a real table ([Cat.find_table_cached], which also
+     sees the ephemeral metas {!bind_with_cte} registers).  That second test is
+     what makes the rewrite terminate — re-entering this pass while binding a
+     wrapper's own query finds the name registered and stops.
+   - A cycle is refused rather than expanded forever.  [CREATE VIEW] validates
+     its body, so the obvious cycles cannot be built, but one can: create [v1]
+     over [v2], [DROP VIEW v2], [CREATE TABLE v2], [CREATE VIEW v2 AS SELECT …
+     FROM v1] (which binds against the TABLE), then [DROP TABLE v2].
+     [expand_views_wrap] carries [active], the chain of views currently being
+     expanded, and refuses a repeat. *)
+
+exception View_expansion_error of error
+
+let view_cycle_error name =
+  Unsupported
+    (Printf.sprintf
+       "view '%s' is defined in terms of itself; a view cannot be recursive"
+       name)
+;;
+
+(* Is [name], in FROM position, a view that this statement must expand? *)
+let from_name_is_view ~views ~scope cat name =
+  (not (List.exists (String.equal name) scope))
+  && Option.is_none (Cat.find_table_cached cat ~name)
+  && Hashtbl.mem views name
+;;
+
+(* The distinct view names among [names], in first-mention order. *)
+let from_view_names ~views ~scope cat names =
+  List.fold_left
+    (fun acc n ->
+       if from_name_is_view ~views ~scope cat n
+          && not (List.exists (String.equal n) acc)
+       then acc @ [ n ]
+       else acc)
+    []
+    names
+;;
+
+let rec expand_views_expr ~views ~scope ~active cat (e : Ast.expr) : Ast.expr =
+  let go = expand_views_expr ~views ~scope ~active cat in
+  let go_s = expand_views_stmt ~views ~scope ~active cat in
+  match e with
+  | Ast.E_subquery s -> Ast.E_subquery (go_s s)
+  | Ast.E_exists s -> Ast.E_exists (go_s s)
+  | Ast.E_in_select (x, s) -> Ast.E_in_select (go x, go_s s)
+  | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
+  | Ast.E_not a -> Ast.E_not (go a)
+  | Ast.E_is_null a -> Ast.E_is_null (go a)
+  | Ast.E_is_not_null a -> Ast.E_is_not_null (go a)
+  | Ast.E_neg a -> Ast.E_neg (go a)
+  | Ast.E_bitnot a -> Ast.E_bitnot (go a)
+  | Ast.E_between (x, lo, hi) -> Ast.E_between (go x, go lo, go hi)
+  | Ast.E_in (x, vs) -> Ast.E_in (go x, List.map go vs)
+  | Ast.E_agg (f, a) -> Ast.E_agg (f, Option.map go a)
+  | Ast.E_agg_distinct (f, a) -> Ast.E_agg_distinct (f, go a)
+  | Ast.E_func (f, args) -> Ast.E_func (f, List.map go args)
+  | Ast.E_cast (a, ty) -> Ast.E_cast (go a, ty)
+  | Ast.E_collate (a, c) -> Ast.E_collate (go a, c)
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Ast.E_case
+      { scrutinee = Option.map go scrutinee
+      ; branches = List.map (fun (c, r) -> go c, go r) branches
+      ; else_ = Option.map go else_
+      }
+  | Ast.E_window { func; args; window } ->
+    Ast.E_window
+      { func
+      ; args = List.map go args
+      ; window =
+          { Ast.partition_by = List.map go window.Ast.partition_by
+          ; Ast.order_by =
+              List.map
+                (fun (k : Ast.order_key) -> { k with Ast.expr = go k.Ast.expr })
+                window.Ast.order_by
+          ; Ast.frame = window.Ast.frame
+          }
+      }
+  (* Leaves.  Listed rather than caught by [| _ ->] for the reason #670 gives
+     for the [Plan.expr] walkers: a new constructor that carries an [expr] or a
+     [stmt] must be a compile error here, not a silently unexpanded view. *)
+  | Ast.E_lit _
+  | Ast.E_col _
+  | Ast.E_tbl_col _
+  | Ast.E_param _
+  | Ast.E_match _
+  | Ast.E_fts_snippet _ -> e
+
+(* Wrap [inner] in one non-recursive CTE per view in [names].  [active] is the
+   chain of views currently being expanded, so a cycle reachable through
+   DROP VIEW + CREATE VIEW is refused rather than expanded forever. *)
+and expand_views_wrap ~views ~scope ~active cat names inner =
+  List.fold_left
+    (fun acc name ->
+       if List.exists (String.equal name) active
+       then raise (View_expansion_error (view_cycle_error name));
+       let body = Hashtbl.find views name in
+       let def = expand_views_stmt ~views ~scope ~active:(name :: active) cat body in
+       Ast.S_with_cte { name; def; query = acc; recursive = false })
+    inner
+    names
+
+and expand_views_stmt ~views ~scope ~active cat (s : Ast.stmt) : Ast.stmt =
+  let go_e = expand_views_expr ~views ~scope ~active cat in
+  let go_s = expand_views_stmt ~views ~scope ~active cat in
+  match s with
+  | Ast.S_select r ->
+    let joins =
+      List.map (fun (j : Ast.join_clause) -> { j with Ast.on = go_e j.Ast.on }) r.joins
+    in
+    let proj =
+      match r.proj with
+      | `Exprs items -> `Exprs (List.map (fun (e, a) -> go_e e, a) items)
+      | (`All | `Cols _) as p -> p
+    in
+    let order =
+      List.map (fun (k : Ast.order_key) -> { k with Ast.expr = go_e k.Ast.expr }) r.order
+    in
+    let rewritten =
+      Ast.S_select
+        { r with
+          proj
+        ; joins
+        ; where = Option.map go_e r.where
+        ; having = Option.map go_e r.having
+        ; order
+        }
+    in
+    let from_names =
+      r.table :: List.map (fun (j : Ast.join_clause) -> j.Ast.table) r.joins
+    in
+    expand_views_wrap
+      ~views
+      ~scope
+      ~active
+      cat
+      (from_view_names ~views ~scope cat from_names)
+      rewritten
+  | Ast.S_compound { op; left; right; order; limit; offset } ->
+    Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
+  | Ast.S_with_cte { name; def; query; recursive } ->
+    (* The CTE name shadows a same-named view for the whole [WITH], its own
+       definition included — that is where a recursive CTE's self-reference
+       resolves. *)
+    let go_s = expand_views_stmt ~views ~scope:(name :: scope) ~active cat in
+    Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
+  | Ast.S_insert_select r -> Ast.S_insert_select { r with select = go_s r.select }
+  | Ast.S_update r ->
+    Ast.S_update
+      { r with
+        assignments = List.map (fun (c, e) -> c, go_e e) r.assignments
+      ; where = Option.map go_e r.where
+      }
+  | Ast.S_delete r -> Ast.S_delete { r with where = Option.map go_e r.where }
+  | Ast.S_insert r -> Ast.S_insert { r with values = List.map (List.map go_e) r.values }
+  (* Everything else, [S_create_view] / [S_create_reactive_view] included: a
+     view's stored body is kept verbatim so the in-memory definition and the
+     [sys_views] SQL it was parsed from stay the same statement.  The body is
+     still expanded on every USE, and CREATE-time validation still expands it
+     because {!bind_internal} runs this pass on the SELECT it binds. *)
+  | _ -> s
+;;
+
+(** #496 / #497: rewrite [s] so every view named in a FROM position — the
+    leading table, a JOIN's right-hand side, or the FROM of any subquery at any
+    depth — is desugared into a CTE on the statement that names it.  [Error] is
+    returned only for a view cycle. *)
+let expand_views ~views cat (s : Ast.stmt) : (Ast.stmt, error) result =
+  if Hashtbl.length views = 0
+  then Ok s
+  else (
+    try Ok (expand_views_stmt ~views ~scope:[] ~active:[] cat s) with
+    | View_expansion_error e -> Error e)
+;;
+
 let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter cat stmt =
+  (* #496/#497: desugar every view named in a FROM position of [stmt] — the
+     leading table, a JOIN's right-hand side, and the FROM of every subquery it
+     carries, at any depth — into a CTE on the statement that names it, before
+     anything is bound.
+
+     Running it here rather than in the [S_select] arm is what makes the DML
+     arms of {!expand_views_stmt} reachable: [bind_expanded] dispatches an
+     UPDATE / DELETE / INSERT straight to its binder, so a view named in one of
+     their subqueries would otherwise never be seen.
+
+     The pass is idempotent, which is what keeps the mutual recursion finite:
+     the wrapper's own query is re-bound through here, and by then
+     {!bind_with_cte} has registered the name as an ephemeral table, so
+     {!from_name_is_view} declines to expand it a second time. *)
+  match expand_views ~views cat stmt with
+  | Error e -> Lwt.return (Error e)
+  | Ok stmt -> bind_expanded ~views ~named_params ~param_counter cat stmt
+
+and bind_expanded ~views ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table
       { name; columns; constraints; if_not_exists; without_rowid; using_columnstore } ->
@@ -5187,51 +5409,25 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
       ; order
       ; limit
       ; offset
-      } as sel ->
-    let* meta_opt = Cat.find_table cat ~name:table in
-    (match meta_opt with
-     | Some _ ->
-       bind_select
-         cat
-         ~param_counter
-         ~named_params
-         ~distinct
-         ~proj
-         ~table
-         ~table_alias
-         ~joins
-         ~where
-         ~group_by
-         ~having
-         ~order
-         ~limit
-         ~offset
-     | None ->
-       (match Hashtbl.find_opt views table with
-        | Some view_def ->
-          bind_internal
-            ~views
-            ~named_params
-            ~param_counter
-            cat
-            (Ast.S_with_cte
-               { name = table; def = view_def; query = sel; recursive = false })
-        | None ->
-          bind_select
-            cat
-            ~param_counter
-            ~named_params
-            ~distinct
-            ~proj
-            ~table
-            ~table_alias
-            ~joins
-            ~where
-            ~group_by
-            ~having
-            ~order
-            ~limit
-            ~offset))
+      } ->
+    (* Any view this statement named has already been turned into an enclosing
+       CTE by {!bind_internal}, so the FROM items here are tables — real ones,
+       or the ephemeral metas {!bind_with_cte} registered. *)
+    bind_select
+      cat
+      ~param_counter
+      ~named_params
+      ~distinct
+      ~proj
+      ~table
+      ~table_alias
+      ~joins
+      ~where
+      ~group_by
+      ~having
+      ~order
+      ~limit
+      ~offset
   | Ast.S_create_index { name; table; columns; where_clause; unique; if_not_exists } ->
     bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_exists
   | Ast.S_update { table; assignments; where; order; limit; offset; returning }
