@@ -2016,3 +2016,12 @@
   alcotest
   lwt.unix
   unix))
+
+; #741: excluded.<col> nested inside a DO UPDATE assignment RHS resolved to the
+; TARGET row, silently. In-memory is sufficient — the defect is entirely in the
+; binder's scope handling, not in storage.
+
+(test
+ (name test_nested_excluded_741)
+ (modules test_nested_excluded_741)
+ (libraries granary granary.encoding alcotest lwt.unix))
