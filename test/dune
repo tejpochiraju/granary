@@ -869,7 +869,7 @@
 (test
  (name test_tpcc_stmt_profile)
  (modules test_tpcc_stmt_profile)
- (libraries granary_tpc alcotest lwt lwt.unix)
+ (libraries granary_tpc granary.store alcotest lwt lwt.unix unix)
  (action
   (setenv
    GRANARY_TPCC_STMT_PROFILE
@@ -1727,3 +1727,12 @@
  (name bench_rollback_recompute_716)
  (modules bench_rollback_recompute_716)
  (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #718: the writer lock's wait/hold accounting. The site-attribution cases need
+; a real WAL store on disk — the Mem backend has no WAL, so its checkpoint and
+; autocheckpoint sites never acquire anything.
+
+(test
+ (name test_lock_stats_718)
+ (modules test_lock_stats_718)
+ (libraries granary granary.unix granary.store alcotest lwt.unix unix))

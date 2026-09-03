@@ -1,3 +1,5 @@
+module Lock_stats = Granary_store.Lock_stats
+
 let enabled = Bench_report.env_str "GRANARY_TPCC_STMT_PROFILE" "" <> ""
 
 type acc =
@@ -207,9 +209,20 @@ let summaries ~service_ms =
    The compactness elision bought was never worth a rendering that cannot
    tell two statements apart. *)
 
-let report ~service_ms =
+(* #718: the writer-lock accounting, when the caller has one to show.  It is
+   the same measured interval as everything above, and it is what says how much
+   of that interval was spent HOLDING the engine's one global critical section
+   rather than merely inside a statement — the split service time cannot see.
+   Rendered by [Lock_stats.pp_report] rather than re-laid-out here, so the
+   stderr block and any other consumer of a report agree. *)
+let lock_block = function
+  | None -> ""
+  | Some r -> "\n" ^ Format.asprintf "%a" Lock_stats.pp_report r
+;;
+
+let report ?lock ~service_ms () =
   match ranked () with
-  | [] -> "tpcc: statement profile empty (no statements recorded)\n"
+  | [] -> lock_block lock ^ "tpcc: statement profile empty (no statements recorded)\n"
   | entries ->
     let buf = Buffer.create 4096 in
     Buffer.add_string
@@ -254,6 +267,7 @@ let report ~service_ms =
                  f.members
                  f.shape))
          fams);
+    Buffer.add_string buf (lock_block lock);
     Buffer.add_string buf "\ncoverage — summed statement time vs driver service time\n";
     List.iter
       (fun (s : summary) ->
@@ -276,7 +290,85 @@ let report ~service_ms =
    match a caller's [with Sys_error _] and escapes it whole (#715 review).
    Closing explicitly on both the success and failure path keeps every
    exception this function can raise a plain, un-wrapped [Sys_error]. *)
-let to_csv ~path ~service_ms =
+(* #718: three further CSV tables, appended after the two above.
+
+   [clock_installed] is repeated on every site row rather than hoisted into a
+   table of its own, because it is what tells a reader whether a column of
+   0.000 means "nothing waited" or "nothing was measured" — and a row of this
+   file will be read on its own, cut out of context by grep or awk, far more
+   often than the file will be read whole.
+
+   The integrity table is separate and is NOT a measurement: both its counters
+   are zero on a healthy run and non-zero only when some acquisition of the
+   writer lock bypassed the accounting, which would make the two tables above
+   quietly incomplete rather than visibly wrong.
+
+   Two caveats a consumer of these rows needs and cannot see in them:
+
+   - [acquisitions] can be 0 while [hold_ms] is not.  The measured window opens
+     with [Lock_stats.reset], which keeps an outstanding hold but re-stamps its
+     start; if a warm-up [Lwt.async] autocheckpoint was still holding at that
+     instant, its acquisition was counted before the window and its hold inside
+     it.  Do not compute a mean as [hold_ms / acquisitions] without guarding.
+   - [held_at_snapshot] is read after the run returns, at which point the last
+     commit's [Lwt.async] autocheckpoint may still be in flight.  When that
+     column is non-empty, the named site's hold is TRUNCATED — it never released
+     before the snapshot — so its [hold_ms] is a lower bound. *)
+let lock_csv_tables line (r : Lock_stats.report) =
+  let bool_s b = if b then "true" else "false" in
+  line "";
+  line
+    (Bench_report.Csv.header
+       [ "site"
+       ; "clock_installed"
+       ; "acquisitions"
+       ; "contended"
+       ; "wait_ms"
+       ; "wait_max_ms"
+       ; "hold_ms"
+       ; "hold_max_ms"
+       ]);
+  List.iter
+    (fun (site, (st : Lock_stats.site_stat)) ->
+       line
+         (Bench_report.Csv.row
+            [ Lock_stats.site_name site
+            ; bool_s r.Lock_stats.clock_installed
+            ; string_of_int st.Lock_stats.acquisitions
+            ; string_of_int st.Lock_stats.contended
+            ; Printf.sprintf "%.3f" (1000. *. st.Lock_stats.wait_s)
+            ; Printf.sprintf "%.3f" (1000. *. st.Lock_stats.wait_max_s)
+            ; Printf.sprintf "%.3f" (1000. *. st.Lock_stats.hold_s)
+            ; Printf.sprintf "%.3f" (1000. *. st.Lock_stats.hold_max_s)
+            ]))
+    r.Lock_stats.sites;
+  line "";
+  line (Bench_report.Csv.header [ "waiter"; "blocked_by_holder"; "waits"; "wait_ms" ]);
+  List.iter
+    (fun (b : Lock_stats.blocked_by) ->
+       line
+         (Bench_report.Csv.row
+            [ Lock_stats.site_name b.Lock_stats.waiter
+            ; Lock_stats.site_name b.Lock_stats.holder
+            ; string_of_int b.Lock_stats.count
+            ; Printf.sprintf "%.3f" (1000. *. b.Lock_stats.wait_s)
+            ]))
+    r.Lock_stats.blocked_by;
+  line "";
+  line
+    (Bench_report.Csv.header
+       [ "unattributed_waits"; "unbalanced_releases"; "held_at_snapshot" ]);
+  line
+    (Bench_report.Csv.row
+       [ string_of_int r.Lock_stats.unattributed_waits
+       ; string_of_int r.Lock_stats.unbalanced_releases
+       ; (match r.Lock_stats.held with
+          | None -> ""
+          | Some s -> Lock_stats.site_name s)
+       ])
+;;
+
+let to_csv ?lock ~path ~service_ms () =
   let oc = open_out path in
   let write () =
     let line s = output_string oc (s ^ "\n") in
@@ -309,7 +401,10 @@ let to_csv ~path ~service_ms =
               ; Printf.sprintf "%.3f" s.driver_service_ms
               ; Printf.sprintf "%.2f" s.attributed_pct
               ]))
-      (summaries ~service_ms)
+      (summaries ~service_ms);
+    match lock with
+    | None -> ()
+    | Some r -> lock_csv_tables line r
   in
   match write () with
   | () -> close_out oc

@@ -801,6 +801,19 @@ let stale_after_vacuum t =
   is_stale t || Hashtbl.fold (fun _ sub acc -> acc || is_stale sub) t.attached false
 ;;
 
+(** #718: the writer-lock accounting for the store THIS handle sits on.
+
+    Deliberately not a fold over the ATTACHed sub-handles, unlike
+    {!transaction_poisoned} and {!stale_after_vacuum}: those answer a yes/no
+    question about the connection, where an unchecked sub-handle makes the
+    answer wrong.  This one describes a lock, each attached schema is a
+    different [Store.t] with a different lock, and summing four independent
+    locks' hold times would produce a number that describes nothing.  Read a
+    sub-handle's lock through its own handle. *)
+let lock_stats t = S.lock_stats t.store
+
+let reset_lock_stats t = S.reset_lock_stats t.store
+
 (* #598: whether ANY schema reachable from this handle has an explicit
    transaction open.  Under ATTACH each schema is its own [Db.t] with its own
    slot, so a connection legitimately holds several at once and the question

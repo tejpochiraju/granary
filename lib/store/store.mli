@@ -511,10 +511,35 @@ val durability_of_string : string -> durability option
 val string_of_durability : durability -> string
 
 (** Install the wall-clock source ([unit -> float], Unix-epoch seconds) used by
-    [Batched] mode's time threshold. Without one, the default [fun () -> 0.]
-    disables the time trigger (only the commit count fires). No-op on the
-    in-memory backend. *)
+    [Batched] mode's time threshold and by the #718 writer-lock accounting.
+    Without one, the default [fun () -> 0.] disables the time trigger (only the
+    commit count fires) and leaves every duration in {!lock_stats} at [0.].
+
+    The [Batched] half is a no-op on the in-memory backend, which has no
+    durability knob; the {!lock_stats} half is not, because both backends
+    serialise writers through the same lock. *)
 val set_clock : t -> (unit -> float) -> unit
+
+(** [lock_stats t] snapshots the writer lock's wait/hold accounting (#718),
+    attributed by acquisition site.
+
+    This is the measurement that separates {e holding} the engine's one global
+    critical section from merely spending time inside a statement: service-time
+    profiling cannot see the split, because [commit] releases the lock before it
+    fsyncs and a [BEGIN] that finds the lock held is waiting rather than
+    working.  {!Granary_store.Lock_stats} documents the attribution rule and the
+    one approximation it makes.
+
+    Durations are [0.] until {!set_clock} has been called — the returned
+    report's [clock_installed] field says which case a run of zeroes is. *)
+val lock_stats : t -> Lock_stats.report
+
+(** [reset_lock_stats t] discards every observation {!lock_stats} would report,
+    so a benchmark can exclude its warm-up window.  A hold that is outstanding
+    when this is called survives, with its start re-stamped to now; see
+    {!Granary_store.Lock_stats.reset} for why both halves of that are
+    deliberate. *)
+val reset_lock_stats : t -> unit
 
 (** Get the per-connection auto-checkpoint threshold (in WAL frames).
     A value of 0 means auto-checkpoint is disabled. Returns 0 on the

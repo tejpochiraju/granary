@@ -189,6 +189,13 @@ let worker_handle t =
   { db; path = t.path; stmt_cache = Hashtbl.create 32 }
 ;;
 
+(* #718.  Every connection minted by [worker_handle] shares this one's
+   [Store.t], and the writer lock — and therefore the accounting — belongs to
+   the store.  So one call reports the whole run's contention no matter which
+   connection it is made on, and there is nothing to sum across terminals. *)
+let lock_stats t = Db.lock_stats t.db
+let reset_lock_stats t = Db.reset_lock_stats t.db
+
 (* ── synchronous ENGINE view, for the load phase only ─────────────────── *)
 
 let run = Lwt_main.run

@@ -161,9 +161,20 @@ val percentiles : float array -> percentiles
     well served by the next transaction. Retries are counted, never folded
     silently into throughput.
 
+    [on_measured_start] (#718) runs once, between the warm-up interval and the
+    measured one, at the same point the driver discards the warm-up's
+    {!Tpcc_stmt_profile} observations — for engine-side accounting the driver
+    cannot reach itself, such as {!Tpcc_conn.reset_lock_stats}.  It is not a
+    general callback: it is called exactly once, synchronously, with no
+    terminal running, and anything it does is invisible to the result.
+
     Raises [Invalid_argument] if [workers] is empty or [config.terminals] is
     below 1. *)
-val run : config -> workers:worker list -> result Lwt.t
+val run
+  :  ?on_measured_start:(unit -> unit)
+  -> config
+  -> workers:worker list
+  -> result Lwt.t
 
 (** [summary r] is the multi-line human-readable report: the configuration,
     a per-profile table, the NewOrder/sec headline, and — when the pool is

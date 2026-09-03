@@ -180,13 +180,35 @@ type summary =
     then becomes rather than dividing by zero.  Ordered by profile name. *)
 val summaries : service_ms:(string * float) list -> summary list
 
-(** [report ~service_ms] renders {!ranked}, then {!families} when it is
-    non-empty, then {!summaries}, as a human-readable block for stderr.
-    Returns a one-line notice when nothing was recorded. *)
-val report : service_ms:(string * float) list -> string
+(** [report ?lock ~service_ms ()] renders {!ranked}, then {!families} when it is
+    non-empty, then [lock] when given, then {!summaries}, as a human-readable
+    block for stderr.  Returns a one-line notice (with [lock] still rendered
+    before it) when nothing was recorded.
 
-(** [to_csv ~path ~service_ms] writes two CSV tables to [path], separated by a
-    blank line: {!ranked} first, then {!summaries}.  Two tables in one file
-    because they are one measurement and separating them invites reading the
-    per-statement table without its own coverage figure. *)
-val to_csv : path:string -> service_ms:(string * float) list -> unit
+    [lock] is the writer-lock accounting for the same measured interval,
+    from {!Tpcc_conn.lock_stats} — the split this module's own numbers cannot
+    show, since service time spans the lock in both directions.  Omitted for an
+    engine that has no such accounting, which is every engine but granary. *)
+val report
+  :  ?lock:Granary_store.Lock_stats.report
+  -> service_ms:(string * float) list
+  -> unit
+  -> string
+
+(** [to_csv ?lock ~path ~service_ms ()] writes CSV tables to [path], separated
+    by blank lines: {!ranked} first, then {!summaries}.  Several tables in one
+    file because they are one measurement, and separating them invites reading
+    the per-statement table without its own coverage figure.
+
+    [lock] (#718) appends three more: one row per writer-lock acquisition site,
+    then the contention matrix, then an integrity row.  The site rows repeat
+    [clock_installed] rather than stating it once, because it is what
+    distinguishes "nothing waited" from "nothing was measured" and a row of
+    this file is read on its own — cut out by grep or awk — more often than the
+    file is read whole. *)
+val to_csv
+  :  ?lock:Granary_store.Lock_stats.report
+  -> path:string
+  -> service_ms:(string * float) list
+  -> unit
+  -> unit

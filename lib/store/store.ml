@@ -320,6 +320,14 @@ type t =
   { backend : backend
   ; rowid_counters : rowid_counters
   ; lock : Rwlock.t
+  ; (* #718: wait/hold accounting for [lock], attributed by acquisition site.
+       Lives on [t] rather than on [bt_state] because [lock] does: the Mem
+       backend serialises writers through the same lock and is where the
+       cheapest tests of the accounting itself run.  Every acquisition and
+       release of [lock] goes through [acquire_writer]/[release_writer] below;
+       an [Rwlock.acquire_write t.lock] that does not is a bug that the report's
+       [unattributed_waits] counter is there to surface. *)
+    lock_stats : Lock_stats.t
   ; (* Shadow copies of Mem backend tree contents for the active RW txn.
        Writes during the txn go to the shadow — the live tree is NEVER
        modified until commit.  This prevents readers (both RO snapshots
@@ -341,6 +349,70 @@ let pp fmt t =
      | Mem _ -> "Mem"
      | Btree _ -> "Btree")
 ;;
+
+(* ------------------------------------------------------------------ *)
+(* #718: the writer lock's only two doors                               *)
+(* ------------------------------------------------------------------ *)
+
+(* Every [Rwlock.acquire_write t.lock] in this file goes through
+   [acquire_writer], and every [Rwlock.release_write t.lock] through
+   [release_writer], so the accounting cannot fall out of step with the lock it
+   describes.  A site that acquires directly is not merely unmeasured: it also
+   holds the lock while the accumulator believes nobody does, so it corrupts the
+   [blocked_by] attribution of everyone who waits behind it.  That is why the
+   report carries [unattributed_waits] — it is the detector for exactly this.
+
+   [contended] is sampled from [Rwlock.writer_active] immediately before the
+   acquire, which is exact rather than inferred: [acquire_write] blocks if and
+   only if a writer holds the lock at that moment.  It therefore stays true on a
+   build with no clock, where every duration is 0.
+
+   No await separates the sample from the acquire, and none separates
+   [note_released] from the release, so nothing can interleave between a lock
+   operation and its accounting. *)
+let acquire_writer t (site : Lock_stats.site) : unit Lwt.t =
+  let started = Lock_stats.now t.lock_stats in
+  let contended = Rwlock.writer_active t.lock in
+  let blocked_by = Lock_stats.held t.lock_stats in
+  let* () = Rwlock.acquire_write t.lock in
+  Lock_stats.note_acquired
+    t.lock_stats
+    site
+    ~waited:(Lock_stats.now t.lock_stats -. started)
+    ~contended
+    ~blocked_by;
+  Lwt.return_unit
+;;
+
+let release_writer t =
+  Lock_stats.note_released t.lock_stats ~at:(Lock_stats.now t.lock_stats);
+  Rwlock.release_write t.lock
+;;
+
+(* Make the rule above checkable rather than merely stated.  From here to the
+   end of the file, [Rwlock.acquire_write] and [Rwlock.release_write] do not
+   typecheck — a direct use is a compile error naming its replacement.
+
+   The runtime detector is not sufficient on its own, which is why this is
+   worth two lines: [unattributed_waits] only fires when someone WAITS BEHIND a
+   bypassing acquisition.  A direct acquire that is never contended leaves no
+   trace at all — its hold silently vanishes from the totals, and
+   [unbalanced_releases] does not catch it either, because the matching release
+   is also direct.  The reader lock is untouched: [acquire_read] /
+   [release_read] / [with_read] pass through unchanged, since #718 instruments
+   the writer lock only. *)
+module Rwlock = struct
+  include Rwlock
+
+  let acquire_write = `Use_acquire_writer_instead_hash_718
+  let release_write = `Use_release_writer_instead_hash_718
+
+  (* Referenced so the two shadows are not "unused declarations".  Suppressing
+     that warning with an attribute would be the wrong shape here — merlint
+     E110 rightly objects, and the warning firing is itself the useful signal
+     that nothing below still reaches for the raw functions. *)
+  let _guards = acquire_write, release_write
+end
 
 (* #95/#176: the page geometry this store is backed by.  The in-memory backend
    has no on-disk geometry, so it reports {!Geometry.default}; VACUUM uses this
@@ -671,6 +743,7 @@ let create () : t =
   { backend = Mem (Hashtbl.create 16)
   ; rowid_counters = Hashtbl.create 16
   ; lock = Rwlock.create ()
+  ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
   ; mem_savepoints = []
   }
@@ -749,6 +822,7 @@ let make_btree_store
   { backend = Btree st
   ; rowid_counters = Hashtbl.create 16
   ; lock = Rwlock.create ()
+  ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
   ; mem_savepoints = []
   }
@@ -1476,7 +1550,11 @@ let note_checkpoint_success (st : bt_state) : unit =
 let active_txn_id (st : bt_state) = Int64.add st.current_header.txn_id 1L
 
 let rw_begin t =
-  let* () = Rwlock.acquire_write t.lock in
+  (* #718: [Txn] is released by [commit]/[rollback], not here, so one recorded
+     hold spans the whole transaction — BEGIN through the mid-COMMIT unlock.
+     That span is the critical section a sibling writer queues behind, which is
+     the quantity #716 could not separate from service time. *)
+  let* () = acquire_writer t Lock_stats.Txn in
   let is_follower =
     match t.backend with
     | Btree st -> st.follower
@@ -1494,11 +1572,11 @@ let rw_begin t =
        torn-down fd.  [close] does not take [t.lock], so a write can still race
        in here; this is best-effort, paired with the quiesce-before-close
        contract documented on [close]. *)
-    Rwlock.release_write t.lock;
+    release_writer t;
     Lwt.fail_with "Store.rw_begin: store is closing — write transactions are rejected")
   else if is_follower
   then (
-    Rwlock.release_write t.lock;
+    release_writer t;
     Lwt.fail_with
       "Store.rw_begin: store is in follower mode — write transactions are rejected while \
        following")
@@ -2080,14 +2158,14 @@ let maybe_autockpt_after_commit t st =
         (fun () ->
            Lwt.catch
              (fun () ->
-                let* () = Rwlock.acquire_write t.lock in
+                let* () = acquire_writer t Lock_stats.Autocheckpoint in
                 Lwt.finalize
                   (fun () ->
                      match st.wal with
                      | None -> Lwt.return_unit
                      | Some wal -> checkpoint_unlocked st wal)
                   (fun () ->
-                     Rwlock.release_write t.lock;
+                     release_writer t;
                      Lwt.return_unit))
              (fun exn ->
                 (* #638: this is the background path — nobody is awaiting this
@@ -2111,7 +2189,7 @@ let commit_wal t st =
     if not !unlocked
     then (
       unlocked := true;
-      Rwlock.release_write t.lock)
+      release_writer t)
   in
   let wal =
     match st.wal with
@@ -2256,7 +2334,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
          shadow);
     t.mem_rw_shadow <- None;
     t.mem_savepoints <- [];
-    Rwlock.release_write t.lock;
+    release_writer t;
     Lwt.return_unit
   | Btree st ->
     (* #356: the append cursor is only valid within a txn (its leaf is dirty);
@@ -2276,7 +2354,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
                let* () = commit_prepare_btree ~header_commit:Header.commit st in
                maybe_autocheckpoint st)
             (fun () ->
-               Rwlock.release_write t.lock;
+               release_writer t;
                Lwt.return_unit)
         in
         Lwt.return 0 (* non-WAL: no WAL frames appended *)
@@ -2327,7 +2405,7 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
         observer doing real work must not stall writers while we hold the
         global write lock. *)
      to_emit := Some (st, Store_event.Txn_rollback { txn_id = active_txn_id st }));
-  Rwlock.release_write t.lock;
+  release_writer t;
   (match !to_emit with
    | Some (st, ev) -> emit_event st ev
    | None -> ());
@@ -2349,7 +2427,7 @@ let checkpoint (t : t) : unit Lwt.t =
     (match st.wal with
      | None -> Lwt.return_unit
      | Some wal ->
-       let* () = Rwlock.acquire_write t.lock in
+       let* () = acquire_writer t Lock_stats.Checkpoint in
        (* Read under the lock, and before the attempt: a failure past
           [Wal.reset] would leave [committed_frames] at 0. *)
        let target = Wal.committed_frames wal in
@@ -2365,7 +2443,7 @@ let checkpoint (t : t) : unit Lwt.t =
                  note_checkpoint_failure st ~target exn;
                  Lwt.fail exn))
          (fun () ->
-            Rwlock.release_write t.lock;
+            release_writer t;
             Lwt.return_unit))
 ;;
 
@@ -2552,12 +2630,23 @@ let set_sync_batch_interval_ms (t : t) (n : int) : unit =
 ;;
 
 let set_clock (t : t) (c : unit -> float) : unit =
+  (* #718: unconditional, and before the backend match.  The durability time
+     trigger below is Btree-only, but the writer lock is not — the Mem backend
+     serialises writers through the same [Rwlock], so a Mem store whose clock
+     was installed must still report real durations. *)
+  Lock_stats.set_clock t.lock_stats c;
   match t.backend with
   | Mem _ -> ()
   | Btree st ->
     st.clock <- c;
     st.last_sync_time <- c ()
 ;;
+
+(* #718: the writer-lock accounting.  See [lock_stats.mli] for what a report
+   can and cannot say — in particular that its durations are 0 until
+   [set_clock] has been called, which [report.clock_installed] discloses. *)
+let lock_stats (t : t) : Lock_stats.report = Lock_stats.report t.lock_stats
+let reset_lock_stats (t : t) : unit = Lock_stats.reset t.lock_stats
 
 (* Number of fsyncs the WAL has performed since open.  Exposed for #77
    group-commit testing: lets the test assert that N concurrent
@@ -3693,7 +3782,7 @@ let set_commit_callback
           frames below the ship cursor forever (silent standby divergence). The
           lock blocks new commits ([rw_begin]) for the brief flush+pin so the
           cursor pins exactly the pre-registration frontier. *)
-       let* () = Rwlock.acquire_write t.lock in
+       let* () = acquire_writer t Lock_stats.Commit_sink in
        Lwt.finalize
          (fun () ->
             (* Flush while still in the old mode — [flush_unsynced] is a no-op
@@ -3720,7 +3809,7 @@ let set_commit_callback
                st.sink_shipped_frames <- Wal.committed_frames wal);
             Lwt.return_unit)
          (fun () ->
-            Rwlock.release_write t.lock;
+            release_writer t;
             Lwt.return_unit))
 ;;
 

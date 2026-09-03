@@ -46,3 +46,26 @@ val ops : t -> Tpcc_txn.ops
     tears down every other handle's store out from under it. Close exactly one
     connection, once, after every worker built from it is done. *)
 val worker_handle : t -> t Lwt.t
+
+(** [lock_stats t] snapshots the writer lock's wait/hold accounting (#718) for
+    the store behind this connection.
+
+    This is what separates {e holding} the engine's one global critical section
+    from time merely spent inside a statement, which {!Tpcc_stmt_profile}'s
+    service time cannot: [COMMIT] releases the lock before it fsyncs, and a
+    [BEGIN] that finds the lock held is waiting rather than working.
+
+    {b One call covers the whole run.}  Every connection from
+    {!worker_handle} shares this one's store, the lock belongs to the store,
+    and so does the accounting — there is nothing to sum across terminals, and
+    calling this on two sibling connections returns the same numbers.
+
+    Durations are real here: {!open_db} installs [Unix.gettimeofday] as the
+    store's clock. *)
+val lock_stats : t -> Granary_store.Lock_stats.report
+
+(** [reset_lock_stats t] discards every observation {!lock_stats} would report,
+    so a run's warm-up window does not contaminate its measured one.  Called
+    from {!Tpcc_driver.run}'s [?on_measured_start] hook, at the same point it
+    resets {!Tpcc_stmt_profile}. *)
+val reset_lock_stats : t -> unit

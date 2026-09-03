@@ -1,0 +1,48 @@
+#718: the #714 statement profile re-run, with the writer-lock accounting this
+issue added alongside it. Same methodology and the same command as
+bench/results/2026-08-11-tpcc-stmt-profile-granary.csv, so the per-statement
+tables are directly comparable row for row:
+
+  GRANARY_TPCC_WAREHOUSES=1, GRANARY_TPCC_TERMINALS=1,
+  GRANARY_TPCC_SECONDS=10, GRANARY_TPCC_WARMUP_SECONDS=2,
+  GRANARY_TPCC_ENGINES=granary, GRANARY_TPC_SEED=42 (default),
+  GRANARY_TPCC_STMT_PROFILE=1, GRANARY_TPCC_STMT_PROFILE_CSV=bench/results.
+
+One bench_tpcc.exe run, not repeated or averaged. Measured interval 10.041 s,
+28.385 NewOrder/sec, 99.6-100.0% of every profile's service time attributed.
+The pre/post consistency oracle reported "ok" on both sides (conditions 1-4),
+which at TERMINALS=1 is expected rather than informative -- #706's race needs a
+second handle.
+
+Host: containerized dev image (granary-dev) on an 8-core Intel i7-8650U
+laptop, load average 1.6-2.6 at launch (sibling work running).
+
+WHAT MAY AND MAY NOT BE COMPARED WITH THE 2026-08-11 RUN
+
+The two runs are on DIFFERENT HOSTS. The 2026-08-11 file carries no .meta
+recording its machine, and this one was produced on a laptop, so:
+
+- The throughput headline is NOT comparable. 28.385 NewOrder/sec here against
+  32.957 on 2026-08-11 says nothing about #717; do not read it as a
+  regression, and do not read it as a win either.
+- The ROLLBACK per-call figure IS comparable, and is the point of the re-run:
+  358.9164 ms/call (4 calls, 25.72% of new_order) -> 0.485 ms/call (3 calls,
+  0.03%). That is 740x on a per-operation latency whose asymptotics changed
+  from a full tree drain to a root-to-leaf descent (#717) on a ~300k-row
+  order_line. No host difference reaches two orders of magnitude, and the two
+  runs load the same W=1 population from the same seed for the same 10 s.
+
+The lock tables (the last three in the CSV) have no counterpart in the
+2026-08-11 file -- nothing in the tree could produce them before #718.
+
+  site            acquires  contend    wait_ms   hold_ms
+  txn                  670       60   2515.531  7504.567
+  autocheckpoint        60        0      0.019  2519.228
+  checkpoint             0        0      0.000     0.000
+  commit_sink            0        0      0.000     0.000
+  txn blocked by autocheckpoint: 60 waits, 2515.353 ms
+  unattributed_waits 0, unbalanced_releases 0
+
+unattributed_waits = 0 over 730 acquisitions is the funnel invariant holding
+under a real workload: no acquisition of the writer lock bypassed the
+accounting, so the two tables above are complete and not merely plausible.

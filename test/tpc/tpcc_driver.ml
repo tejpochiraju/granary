@@ -355,7 +355,7 @@ let sorted_errors rec_ =
     if va <> vb then compare vb va else compare ka kb)
 ;;
 
-let run config ~workers =
+let run ?(on_measured_start = fun () -> ()) config ~workers =
   if workers = [] then invalid_arg "Tpcc_driver.run: empty worker pool";
   if config.terminals < 1 then invalid_arg "Tpcc_driver.run: terminals must be >= 1";
   let profiles = List.filter is_runnable Tpcc_txn.all in
@@ -367,6 +367,12 @@ let run config ~workers =
      the steady-state means.  Unconditional: on a non-profiling run this is
      [Hashtbl.reset] on an empty table. *)
   Tpcc_stmt_profile.reset ();
+  (* #718: engine state the caller wants zeroed at the same instant, and for
+     the same reason — the writer-lock accounting lives on a [Store.t] the
+     driver has no access to, so the caller supplies the reset rather than the
+     driver reaching for it.  Unconditional, like the reset above: on a run
+     that passes no hook this is one call to a no-op. *)
+  on_measured_start ();
   let rec_ = make_recorder ~record:true profiles in
   let+ elapsed_s = run_interval pool rec_ ~config ~profiles ~duration:config.seconds in
   { config

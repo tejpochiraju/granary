@@ -260,6 +260,28 @@ val vacuum : t -> unit Lwt.t
     ran the VACUUM. *)
 val stale_after_vacuum : t -> bool
 
+(** [lock_stats t] snapshots the writer-lock wait/hold accounting (#718) for the
+    store this handle sits on.
+
+    It is the measurement that separates time spent {e holding} the engine's one
+    global critical section from time merely spent inside a statement — a split
+    no service-time profile can see, because [COMMIT] releases the lock before
+    it fsyncs and a [BEGIN] that finds the lock held is waiting rather than
+    working.  Durations are [0.] unless a clock was installed at open time (the
+    [?clock] argument of {!open_file}/{!of_store}); the report's
+    [clock_installed] field distinguishes that from "nothing waited".
+
+    Under ATTACH this reports {e this} handle's store only, and does not fold
+    over the attached schemas the way {!transaction_poisoned} does: each
+    attached schema is a different store with a different lock, so a sum across
+    them would describe no lock at all. *)
+val lock_stats : t -> Granary_store.Lock_stats.report
+
+(** [reset_lock_stats t] discards every observation {!lock_stats} would report,
+    for this handle's store — so a benchmark can exclude its warm-up window from
+    the measured one. *)
+val reset_lock_stats : t -> unit
+
 (** #555: whether this connection has been {e poisoned} by an overlapping
     explicit transaction — either the top-level handle or any ATTACHed schema.
 

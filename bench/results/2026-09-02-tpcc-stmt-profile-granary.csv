@@ -1,0 +1,72 @@
+profile,sql,calls,rows,total_ms,mean_ms,pct_of_profile
+new_order,COMMIT,282,0,1881.910,6.6734,40.20
+new_order,BEGIN,285,0,1208.987,4.2421,25.82
+new_order,"UPDATE stock SET s_quantity = ?, s_ytd = s_ytd + ?, s_order_cnt = s_order_cnt + 1, s_remote_cnt = s_remote_cnt + ? WHERE s_w_id = ? AND s_i_id = ?",2820,0,437.639,0.1552,9.35
+new_order,"INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES (?,?,?,?,?,?,?,?,?,?)",2820,0,269.661,0.0956,5.76
+new_order,"SELECT i_price, i_name, i_data FROM item WHERE i_id = ?",2823,2820,234.694,0.0831,5.01
+new_order,"SELECT c_discount, c_last, c_credit FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",285,285,89.854,0.3153,1.92
+new_order,"INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES (?,?,?,?,?,?,?,?)",285,0,89.210,0.3130,1.91
+new_order,"SELECT s_quantity, s_dist_08, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",310,310,52.629,0.1698,1.12
+new_order,"SELECT s_quantity, s_dist_09, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",360,360,51.191,0.1422,1.09
+new_order,"SELECT s_quantity, s_dist_05, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",358,358,48.166,0.1345,1.03
+new_order,"SELECT s_quantity, s_dist_01, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",328,328,46.105,0.1406,0.98
+new_order,"INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES (?,?,?)",285,0,44.986,0.1578,0.96
+new_order,"SELECT s_quantity, s_dist_10, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",319,319,39.965,0.1253,0.85
+new_order,"SELECT s_quantity, s_dist_02, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",248,248,34.753,0.1401,0.74
+new_order,"SELECT s_quantity, s_dist_06, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",235,235,33.023,0.1405,0.71
+new_order,"SELECT s_quantity, s_dist_07, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",239,239,32.076,0.1342,0.69
+new_order,"SELECT s_quantity, s_dist_04, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",236,236,31.982,0.1355,0.68
+new_order,"SELECT s_quantity, s_dist_03, s_data FROM stock WHERE s_w_id = ? AND s_i_id = ?",187,187,20.003,0.1070,0.43
+new_order,UPDATE district SET d_next_o_id = d_next_o_id + 1 WHERE d_w_id = ? AND d_id = ?,285,0,13.054,0.0458,0.28
+new_order,SELECT w_tax FROM warehouse WHERE w_id = ?,285,285,11.296,0.0396,0.24
+new_order,"SELECT d_tax, d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?",285,285,9.115,0.0320,0.19
+new_order,ROLLBACK,3,0,1.455,0.4849,0.03
+delivery,COMMIT,29,0,1584.802,54.6483,64.15
+delivery,UPDATE order_line SET ol_delivery_d = ? WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?,290,0,396.017,1.3656,16.03
+delivery,BEGIN,29,0,146.321,5.0455,5.92
+delivery,"UPDATE customer SET c_balance = c_balance + ?, c_delivery_cnt = c_delivery_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",290,0,142.289,0.4907,5.76
+delivery,UPDATE orders SET o_carrier_id = ? WHERE o_w_id = ? AND o_d_id = ? AND o_id = ?,290,0,74.175,0.2558,3.00
+delivery,SELECT o_c_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_id = ?,290,290,37.408,0.1290,1.51
+delivery,SELECT SUM(ol_amount) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?,290,290,35.080,0.1210,1.42
+delivery,DELETE FROM new_order WHERE no_w_id = ? AND no_d_id = ? AND no_o_id = ?,290,0,33.831,0.1167,1.37
+delivery,SELECT MIN(no_o_id) FROM new_order WHERE no_w_id = ? AND no_d_id = ?,290,290,20.506,0.0707,0.83
+payment,BEGIN,296,0,1042.337,3.5214,49.96
+payment,COMMIT,296,0,770.408,2.6027,36.92
+payment,"SELECT c_id, c_first, c_middle, c_last, c_balance, c_ytd_payment, c_payment_cnt, c_credit, c_data FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ? ORDER BY c_first",160,267,80.143,0.5009,3.84
+payment,"UPDATE customer SET c_balance = c_balance - ?, c_ytd_payment = c_ytd_payment + ?, c_payment_cnt = c_payment_cnt + 1 WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",253,0,73.131,0.2891,3.50
+payment,"SELECT c_id, c_first, c_middle, c_last, c_balance, c_ytd_payment, c_payment_cnt, c_credit, c_data FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",136,136,45.815,0.3369,2.20
+payment,"INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES (?,?,?,?,?,?,?,?)",296,0,25.493,0.0861,1.22
+payment,UPDATE district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?,296,0,18.345,0.0620,0.88
+payment,UPDATE warehouse SET w_ytd = w_ytd + ? WHERE w_id = ?,296,0,13.342,0.0451,0.64
+payment,"UPDATE customer SET c_balance = c_balance - ?, c_ytd_payment = c_ytd_payment + ?, c_payment_cnt = c_payment_cnt + 1, c_data = ? WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",43,0,12.173,0.2831,0.58
+payment,SELECT d_name FROM district WHERE d_w_id = ? AND d_id = ?,296,296,3.481,0.0118,0.17
+payment,SELECT w_name FROM warehouse WHERE w_id = ?,296,296,1.817,0.0061,0.09
+stock_level,SELECT COUNT(DISTINCT s_i_id) FROM order_line INNER JOIN stock ON s_i_id = ol_i_id WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id < ? AND ol_o_id >= ? AND s_w_id = ? AND s_quantity < ?,29,29,526.019,18.1386,84.05
+stock_level,COMMIT,29,0,50.308,1.7348,8.04
+stock_level,BEGIN,29,0,48.279,1.6648,7.71
+stock_level,SELECT d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?,29,29,1.236,0.0426,0.20
+order_status,BEGIN,28,0,73.159,2.6128,51.26
+order_status,COMMIT,28,0,44.620,1.5936,31.26
+order_status,"SELECT ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?",28,287,9.190,0.3282,6.44
+order_status,"SELECT c_id, c_first, c_middle, c_last, c_balance FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ? ORDER BY c_first",17,24,6.319,0.3717,4.43
+order_status,"SELECT o_id, o_entry_d, o_carrier_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_c_id = ? ORDER BY o_id DESC LIMIT 1",28,28,6.213,0.2219,4.35
+order_status,"SELECT c_id, c_first, c_middle, c_last, c_balance FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",11,11,3.229,0.2935,2.26
+
+profile,statements_total_ms,driver_service_ms,attributed_pct
+delivery,2470.430,2473.837,99.86
+new_order,4681.753,4699.660,99.62
+order_status,142.730,142.949,99.85
+payment,2086.485,2091.920,99.74
+stock_level,625.841,626.040,99.97
+
+site,clock_installed,acquisitions,contended,wait_ms,wait_max_ms,hold_ms,hold_max_ms
+txn,true,670,60,2515.531,75.545,7504.567,94.332
+checkpoint,true,0,0,0.000,0.000,0.000,0.000
+autocheckpoint,true,60,0,0.019,0.001,2519.228,75.674
+commit_sink,true,0,0,0.000,0.000,0.000,0.000
+
+waiter,blocked_by_holder,waits,wait_ms
+txn,autocheckpoint,60,2515.353
+
+unattributed_waits,unbalanced_releases,held_at_snapshot
+0,0,

@@ -835,6 +835,63 @@ readable) by failing the main-file `write_page` — in WAL mode the main file is
 written *only* by a checkpoint, so commits keep succeeding while every
 checkpoint fails.
 
+### The writer lock is measured, and every acquisition goes through one door (#718)
+
+`Store.lock_stats` reports the writer lock's wait and hold time per acquisition
+site (`Txn`, `Checkpoint`, `Autocheckpoint`, `Commit_sink`), plus a "who held it
+when the wait began" matrix. It exists because service-time profiling cannot see
+the critical section: `commit_wal` releases the lock *before* it fsyncs, and a
+`BEGIN` that finds the lock held is waiting rather than working. #716's
+"75.3% of NewOrder service time is transaction control" was sound arithmetic
+over service time; "75.3% of the critical section" did not follow from it.
+
+**Every `Rwlock.acquire_write t.lock` and `Rwlock.release_write t.lock` in
+`store.ml` goes through `acquire_writer` / `release_writer`.** A site that
+acquires directly is not merely unmeasured — it holds the lock while the
+accumulator believes nobody does, so it corrupts the `blocked_by` attribution of
+everyone who waits behind it. `report.unattributed_waits` and
+`unbalanced_releases` are the detectors for exactly that, and they are bug
+signals rather than measurements: a bypassed acquisition leaves the totals
+looking entirely plausible. A new acquisition site owes itself a new `site`
+constructor rather than borrowing one.
+
+Two properties are worth knowing before editing this:
+
+- **The contention COUNTS need no clock.** They come from
+  `Rwlock.writer_active` sampled immediately before the acquire, which is exact
+  (`acquire_write` blocks iff a writer holds the lock at that moment), so they
+  stay valid on a pure-Mirage build where every duration is `0.`.
+  `report.clock_installed` is what keeps a reader from mistaking that zero for
+  "nothing waited" — `Store.set_clock` installs the clock, and its default
+  returns `0.`.
+- **A wait is attributed to the holder observed when the wait BEGAN.**
+  `Rwlock.acquire_write` wakes every waiter on release and lets the scheduler
+  pick, so there is no queue position to read; a wait spanning several holders
+  lands wholly on the first. Documented approximation, deliberate.
+
+What it measured, first time out (`bench/results/2026-09-02-tpcc-stmt-profile-granary.csv`):
+at **one** terminal the writer lock is **99.8% occupied**, and the background
+autocheckpoint holds it for **25.1%** of the interval while being the blocker
+for **100%** of all writer-lock wait. That settles #716 item 2 — `BEGIN` is
+waiting, and it waits for `maybe_autockpt_after_commit` — and it means no part
+of #716's headline converts to throughput at `TERMINALS > 1` until something
+leaves the critical section. Tracked as #719.
+
+**This instrument cannot see scheduler drain, so it narrows that hypothesis
+rather than excluding it.** An uncontended `Rwlock.acquire_write` returns an
+already-resolved promise, so an uncontended acquisition contains no yield by
+construction; the sub-millisecond residual in the `wait_ms` column is the
+instrument's own two-clock-read floor (~0.3 µs per acquisition, and the
+zero-contention `autocheckpoint` row is the built-in control for it), not drain.
+Do not quote that residual as a drain measurement.
+`COMMIT`'s fsync is outside all of it by construction and is a separate
+question.
+
+Any test of this must be **file-backed and WAL-mode** for the site attribution:
+the Mem backend has no WAL, so `Store.checkpoint` returns before it acquires
+anything and no autocheckpoint is ever dispatched — an in-memory version passes
+while measuring nothing. `test/test_lock_stats_718.ml` is.
+
 ### One `Db.t`, one explicit transaction (#555)
 
 A `Db.t` carries a single explicit-transaction slot and every statement resolves

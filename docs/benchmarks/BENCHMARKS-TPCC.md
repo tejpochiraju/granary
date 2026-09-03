@@ -739,7 +739,10 @@ overwrite the measurement.
 - **It rules nothing in or out about *where the lock is held*.** That split is
   unmeasured (see the caveat at the top), and both of the two largest rows —
   `COMMIT`'s post-unlock fsync and `BEGIN`'s apparent waiting — sit on the wrong
-  side of it for any conclusion about lock-hold time to be drawn here.
+  side of it for any conclusion about lock-hold time to be drawn here. (#718
+  built the instrumentation that closes this gap and re-ran the profile against
+  it — see the next section. `BEGIN`'s waiting is now attributed; `COMMIT`'s
+  fsync still is not, and structurally cannot be.)
 
 The other four profiles show the same shape and are in the CSV: `payment` is
 87.5% `BEGIN`+`COMMIT`, `delivery` 69.7%, `order_status` 83.2%. `stock_level` is
@@ -748,3 +751,91 @@ the one exception — 85.9% of it is its single `COUNT(DISTINCT s_i_id)` join, a
 
 Full data, including all five profiles and the coverage rows:
 `bench/results/2026-08-11-tpcc-stmt-profile-granary.csv`.
+
+### Where the writer lock actually goes (#718)
+
+`bench/results/2026-09-02-tpcc-stmt-profile-granary.csv` re-runs the section
+above with the writer-lock accounting #718 added — same command, same knobs,
+same W=1/1-terminal/10 s operating point. The per-statement tables are
+comparable row for row; the throughput headline is **not**, because the two runs
+are on different hosts (see the `.meta`). The last three CSV tables have no
+counterpart in the 2026-08-11 file: nothing in the tree could produce them
+before #718.
+
+The section above ends by saying it "rules nothing in or out about *where the
+lock is held*". This is that measurement.
+
+| site | acquires | contended | wait_ms | hold_ms | share of the 10.041 s interval |
+|---|---|---|---|---|---|
+| `txn` | 670 | 60 | 2515.531 | 7504.567 | 74.7% |
+| `autocheckpoint` | 60 | 0 | 0.019 | 2519.228 | **25.1%** |
+| `checkpoint` | 0 | 0 | 0.000 | 0.000 | — |
+| `commit_sink` | 0 | 0 | 0.000 | 0.000 | — |
+
+and the contention matrix has exactly one non-empty cell:
+
+```
+waiter  blocked_by_holder  waits   wait_ms
+txn     autocheckpoint        60   2515.353
+```
+
+#### What this settles
+
+- **#716 item 2 is answered, and its named candidate is the cause.** That issue
+  said `BEGIN`'s 3.228 ms "cannot be transaction-setup cost", offered the
+  `Lwt.async` autocheckpoint as a "candidate, not a cause", and explicitly did
+  not exclude scheduler drain. **Every one of `txn`'s 60 contended acquisitions
+  was behind the autocheckpoint**, carrying 2515.353 ms of the 2515.531 ms of
+  all writer-lock wait in the run — 99.99%. `BEGIN` is waiting, and it is
+  waiting for the background checkpoint.
+
+  **The remaining 0.178 ms is the instrument's own measurement floor, not
+  drain, and this table structurally cannot see drain.** An uncontended
+  `Rwlock.acquire_write` returns `Lwt.return_unit` (`lib/store/rwlock.ml:59-61`)
+  and `Lwt.bind` on an already-resolved promise runs its callback
+  synchronously — so an uncontended acquisition contains no scheduler yield at
+  all, by construction. What the 0.178 ms measures is the two `Unix.gettimeofday`
+  reads bracketing each acquire: spread over `txn`'s 610 *uncontended*
+  acquisitions that is 0.29 µs each, and the table carries its own control —
+  `autocheckpoint` is 60 acquisitions with `contended = 0` and
+  `wait_ms = 0.019`, i.e. 0.32 µs each, the same floor to within noise.
+
+  Separately, the drain hypothesis #716 raised was drain at the awaits *the
+  profiler* brackets, which sits outside `acquire_write` entirely. This
+  measurement narrows it hard — `BEGIN`'s excess is accounted for as lock wait
+  behind the autocheckpoint, leaving little room for anything else — but it does
+  not bound it at 0.178 ms, and nothing here excludes it.
+- **The wait is concentrated, not spread.** 60 of 670 transactions — 9.0% —
+  wait at all; each of those waits a mean of 41.9 ms and up to 75.5 ms. The
+  other 91% wait for nothing. That is the whole of the `new_order` p50/p99 gap
+  (12.4 ms against 67.7 ms) and it is a maintenance task, not query work.
+- **The writer lock is 99.8% occupied at ONE terminal.** 7504.567 + 2519.228 =
+  10023.8 ms of a 10041 ms interval. The two cannot overlap — one writer at a
+  time — so this is a floor on occupancy, not an estimate, and it is the answer
+  to #718's "how much of #716's headline converts to throughput at
+  `TERMINALS > 1`": **none of it, until something leaves the critical section**.
+  There is no idle lock for a second writer to take. The single-writer ceiling
+  the sweep above reports is not a scheduling artifact; it is saturation.
+- **A quarter of that saturation is not the workload.** The autocheckpoint's
+  25.1% is WAL maintenance holding the one lock every transaction needs, at a
+  1000-frame threshold nothing in the harness overrides. Filed as **#719**.
+- **#717 converted, and the per-call figure is the safe way to see it.**
+  `ROLLBACK` went from 358.9164 ms/call (4 calls, 25.72% of `new_order`, the
+  run's p99 and max) to **0.485 ms/call** (3 calls, 0.03%) — 740x on a
+  per-operation latency whose asymptotics changed from a full tree drain to a
+  root-to-leaf descent over a ~300k-row `order_line`. No host difference reaches
+  two orders of magnitude. `ROLLBACK` is no longer among `new_order`'s costs.
+
+#### What it does not settle
+
+- **It says nothing about `COMMIT`.** `commit_wal` releases the lock before the
+  fsync, so the fsync is outside every number in the table above — by design,
+  and it is the part `group_commit_sync` coalesces across writers, i.e. the part
+  that does *not* serialise. `COMMIT` remains 40.2% of `new_order`'s service
+  time and the accounting deliberately cannot attribute it.
+- **It is one terminal.** At `TERMINALS > 1` the matrix would grow a
+  `txn`-behind-`txn` cell, which is the quantity a multi-terminal design
+  question needs and which this run has none of. Read `#706`'s caveat before
+  trusting a multi-terminal run's output at all.
+- **It is one run on a loaded laptop.** The shares are large enough that load
+  cannot invent them, but no figure here is a repeated measurement.

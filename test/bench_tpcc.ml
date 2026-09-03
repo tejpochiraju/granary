@@ -239,13 +239,37 @@ let load_failures r =
    [load] completes — a worker handle minted before the load phase's DDL runs
    would carry a catalog that cannot see the freshly created tables (see
    {!Tpcc_conn.worker_handle}'s doc). *)
-let run_engine ~engine ~config ~gen ~load ~mk_workers ~exec ~query_rows ~self_test =
+(* #718: [lock] is granary-only, and deliberately a pair of closures rather than
+   a value.  [reset] has to fire between the driver's warm-up and measured
+   windows — the same instant [Tpcc_stmt_profile.reset] does, and for the same
+   reason — which is inside [D.run]; [snapshot] has to fire after it.  Reference
+   SQLite passes [None]: its lock is C SQLite's, and there is nothing here that
+   can see inside it. *)
+let run_engine
+      ?lock
+      ~engine
+      ~config
+      ~gen
+      ~load
+      ~mk_workers
+      ~exec
+      ~query_rows
+      ~self_test
+      ()
+  =
   Printf.eprintf "[%s] loading W=%d…%!" engine (G.warehouses gen);
   let (), load_wall, _ = BR.time_it load in
   Printf.eprintf " %.2fs\n%!" load_wall;
   let workers = mk_workers () in
   let before = print_check (check_conditions query_rows ~engine ~where:"before") in
-  let result = Lwt_main.run (D.run config ~workers:(List.map T.run workers)) in
+  let on_measured_start () =
+    match lock with
+    | Some (reset, _) -> reset ()
+    | None -> ()
+  in
+  let result =
+    Lwt_main.run (D.run ~on_measured_start config ~workers:(List.map T.run workers))
+  in
   let after = print_check (check_conditions query_rows ~engine ~where:"after") in
   let self = if self_test then prove_the_oracle_can_fail exec query_rows ~engine else 0 in
   (* #714: [D.run] resets the profile after its own warm-up window, so what is
@@ -261,13 +285,20 @@ let run_engine ~engine ~config ~gen ~load ~mk_workers ~exec ~query_rows ~self_te
         (fun (p : D.profile_stats) -> p.D.name, p.D.service_total_ms)
         result.D.per_profile
     in
-    Printf.eprintf "[%s]%s%!" engine (SP.report ~service_ms);
+    (* Snapshot after [D.run] returns, so it covers exactly the measured
+       interval its [on_measured_start] reset opened. *)
+    let lock =
+      match lock with
+      | Some (_, snapshot) -> Some (snapshot ())
+      | None -> None
+    in
+    Printf.eprintf "[%s]%s%!" engine (SP.report ?lock ~service_ms ());
     match BR.env_str "GRANARY_TPCC_STMT_PROFILE_CSV" "" with
     | "" -> ()
     | dir ->
       let path = Filename.concat dir (Printf.sprintf "tpcc-stmt-profile-%s.csv" engine) in
       (try
-         SP.to_csv ~path ~service_ms;
+         SP.to_csv ?lock ~path ~service_ms ();
          Printf.eprintf "[%s] statement profile CSV: %s\n%!" engine path
        with
        | Sys_error msg ->
@@ -296,6 +327,7 @@ let run_granary ~dir ~config ~gen ~self_test =
   let c = Conn.open_db ~dir in
   let out =
     run_engine
+      ~lock:((fun () -> Conn.reset_lock_stats c), fun () -> Conn.lock_stats c)
       ~engine:Conn.name
       ~config
       ~gen
@@ -308,6 +340,7 @@ let run_granary ~dir ~config ~gen ~self_test =
       ~exec:(Conn.exec c)
       ~query_rows:(Conn.query_rows c)
       ~self_test
+      ()
   in
   Conn.close c;
   out
@@ -326,6 +359,7 @@ let run_sqlite ~dir ~config ~gen ~self_test =
       ~exec:(Ref_sqlite.exec s)
       ~query_rows:(Ref_sqlite.query_rows s)
       ~self_test
+      ()
   in
   Ref_sqlite.close s;
   out

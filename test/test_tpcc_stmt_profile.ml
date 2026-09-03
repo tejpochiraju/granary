@@ -167,7 +167,7 @@ let test_colliding_prefix_and_suffix_shapes_render_distinct_sql () =
   fresh ();
   P.record ~profile:"payment" ~sql:payment_update_no_data ~rows:0 ~secs:0.288;
   P.record ~profile:"payment" ~sql:payment_update_with_data ~rows:0 ~secs:0.044;
-  let report = P.report ~service_ms:[] in
+  let report = P.report ~service_ms:[] () in
   let lines_mentioning_update =
     String.split_on_char '\n' report
     |> List.filter (fun l -> contains "UPDATE customer" l)
@@ -236,7 +236,7 @@ let test_families_ignores_shapes_that_do_not_fan_out () =
   Alcotest.(check bool)
     "and the report prints no family section"
     false
-    (contains "generated-SQL families" (P.report ~service_ms:[]))
+    (contains "generated-SQL families" (P.report ~service_ms:[] ()))
 ;;
 
 let test_families_never_merge_across_profiles () =
@@ -254,7 +254,7 @@ let test_families_never_merge_across_profiles () =
   Alcotest.(check bool)
     "the report names the rollup"
     true
-    (contains "generated-SQL families" (P.report ~service_ms:[]))
+    (contains "generated-SQL families" (P.report ~service_ms:[] ()))
 ;;
 
 let test_empty_table_renders () =
@@ -263,7 +263,10 @@ let test_empty_table_renders () =
     "no entries"
     []
     (List.map (fun e -> e.P.sql) (P.ranked ()));
-  Alcotest.(check bool) "report says so" true (String.length (P.report ~service_ms:[]) > 0)
+  Alcotest.(check bool)
+    "report says so"
+    true
+    (String.length (P.report ~service_ms:[] ()) > 0)
 ;;
 
 let test_reset_clears () =
@@ -303,6 +306,128 @@ let test_run_is_inert_when_disabled () =
   fresh ();
   Lwt_main.run (Tpcc_txn.run (mock_ops ()) a_stock_level_input);
   Alcotest.(check int) "nothing recorded" 0 (List.length (P.ranked ()))
+;;
+
+(* ── #718: the writer-lock section ───────────────────────────────────────── *)
+
+(* The profiler's own numbers are service time, which spans the writer lock in
+   both directions: a COMMIT releases it before the fsync, and a BEGIN that
+   finds it held is waiting rather than working.  The lock section is the other
+   half of the measurement, and these pin that it is carried through both
+   renderings — and, just as importantly, that omitting it leaves the reference
+   SQLite arm's output byte-for-byte what it was. *)
+
+let a_lock_report () =
+  let ls = Granary_store.Lock_stats.create () in
+  Granary_store.Lock_stats.set_clock ls (fun () -> 0.0);
+  Granary_store.Lock_stats.note_acquired
+    ls
+    Granary_store.Lock_stats.Autocheckpoint
+    ~waited:0.0
+    ~contended:false
+    ~blocked_by:None;
+  Granary_store.Lock_stats.note_released ls ~at:0.25;
+  Granary_store.Lock_stats.note_acquired
+    ls
+    Granary_store.Lock_stats.Txn
+    ~waited:0.125
+    ~contended:true
+    ~blocked_by:(Some Granary_store.Lock_stats.Autocheckpoint);
+  Granary_store.Lock_stats.note_released ls ~at:0.5;
+  Granary_store.Lock_stats.report ls
+;;
+
+let test_report_carries_the_lock_section () =
+  fresh ();
+  P.record ~profile:"new_order" ~sql:"BEGIN" ~rows:0 ~secs:0.01;
+  let with_lock = P.report ~lock:(a_lock_report ()) ~service_ms:[] () in
+  let without = P.report ~service_ms:[] () in
+  Alcotest.(check bool)
+    "the section is there"
+    true
+    (contains "writer-lock accounting" with_lock);
+  Alcotest.(check bool)
+    "naming who the waiter queued behind"
+    true
+    (contains "blocked by autocheckpoint" with_lock);
+  Alcotest.(check bool)
+    "and absent for an engine that has no such accounting"
+    false
+    (contains "writer-lock accounting" without)
+;;
+
+(* An empty accumulator renders every duration as 0.000, which is
+   indistinguishable from a busy run that never contended — unless the report
+   says which.  It does, and the profiler must not swallow that line. *)
+let test_report_carries_the_no_clock_disclosure () =
+  fresh ();
+  let lock = Granary_store.Lock_stats.report (Granary_store.Lock_stats.create ()) in
+  Alcotest.(check bool)
+    "the missing clock is disclosed through the profiler too"
+    true
+    (contains "NO CLOCK INSTALLED" (P.report ~lock ~service_ms:[] ()))
+;;
+
+let read_file path =
+  let ic = open_in path in
+  let n = in_channel_length ic in
+  let s = really_input_string ic n in
+  close_in ic;
+  s
+;;
+
+let with_tmp_csv f =
+  let path = Printf.sprintf "/tmp/granary_tpcc_profile_718_%d.csv" (Unix.getpid ()) in
+  let cleanup () =
+    try Sys.remove path with
+    | _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () -> f path)
+;;
+
+let test_csv_appends_the_three_lock_tables () =
+  fresh ();
+  P.record ~profile:"new_order" ~sql:"BEGIN" ~rows:0 ~secs:0.01;
+  with_tmp_csv (fun path ->
+    P.to_csv ~lock:(a_lock_report ()) ~path ~service_ms:[] ();
+    let csv = read_file path in
+    Alcotest.(check bool)
+      "per-site table"
+      true
+      (contains "site,clock_installed,acquisitions,contended" csv);
+    Alcotest.(check bool)
+      "contention matrix"
+      true
+      (contains "waiter,blocked_by_holder,waits,wait_ms" csv);
+    Alcotest.(check bool)
+      "integrity row"
+      true
+      (contains "unattributed_waits,unbalanced_releases,held_at_snapshot" csv);
+    Alcotest.(check bool)
+      "one row per site, whether or not it acquired anything"
+      true
+      (contains "commit_sink,true,0,0" csv);
+    (* Repeated on every site row on purpose: a row of this file is read on its
+       own, cut out by grep, far more often than the file is read whole. *)
+    Alcotest.(check int)
+      "clock_installed repeated on every site row"
+      (List.length Granary_store.Lock_stats.all_sites)
+      (List.length
+         (List.filter (fun l -> contains ",true," l) (String.split_on_char '\n' csv))))
+;;
+
+let test_csv_without_a_lock_report_is_unchanged () =
+  fresh ();
+  P.record ~profile:"new_order" ~sql:"BEGIN" ~rows:0 ~secs:0.01;
+  with_tmp_csv (fun path ->
+    P.to_csv ~path ~service_ms:[] ();
+    let csv = read_file path in
+    Alcotest.(check bool)
+      "no lock tables for the reference engine"
+      false
+      (contains "clock_installed" csv);
+    Alcotest.(check bool) "the statement table is still there" true (contains "BEGIN" csv))
 ;;
 
 let () =
@@ -347,6 +472,24 @@ let () =
             "families never merge across profiles"
             `Quick
             test_families_never_merge_across_profiles
+        ] )
+    ; ( "lock_section_718"
+      , [ Alcotest.test_case
+            "report carries the lock section"
+            `Quick
+            test_report_carries_the_lock_section
+        ; Alcotest.test_case
+            "report carries the no-clock disclosure"
+            `Quick
+            test_report_carries_the_no_clock_disclosure
+        ; Alcotest.test_case
+            "csv appends the three lock tables"
+            `Quick
+            test_csv_appends_the_three_lock_tables
+        ; Alcotest.test_case
+            "csv without a lock report is unchanged"
+            `Quick
+            test_csv_without_a_lock_report_is_unchanged
         ] )
     ; ( "coverage"
       , [ Alcotest.test_case
