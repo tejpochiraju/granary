@@ -2246,6 +2246,16 @@ let ast_binop_to_plan : Ast.binop -> Plan.binop = function
 let rec ast_expr_to_plan_check (columns : Row.column list) (e : Ast.expr) : Plan.expr =
   match e with
   | Ast.E_lit l -> Plan.P_lit l
+  (* #744: this is the re-compiler for the SQL text the catalog stores about
+     itself — a CHECK, a GENERATED expression, a partial index's WHERE — so it
+     meets a bare [true]/[false] on every write once one is written down.  The
+     same rule as [Sema]'s: the columns are consulted first, and the literal is
+     the fallback for a name none of them answers to. *)
+  | (Ast.E_col name | Ast.E_tbl_col (_, name))
+    when (not
+            (List.exists (fun (c : Row.column) -> String.equal c.Row.name name) columns))
+         && Option.is_some (Ast.bool_ident_lit name) ->
+    Plan.P_lit (Option.get (Ast.bool_ident_lit name))
   | Ast.E_col name -> Plan.P_col (find_col_idx_by_name columns name)
   | Ast.E_tbl_col (_, name) -> Plan.P_col (find_col_idx_by_name columns name)
   | Ast.E_binop (op, a, b) ->
@@ -10527,6 +10537,16 @@ let rec substitute_outer_in_expr
     (match bnd.bind_qual tbl col with
      | Some pinned -> pinned
      | None -> e)
+  (* #744: a bare [true]/[false] is never an outer column reference.  The scope
+     test below already answers "owned" whenever the subquery's own FROM has a
+     column of that name, so this arm only fires where nothing inside answers to
+     it — which is exactly where [Sema] resolves it to the literal.  Without it,
+     [stmt_has_free_column_ref] (which runs this walker against a binding that
+     resolves nothing, #635) reads every [WHERE true] inside a subquery as a
+     free outer reference: the subquery is then treated as correlated, and
+     [SELECT (SELECT COUNT(x) FROM q WHERE true)] answered NULL while the [IN]
+     spelling raised {!refuse_unresolved_correlation}. *)
+  | Ast.E_col name when Option.is_some (Ast.bool_ident_lit name) -> e
   | Ast.E_col name when not (scope.has_col name) ->
     (match bnd.bind_unqual name with
      | Some pinned -> pinned

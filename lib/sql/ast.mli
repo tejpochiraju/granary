@@ -579,6 +579,23 @@ val quote_ident : string -> string
     literals). *)
 val expr_to_sql : expr -> string
 
+(** #744: the literal a bare [TRUE] or [FALSE] stands for, or [None] for any
+    other name.
+
+    They are deliberately NOT lexer keywords. SQLite resolves them exactly this
+    way — {i sqlite3ExprIdToTrueFalse}, reached only after a column lookup has
+    already failed — so [SELECT true FROM t] still reads the column when [t]
+    has one called [true], and a table, alias or column may be named [true]
+    anywhere. Keeping them out of [lexer.mll] also keeps them out of
+    {!Granary_encoding.Sql_ident.sql_keywords}, so the #619 drift guard is
+    untouched and no stored SQL starts needing new quoting (#572).
+
+    They are aliases for the integers 1 and 0, not a boolean storage class:
+    [TRUE + TRUE] is 2 and [typeof(TRUE)] is [integer], so
+    [Exec.value_class_rank] and the #579/#733/#738 comparators never hear about
+    them. *)
+val bool_ident_lit : string -> literal option
+
 (** #491: [rename_view_columns names body] desugars a [CREATE VIEW v (names)
     AS body] column list into [body]'s own output aliases — the transformation
     the column list denotes. Returns [Error msg] when [body] has no explicit

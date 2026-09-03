@@ -690,12 +690,29 @@ let bind_case ~bind ~scrutinee ~branches ~else_ =
    The flag must NOT be widened into a default: [excluded.x] has to stay
    unresolvable in a plain SELECT/WHERE/UPDATE, which is what sqlite3 does
    ("no such column: excluded.v"). *)
+(* #744: [TRUE] and [FALSE] are bare identifiers that stand for the integers 1
+   and 0 when — and only when — nothing in scope answers to the name.  The rule
+   itself lives in {!Ast.bool_ident_lit}, which the parser and [Exec] share; see
+   its doc comment in [ast.mli] for why it is a resolution fallback rather than
+   a pair of lexer keywords. *)
+let bool_ident_lit = Ast.bool_ident_lit
+
+let or_bool_ident name mk err =
+  match bool_ident_lit name with
+  | Some l -> Ok (mk l)
+  | None -> Error err
+;;
+
 let rec bind_expr ?(excluded = false) ~param_counter ~named_params (meta : Cat.table_meta)
   = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
     (match col_index meta.columns name with
-     | None -> Error (Unknown_column { table = meta.name; column = name })
+     | None ->
+       or_bool_ident
+         name
+         (fun l -> BE_lit l)
+         (Unknown_column { table = meta.name; column = name })
      | Some i -> Ok (BE_col i))
   | Ast.E_tbl_col (tbl, name)
     when excluded && String.equal (String.uppercase_ascii tbl) "EXCLUDED" ->
@@ -840,7 +857,10 @@ let rec bind_expr_join
      | [ be ] -> Ok be
      | [] ->
        let tm0, _, _ = List.hd tables in
-       Error (Unknown_column { table = tm0.Cat.name; column = name })
+       or_bool_ident
+         name
+         (fun l -> BE_lit l)
+         (Unknown_column { table = tm0.Cat.name; column = name })
      | _ :: _ -> Error (Ambiguous_column name))
   | Ast.E_tbl_col (tbl, name) ->
     (match List.find_opt (fun t -> String.equal (from_ident t) tbl) tables with
@@ -1258,7 +1278,7 @@ let rec bind_expr_agg
     | Ast.E_lit l -> Ok (BE_lit l)
     | Ast.E_col name ->
       (match resolver.resolve_unqual name with
-       | Error e -> Error e
+       | Error e -> or_bool_ident name (fun l -> BE_lit l) e
        | Ok i -> Ok (BE_col i))
     | Ast.E_tbl_col (t, c) ->
       (match resolver.resolve_qual t c with
@@ -2022,6 +2042,12 @@ let bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values =
     let synth_meta = fts_as_table_meta fts_meta in
     let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
       match e with
+      (* #744: a VALUES list has no row in scope, so a bare [true]/[false] is
+         the literal even on a table that has a column of that name — which is
+         what sqlite3 answers (oracle-checked).  Going through [bind_expr] would
+         consult the columns first and read the column instead. *)
+      | Ast.E_col n when Option.is_some (bool_ident_lit n) ->
+        Ok (BE_lit (Option.get (bool_ident_lit n)))
       | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
         bind_expr ~param_counter ~named_params synth_meta e
       | _ -> Error (Unsupported "complex expression in INSERT VALUES")
@@ -2162,6 +2188,11 @@ let bind_explicit_insert_cols
   (* Bind a single VALUES expr without column context. *)
   let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
     match e with
+    (* #744: see the note on the FTS twin above — a VALUES list has no row in
+       scope, so [true]/[false] is the literal here even on a table with a
+       column of that name. *)
+    | Ast.E_col n when Option.is_some (bool_ident_lit n) ->
+      Ok (BE_lit (Option.get (bool_ident_lit n)))
     | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
       bind_expr ~param_counter ~named_params meta e
     | _ -> Error (Unsupported "complex expression in INSERT VALUES")
@@ -2877,6 +2908,25 @@ let bind_unaggregated_proj
   (* Alias-aware multi-table binder, used even for single-table queries so
      qualified refs resolve only against in-scope tables/aliases. *)
   let bind_one e = bind_expr_join ~param_counter ~named_params ~tables e in
+  (* #744: [`Cols] is a [string list] and so cannot hold a literal, and the
+     parser emits it whenever EVERY projection item is a bare name — so
+     [SELECT true FROM z] arrives here as [`Cols ["true"]] and the ordinal
+     lookup below is the only thing that ever sees it.  Promote the whole
+     projection to [`Exprs] when a name is one the #744 fallback will answer,
+     keeping the name as the alias so the output column is still called [true].
+     Same shape, and the same conditionality, as [Exec.substitute_outer_proj]'s
+     #732 promotion: a projection with nothing to promote keeps the [`Cols]
+     shape the rest of the engine sees today. *)
+  let proj =
+    match proj with
+    | `Cols names
+      when List.exists
+             (fun n ->
+                Option.is_some (bool_ident_lit n)
+                && Result.is_error (select_proj_lookup ~tables ~meta n))
+             names -> `Exprs (List.map (fun n -> Ast.E_col n, Some n) names)
+    | p -> p
+  in
   let windows_queue : window_sema Queue.t = Queue.create () in
   let ords_result_lwt =
     match proj with
@@ -2955,7 +3005,7 @@ let bind_post_agg
     | Ast.E_lit l -> Ok (BE_lit l)
     | Ast.E_col name ->
       (match (select_proj_lookup ~tables ~meta) name with
-       | Error e -> Error e
+       | Error e -> or_bool_ident name (fun l -> BE_lit l) e
        | Ok i ->
          (match select_find_pos group_cols i with
           | Some pos -> Ok (BE_col pos)
@@ -3257,7 +3307,7 @@ let project_agg_item
   match e with
   | Ast.E_col name ->
     (match select_proj_lookup ~tables ~meta name with
-     | Error e -> Error e
+     | Error e -> or_bool_ident name (fun l -> AP_expr (BE_lit l)) e
      | Ok i ->
        (* Must appear in GROUP BY. *)
        (match select_find_pos group_cols i with

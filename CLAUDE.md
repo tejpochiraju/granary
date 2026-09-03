@@ -1793,6 +1793,97 @@ EOF
   `burnt_rowid_on_a_discarded_insert_row` in
   `test/test_nested_excluded_741.ml`.
 
+- **`TRUE` and `FALSE` are aliases for 1 and 0, resolved as a NAME-RESOLUTION
+  FALLBACK rather than as keywords (#744, decided 2026-09-03).** Neither word
+  existed anywhere in the grammar, so both fell through to the identifier rule
+  and bound as column references: `SELECT TRUE` answered
+  `unknown column: __const__.TRUE`. The sharp consequence was that sqlite3 and
+  granary accepted **disjoint** spellings of an `INSERT ... SELECT` upsert —
+  sqlite3's grammar needs the disambiguating `WHERE true` (its bare form is
+  ambiguous with a join's `ON` and is a parse error), granary took only the bare
+  form (#653), and the intersection was empty. Both spellings now work here;
+  granary's permissive one is a deliberate superset and is unchanged.
+
+  Two decisions, and both are about what was NOT done:
+
+  - **They are aliases for the integers, not a boolean storage class.**
+    Oracle-checked: `SELECT TRUE + TRUE` is `2` and `typeof(TRUE)` is
+    `integer`. So `Exec.value_class_rank` and the #579/#733/#738 comparators
+    never hear about them — no comparator learns a new class, and none of that
+    work is disturbed.
+  - **Nothing was added to `lexer.mll`.** The rule lives in
+    `Ast.bool_ident_lit` and is consulted only where a column lookup has already
+    FAILED, which is exactly how SQLite resolves them
+    (`sqlite3ExprIdToTrueFalse`, reached from `lookupName` when the match count
+    is zero). Identifier context therefore wins by construction —
+    oracle-checked, `SELECT true FROM t` where `t` has a column named `true`
+    answers the column in both engines — and, because the keyword table did not
+    grow, #619's lexer/`Sql_ident` drift guard is untouched and no stored SQL
+    starts needing quoting it did not need before (#572). Adding a `TRUE` token
+    was rejected for the first reason alone: no token can defer to a column.
+
+  **`Ast.bool_ident_lit` is the single chokepoint and the reason a fallback this
+  diffuse is auditable.** Every site that can meet a bare `true`/`false` consults
+  it and none may grow a second opinion: the parser's `def_value` (a `DEFAULT` has no row in scope, so no
+  column can be meant); `Sema`'s five unqualified-column resolution failures
+  (`bind_expr`, `bind_expr_join`, the aggregate resolver, and the window and
+  projection arms over `select_proj_lookup`); its two `bind_value_expr`s — a
+  VALUES list has no row in scope either, so `INSERT INTO u VALUES (true, 2)`
+  stores `1` even when `u` HAS a column named `true`, oracle-checked; and
+  `Exec.ast_expr_to_plan_check`, the re-compiler for the SQL text the catalog
+  stores about itself (a CHECK, a GENERATED expression, a partial index's
+  WHERE), which is a different resolver from `Sema`'s and meets a bare `true` on
+  every write once one is written down.
+
+  Two of the sites are not obvious and would each have shipped a wrong answer:
+
+  - **The projection needed a `` `Cols `` promotion.** The parser emits
+    `` `Cols `` — a bare `string list`, which cannot hold a literal — whenever
+    EVERY select item is a plain name, so `SELECT true FROM q` took a path no
+    expression ever reaches and stayed an `unknown column` error. It is promoted
+    to `` `Exprs `` when a name is one the fallback answers, keeping the name as
+    the alias; the same promotion, and the same conditionality,
+    `Exec.substitute_outer_proj` already makes for #732.
+  - **`Exec.substitute_outer_in_expr` needed an arm, and this is the one that
+    would come back first.** #635's correlation detector runs that walker
+    against a binding that resolves NOTHING and records that it was asked, so
+    every `WHERE true` inside a subquery read as a free outer reference and the
+    subquery was misclassified as correlated: a scalar subquery counting rows
+    under `WHERE true` answered NULL — silently wrong — and the `IN` spelling
+    raised out of the executor. A bare `true`/`false` is never an outer column
+    reference, and the scope test already answers "owned" when the subquery's
+    own FROM has a column of that name, so the arm sits above it and is a
+    no-op in that case.
+
+  **`IS TRUE` / `IS NOT FALSE` are deliberately out of scope, and the important
+  half is that the fallback could not turn them into a silent wrong answer.**
+  They are truthiness, not equality — oracle-checked, `2 IS TRUE` is `1` while
+  `2 IS 1` is `0`, and `'1' IS TRUE` is `1` while `'1' IS 1` is `0`. Granary has
+  no general `x IS y` operator at all: `IS` appears only in the `IS NULL` /
+  `IS NOT NULL` productions, so `1 IS TRUE` was a PARSE error before #744 and
+  still is, pinned as such. Adding the productions is a separate gap.
+
+  Two recorded divergences, both narrower than the fix:
+
+  - **A QUOTED `true` is the literal here** — `"true"`, backticked or bracketed
+    — where sqlite3 keeps quoting semantically significant (it answers the TEXT
+    `'true'` for the double-quoted spelling through its double-quoted-string
+    misfeature, and an error for the other two). Distinguishing them needs an
+    `Ast.expr` constructor carrying quotedness, which granary has never had;
+    it already treats all four spellings of a non-keyword name as one
+    identifier everywhere else.
+  - **`GROUP BY true` is still refused**, where sqlite3 groups by the constant.
+    `Ast.group_by_item` is `string * string option`, a name and a qualifier, so
+    a constant group key is not expressible at all (`GROUP BY 1` is a parse
+    error too) — the same orthogonal gap #722's `GROUP BY x COLLATE NOCASE`
+    entry names, not a boolean one. It fails loudly.
+
+  The grammar is untouched apart from `def_value`'s semantic action, so menhir's
+  counts are unchanged either side of the fix: **35 states with shift/reduce
+  conflicts, 290 shift/reduce conflicts arbitrarily resolved**, and the same
+  four pre-existing warnings. Pinned by `test/test_bool_literal_744.ml`, whose
+  every expected value was read off sqlite3 3.45.1 rather than predicted.
+
 - **A skipped `INSERT` leaves nothing behind in the STORE and the CATALOG,
   including its BEFORE INSERT trigger's nested DML, in an explicit transaction
   as well as in autocommit (#631, fixed 2026-08-06).** Read the scope literally:

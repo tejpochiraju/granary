@@ -743,6 +743,19 @@ let rec expr_to_sql = function
 
    [`All] is refused rather than guessed at: the arity of [SELECT *] is not
    known without the catalog, which the parser does not have. *)
+(* #744: the literal a bare TRUE/FALSE stands for.  See ast.mli for why this is
+   a name-resolution fallback rather than a pair of lexer keywords.  Every site
+   that can meet a bare [true]/[false] consults THIS function — the parser's
+   DEFAULT value, [Sema]'s five column-resolution failures and its INSERT VALUES
+   binders, and [Exec]'s re-compiler for stored CHECK / GENERATED / partial-index
+   SQL — so none of them can drift into a different opinion about the spelling. *)
+let bool_ident_lit name =
+  match String.lowercase_ascii name with
+  | "true" -> Some (L_int 1L)
+  | "false" -> Some (L_int 0L)
+  | _ -> None
+;;
+
 let rec rename_view_columns (names : string list) (q : stmt) : (stmt, string) result =
   let n = List.length names in
   let plural k = if k = 1 then "" else "s" in
