@@ -253,8 +253,8 @@ let seed2 db =
 ;;
 
 (* Hand-computed over fixture 2 (not observed from sqlite3):
-     p (n=2): partitions {10}, {14} -> every row's COUNT(*) OVER is 1
-     q (n=0): partition  {0}        -> every row's COUNT(*) OVER is 2 *)
+     p (n=2): partitions {10}, {14} -> every row's COUNT( * ) OVER is 1
+     q (n=0): partition  {0}        -> every row's COUNT( * ) OVER is 2 *)
 let a_window_partition_by_carries_the_outer_value () =
   with_db (fun db ->
     seed2 db;
