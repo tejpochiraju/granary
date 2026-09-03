@@ -418,7 +418,7 @@ let the_filter_and_the_sort_now_agree_across_classes () =
    sqlite3, over i in {1,2,3}:
      SELECT i FROM c WHERE i < 'abc';          1, 2, 3
      SELECT i FROM c WHERE i > 'abc';          (none)
-     SELECT count(*) FROM c WHERE i <> 'abc';  3 *)
+     SELECT count( * ) FROM c WHERE i <> 'abc';  3 *)
 let a_cross_class_bound_leaves_the_seek_open () =
   with_db (fun db ->
     exec db "CREATE TABLE c (w INTEGER, i INTEGER, PRIMARY KEY (w, i))";
