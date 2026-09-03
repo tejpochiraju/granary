@@ -2862,6 +2862,56 @@ let checkpoint_health (t : t) : checkpoint_health =
     }
 ;;
 
+(* #637: the pre-#636 stale-generation detector, lifted to the store. *)
+type wal_replay_status =
+  | Wal_replay_not_examined
+  | Wal_replay_no_evidence
+  | Wal_replay_stale_generation of
+      { frame_idx : int
+      ; previous_txn_id : int64
+      ; frame_txn_id : int64
+      }
+
+type wal_replay_check =
+  { status : wal_replay_status
+  ; frames_walked : int
+  ; header_frames : int
+  }
+
+(* The three-way answer is the point.  [Wal_replay_no_evidence] is NOT
+   "verified clean": it says this open's WAL recovery walked at least two
+   header frames and their txn_ids increased.  It says nothing about damage a
+   PREVIOUS open already baked into the main file, which is exactly the
+   silent-row-loss variant #637 is about, and nothing about a database whose WAL
+   was empty at this open.  Collapsing that into "clean" is worse than having no
+   detector, so a walk with less than two header frames to compare answers
+   [Wal_replay_not_examined] instead. *)
+let wal_replay_check (t : t) : wal_replay_check =
+  let not_examined =
+    { status = Wal_replay_not_examined; frames_walked = 0; header_frames = 0 }
+  in
+  match t.backend with
+  | Mem _ -> not_examined
+  | Btree st ->
+    (match st.wal with
+     | None -> not_examined
+     | Some wal ->
+       let r = Wal.replay_check wal in
+       let status =
+         match r.Wal.stale_generation with
+         | Some (frame_idx, previous_txn_id, frame_txn_id) ->
+           Wal_replay_stale_generation { frame_idx; previous_txn_id; frame_txn_id }
+         | None ->
+           if r.Wal.header_frames >= 2
+           then Wal_replay_no_evidence
+           else Wal_replay_not_examined
+       in
+       { status
+       ; frames_walked = r.Wal.frames_walked
+       ; header_frames = r.Wal.header_frames
+       })
+;;
+
 let clear_checkpoint_error (t : t) : unit =
   match t.backend with
   | Mem _ -> ()

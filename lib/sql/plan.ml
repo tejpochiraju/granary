@@ -337,6 +337,9 @@ type op =
   | Op_pragma_checkpoint_status
   (** #638 read the checkpoint-failure signal: one row of
       (total_failures, consecutive_failures, last_error). *)
+  | Op_pragma_wal_replay_check
+  (** #637 report recovery's generation-boundary evidence: one row of
+      (status, frames_walked, header_frames, detail). *)
   | Op_pragma_get_wal_autocheckpoint (** Read per-connection auto-checkpoint threshold. *)
   | Op_pragma_set_wal_autocheckpoint of { n : int64 }
   (** Set per-connection auto-checkpoint threshold (0 disables). *)

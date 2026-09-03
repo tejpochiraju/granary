@@ -3136,6 +3136,7 @@ let plan_pragma_rows cat kind =
   | Ast.Pragma_defer_foreign_keys_set _
   | Ast.Pragma_wal_checkpoint
   | Ast.Pragma_checkpoint_status
+  | Ast.Pragma_wal_replay_check
   | Ast.Pragma_wal_autocheckpoint
   | Ast.Pragma_wal_autocheckpoint_set _
   | Ast.Pragma_synchronous
@@ -3166,6 +3167,7 @@ let plan_pragma cat kind =
   | Ast.Pragma_defer_foreign_keys_set on -> Plan.Op_pragma_set_defer_fk { on }
   | Ast.Pragma_wal_checkpoint -> Plan.Op_pragma_wal_checkpoint
   | Ast.Pragma_checkpoint_status -> Plan.Op_pragma_checkpoint_status
+  | Ast.Pragma_wal_replay_check -> Plan.Op_pragma_wal_replay_check
   | Ast.Pragma_wal_autocheckpoint -> Plan.Op_pragma_get_wal_autocheckpoint
   | Ast.Pragma_wal_autocheckpoint_set n -> Plan.Op_pragma_set_wal_autocheckpoint { n }
   | Ast.Pragma_synchronous -> Plan.Op_pragma_get_synchronous

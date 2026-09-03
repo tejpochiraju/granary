@@ -2203,6 +2203,70 @@ The refusal does **not** poison the handle (nothing is doomed) and a bare
 unfixed code that test does not fail, it HANGS** — verified by mutation, and
 worth knowing before editing it.
 
+### A pre-#636 stale replay is reported, never refused (#637)
+
+#636 stopped the stale-generation replay from the next successful checkpoint
+onward; it does not heal a file already on disk in the bad state, so an
+upgrading user gets **one further stale replay** — silently. Two outcomes were
+measured on the unfixed code: a database that will not open at all, and — the
+dangerous one — a database that opens, answers queries, and is short 365
+committed rows.
+
+The decision is **option 1 of the issue: a detector plus a PRAGMA to report**,
+in the same spirit as #638's `PRAGMA checkpoint_status`. Refusing to open
+(option 2) was rejected: it converts a database that may be perfectly fine into
+a hard failure, and without a repair path that is a worse trade than telling the
+operator what was seen.
+
+**The signal is header-page `txn_id` monotonicity.** Every commit writes exactly
+one header page (page 0 or 1, alternating) with `txn_id = previous + 1`, in the
+same batch as its commit-flagged frame, so within one generation the header
+frames recovery walks past carry strictly increasing `txn_id`s. A decrease means
+the walk ran off the end of the newest generation into the physical remains of
+an older one — present in **both** of #636's outcomes.
+`Wal.recover_index` records it (no extra I/O: it already walks every frame),
+`Wal.replay_check` / `Store.wal_replay_check` expose it, and
+`PRAGMA wal_replay_check` renders one row of
+`(status, frames_walked, header_frames, detail)`.
+
+**`status` has three values, and collapsing them to two would be worse than
+having no detector.** `no_evidence` means "walked at least two header frames and
+they increased", never "verified clean" — damage a PREVIOUS open already
+replayed into the main file leaves a structurally valid database that no
+integrity check finds either, and a post-#636 checkpoint has by then physically
+destroyed the evidence. A walk with fewer than two header frames answers
+`not_examined` rather than pretending to `no_evidence`; so do the in-memory
+backend and a non-WAL store. The `detail` column carries the caveat in words,
+because a bare status is exactly the thing that gets over-read.
+
+**Only a regression at or below the last commit frame is reported.** A frame
+checksum covers `(salt, seed, page_id, flags, page)` and **not** the frame's
+index, so leftovers from an earlier, longer write verify wherever they sit —
+including the tail of a batch a crash tore in half before its commit frame was
+written. Recovery walks such a tail and then discards it for want of a commit,
+so the database is correct; flagging it would make the detector cry wolf on
+ordinary crash recovery. The stale frames #637 is about were *applied*, and
+therefore sit within the committed prefix. `an_unapplied_stale_tail_is_not_reported`
+in `test/test_wal_replay_check_637.ml` pins that, and fails by mutation if the
+restriction is removed.
+
+Three things it still cannot see, recorded so nobody reads the PRAGMA as an
+oracle: damage replayed at an earlier open (above); a stale remainder that is a
+fragment of one old commit batch carrying no header-page frame; and a database
+that will not open at all — loud by construction, but no PRAGMA runs on it.
+
+`test/test_wal_replay_check_637.ml` is file-backed and WAL-mode for every
+PRAGMA case (the Mem backend has no WAL, so an in-memory version passes while
+measuring nothing). Its headline case,
+`a_pre_636_file_is_detected_end_to_end`, rebuilds the pre-#636 physical state
+out of ordinary SQL plus two byte-level writes to the `-wal` file: commit a long
+generation, checkpoint it into the main file, restore that generation's 24-byte
+header — its unrotated `(salt, seed)` marker — over the truncated WAL so the
+next writer starts at frame 0 under the same marker, write a short successor
+there, and splice the old generation's tail back on behind it. The fixed code
+cannot be talked into producing that state, which is the point of #636; every
+spliced frame still verifies, which is the point of #637.
+
 ### One `Db.t`, one explicit transaction (#555)
 
 A `Db.t` carries a single explicit-transaction slot and every statement resolves

@@ -2036,3 +2036,23 @@
  (name test_nested_excluded_741)
  (modules test_nested_excluded_741)
  (libraries granary granary.encoding alcotest lwt.unix))
+
+; #637: a database already corrupted by the pre-#636 WAL replay is neither
+; detected nor repaired on upgrade. PRAGMA wal_replay_check is the detector.
+; The fabricated-corruption cases drive the real Wal.open_/recover_index over an
+; in-memory byte device (the corrupt shape cannot be produced by the fixed
+; code); the PRAGMA cases are file-backed and WAL-mode, because the Mem backend
+; has no WAL and would pass vacuously.
+
+(test
+ (name test_wal_replay_check_637)
+ (modules test_wal_replay_check_637)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  cstruct
+  alcotest
+  lwt.unix
+  unix))

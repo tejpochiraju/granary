@@ -19,6 +19,32 @@ type frame =
   ; page : Cstruct.t
   }
 
+(* #637: what recovery's forward walk observed about GENERATION BOUNDARIES.
+
+   Every commit writes exactly one header page (page 0 or 1, alternating) with
+   [txn_id = previous + 1], and [append_commit] puts it in the same batch as the
+   commit-flagged frame.  So within ONE generation the header-page frames
+   recovery walks past carry STRICTLY INCREASING [txn_id]s.  A DECREASE means
+   the walk has run off the end of the newest generation and into the physical
+   remains of an older one — which is precisely the pre-#636 corruption, where
+   [reset] never rotated the [(salt, seed)] marker so every frame of the
+   checkpointed generation still verified and recovery replayed it over newer
+   data.
+
+   Recorded rather than acted on: see {!replay_check} in the .mli for what this
+   can and cannot detect, and why the answer is a report and not a refusal. *)
+type replay_check =
+  { frames_walked : int (** frames recovery's forward walk consumed *)
+  ; header_frames : int
+    (** of those, how many were header pages carrying a readable [txn_id] —
+        the material the monotonicity test actually had *)
+  ; stale_generation : (int * int64 * int64) option
+    (** [(frame_idx, previous_txn_id, frame_txn_id)] of the FIRST header frame
+        whose [txn_id] failed to increase, or [None] if none did *)
+  }
+
+let empty_replay_check = { frames_walked = 0; header_frames = 0; stale_generation = None }
+
 type error =
   | Block_error of string
   | Corrupt_frame of int
@@ -99,6 +125,10 @@ type t =
         the rotation there would let recovery resurrect them over a shorter
         successor generation — exactly the bug #636 is about, reached through
         the fast path meant to be free. *)
+  ; mutable replay_check : replay_check
+    (** #637: set once by [recover_index] at open and never changed again — not
+        by [reset], because it is a statement about the FILE THIS HANDLE OPENED,
+        which stays true after a checkpoint rotates the marker. *)
   ; mutable poisoned : string option
     (** #562/#636 (B1): set when [reset]'s header write or fsync failed, so it
         is UNKNOWN whether the device holds the old marker or the new one.
@@ -128,6 +158,7 @@ let default_frame_cache_capacity =
 ;;
 
 let committed_frames t = t.committed_frames
+let replay_check t = t.replay_check
 let size_bytes t = t.size_bytes
 let sync_count t = t.sync_count
 let epoch t = t.epoch
@@ -378,6 +409,25 @@ let read_frame_raw ?(verify = true) t idx =
 (* Open + recovery                                                     *)
 (* ----------------------------------------------------------------- *)
 
+(* #637: the header-page [txn_id] carried by frame [f], when it has one.
+
+   Pages 0 and 1 are the two alternating header pages and nothing else is ever
+   written to them, so a frame naming one carries a header page — but the kind
+   byte is checked anyway rather than trusting the page id, and
+   [Page.read_header_fields] is used rather than a hand-rolled offset so this
+   cannot drift away from the layout it is reading.  [f.page] is already
+   PLAINTEXT (encrypted frames are decrypted by [read_frame_raw]), and its
+   frame checksum has just passed, so no further validation is owed. *)
+let header_txn_id_of_frame (f : frame) : int64 option =
+  if not (Int64.equal f.page_id 0L || Int64.equal f.page_id 1L)
+  then None
+  else (
+    match Page.read_common f.page with
+    | { Page.kind = Page.Header; _ } -> Some (Page.read_header_fields f.page).Page.txn_id
+    | _ -> None
+    | exception _ -> None)
+;;
+
 let recover_index t =
   (* Walk forward; keep "pending" updates in a local table; on commit frame
      flush pending into the persistent index and bump committed_frames.
@@ -386,6 +436,23 @@ let recover_index t =
   let last_commit_idx = ref (-1) in
   let stop = ref false in
   let idx = ref 0 in
+  (* #637: generation-boundary evidence, accumulated as we walk.  [last_hdr] is
+     the newest header-page [txn_id] seen so far; [regression] latches the FIRST
+     failure to increase and is never overwritten, so the report names where the
+     walk first left the newest generation rather than where it last did. *)
+  let header_frames = ref 0 in
+  let last_hdr = ref None in
+  let regression = ref None in
+  let note_header i txn =
+    incr header_frames;
+    match !last_hdr with
+    | Some prev when Int64.compare txn prev <= 0 ->
+      (* A stale frame.  Latch the first one, and do NOT lower [last_hdr]:
+         inside a stale generation every further header frame would otherwise
+         look like a fresh increase off the lowered mark. *)
+      if !regression = None then regression := Some (i, prev, txn)
+    | _ -> last_hdr := Some txn
+  in
   let rec loop () =
     if !stop
     then Lwt.return_ok ()
@@ -397,6 +464,9 @@ let recover_index t =
         stop := true;
         Lwt.return_ok () (* EOF or bad checksum *)
       | Ok (Some f) ->
+        (match header_txn_id_of_frame f with
+         | Some txn -> note_header !idx txn
+         | None -> ());
         Hashtbl.replace pending f.page_id !idx;
         if f.is_commit
         then (
@@ -416,6 +486,24 @@ let recover_index t =
   | Error e -> Lwt.return_error e
   | Ok () ->
     t.committed_frames <- !last_commit_idx + 1;
+    (* #637: a regression PAST the last commit frame is discarded, and this is
+       the difference between a detector and a false alarm.  The frame checksum
+       covers [(salt, seed, page_id, flags, page)] and NOT the frame's index, so
+       any frame left over from an earlier, longer write at the same index still
+       verifies — including the tail of a batch that was torn by a crash and
+       never committed.  Such a tail is walked but never APPLIED (its pending
+       updates are dropped for want of a commit frame), so flagging it would
+       report corruption on a database that is entirely correct.  What #637 is
+       about is stale frames that WERE applied, and those necessarily sit at or
+       below [last_commit_idx].  Indices only increase, so if the first
+       regression is past the mark every later one is too. *)
+    let stale =
+      match !regression with
+      | Some (i, _, _) when i > !last_commit_idx -> None
+      | r -> r
+    in
+    t.replay_check
+    <- { frames_walked = !idx; header_frames = !header_frames; stale_generation = stale };
     Lwt.return_ok ()
 ;;
 
@@ -466,6 +554,7 @@ let open_
              a frame either: this is the one branch that is PROVABLY fresh, and
              the only one that may start with the flag clear. *)
           wrote_since_rotation = false
+        ; replay_check = empty_replay_check
         ; poisoned = None
         }
   else
@@ -513,6 +602,7 @@ let open_
                 header write + fsync on the first checkpoint after opening a
                 header-damaged or pre-allocated zero-filled WAL. *)
              wrote_since_rotation = true
+           ; replay_check = empty_replay_check
            ; poisoned = None
            })
     | Ok (Some (salt, seed)) ->
@@ -540,6 +630,7 @@ let open_
              but whose sync failed leaves [committed_frames = 0] with valid
              frames on disk.  Assume the worst so the first [reset] rotates. *)
           wrote_since_rotation = true
+        ; replay_check = empty_replay_check
         ; poisoned = None
         }
       in
