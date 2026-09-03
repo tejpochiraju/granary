@@ -148,7 +148,7 @@ let contains ~needle hay =
         3  | b | 300.0 | 0.00 |   1
         4  | b |  50.0 | 0.50 |   4
         5  | c |  10.0 | 0.00 |   5
-   SUM(qty) = 15, COUNT(*) = 5.
+   SUM(qty) = 15, and there are 5 rows.
 
    f: a factor per k — a:10, b:100, c:1000. Used as the correlated source. *)
 let seed db =
