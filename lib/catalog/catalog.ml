@@ -1704,16 +1704,43 @@ let load_all_reactive_views_in_tx (tx : _ S.txn) =
   load_all_pairs_in_tx tx sys_reactive_views_tid
 ;;
 
-let load_all_reactive_views store = S.with_ro store load_all_reactive_views_in_tx
+(* #476: the reactive-view registry's catalog entry points return a [result],
+   unlike their view/trigger siblings, because their callers sit directly under
+   [Db.execute]'s [(unit, error) result] contract: [CREATE REACTIVE VIEW] and
+   [DROP REACTIVE VIEW] are driven by [Db.rv_create] / [Db.rv_drop] rather than
+   by the staged-DDL path, so a store fault here used to escape as a RAISED
+   exception through an API that promises an [Error].  [Db.rv_drop] previously
+   compensated with an [Lwt.catch] of its own; converting at the source removes
+   that wrapper and gives every reactive-view catalog call one convention.
+
+   Cancellation and the two resource exhaustions are deliberately re-raised
+   rather than reported as a catalog failure — the same rule [Db.rv_drop]'s
+   removed handler applied. *)
+let rv_catalog_result f =
+  Lwt.catch
+    (fun () ->
+       let%lwt v = f () in
+       Lwt.return (Ok v))
+    (function
+      | (Lwt.Canceled | Stack_overflow | Out_of_memory) as e -> Lwt.fail e
+      | Failure msg -> Lwt.return (Error msg)
+      | e -> Lwt.return (Error (Printexc.to_string e)))
+;;
+
+let load_all_reactive_views store =
+  rv_catalog_result (fun () -> S.with_ro store load_all_reactive_views_in_tx)
+;;
 
 let persist_reactive_view ?txn store ~name ~sql =
-  borrow_or_autocommit ?txn store (fun tx ->
-    S.put tx sys_reactive_views_tid (Bytes.of_string name) (Bytes.of_string sql))
+  rv_catalog_result (fun () ->
+    borrow_or_autocommit ?txn store (fun tx ->
+      S.put tx sys_reactive_views_tid (Bytes.of_string name) (Bytes.of_string sql)))
 ;;
 
 let remove_reactive_view ?txn store ~name =
-  borrow_or_autocommit ?txn store (fun tx ->
-    S.del tx sys_reactive_views_tid (Bytes.of_string name))
+  rv_catalog_result (fun () ->
+    borrow_or_autocommit ?txn store (fun tx ->
+      S.del tx sys_reactive_views_tid (Bytes.of_string name)))
 ;;
 
 (* ------------------------------------------------------------------ *)
