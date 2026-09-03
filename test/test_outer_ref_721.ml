@@ -216,8 +216,8 @@ let a_window_argument_carries_the_outer_value () =
       [ [ "a"; "32" ]; [ "b"; "-28" ]; [ "c"; "-194" ] ]
       (rows_of
          db
-         "SELECT k, (SELECT SUM(i.v + o.n) OVER () FROM i WHERE i.fk = o.k LIMIT 1) \
-          FROM o"))
+         "SELECT k, (SELECT SUM(i.v + o.n) OVER () FROM i WHERE i.fk = o.k LIMIT 1) FROM \
+          o"))
 ;;
 
 (* Its control. sqlite3 (oracle): a|30  b|-30  c|-200 *)
@@ -263,8 +263,8 @@ let a_window_partition_by_carries_the_outer_value () =
       [ [ "p"; "1" ]; [ "q"; "2" ] ]
       (rows_of
          db
-         "SELECT k, (SELECT COUNT(*) OVER (PARTITION BY i2.v * o2.n) FROM i2 WHERE \
-          i2.fk = o2.k LIMIT 1) FROM o2"))
+         "SELECT k, (SELECT COUNT(*) OVER (PARTITION BY i2.v * o2.n) FROM i2 WHERE i2.fk \
+          = o2.k LIMIT 1) FROM o2"))
 ;;
 
 (* Its control: without the outer factor both outer rows partition by the two
@@ -277,8 +277,8 @@ let the_same_partition_by_without_the_outer_reference_differs () =
       [ [ "p"; "1" ]; [ "q"; "1" ] ]
       (rows_of
          db
-         "SELECT k, (SELECT COUNT(*) OVER (PARTITION BY i2.v) FROM i2 WHERE i2.fk = \
-          o2.k LIMIT 1) FROM o2"))
+         "SELECT k, (SELECT COUNT(*) OVER (PARTITION BY i2.v) FROM i2 WHERE i2.fk = o2.k \
+          LIMIT 1) FROM o2"))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -323,8 +323,8 @@ let the_same_window_order_by_without_the_outer_reference_differs () =
       [ [ "up"; "1" ]; [ "dn"; "1" ] ]
       (rows_of
          db
-         "SELECT k, (SELECT FIRST_VALUE(i3.v) OVER (ORDER BY i3.v) FROM i3 WHERE i3.fk \
-          = o3.k) FROM o3"))
+         "SELECT k, (SELECT FIRST_VALUE(i3.v) OVER (ORDER BY i3.v) FROM i3 WHERE i3.fk = \
+          o3.k) FROM o3"))
 ;;
 
 (* The boundary this fix must not have moved: an aggregate over the subquery's

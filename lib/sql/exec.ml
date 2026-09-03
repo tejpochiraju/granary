@@ -7885,9 +7885,7 @@ let to_stream_ref
     through [Db.query].  Returns the report rows and the number of rows actually
     deleted; the write path reports the latter as the statement's change count,
     the query path streams the former. *)
-let not_null_repair_run_ref
-  : (S.t -> txn_mode -> Cat.t -> (Row.t list * int) Lwt.t) ref
-  =
+let not_null_repair_run_ref : (S.t -> txn_mode -> Cat.t -> (Row.t list * int) Lwt.t) ref =
   ref (fun _store _mode _cat -> failwith "not_null_repair_run_ref not yet initialised")
 ;;
 
@@ -10408,8 +10406,7 @@ and substitute_outer_in_stmt
     reshapes the statement it is only supposed to inspect. *)
 and substitute_outer_proj
       (go_e : Ast.expr -> Ast.expr)
-      (proj :
-        [ `All | `Cols of string list | `Exprs of (Ast.expr * string option) list ])
+      (proj : [ `All | `Cols of string list | `Exprs of (Ast.expr * string option) list ])
   : [ `All | `Cols of string list | `Exprs of (Ast.expr * string option) list ]
   =
   match proj with
@@ -13249,7 +13246,9 @@ and stream_aggregate
        correlated projection, and NOT the way [resolve] below resolves
        [having]/[proj] against the aggregate output row.  Two different rules
        for two different rows; see [agg_arg_subquery_refusal]. *)
-    let* rows, aggs = resolve_correlated_agg_args clock params store mode cat ~s_opt child rows aggs in
+    let* rows, aggs =
+      resolve_correlated_agg_args clock params store mode cat ~s_opt child rows aggs
+    in
     (* What survives is correlated. Its only possible source in the aggregate
        output row is a grouped column; [binding_of_group_cols] maps those back
        to their table and column, and anything else is refused rather than
@@ -13496,9 +13495,7 @@ and resolve_agg_arg_for_row
    order, under the same predicate, as the [corr] list the values were computed
    from — that correspondence is what makes the slot numbers line up, so the
    two must not be given separate filters. *)
-and rewrite_agg_arg_slots (width : int) (aggs : Plan.agg_spec list)
-  : Plan.agg_spec list
-  =
+and rewrite_agg_arg_slots (width : int) (aggs : Plan.agg_spec list) : Plan.agg_spec list =
   let slot = ref (width - 1) in
   List.map
     (fun (s : Plan.agg_spec) ->
@@ -13965,9 +13962,9 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
   (match mode with
    | In_ro_txn _ ->
      failwith
-       "PRAGMA not_null_repair deletes rows and cannot run against a read-only \
-        snapshot or transaction; survey it with PRAGMA not_null_check, and repair \
-        it on a writable connection"
+       "PRAGMA not_null_repair deletes rows and cannot run against a read-only snapshot \
+        or transaction; survey it with PRAGMA not_null_check, and repair it on a \
+        writable connection"
    | Auto | In_txn _ -> ());
   let* tables = Cat.list_tables cat_val in
   (* Reuse the ambient write txn when there is one: opening our own would block

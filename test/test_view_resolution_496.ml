@@ -80,12 +80,16 @@ let rendered rows =
   List.sort
     compare
     (List.map
-       (fun (r : Row.t) -> String.concat "|" (Array.to_list (Array.map value_to_string r)))
+       (fun (r : Row.t) ->
+          String.concat "|" (Array.to_list (Array.map value_to_string r)))
        rows)
 ;;
 
 let strings = Alcotest.(list string)
-let check name expected rows = Alcotest.check strings name (List.sort compare expected) (rendered rows)
+
+let check name expected rows =
+  Alcotest.check strings name (List.sort compare expected) (rendered rows)
+;;
 
 (* The #496 schema, plus a second table to join against and a view over a
    view. *)
@@ -132,7 +136,10 @@ let view_in_an_in_subquery () =
     check
       "IN (SELECT ... FROM view)"
       [ "b" ]
-      (query db "SELECT o_name FROM orders WHERE o_orderkey IN (SELECT k FROM plain WHERE q > 6.0)"))
+      (query
+         db
+         "SELECT o_name FROM orders WHERE o_orderkey IN (SELECT k FROM plain WHERE q > \
+          6.0)"))
 ;;
 
 (* A CORRELATED subquery over a view: the outer reference has to survive the
@@ -176,7 +183,11 @@ let view_in_either_join_position () =
     let right = query db "SELECT o_name FROM orders INNER JOIN plain ON k = o_orderkey" in
     check "view as the leading FROM item" [ "a"; "b" ] left;
     check "view as the JOIN right-hand side" [ "a"; "b" ] right;
-    Alcotest.check strings "operand order does not change the answer" (rendered left) (rendered right))
+    Alcotest.check
+      strings
+      "operand order does not change the answer"
+      (rendered left)
+      (rendered right))
 ;;
 
 (* A LEFT JOIN too — a different planner arm from the inner one. sqlite3: a|5, b|7. *)
@@ -249,7 +260,10 @@ let an_alias_hides_the_view_name () =
 let view_of_view () =
   with_db (fun db ->
     seed db;
-    check "view selecting from a view" [ "1|5"; "2|7" ] (query db "SELECT kk, qq FROM vov"))
+    check
+      "view selecting from a view"
+      [ "1|5"; "2|7" ]
+      (query db "SELECT kk, qq FROM vov"))
 ;;
 
 (* The nested view has to expand in JOIN position too — that is both issues at
@@ -371,10 +385,7 @@ let the_leading_from_position_is_unchanged () =
   with_db (fun db ->
     seed db;
     check "plain select from a view" [ "1|5"; "2|7" ] (query db "SELECT k, q FROM plain");
-    check
-      "aggregate over a view"
-      [ "2" ]
-      (query db "SELECT COUNT(*) FROM plain");
+    check "aggregate over a view" [ "2" ] (query db "SELECT COUNT(*) FROM plain");
     check
       "filter and order over a view"
       [ "2|7" ]

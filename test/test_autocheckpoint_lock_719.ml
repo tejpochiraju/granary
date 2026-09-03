@@ -294,7 +294,6 @@ let seed_from st ~first ~last =
 ;;
 
 let seed st n = seed_from st ~first:1 ~last:n
-;;
 
 (* ------------------------------------------------------------------ *)
 (* 1. The lock is free while the checkpoint migrates.                   *)
@@ -411,8 +410,8 @@ let the_background_autocheckpoint_is_accounted_and_loses_nothing () =
           releases fails here rather than hanging the suite. *)
        let rec drain n =
          let r = Store.lock_stats st in
-         if n = 0
-            || ((stat_of r LS.Autocheckpoint).LS.acquisitions > 0 && r.LS.held = None)
+         if
+           n = 0 || ((stat_of r LS.Autocheckpoint).LS.acquisitions > 0 && r.LS.held = None)
          then Lwt.return n
          else
            let* () = Lwt.pause () in

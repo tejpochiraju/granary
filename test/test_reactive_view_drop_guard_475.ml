@@ -116,11 +116,11 @@ let user_drop_inside_a_refresh_window_is_refused () =
          "the refusal points at DROP REACTIVE VIEW"
          true
          (contains ~needle:"DROP REACTIVE VIEW" msg));
-    Alcotest.(check bool)
-      "_rv_v2 survived the attempt"
-      true
-      (table_exists db "_rv_v2");
-    Alcotest.(check (list (pair string int))) "…and v2 is still correct" [ "a", 1 ] (mv db "v2");
+    Alcotest.(check bool) "_rv_v2 survived the attempt" true (table_exists db "_rv_v2");
+    Alcotest.(check (list (pair string int)))
+      "…and v2 is still correct"
+      [ "a", 1 ]
+      (mv db "v2");
     (* The depth counter was restored, so maintenance still runs afterwards — a
        leaked increment would silently park [drive_reactive] on its fast path
        and stop maintaining every view with no error at all. *)
@@ -129,10 +129,7 @@ let user_drop_inside_a_refresh_window_is_refused () =
       "the guard was released: v1 is still maintained after the refresh"
       [ "a", 2 ]
       (mv db "v1");
-    Alcotest.(check (list (pair string int)))
-      "…and so is v2"
-      [ "a", 2 ]
-      (mv db "v2"))
+    Alcotest.(check (list (pair string int))) "…and so is v2" [ "a", 2 ] (mv db "v2"))
 ;;
 
 (* ------------------------------------------------------------------ *)

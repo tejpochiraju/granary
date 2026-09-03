@@ -1789,6 +1789,7 @@
   cstruct
   mirage-crypto-rng
   mirage-crypto-rng.unix))
+
 ; #487: a syntax failure carries its position (line, column, byte offset) and
 ; the offending token, through every entry point that can report one. The
 ; multi-line cases matter: the lexer never calls Lexing.new_line, so a
@@ -1798,6 +1799,7 @@
  (name test_parse_error_487)
  (modules test_parse_error_487)
  (libraries granary alcotest lwt.unix))
+
 ; #583: Db.dump's #548 NOT NULL refusal points at PRAGMA not_null_check for the
 ; scope and PRAGMA not_null_repair for the repair, keeping the hand-written
 ; UPDATE/DELETE as the manual escape hatch.
@@ -1831,6 +1833,7 @@
   alcotest
   lwt.unix
   unix))
+
 ; #475: the internal [DROP TABLE _rv_<name>] guard is keyed on the table the
 ; driver is currently dropping, not on a "the driver is busy" flag. The flag
 ; stayed set across every await of a refresh, so a user drop interleaving into
@@ -1856,6 +1859,7 @@
  (name test_reactive_view_catalog_error_476)
  (modules test_reactive_view_catalog_error_476)
  (libraries granary granary.store granary.catalog alcotest lwt.unix))
+
 ; #496/#497: a view is resolved at EVERY FROM position — a JOIN's right-hand
 ; side and a subquery's own FROM included, at any nesting depth — not only as
 ; the statement's leading FROM table. One root cause, two issues; #496 was the
@@ -1866,6 +1870,7 @@
  (name test_view_resolution_496)
  (modules test_view_resolution_496)
  (libraries granary granary.encoding alcotest lwt.unix))
+
 ; #665: #568's SUM/AVG numeric check now reaches #488's EXPRESSION argument —
 ; the third spelling, which had no column ordinal and so escaped it entirely.
 ; Pins the bind-time refusal, the empty-table half a runtime check cannot have,
@@ -1942,6 +1947,7 @@
  (name test_rollback_deltas_666)
  (modules test_rollback_deltas_666)
  (libraries granary alcotest lwt.unix))
+
 ; #719: the checkpoint's page migration no longer runs under the writer lock —
 ; only the final catch-up + Wal.reset does. File-backed and WAL-mode (the Mem
 ; backend has no WAL), and the first two cases hook the main file's write_page

@@ -88,9 +88,7 @@ let outcome db sql =
      with
      | Ok rows ->
        `Rows
-         (List.map
-            (fun r -> String.concat "," (Array.to_list (Array.map render r)))
-            rows)
+         (List.map (fun r -> String.concat "," (Array.to_list (Array.map render r))) rows)
      | Error _ -> `Runtime)
 ;;
 
@@ -285,7 +283,10 @@ let () =
             "the issue's CASE repro is refused at bind time"
             `Quick
             case_expression_is_refused_at_bind_time
-        ; Alcotest.test_case "an empty table is refused too" `Quick empty_table_is_refused_too
+        ; Alcotest.test_case
+            "an empty table is refused too"
+            `Quick
+            empty_table_is_refused_too
         ; Alcotest.test_case
             "every statically-typed non-numeric expression is refused"
             `Quick

@@ -806,9 +806,7 @@ let resolve_target_ast (top : t) (ast : Sql.Ast.stmt) : t =
     routing statement and never mutates routing state, so it is not a second way
     for a caller to move their own routing (#598): the caller cannot reach it,
     and nothing it does is observable as a schema switch. *)
-let compile_routed ?on (top : t) (sql : string)
-  : (Sql.Plan.op, error) result Lwt.t * t
-  =
+let compile_routed ?on (top : t) (sql : string) : (Sql.Plan.op, error) result Lwt.t * t =
   match parse sql with
   | Error e -> Lwt.return (Error e), Option.value on ~default:top
   | Ok ast ->
@@ -3181,9 +3179,9 @@ let not_null_violation_message ~table ~column =
      names the violation the dump stopped on, not the scope: run PRAGMA not_null_check \
      to see every offending (table, column, count) in the file, then PRAGMA \
      not_null_repair to delete those rows through the ordinary delete path (indexes and \
-     ON DELETE cascades honoured).  To repair by hand instead, UPDATE %s SET %s = <value> \
-     WHERE %s IS NULL keeps the rows and DELETE FROM %s WHERE %s IS NULL drops them.  To \
-     extract the rows from the unrepaired file, dump with ~data_only:true."
+     ON DELETE cascades honoured).  To repair by hand instead, UPDATE %s SET %s = \
+     <value> WHERE %s IS NULL keeps the rows and DELETE FROM %s WHERE %s IS NULL drops \
+     them.  To extract the rows from the unrepaired file, dump with ~data_only:true."
     table
     column
     (Sql.Exec.quote_ident table)

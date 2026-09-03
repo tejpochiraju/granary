@@ -137,8 +137,8 @@ let seed db =
   exec db "INSERT INTO t VALUES (1, 5)";
   exec
     db
-    "CREATE TRIGGER t_bi BEFORE INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.k, \
-     'g'); END";
+    "CREATE TRIGGER t_bi BEFORE INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.k, 'g'); \
+     END";
   exec db "CREATE REACTIVE VIEW av AS SELECT grp, COUNT(*) FROM audit GROUP BY grp"
 ;;
 

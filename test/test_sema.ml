@@ -2283,7 +2283,8 @@ let bind_select_agg_subquery_arg_accepted_664 () =
          ; _
          }) -> ()
   | _ ->
-    Alcotest.fail "expected Ok with SUM(id + (SELECT 1)) bound as an expression arg (#664)"
+    Alcotest.fail
+      "expected Ok with SUM(id + (SELECT 1)) bound as an expression arg (#664)"
 ;;
 
 let bind_select_col_not_in_group_by_rejected () =

@@ -110,7 +110,8 @@ let scalar_both_paths db sql expected =
        match rows db sql with
        | [ r ] when Array.length r = 1 ->
          Alcotest.(check (float 1e-9)) label expected (num r.(0))
-       | rs -> Alcotest.failf "%s: expected one 1-column row, got %d" label (List.length rs))
+       | rs ->
+         Alcotest.failf "%s: expected one 1-column row, got %d" label (List.length rs))
     [ true; false ];
   set_fastpath true
 ;;
@@ -118,7 +119,9 @@ let scalar_both_paths db sql expected =
 let grouped db sql =
   List.sort
     compare
-    (List.map (fun r -> String.concat "," (Array.to_list (Array.map render r))) (rows db sql))
+    (List.map
+       (fun r -> String.concat "," (Array.to_list (Array.map render r)))
+       (rows db sql))
 ;;
 
 (** A refusal surfaces either as a [Db.error] or as an exception raised while
@@ -152,8 +155,9 @@ let contains ~needle hay =
 
    f: a factor per k — a:10, b:100, c:1000. Used as the correlated source. *)
 let seed db =
-  exec db "CREATE TABLE li (id INTEGER PRIMARY KEY, k TEXT, price REAL, disc REAL, qty \
-           INTEGER)";
+  exec
+    db
+    "CREATE TABLE li (id INTEGER PRIMARY KEY, k TEXT, price REAL, disc REAL, qty INTEGER)";
   List.iter
     (exec db)
     [ "INSERT INTO li VALUES (1, 'a', 100.0, 0.10, 2)"
@@ -293,8 +297,11 @@ let distinct_over_a_correlated_argument () =
 let two_correlated_arguments_get_their_own_slots () =
   with_db (fun db ->
     seed db;
-    match rows db "SELECT SUM(qty * (SELECT factor FROM f WHERE f.k = li.k)), MAX((SELECT \
-                   factor FROM f WHERE f.k = li.k)), COUNT(*) FROM li"
+    match
+      rows
+        db
+        "SELECT SUM(qty * (SELECT factor FROM f WHERE f.k = li.k)), MAX((SELECT factor \
+         FROM f WHERE f.k = li.k)), COUNT(*) FROM li"
     with
     | [ r ] when Array.length r = 3 ->
       Alcotest.(check (float 1e-9)) "SUM slot" 5550.0 (num r.(0));
@@ -357,10 +364,7 @@ let an_unresolvable_correlation_is_refused () =
     let msg =
       err_of db "SELECT SUM(qty * (SELECT factor FROM f WHERE f.k = nosuch.k)) FROM li"
     in
-    Alcotest.(check bool)
-      (Printf.sprintf "refused (got %S)" msg)
-      true
-      (msg <> "");
+    Alcotest.(check bool) (Printf.sprintf "refused (got %S)" msg) true (msg <> "");
     (* And it is the ARGUMENT's message, not #558's GROUP BY one — the two
        point at different rules and must not be confused. *)
     let msg2 =
@@ -397,8 +401,8 @@ let fast_path_is_given_up_not_used () =
               (List.hd
                  (rows
                     db
-                    "SELECT SUM(qty * (SELECT factor FROM f WHERE f.k = li.k)) FROM li"))
-                .(0));
+                    "SELECT SUM(qty * (SELECT factor FROM f WHERE f.k = li.k)) FROM li")).(
+              0));
          (* A filtered scan is the fast path's second shape. qty>2 rows: id 2
             (3*10=30), id 4 (4*100=400), id 5 (5*1000=5000). *)
          Alcotest.(check (float 1e-9))
@@ -409,8 +413,7 @@ let fast_path_is_given_up_not_used () =
                  (rows
                     db
                     "SELECT SUM(qty * (SELECT factor FROM f WHERE f.k = li.k)) FROM li \
-                     WHERE qty > 2"))
-                .(0))))
+                     WHERE qty > 2")).(0))))
 ;;
 
 (** A control: an aggregate with NO subquery anywhere must still take the fast

@@ -32,7 +32,6 @@ module Db = Granary.Db
    provider (the parent here is in-memory, so opening it does not install it
    automatically). *)
 let () = Granary_unix.install ()
-
 let run = Lwt_main.run
 
 let scratch_file suffix =

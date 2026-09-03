@@ -154,7 +154,12 @@ let the_manual_repairs_and_data_only_survive () =
            (Printf.sprintf "the diagnostic still mentions %S (got %S)" needle msg)
            true
            (contains ~needle msg))
-      [ "stock"; "si"; "NOT NULL"; "#548"; "UPDATE stock SET si"; "DELETE FROM stock"
+      [ "stock"
+      ; "si"
+      ; "NOT NULL"
+      ; "#548"
+      ; "UPDATE stock SET si"
+      ; "DELETE FROM stock"
       ; "~data_only:true"
       ])
 ;;
@@ -184,7 +189,8 @@ let following_the_diagnostic_makes_the_dump_succeed () =
       []
       (texts db "PRAGMA not_null_check");
     match run (Db.dump_to_string db ()) with
-    | Error e -> Alcotest.failf "dump still refused after the named repair: %a" Db.pp_error e
+    | Error e ->
+      Alcotest.failf "dump still refused after the named repair: %a" Db.pp_error e
     | Ok script ->
       Alcotest.(check bool)
         "the surviving row is dumped"
@@ -202,10 +208,13 @@ let () =
     [ ( "diagnostic"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
-          [ "names PRAGMA not_null_check and not_null_repair", the_diagnostic_names_the_pragmas
-          ; "keeps the manual repairs and ~data_only:true", the_manual_repairs_and_data_only_survive
+          [ ( "names PRAGMA not_null_check and not_null_repair"
+            , the_diagnostic_names_the_pragmas )
+          ; ( "keeps the manual repairs and ~data_only:true"
+            , the_manual_repairs_and_data_only_survive )
           ; "the named survey reports the scope", the_named_survey_reports_the_scope
-          ; "following it makes the dump succeed", following_the_diagnostic_makes_the_dump_succeed
+          ; ( "following it makes the dump succeed"
+            , following_the_diagnostic_makes_the_dump_succeed )
           ] )
     ]
 ;;

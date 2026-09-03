@@ -339,9 +339,7 @@ let subqueries_in_an_aggregate_argument_are_evaluated () =
       [ "b"; "a"; "c" ]
       (List.map
          (fun r -> text r.(0))
-         (rows
-            db
-            "SELECT k FROM li GROUP BY k ORDER BY SUM(price * (SELECT 1)) DESC")))
+         (rows db "SELECT k FROM li GROUP BY k ORDER BY SUM(price * (SELECT 1)) DESC")))
 ;;
 
 (* ---------------------------------------------------------------- #495 *)

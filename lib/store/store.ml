@@ -2029,12 +2029,12 @@ let with_ckpt_io (st : bt_state) f =
 let rec unlocked_ckpt_passes (st : bt_state) (wal : Wal.t) ~since ~migrated ~pass =
   if st.closing
   then Lwt.return since
-  else
+  else (
     let gate = wait_for_ro_readers_past st in
     let* head, n = migrate_ckpt_pass st wal ~since ~migrated ~gate in
     if n = 0 || pass >= max_unlocked_ckpt_passes
     then Lwt.return head
-    else unlocked_ckpt_passes st wal ~since:head ~migrated ~pass:(pass + 1)
+    else unlocked_ckpt_passes st wal ~since:head ~migrated ~pass:(pass + 1))
 ;;
 
 (* #719 phase A: migrate outside the writer lock, then fsync the main file
@@ -2119,11 +2119,11 @@ let ckpt_install (st : bt_state) (wal : Wal.t) ~since ~migrated ~synced_through 
        nothing can slip in between the count reaching 0 and the reset landing. *)
     let* () = wait_until st (fun () -> st.sink_ships_in_flight = 0) in
     let* rr = Wal.reset wal in
-    (match rr with
-     | Error e -> failwith (Format.asprintf "checkpoint wal reset: %a" Wal.pp_error e)
-     | Ok () ->
-       after_ckpt_reset st wal ~migrated:!migrated;
-       Lwt.return_unit)
+    match rr with
+    | Error e -> failwith (Format.asprintf "checkpoint wal reset: %a" Wal.pp_error e)
+    | Ok () ->
+      after_ckpt_reset st wal ~migrated:!migrated;
+      Lwt.return_unit
 ;;
 
 let ckpt_install_guarded (st : bt_state) (wal : Wal.t) ~since ~migrated ~synced_through =

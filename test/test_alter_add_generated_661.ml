@@ -127,8 +127,9 @@ let seed db =
 let the_issues_repro () =
   with_db (fun db ->
     seed db;
-    exec db "ALTER TABLE g ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) \
-             VIRTUAL";
+    exec
+      db
+      "ALTER TABLE g ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) VIRTUAL";
     Alcotest.(check (list string))
       "pre-existing rows recompute the new column"
       [ "1,1,2"; "2,2,3" ]
@@ -147,10 +148,12 @@ let the_issues_repro () =
 let both_constraint_orders_are_exempt () =
   with_db (fun db ->
     seed db;
-    exec db "ALTER TABLE g ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) \
-             VIRTUAL";
-    exec db "ALTER TABLE g ADD COLUMN x INTEGER GENERATED ALWAYS AS (v * 2) VIRTUAL NOT \
-             NULL";
+    exec
+      db
+      "ALTER TABLE g ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) VIRTUAL";
+    exec
+      db
+      "ALTER TABLE g ADD COLUMN x INTEGER GENERATED ALWAYS AS (v * 2) VIRTUAL NOT NULL";
     Alcotest.(check (list string))
       "both added columns read"
       [ "1,2,2"; "2,3,4" ]
@@ -184,9 +187,7 @@ let a_plain_not_null_column_is_still_refused () =
       (Printf.sprintf "plain NOT NULL still refused (got %S)" msg)
       true
       (contains ~needle:"DEFAULT" msg);
-    let msg2 =
-      exec_err db "ALTER TABLE g ADD COLUMN p2 INTEGER NOT NULL DEFAULT NULL"
-    in
+    let msg2 = exec_err db "ALTER TABLE g ADD COLUMN p2 INTEGER NOT NULL DEFAULT NULL" in
     Alcotest.(check bool)
       (Printf.sprintf "an explicit NULL DEFAULT is still refused (got %S)" msg2)
       true
@@ -212,8 +213,9 @@ let a_nullable_virtual_column_still_works () =
 let the_not_null_is_really_enforced_after_the_alter () =
   with_db (fun db ->
     seed db;
-    exec db "ALTER TABLE g ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) \
-             VIRTUAL";
+    exec
+      db
+      "ALTER TABLE g ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) VIRTUAL";
     let msg = exec_err db "INSERT INTO g (id, v) VALUES (4, NULL)" in
     Alcotest.(check bool)
       (Printf.sprintf "NULL base column rejected (got %S)" msg)
@@ -244,8 +246,9 @@ let a_pre_existing_violation_is_not_validated_by_the_alter () =
     exec db "CREATE TABLE h (id INTEGER PRIMARY KEY, v INTEGER)";
     exec db "INSERT INTO h (id, v) VALUES (1, NULL)";
     (* Not validated: the ALTER succeeds over a row that violates it. *)
-    exec db "ALTER TABLE h ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) \
-             VIRTUAL";
+    exec
+      db
+      "ALTER TABLE h ADD COLUMN w INTEGER NOT NULL GENERATED ALWAYS AS (v + 1) VIRTUAL";
     Alcotest.(check (list string))
       "the violating row reads NULL rather than being rejected"
       [ "1,NULL" ]

@@ -260,8 +260,7 @@ let a_read_only_snapshot_is_refused_at_the_statement_level () =
            Alcotest.(check bool)
              (Printf.sprintf "and not the storage-layer mode (got %S)" msg)
              false
-             (contains ~needle:"In_ro_txn" msg))
-    )
+             (contains ~needle:"In_ro_txn" msg)))
 ;;
 
 (* A snapshot read of the REPORT half is still legitimate — surveying history is
@@ -283,13 +282,13 @@ let a_read_only_snapshot_still_serves_the_report () =
          exec db "INSERT INTO s VALUES (2)";
          Db.history_pin db ~txn_id:t1;
          match run (Db.query_as_of db (`Txn t1) "PRAGMA not_null_check") with
-         | Error e -> Alcotest.failf "not_null_check refused on a snapshot: %a" Db.pp_error e
+         | Error e ->
+           Alcotest.failf "not_null_check refused on a snapshot: %a" Db.pp_error e
          | Ok stream ->
            Alcotest.(check int)
              "a clean snapshot reports nothing"
              0
-             (List.length (run (Lwt_stream.to_list stream))))
-    )
+             (List.length (run (Lwt_stream.to_list stream)))))
 ;;
 
 let () =
@@ -307,8 +306,8 @@ let () =
     ; ( "read-only snapshot"
       , List.map
           (fun (n, f) -> Alcotest.test_case n `Quick f)
-          [ "the repair is refused at the statement level"
-          , a_read_only_snapshot_is_refused_at_the_statement_level
+          [ ( "the repair is refused at the statement level"
+            , a_read_only_snapshot_is_refused_at_the_statement_level )
           ; "the report is still served", a_read_only_snapshot_still_serves_the_report
           ] )
     ]

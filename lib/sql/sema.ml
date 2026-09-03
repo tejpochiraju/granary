@@ -1056,8 +1056,7 @@ let rec expr_col_refs = function
    expression — which has no column ordinal at all and so escaped this
    entirely.  [agg_numeric_ty_check] below is the shared verdict and
    [agg_arg_static_ty] is the expression spelling's type source. *)
-let agg_numeric_ty_check (func : Ast.agg_func) (ty : Row.ty option)
-  : (unit, error) result
+let agg_numeric_ty_check (func : Ast.agg_func) (ty : Row.ty option) : (unit, error) result
   =
   (* #665: the type half of the check, factored out so the ORDINAL spelling (a
      bare column, whose type comes from the catalog) and the EXPRESSION
@@ -1125,8 +1124,21 @@ let rec agg_arg_static_ty ~(col_ty : int -> Row.ty option) (e : bound_expr)
      | Some Row.Real, _ | _, Some Row.Real -> Some Row.Real
      | _ -> None)
   | BE_binop
-      ( ( Eq | Ne | Lt | Le | Gt | Ge | And | Or | Bit_and | Bit_or | Lshift | Rshift
-        | Mod | Like | Glob )
+      ( ( Eq
+        | Ne
+        | Lt
+        | Le
+        | Gt
+        | Ge
+        | And
+        | Or
+        | Bit_and
+        | Bit_or
+        | Lshift
+        | Rshift
+        | Mod
+        | Like
+        | Glob )
       , _
       , _ ) -> Some Row.Integer
   | BE_not _
@@ -1143,11 +1155,17 @@ let rec agg_arg_static_ty ~(col_ty : int -> Row.ty option) (e : bound_expr)
        nothing: its implicit NULL is skipped by SUM and AVG exactly as a NULL
        row value is, so it cannot make a TEXT branch legal — the same reading
        under which [SUM(text_col)] is refused on an empty table. *)
-    let arms = List.map (fun (_, r) -> self r) branches @ List.map self (Option.to_list else_) in
+    let arms =
+      List.map (fun (_, r) -> self r) branches @ List.map self (Option.to_list else_)
+    in
     (match arms with
      | [] -> None
      | t :: rest -> if List.for_all (fun u -> u = t) rest then t else None)
-  | BE_func _ | BE_param _ | BE_subquery _ | BE_excluded_col _ | BE_window_slot _
+  | BE_func _
+  | BE_param _
+  | BE_subquery _
+  | BE_excluded_col _
+  | BE_window_slot _
   | BE_out_col _ -> None
 ;;
 
@@ -1407,9 +1425,7 @@ and bind_agg_arg
           catalog, and an expression whose type is statically indeterminate is
           left alone. *)
        (match
-          agg_numeric_ty_check
-            func
-            (agg_arg_static_ty ~col_ty:resolver.agg_arg_col_ty be)
+          agg_numeric_ty_check func (agg_arg_static_ty ~col_ty:resolver.agg_arg_col_ty be)
         with
         | Error er -> Error er
         | Ok () -> Ok (None, Some be)))
@@ -5301,8 +5317,7 @@ let from_name_is_view ~views ~scope cat name =
 let from_view_names ~views ~scope cat names =
   List.fold_left
     (fun acc n ->
-       if from_name_is_view ~views ~scope cat n
-          && not (List.exists (String.equal n) acc)
+       if from_name_is_view ~views ~scope cat n && not (List.exists (String.equal n) acc)
        then acc @ [ n ]
        else acc)
     []

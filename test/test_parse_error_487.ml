@@ -65,10 +65,7 @@ let via_change_count db sql =
 
 let via_query db sql = parse_msg ~what:"query" (run (Db.query db sql))
 let via_prepare db sql = parse_msg ~what:"prepare" (run (Db.prepare db sql))
-
-let via_columns db sql =
-  parse_msg ~what:"query_columns" (run (Db.query_columns db sql))
-;;
+let via_columns db sql = parse_msg ~what:"query_columns" (run (Db.query_columns db sql))
 
 let entry_points =
   [ "execute", via_execute
@@ -190,8 +187,8 @@ let pp_error_renders_the_detail () =
       | Error e -> Format.asprintf "%a" Db.pp_error e
     in
     let expected =
-      "parse error: syntax error at line 1, column 10 (byte offset 9): unexpected \
-       token \"FORM\""
+      "parse error: syntax error at line 1, column 10 (byte offset 9): unexpected token \
+       \"FORM\""
     in
     Alcotest.(check string) "rendered" expected msg)
 ;;
