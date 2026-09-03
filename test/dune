@@ -1789,3 +1789,12 @@
   cstruct
   mirage-crypto-rng
   mirage-crypto-rng.unix))
+; #487: a syntax failure carries its position (line, column, byte offset) and
+; the offending token, through every entry point that can report one. The
+; multi-line cases matter: the lexer never calls Lexing.new_line, so a
+; single-line-only test would pass against a hardcoded line 1.
+
+(test
+ (name test_parse_error_487)
+ (modules test_parse_error_487)
+ (libraries granary alcotest lwt.unix))

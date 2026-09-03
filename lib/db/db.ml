@@ -672,14 +672,68 @@ let vacuum t : unit Lwt.t =
                 Lwt.return_unit))))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #487: positioned parse errors                                        *)
+(* ------------------------------------------------------------------ *)
+
+(* Line (1-based) and column (1-based, counted in bytes) of byte [offset]
+   within [src].
+
+   The line is counted here from the source text rather than read off the
+   lexbuf: [Sql.Lexer] skips whitespace with a single rule and never calls
+   {!Lexing.new_line}, so [lexbuf]'s own [pos_lnum] is 1 for every position in
+   every statement.  Counting from [src] is correct whatever the lexer does
+   with newlines, which is what keeps this from silently reporting "line 1"
+   again the moment someone edits [lexer.mll]. *)
+let line_col_of_offset src offset =
+  let offset = max 0 (min offset (String.length src)) in
+  let line = ref 1 in
+  let bol = ref 0 in
+  for i = 0 to offset - 1 do
+    if Char.equal (String.unsafe_get src i) '\n'
+    then (
+      incr line;
+      bol := i + 1)
+  done;
+  !line, offset - !bol + 1
+;;
+
+(* "line L, column C (byte offset O)" for the token the lexer matched last —
+   which, when Menhir's monolithic entry point raises [Error], is the token it
+   could not shift, and when the lexer itself fails is the text it choked on. *)
+let error_position src lexbuf =
+  let offset = Lexing.lexeme_start lexbuf in
+  let line, col = line_col_of_offset src offset in
+  Printf.sprintf "line %d, column %d (byte offset %d)" line col offset
+;;
+
+(* #487: the grammar resolves ~290 shift/reduce conflicts arbitrarily, so the
+   automaton state at failure does not correspond to an honest "expected X"
+   set.  Report the position and the offending token, which are exact, and
+   claim nothing about what would have been accepted. *)
+let syntax_error_msg src lexbuf =
+  let tok = Lexing.lexeme lexbuf in
+  let what =
+    if String.length tok = 0
+    then "unexpected end of input"
+    else Printf.sprintf "unexpected token %S" tok
+  in
+  Printf.sprintf "syntax error at %s: %s" (error_position src lexbuf) what
+;;
+
+(* A [Failure] out of the lexer ("unexpected char", "unterminated string
+   literal") or out of a semantic action already says what went wrong; it only
+   ever lacked the where. *)
+let lex_error_msg src lexbuf msg =
+  Printf.sprintf "%s at %s" msg (error_position src lexbuf)
+;;
+
 let parse sql =
-  match
-    let lexbuf = Lexing.from_string sql in
-    Sql.Parser.stmt_eof Sql.Lexer.token lexbuf
-  with
+  let lexbuf = Lexing.from_string sql in
+  match Sql.Parser.stmt_eof Sql.Lexer.token lexbuf with
   | stmt -> Ok stmt
-  | exception Sql.Parser.Error -> Error (Parse "syntax error")
-  | exception Failure msg -> Error (Parse msg)
+  | exception Sql.Parser.Error -> Error (Parse (syntax_error_msg sql lexbuf))
+  | exception Failure msg -> Error (Parse (lex_error_msg sql lexbuf msg))
 ;;
 
 let compile t sql =
@@ -2235,7 +2289,11 @@ let execute_core top sql =
   | Error _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
   | Error (Sema (Sql.Sema.Unknown_table view_name)) when Hashtbl.mem t.views view_name ->
     (match parse sql with
-     | Error _ -> Lwt.return (Error (Parse "syntax error"))
+     (* #487: unreachable in practice (the same [sql] already parsed for the
+        bind that produced [Unknown_table]), but manufacturing a fresh bare
+        "syntax error" here would make the message depend on which entry point
+        the caller used.  Propagate. *)
+     | Error e -> Lwt.return (Error e)
      | Ok ast -> execute_instead_of t view_name ast)
   | Error e -> Lwt.return (Error e)
   | Ok op ->
@@ -2258,7 +2316,8 @@ let execute_change_count_core top sql =
   | Error _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
   | Error (Sema (Sql.Sema.Unknown_table view_name)) when Hashtbl.mem t.views view_name ->
     (match parse sql with
-     | Error _ -> Lwt.return (Error (Parse "syntax error"))
+     (* #487: same as [execute_core] — propagate the positioned error. *)
+     | Error e -> Lwt.return (Error e)
      | Ok ast ->
        let* r = execute_instead_of t view_name ast in
        count_of_unit r)

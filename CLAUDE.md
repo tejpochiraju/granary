@@ -1130,6 +1130,47 @@ readable) by failing the main-file `write_page` — in WAL mode the main file is
 written *only* by a checkpoint, so commits keep succeeding while every
 checkpoint fails.
 
+### A parse error carries its position and the offending token (#487)
+
+Every syntax failure used to be the bare string `parse error: syntax error`.
+It now reads, for example:
+
+```
+parse error: syntax error at line 2, column 8 (byte offset 21): unexpected token "FORM"
+```
+
+Three things are decided here rather than incidental:
+
+- **No expected-token set.** The issue asked for one "ideally", and it is
+  deliberately not provided. `lib/sql/parser.mly` resolves ~290 shift/reduce
+  conflicts arbitrarily, so the automaton state at failure does not correspond
+  to an honest "expected X" list — a synthesised one would be confidently
+  wrong, which is worse than silence. Position and offending token come
+  straight off the lexbuf and are exact.
+- **The line is counted from the SOURCE TEXT, not read off the lexbuf.**
+  `lib/sql/lexer.mll` skips whitespace with one rule and never calls
+  `Lexing.new_line`, so `lexbuf.lex_start_p.pos_lnum` is 1 for every position
+  in every statement. `Db.line_col_of_offset` counts newlines in the SQL string
+  up to `Lexing.lexeme_start`, which stays correct whatever the lexer does with
+  newlines. **A single-line-only test cannot tell the two apart** — that is why
+  `test/test_parse_error_487.ml` carries three multi-line cases.
+- **`Db.Parse` still carries a plain `string`.** The positioned detail is the
+  payload and `pp_error` still prefixes `parse error: `, so no consumer needed
+  rewriting. Making it structured would have stranded the four test files that
+  bind the payload as a string for their own diagnostics, for no caller that
+  wanted the parts separately.
+
+A `Failure` out of the lexer (`unexpected char: '@'`) or out of a parser
+semantic action already said *what*; it is now suffixed with the same
+`at line L, column C (byte offset O)`.
+
+The two `Error (Parse "syntax error")` arms in `execute_core` and
+`execute_change_count_core` — the INSTEAD OF re-parse, unreachable in practice
+because the same SQL already parsed for the bind that produced
+`Unknown_table` — now propagate the real error instead of manufacturing a
+fresh bare one. Error quality must not depend on which entry point the caller
+used.
+
 ### The writer lock is measured, and every acquisition goes through one door (#718)
 
 `Store.lock_stats` reports the writer lock's wait and hold time per acquisition
