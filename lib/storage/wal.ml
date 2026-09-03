@@ -232,9 +232,58 @@ let write_header ~write_at ~sync ~salt ~seed =
      | Ok () -> Lwt.return_ok ())
 ;;
 
+(* #613: where a FRESH WAL's [(salt, seed)] generation marker comes from.
+
+   It used to be two [Random.int64] draws.  Nothing in this tree calls
+   [Random.self_init] — and [self_init] is not available to a MirageOS
+   unikernel anyway, since it reads the clock and the pid — so OCaml's default
+   PRNG state is identical in every process: every WAL created by a freshly
+   started process got the SAME pair.  Since #636 that pair is not merely
+   checksum entropy, it is the generation marker recovery trusts to decide
+   which frames are this file's own, so a constant marker means a [-wal] file
+   restored next to the WRONG main database verifies as that database's log by
+   construction rather than by chance.
+
+   [Mirage_crypto_rng] is the entropy source this library already depends on
+   (see [Crypto]), and it is the one that works on both platforms: a unikernel
+   seeds it from the Mirage runtime, a Unix application from
+   [Mirage_crypto_rng_unix.use_default ()] — which {!Granary_unix.install} now
+   does for every file-backed open.
+
+   It can be UNSEEDED, though, and [lib/] deliberately never seeds it itself
+   (see [Store.ensure_rng_seeded]): a plaintext store must keep opening with no
+   RNG installed at all.  So the draw degrades to the old [Random] pair rather
+   than failing the open — a fresh WAL is not worth refusing over a marker
+   whose only job is to tell generations apart.  In that degraded mode #613's
+   defect is still present, which is why the fix is not the source alone but
+   the source plus the Unix driver seeding.
+
+   [set_initial_marker_source] is the seam for a caller with its own entropy,
+   and for the fault-injection tests, which need the marker to be reproducible
+   rather than fresh. *)
+let default_initial_marker () =
+  match Mirage_crypto_rng.generate 16 with
+  | b -> Some (String.get_int64_be b 0, String.get_int64_be b 8)
+  | exception
+      (Mirage_crypto_rng.Unseeded_generator | Mirage_crypto_rng.No_default_generator) ->
+    None
+;;
+
+let initial_marker_source : (unit -> (int64 * int64) option) ref =
+  ref default_initial_marker
+;;
+
+let set_initial_marker_source f = initial_marker_source := f
+let reset_initial_marker_source () = initial_marker_source := default_initial_marker
+
+let draw_initial_marker () =
+  match !initial_marker_source () with
+  | Some (salt, seed) -> salt, seed
+  | None -> Random.int64 Int64.max_int, Random.int64 Int64.max_int
+;;
+
 let init_header ~write_at ~sync =
-  let salt = Random.int64 Int64.max_int in
-  let seed = Random.int64 Int64.max_int in
+  let salt, seed = draw_initial_marker () in
   let* r = write_header ~write_at ~sync ~salt ~seed in
   match r with
   | Error e -> Lwt.return_error e

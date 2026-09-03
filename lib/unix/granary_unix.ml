@@ -33,7 +33,27 @@ let provider : Granary.Db.file_provider =
   }
 ;;
 
-let install () = Granary.Db.set_file_provider provider
+(* #613: seed the process-wide {!Mirage_crypto_rng} as well as installing the
+   file provider.
+
+   [lib/] is Mirage-clean and deliberately never seeds (a plaintext store must
+   open with no generator installed at all), but THIS module is the Unix
+   platform driver — the one place allowed to know how a Unix process gets
+   entropy.  A fresh WAL draws its [(salt, seed)] generation marker from that
+   generator and otherwise falls back to an un-self-init'd [Random], i.e. to
+   the same marker in every freshly started process (#613).  Seeding here means
+   every file-backed granary gets a per-file marker without the application
+   having to know the WAL has one.
+
+   [use_default] is idempotent and cheap after the first call, which is what
+   lets [install] stay the "call me as often as you like" function it already
+   was.  It also removes the [Store.Encryption_rng_unseeded] foot-gun for
+   file-backed encrypted opens; block-backed opens are unaffected, since they
+   never reach this driver. *)
+let install () =
+  Mirage_crypto_rng_unix.use_default ();
+  Granary.Db.set_file_provider provider
+;;
 
 let to_db ?clock ?durability ~path = function
   | Error e ->

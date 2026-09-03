@@ -245,3 +245,23 @@ val salt : t -> int64
 
 (** Return the WAL's seed (assigned at open). *)
 val seed : t -> int64
+
+(** Override where a freshly created WAL's [(salt, seed)] generation marker is
+    drawn from (#613).
+
+    The default draws 16 bytes from {!Mirage_crypto_rng} and returns [None]
+    when that generator is absent or unseeded, in which case the WAL falls back
+    to OCaml's default [Random] state — which is IDENTICAL in every freshly
+    started process, so every WAL created by such a process shares one marker.
+    A Unix application gets a properly seeded generator from
+    [Granary_unix.install]; a unikernel gets one from the Mirage runtime.
+
+    Set this to supply your own entropy, or to make the marker reproducible for
+    a fault-injection test. Returning [None] selects the degraded [Random]
+    fallback described above. Process-global; call
+    {!reset_initial_marker_source} to restore the default. *)
+val set_initial_marker_source : (unit -> (int64 * int64) option) -> unit
+
+(** Restore the default generation-marker source installed by this module
+    (#613). *)
+val reset_initial_marker_source : unit -> unit
