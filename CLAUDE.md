@@ -517,6 +517,82 @@ EOF
   in `test/test_not_null_599.ml` pins all four spellings together for that
   reason.
 
+- **An aggregated SELECT sorts by grouped columns, or it refuses (#663, decided
+  2026-09-02).** This is the same rule the projection and HAVING already
+  applied, arriving late at the third of the three clauses — and it is a
+  **deliberate divergence from sqlite3**, which accepts a bare non-grouped
+  column in `ORDER BY` (oracle-checked: it returns rows, picking an arbitrary
+  row's value from each group). Granary already declines that permissiveness in
+  the other two clauses, and ORDER BY was the one where the consequence of not
+  having the rule was a *wrong answer* rather than an error.
+
+  The mechanism is worth knowing because it is the same one twice. An
+  aggregated SELECT sorts AFTER projection, and
+  `Planner.plan_post_agg_sort_input_space`'s `remap_e` rewrites a key's column
+  index from pre-aggregation space into the aggregated output row. It only
+  rewrites an index it *finds in* `group_by`, and — until #663 — only at the
+  ROOT of the key expression. So:
+
+  - a **non-grouped** column bound to its input index, was not remapped, and the
+    key read whatever OUTPUT column sat at that index.
+    `SELECT nm, COUNT(*) FROM g3 GROUP BY nm ORDER BY pad` sorted by the count,
+    silently; on a table wide enough that the input index exceeded the output
+    arity it indexed past the end of the row and raised `Invalid_argument` from
+    `Exec` mid-query instead of a `Db.error`.
+  - a **grouped** column *inside an expression* was not remapped either, because
+    the rewrite did not recurse. That one only ever looked right when the
+    grouped column sat at input index 0, where the two spaces coincide — which
+    is what every fixture in the tree happened to do.
+
+  Both halves are needed and they lean on each other: `Sema.bind_select_order`
+  now refuses a key naming any non-grouped column (via `expr_col_refs`, so a
+  column buried in a `CASE` or a concatenation is caught too), which is
+  precisely what makes it safe for `remap_e` to recurse — **every** `P_col`
+  remaining under an aggregated ORDER BY key is a grouped column, so descending
+  cannot mis-fire on one that should have been left alone.
+
+  **Being grouped is necessary but NOT sufficient to be remappable, and that
+  gap is a third thing the fix owes.** `remap_e`'s inner search needs the
+  column to appear in `agg_proj` as an `AP_group_col` — to be *projected as a
+  bare group column*. Group by a column and do not project it and the search
+  fails, so the old `| None -> e` arm kept the pre-aggregation index and both
+  of the symptoms above came straight back:
+  `SELECT COUNT(*) FROM g GROUP BY nm ORDER BY nm` raised `Invalid_argument`
+  out of the executor, and `SELECT UPPER(nm), COUNT(*) … ORDER BY nm` sorted by
+  the count. Making `remap_e` recursive *widened* the reach of that arm rather
+  than narrowing it. An unprojected grouped column now gets a **hidden output
+  slot** — appended to `Op_aggregate`'s own projection where its ordinal means
+  what it was bound to mean, sorted on by position, and trimmed by an
+  `Op_project` around the sort — which is exactly the mechanism
+  `plan_agg_order_hidden` already uses for #495's aggregate keys. One slot per
+  grouped column, not per mention. `GROUP BY` a column you do not project and
+  then `ORDER BY` it is idiomatic, not a corner.
+
+  **`is_aggregated` is not the same question as "has a GROUP BY", and the check
+  is gated on both.** It is also true for an aggregate in the projection with
+  no GROUP BY at all, where `group_cols` is `[]` and therefore every column
+  reference fails the membership test. Gating on `is_aggregated` alone refused
+  `SELECT COUNT(*) FROM g ORDER BY nm` — which sqlite3 answers, which `main`
+  answered, and whose error message named a grouping there is none of. Such a
+  statement returns exactly one row, so its ORDER BY is a no-op whatever it
+  names; the refusal is skipped and the planner drops the sort rather than
+  indexing a one-column output row with a pre-aggregation ordinal.
+
+  The two sites that produce the refusal message —
+  `bind_select_order_agg`'s `grouped` and `bind_select`'s `grouped_check` —
+  share one `non_grouped_order_msg` helper rather than two copy-pasted format
+  strings.
+
+  Three things stay legal and are pinned as such: an ordinal and an output alias
+  (both address the output row directly and are not column references, #489), an
+  expression over a *grouped* column, and every non-aggregated SELECT
+  (`grouped_check` is `None` there — a bare column is bound and evaluated
+  against the input row exactly as before). An ORDER BY that *mentions an
+  aggregate* keeps taking #495's separate `bind_select_order_agg` path, which
+  had this discipline from the start. Pinned by `test/test_agg_order_by_663.ml`,
+  whose first two cases assert the projection and HAVING already had the rule —
+  that is what makes this consistency rather than a new opinion.
+
 - **One rule resolves a correlated subquery's outer references (#635/#626/#615, 2026-08-06).**
   An input's **scope identifier** is its FROM item's alias where it has one and
   its table name otherwise — an alias *replaces* the name. A qualified outer

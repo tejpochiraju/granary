@@ -2522,7 +2522,61 @@ let plan_post_agg_sort_input_space ~group_by ~agg_proj ~order ~projected =
     in
     go 0 lst
   in
-  let remap_e e =
+  (* #663: RECURSIVE, not a single top-level match.  This used to rewrite only a
+     bare [P_col] at the root of a key, so an ORDER BY over an EXPRESSION of a
+     grouped column — [ORDER BY nm || 'q'] — kept the pre-aggregation index
+     inside the expression and evaluated it against the aggregated OUTPUT row.
+     On a table where the grouped column is not at input index 0 that reads a
+     different output column entirely (the aggregate slot), silently, or
+     indexes past the end of the row; it only looked right because the usual
+     fixture groups by the first column, where the two indices coincide.
+
+     Every remaining [P_col] under an aggregated ORDER BY key IS a grouped
+     column, because [Sema.bind_select_order] now refuses the key outright if
+     any column it names is not grouped (#663's other half).  So descending
+     cannot mis-fire on a column that should have been left alone: there are
+     none.
+
+     {b But being GROUPED is not enough to be remappable, and that gap was the
+     first revision's blocker.}  The inner search needs the column to appear in
+     [agg_proj] as an [AP_group_col] — i.e. to be PROJECTED as a bare group
+     column.  [SELECT COUNT( * ) FROM g GROUP BY nm ORDER BY nm] groups by [nm]
+     and projects only the count, so the search failed, the [None] arm kept the
+     PRE-AGGREGATION index, and the sort read past the end of a one-column
+     output row: [Invalid_argument] escaping the executor mid-query, for an
+     idiomatic shape.  With [UPPER(nm)] projected instead of [nm] it did not
+     crash but sorted by the aggregate.  Making the walk recursive WIDENED the
+     reach of that arm rather than narrowing it, since it now fires inside
+     expressions too.
+
+     So a grouped column that is not projected gets a HIDDEN output slot, the
+     same mechanism [plan_agg_order_hidden] uses for #495's aggregate keys: the
+     column is appended to [Op_aggregate]'s own projection where its ordinal
+     means what it was bound to mean, sorted on by position, and trimmed away
+     by an [Op_project] around the sort so nothing downstream sees it.  Slots
+     are allocated at most once per grouped column, so [ORDER BY nm, nm || 'q']
+     adds one, not two.
+
+     The three subquery-bearing nodes stay opaque — the columns inside them
+     belong to their own from-list, not to this GROUP BY. *)
+  let n_visible =
+    match projected with
+    | Plan.Op_aggregate r -> Some (List.length r.proj)
+    | _ -> None
+  in
+  (* Group-column positions given a hidden slot, in allocation order. *)
+  let hidden = ref [] in
+  let alloc_hidden gc_pos =
+    match n_visible with
+    | None -> None
+    | Some n ->
+      (match find_idx (( = ) gc_pos) !hidden with
+       | Some k -> Some (n + k)
+       | None ->
+         hidden := !hidden @ [ gc_pos ];
+         Some (n + List.length !hidden - 1))
+  in
+  let rec remap_e e =
     match e with
     | Plan.P_col i ->
       (match find_idx (( = ) i) group_by with
@@ -2536,8 +2590,32 @@ let plan_post_agg_sort_input_space ~group_by ~agg_proj ~order ~projected =
               plan_proj
           with
           | Some out_pos -> Plan.P_col out_pos
-          | None -> e))
-    | _ -> e
+          | None ->
+            (match alloc_hidden gc_pos with
+             | Some out_pos -> Plan.P_col out_pos
+             | None -> e)))
+    | Plan.P_binop (op, a, b) -> Plan.P_binop (op, remap_e a, remap_e b)
+    | Plan.P_not a -> Plan.P_not (remap_e a)
+    | Plan.P_is_null a -> Plan.P_is_null (remap_e a)
+    | Plan.P_is_not_null a -> Plan.P_is_not_null (remap_e a)
+    | Plan.P_neg a -> Plan.P_neg (remap_e a)
+    | Plan.P_bitnot a -> Plan.P_bitnot (remap_e a)
+    | Plan.P_between (x, lo, hi) -> Plan.P_between (remap_e x, remap_e lo, remap_e hi)
+    | Plan.P_in (x, vs) -> Plan.P_in (remap_e x, List.map remap_e vs)
+    | Plan.P_func (f, args) -> Plan.P_func (f, List.map remap_e args)
+    | Plan.P_case { scrutinee; branches; else_ } ->
+      Plan.P_case
+        { scrutinee = Option.map remap_e scrutinee
+        ; branches = List.map (fun (c, r) -> remap_e c, remap_e r) branches
+        ; else_ = Option.map remap_e else_
+        }
+    | Plan.P_cast (x, ty) -> Plan.P_cast (remap_e x, ty)
+    | Plan.P_collate (x, c) -> Plan.P_collate (remap_e x, c)
+    (* Opaque by decision (subqueries) or genuinely leaves.  Exhaustive rather
+       than [| _ -> e]: a new constructor carrying an expression must be a
+       compile error here, since missing one is precisely the defect above. *)
+    | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ -> e
+    | Plan.P_lit _ | Plan.P_param _ | Plan.P_excluded_col _ | Plan.P_window_slot _ -> e
   in
   let keys =
     List.map
@@ -2571,7 +2649,19 @@ let plan_post_agg_sort_input_space ~group_by ~agg_proj ~order ~projected =
          e', dir, nulls)
       order
   in
-  if keys = [] then projected else Plan.Op_sort { keys; child = projected }
+  if keys = []
+  then projected
+  else (
+    match !hidden, projected, n_visible with
+    | [], _, _ | _, _, None -> Plan.Op_sort { keys; child = projected }
+    | hs, Plan.Op_aggregate r, Some n ->
+      let child =
+        Plan.Op_aggregate
+          { r with proj = r.proj @ List.map (fun k -> Plan.PI_group_col k) hs }
+      in
+      Plan.Op_project
+        { ordinals = List.init n Fun.id; child = Plan.Op_sort { keys; child } }
+    | _, child, _ -> Plan.Op_sort { keys; child })
 ;;
 
 (* The post-aggregation sort: #495's output-space keys when the ORDER BY

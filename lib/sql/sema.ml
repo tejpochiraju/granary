@@ -976,6 +976,61 @@ let rec expr_has_agg = function
   | Ast.E_fts_snippet _ -> false
 ;;
 
+(* #663: every column reference an AST expression makes, as written —
+   [(None, name)] for a bare one, [(Some tbl, name)] for a qualified one.
+
+   Used by the aggregated ORDER BY guard below.  Two constructors are
+   deliberately OPAQUE rather than descended into:
+
+   - [E_agg] / [E_agg_distinct]: a column inside an aggregate's argument is
+     legal without being grouped, which is the whole point of an aggregate.
+     (The guard's caller only runs on a clause that mentions no aggregate at
+     all — see [order_mentions_agg] — so these arms are unreachable from it
+     today; they are written to the rule rather than to the reachability, so
+     that a future caller cannot inherit a wrong answer.)
+   - [E_subquery] / [E_exists] / [E_in_select]: the columns in a subquery's own
+     clauses belong to ITS from-list, not to this one's GROUP BY.  Descending
+     would reject a perfectly good uncorrelated subquery for naming its own
+     columns.
+
+   Exhaustive on purpose: a new [Ast.expr] constructor that carries a column
+   should be a compile error here, not a silently unchecked reference. *)
+let rec expr_col_refs = function
+  | Ast.E_col name -> [ None, name ]
+  | Ast.E_tbl_col (t, c) -> [ Some t, c ]
+  | Ast.E_lit _ | Ast.E_param _ | Ast.E_match _ -> []
+  | Ast.E_agg _ | Ast.E_agg_distinct _ -> []
+  | Ast.E_subquery _ | Ast.E_exists _ -> []
+  | Ast.E_in_select (x, _) -> expr_col_refs x
+  | Ast.E_binop (_, a, b) -> expr_col_refs a @ expr_col_refs b
+  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
+    expr_col_refs e
+  | Ast.E_between (x, lo, hi) -> expr_col_refs x @ expr_col_refs lo @ expr_col_refs hi
+  | Ast.E_in (x, vals) -> expr_col_refs x @ List.concat_map expr_col_refs vals
+  | Ast.E_func (_, args) -> List.concat_map expr_col_refs args
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:[] ~some:expr_col_refs scrutinee
+    @ List.concat_map (fun (c, r) -> expr_col_refs c @ expr_col_refs r) branches
+    @ Option.fold ~none:[] ~some:expr_col_refs else_
+  | Ast.E_cast (e, _) -> expr_col_refs e
+  | Ast.E_collate (e, _) -> expr_col_refs e
+  (* [E_window] genuinely DOES carry column references — in its arguments, its
+     PARTITION BY and its own ORDER BY — and answering [[]] for it is therefore
+     a wrong answer, not an opaque-by-design one like the aggregates and
+     subqueries above.  It is unreachable today:
+     [ORDER BY ROW_NUMBER() OVER (ORDER BY pad)] on a grouped select is refused
+     earlier with "window functions not yet supported in join context".  So
+     this is documentation, not a defect — but the whole point of enumerating
+     the arms is that a future change must not inherit a wrong answer
+     silently, and this one would.  Descending here is what a fix owes.
+
+     [E_fts_snippet] is a TRUE leaf: a table name, a column index, three string
+     tags and a token count, with no [expr] field anywhere ([Ast.E_fts_snippet],
+     ast.ml:247).  [[]] is exactly right for it and always will be. *)
+  | Ast.E_window _ -> []
+  | Ast.E_fts_snippet _ -> []
+;;
+
 (** Check if any subquery node appears anywhere in an AST [expr].  The
     [bound_expr] equivalent is [expr_has_subquery] below; this one exists
     because #488's aggregate-argument binder has to decide {i before} binding
@@ -3322,6 +3377,7 @@ let bind_select_order
       ~(tables : (Cat.table_meta * int * string option) list)
       ~(out_aliases : string option list)
       ~(out_ref : int64 -> (bound_expr, error) result)
+      ~(grouped_check : (string option * string -> (unit, error) result) option)
       order
   =
   (* 1-based position of the output column carrying alias [name], if any.
@@ -3338,27 +3394,62 @@ let bind_select_order
     in
     go 0 out_aliases
   in
+  (* #663: in an AGGREGATED select this binder used to bind a bare column with
+     NO GROUP BY membership check, unlike the resolver in
+     [bind_select_having] and unlike [project_agg_item].  The sort runs AFTER
+     projection, and [remap_e] inside
+     [Planner.plan_post_agg_sort_input_space] rewrites only an
+     index it finds in [group_by] — so a known but non-grouped column kept its
+     INPUT index and the key read whatever OUTPUT column sits at that index:
+
+       CREATE TABLE g3 (nm TEXT, pad TEXT);
+       SELECT nm, COUNT( * ) FROM g3 GROUP BY nm ORDER BY pad;
+         (spaces inside COUNT deliberate: [(] followed by [*] opens a nested
+          OCaml comment, which swallows the rest of this one)
+
+     [pad] is input index 1, [group_by] is [0], so the key stayed [P_col 1] —
+     output column 1, the COUNT.  Rows came back sorted by the count, silently,
+     with no mention of [pad].  On a table wide enough that the input index
+     exceeds the output arity, the same path indexed past the end of the output
+     row and raised [Invalid_argument] from [Exec] mid-query rather than a
+     [Db.error].
+
+     [grouped_check] is [None] for a non-aggregated select (nothing to check:
+     the key is bound against the input row and evaluated against it) and
+     [Some check] otherwise.  It is consulted for EVERY column the key names,
+     not only a bare top-level one, so an ORDER BY that concatenates [pad] into
+     a larger expression is refused too.  It runs AFTER the ordinal and alias
+     paths, which address the output row directly and are not column
+     references at all.
+
+     A reference [check] cannot RESOLVE is passed through rather than rejected,
+     so an unknown name still produces the [bind_expr_join] error it always
+     did instead of a misleading non-grouped one. *)
+  let check_grouped (e : Ast.expr) k =
+    match grouped_check with
+    | None -> k ()
+    | Some check ->
+      let rec first_error = function
+        | [] -> k ()
+        | r :: rest ->
+          (match check r with
+           | Error _ as err -> err
+           | Ok () -> first_error rest)
+      in
+      first_error (expr_col_refs e)
+  in
   let bind_order_expr (e : Ast.expr) =
     match e with
     | Ast.E_lit (Ast.L_int n) -> out_ref n
     | Ast.E_col name ->
       (match alias_pos name with
        | Some pos -> out_ref pos
+       (* Alias-aware binder for both single-table and joined queries; see
+          comment in [bind_one] above.  [check_grouped] first — see below. *)
        | None ->
-         (* Alias-aware binder for both single-table and joined
-            queries; see comment in [bind_one] above.
-
-            KNOWN HOLE, pre-existing and not introduced by #489/#490: in an
-            AGGREGATED select this fall-through applies no GROUP BY membership
-            check, unlike [bind_select_having]'s resolver.  A known but
-            non-grouped column binds to its INPUT index, [Planner.remap_e]
-            leaves any index it does not find in [group_cols] alone, and the
-            key then reads whatever output column sits at that index — or
-            indexes past the end of the output row and raises from [Exec].
-            Tracked as #663; the fix belongs with the aggregated ORDER BY
-            resolver (#658's [bind_select_order_agg]), not here. *)
-         bind_expr_join ~param_counter ~named_params ~tables e)
-    | _ -> bind_expr_join ~param_counter ~named_params ~tables e
+         check_grouped e (fun () -> bind_expr_join ~param_counter ~named_params ~tables e))
+    | _ ->
+      check_grouped e (fun () -> bind_expr_join ~param_counter ~named_params ~tables e)
   in
   List.fold_left
     (fun acc (ok : Ast.order_key) ->
@@ -3406,6 +3497,14 @@ let order_mentions_agg ~alias_map (order : Ast.order_key list) =
    The whole clause takes this path or none of it does (see
    [order_mentions_agg]): mixing the two spaces in one clause would leave the
    planner remapping some keys and not others against the same row. *)
+(* #663: ONE message literal for the two sites that refuse an aggregated
+   ORDER BY key naming a non-grouped column — [bind_select_order_agg]'s
+   [grouped] and [bind_select]'s [grouped_check].  They were copy-pasted, with
+   no compiler holding them equal. *)
+let non_grouped_order_msg what =
+  Printf.sprintf "ORDER BY references non-grouped column '%s'" what
+;;
+
 let bind_select_order_agg
       ~param_counter
       ~named_params
@@ -3423,10 +3522,7 @@ let bind_select_order_agg
     | Ok i ->
       (match select_find_pos group_cols i with
        | Some pos -> Ok pos
-       | None ->
-         Error
-           (Unsupported
-              (Printf.sprintf "ORDER BY references non-grouped column '%s'" what)))
+       | None -> Error (Unsupported (non_grouped_order_msg what)))
   in
   let resolver =
     { resolve_unqual = (fun n -> grouped (select_proj_lookup ~tables ~meta n) n)
@@ -3634,8 +3730,56 @@ let bind_select_resolved
       | Error e -> Error e
       | Ok (keys, order_aggs) -> Ok ([], keys, order_aggs))
     else (
+      (* #663: an aggregated select's ORDER BY must name grouped columns only,
+         the same rule [bind_select_having] and [project_agg_item] apply.  Built
+         here rather than inside [bind_select_order] so that binder stays
+         ignorant of aggregation; it is the same [select_find_pos group_cols]
+         test [bind_select_order_agg]'s [grouped] makes, and it reuses that
+         function's message so all three sites say the same thing. *)
+      let grouped_check =
+        (* #663 review: gated on [is_aggregated] AND on there being a GROUP BY
+           to be non-grouped against.  [is_aggregated] is also true for an
+           aggregate in the projection with NO GROUP BY at all, and [group_cols]
+           is then [[]], so every column reference failed the test and
+           [SELECT COUNT( * ) FROM g ORDER BY nm] was refused — a working query
+           (sqlite3 answers, and so did main) turned into an error, with a
+           message naming a grouping there is none of.  Such a statement returns
+           exactly ONE row, so its ORDER BY is a no-op whatever it names; the
+           planner drops the sort rather than indexing the output row with a
+           pre-aggregation ordinal. *)
+        if (not is_aggregated) || group_cols = []
+        then None
+        else
+          Some
+            (fun (qual, name) ->
+              let lookup =
+                match qual with
+                | None -> select_proj_lookup ~tables ~meta name
+                | Some t -> select_qual_lookup ~tables t name
+              in
+              match lookup with
+              (* Unresolvable here: leave it to [bind_expr_join]'s own error. *)
+              | Error _ -> Ok ()
+              | Ok i ->
+                (match select_find_pos group_cols i with
+                 | Some _ -> Ok ()
+                 | None ->
+                   Error
+                     (Unsupported
+                        (non_grouped_order_msg
+                           (match qual with
+                            | Some t -> t ^ "." ^ name
+                            | None -> name)))))
+      in
       match
-        bind_select_order ~param_counter ~named_params ~tables ~out_aliases ~out_ref order
+        bind_select_order
+          ~param_counter
+          ~named_params
+          ~tables
+          ~out_aliases
+          ~out_ref
+          ~grouped_check
+          order
       with
       | Error e -> Error e
       | Ok keys -> Ok (keys, [], []))
