@@ -28,7 +28,13 @@ type value = Granary_encoding.Row.value =
 type row = Granary_encoding.Row.t (* value array *)
 
 type error =
-  | Parse of string (** SQL syntax error *)
+  | Parse of string
+  (** SQL syntax error.  Since #487 the message carries the position — line,
+          column and byte offset — and the offending token; for example
+          [syntax error at line 2, column 8 (byte offset 21): unexpected token FORM].
+          It deliberately names no expected-token set: the grammar resolves
+          ~290 shift/reduce conflicts arbitrarily, so the automaton state at
+          failure does not correspond to an honest one. *)
   | Sema of Granary_sql.Sema.error (** name/type error *)
   | Runtime of string (** unexpected internal error *)
   | History_unavailable
