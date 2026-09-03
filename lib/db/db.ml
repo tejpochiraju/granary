@@ -4239,6 +4239,19 @@ let rv_create top ~sql ~name query refresh =
                   | Some c -> List.length c
                   | None -> 0)
              in
+             (* #747/#750: this guard no longer decides anything a caller can
+                reach through a table.  [Sema] refuses an [S_with_cte] root
+                (#486), an [S_compound] root (#750) and a [`All] projection
+                (#747) before the statement gets here, and for the surviving
+                [S_select] root [Reactive_view.out_cols_of_proj] always answers
+                [Some], so [arity] comes from the projection rather than from
+                the data.  ONE spelling still reaches it, and it is not a
+                compound: a FROM-less [SELECT *] parses to
+                [S_const_select { exprs = [] }], which is neither an
+                [S_select] (so the star check does not see it) nor backed by a
+                table (so there is nothing to widen it from).  Keep the guard —
+                its message no longer blames [SELECT *], because emptiness
+                stopped being the criterion for everything else. *)
              if arity = 0
              then
                Lwt.return

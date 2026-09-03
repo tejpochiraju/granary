@@ -1869,6 +1869,38 @@ let reject_reactive_derived_table (query : Ast.stmt) =
   | _ -> Ok ()
 ;;
 
+(* #750: an [S_compound] root -- UNION / UNION ALL / INTERSECT / EXCEPT -- is
+   refused for the same reason as #486 above, and by the same mechanism:
+   [Reactive_view.base_tables_of] reads the base tables off the [S_select] at
+   the root of the body and answers [] for anything else.  A compound view
+   therefore registered with NO base tables, so no write to either arm's table
+   ever marked it dirty: it materialised correctly once and then served that
+   first snapshot forever, with no error at any point.
+
+   This was the THIRD instance of one pattern -- a [Reactive_view] helper
+   matching [S_select] and answering a benign-looking default for everything
+   else -- after #486 ([base_tables_of], derived table) and #747 ([proj_of],
+   [SELECT *]).  All three are closed the same way: refuse the shape at bind
+   time, because a maintained view needs a statically determinable one.
+
+   Supporting it properly is a separate decision, not an omission.  It needs
+   [base_tables_of] to union both arms AND a correct incremental rule per set
+   operation, and neither UNION (distinct) nor EXCEPT is an additive merge over
+   Z-sets -- a row deleted from one arm may or may not leave the result
+   depending on the other arm's multiplicity.  Half of that -- the base tables
+   without the delta rule -- would replace a stale view with a wrong one. *)
+let reject_reactive_compound (query : Ast.stmt) =
+  match query with
+  | Ast.S_compound _ ->
+    Error
+      (Unsupported
+         "CREATE REACTIVE VIEW does not support UNION / UNION ALL / INTERSECT / EXCEPT \
+          as its body (#750): a maintained view's base tables must be statically \
+          determinable, and a compound body has none, so the view would never be \
+          invalidated")
+  | _ -> Ok ()
+;;
+
 (* #747: a reactive view is MAINTAINED, so its output shape has to be a
    property of the statement rather than of the data that happened to be
    present when it was created.  [SELECT *] is not: [Db.rv_create] derived the
@@ -1888,10 +1920,11 @@ let reject_reactive_derived_table (query : Ast.stmt) =
    compound's arms and through a CTE wrapper's body -- and deliberately not
    into a CTE definition or a subquery.  A star there does not determine the
    view's own arity: [SELECT a FROM (SELECT * FROM t) d] still yields exactly
-   one column whatever [t] grows.  (The [S_with_cte] arm is unreachable today,
-   since [reject_reactive_derived_table] runs first and refuses that root
-   outright; it is written out so that lifting #486 does not silently reopen
-   this hole.)  A qualified star [t.*] is not in the grammar at all, so there is
+   one column whatever [t] grows.  (The [S_with_cte] and [S_compound] arms are
+   unreachable today, since [reject_reactive_derived_table] and
+   [reject_reactive_compound] run first and refuse those roots outright; they
+   are written out so that lifting #486 or #750 does not silently reopen this
+   hole.)  A qualified star [t.*] is not in the grammar at all, so there is
    no spelling of it to cover. *)
 let rec reactive_projects_star (query : Ast.stmt) =
   match query with
@@ -5771,7 +5804,8 @@ and bind_expanded ~views ~named_params ~param_counter cat stmt =
     (match
        Result.bind (reject_reserved_name name) (fun () ->
          Result.bind (reject_reactive_derived_table query) (fun () ->
-           reject_reactive_star query))
+           Result.bind (reject_reactive_compound query) (fun () ->
+             reject_reactive_star query)))
      with
      | Error e -> Lwt.return (Error e)
      | Ok () ->

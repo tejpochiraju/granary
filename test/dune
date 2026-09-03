@@ -2150,3 +2150,15 @@
  (name test_view_callback_746)
  (modules test_view_callback_746)
  (libraries granary alcotest lwt.unix))
+
+; #750: a compound-root CREATE REACTIVE VIEW is refused. base_tables_of
+; answered [] for an S_compound root, so the view registered with no base
+; tables and served its creation-time snapshot forever with no error. Carries
+; its own control (a supported view that DOES track writes) so the refusal
+; tests cannot pass vacuously. In-memory is enough: bind-time behaviour plus
+; in-process view maintenance, no durability dimension.
+
+(test
+ (name test_reactive_view_compound_750)
+ (modules test_reactive_view_compound_750)
+ (libraries granary alcotest lwt.unix))
