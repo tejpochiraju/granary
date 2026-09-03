@@ -1784,3 +1784,15 @@
  (name test_agg_numeric_665)
  (modules test_agg_numeric_665)
  (libraries granary alcotest lwt.unix))
+
+; #664: a subquery inside an aggregate ARGUMENT is evaluated, not refused.
+; #488 made the argument an expression, so subqueries became bindable there and
+; nothing resolved them; #658 contained that with a bind-time refusal and this
+; replaces it. Uncorrelated ones resolve once per statement; correlated ones
+; resolve per INPUT row (not per group, as #558's projection/HAVING path does),
+; and the #247 fast path gives such a query up.
+
+(test
+ (name test_agg_arg_subquery_664)
+ (modules test_agg_arg_subquery_664)
+ (libraries granary granary.encoding alcotest lwt.unix unix))

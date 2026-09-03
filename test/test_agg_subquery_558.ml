@@ -305,16 +305,21 @@ let plain_aggregate_expressions_are_untouched () =
       (rows_of db "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1"))
 ;;
 
-(* #558's relaxation is about the expression AROUND the aggregate, not its
-   argument.  Since #488 an aggregate argument IS a general expression, so the
-   reason this is still refused is no longer "it is not a column reference" —
-   it is [Sema.expr_has_subquery_ast], the one shape #488 kept refusing. The
-   assertion is unchanged; only its justification moved. *)
-let a_subquery_as_an_aggregate_argument_is_still_refused () =
+(* #558's relaxation was about the expression AROUND the aggregate, not its
+   argument; #488 made the argument a general expression and kept refusing a
+   subquery in it, and #664 removed that last refusal by extending #558's own
+   pre-evaluation to the argument.  So this case is the same statement with the
+   opposite expectation: [(SELECT 1 FROM u)] is an uncorrelated scalar
+   subquery, resolves once to 1, and COUNT then counts the rows of each group.
+   Kept here rather than deleted, because a control that flips is the clearest
+   record that the boundary moved. *)
+let a_subquery_as_an_aggregate_argument_is_now_evaluated () =
   with_db (fun db ->
     seed db;
-    let msg = err_of db "SELECT a, COUNT((SELECT 1 FROM u)) FROM t GROUP BY a" in
-    Alcotest.(check bool) (Printf.sprintf "still refused (got %S)" msg) true (msg <> ""))
+    check_rows
+      ~label:"COUNT over an uncorrelated scalar subquery argument"
+      [ [ "1"; "2" ]; [ "2"; "1" ] ]
+      (rows_of db "SELECT a, COUNT((SELECT 1 FROM u)) FROM t GROUP BY a"))
 ;;
 
 let () =
@@ -363,9 +368,9 @@ let () =
             `Quick
             plain_aggregate_expressions_are_untouched
         ; Alcotest.test_case
-            "a subquery as an aggregate argument is still refused"
+            "a subquery as an aggregate argument is now evaluated (#664)"
             `Quick
-            a_subquery_as_an_aggregate_argument_is_still_refused
+            a_subquery_as_an_aggregate_argument_is_now_evaluated
         ] )
     ]
 ;;

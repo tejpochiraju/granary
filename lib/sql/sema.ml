@@ -1042,45 +1042,6 @@ let rec expr_col_refs = function
   | Ast.E_fts_snippet _ -> []
 ;;
 
-(** Check if any subquery node appears anywhere in an AST [expr].  The
-    [bound_expr] equivalent is [expr_has_subquery] below; this one exists
-    because #488's aggregate-argument binder has to decide {i before} binding
-    (see [bind_agg_arg]), and unlike the bound form it must also look inside
-    [E_exists]/[E_subquery] rather than treat them as opaque leaves. *)
-let rec expr_has_subquery_ast = function
-  | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ -> true
-  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
-  | Ast.E_agg (_, arg) -> Option.fold ~none:false ~some:expr_has_subquery_ast arg
-  (* #491: a DISTINCT aggregate's argument is an argument like any other, so
-     #488's subquery refusal must see through it too — otherwise
-     [SUM(DISTINCT qty * (SELECT 2))] would bind a [P_subquery] that nothing
-     resolves and read NULL, which is the quiet wrong answer #488 refused. *)
-  | Ast.E_agg_distinct (_, arg) -> expr_has_subquery_ast arg
-  | Ast.E_binop (_, a, b) -> expr_has_subquery_ast a || expr_has_subquery_ast b
-  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
-    expr_has_subquery_ast e
-  | Ast.E_between (x, lo, hi) ->
-    expr_has_subquery_ast x || expr_has_subquery_ast lo || expr_has_subquery_ast hi
-  | Ast.E_in (x, vals) ->
-    expr_has_subquery_ast x || List.exists expr_has_subquery_ast vals
-  | Ast.E_func (_, args) -> List.exists expr_has_subquery_ast args
-  | Ast.E_case { scrutinee; branches; else_ } ->
-    Option.fold ~none:false ~some:expr_has_subquery_ast scrutinee
-    || List.exists
-         (fun (c, r) -> expr_has_subquery_ast c || expr_has_subquery_ast r)
-         branches
-    || Option.fold ~none:false ~some:expr_has_subquery_ast else_
-  | Ast.E_cast (e, _) -> expr_has_subquery_ast e
-  | Ast.E_collate (e, _) -> expr_has_subquery_ast e
-  | Ast.E_window { args; _ } ->
-    (* The window SPEC's own expressions are not walked: a window function
-       inside an aggregate argument is refused outright by [bind_expr_agg]
-       ("window functions not yet supported in aggregate context"), so the only
-       caller of this function can never reach them. *)
-    List.exists expr_has_subquery_ast args
-  | Ast.E_fts_snippet _ -> false
-;;
-
 (* #568: SUM/AVG over a TEXT or BLOB column is rejected at bind time.  This
    used to live only in [project_agg] (the binder for a *bare* aggregate
    projection item), so wrapping the same aggregate in any expression —
@@ -1325,8 +1286,9 @@ let rec bind_expr_agg
          Ok (BE_col (add_agg { func; col_ord; arg_expr; distinct = false })))
     (* #491 x #488: a DISTINCT argument goes through the SAME [bind_agg_arg] as
        a plain one, so it gets the expression form, the nested-aggregate
-       refusal and the subquery refusal for free — [COUNT(DISTINCT a * b)] is
-       bound exactly like [COUNT(a * b)], with one bit set. *)
+       refusal and (since #664) subquery evaluation for free —
+       [COUNT(DISTINCT a * b)] is bound exactly like [COUNT(a * b)], with one
+       bit set. *)
     | Ast.E_agg_distinct (func, arg) ->
       (match bind_agg_arg ~param_counter ~named_params ~resolver func (Some arg) with
        | Error e -> Error e
@@ -1382,23 +1344,24 @@ let rec bind_expr_agg
     (a GROUP BY projection and HAVING both restrict bare column refs to grouped
     columns; the argument must not inherit that).
 
-    Two shapes are refused here rather than left to fall out of the generic
-    binder, because in both cases the generic binder would ACCEPT them and the
-    engine would then answer something that is not what was asked:
+    One shape is refused here rather than left to fall out of the generic
+    binder, because the generic binder would ACCEPT it and the engine would
+    then answer something that is not what was asked: a nested aggregate
+    ([SUM(SUM(x))]) would be registered as a second, separate aggregate over
+    the input rows.
 
-    - A nested aggregate ([SUM(SUM(x))]) would be registered as a second,
-      separate aggregate over the input rows.
-    - A subquery ([SUM(qty * (SELECT 2))]) binds as a leaf (the #558 arms of
-      [bind_expr_agg]) and becomes a [P_subquery] that nothing ever resolves:
-      [stream_aggregate] pre-evaluates subqueries in [having] and [proj] only,
-      the #247 fast path does it for the filter predicate only, and
-      [Exec.eval_expr] answers [Row.V_null] for a surviving [P_subquery].  So
-      [SELECT SUM(qty * (SELECT 2)) FROM li] would read NULL and
-      [COUNT(price * (SELECT 1))] would read 0, with no error at all.  Before
-      #488 the whole shape was refused as "not a column reference", so this is
-      newly reachable; a visible error beats a quiet wrong answer (the same
-      call #566 made).  Resolving it properly — pre-evaluating an aggregate
-      ARGUMENT's subqueries the way #558 does for the projection — is #664.
+    **#664: a SUBQUERY in the argument is no longer refused, it is evaluated.**
+    It binds as a leaf (the #558 arms of [bind_expr_agg]) and becomes a
+    [P_subquery]; [Exec.stream_aggregate] now pre-evaluates an argument's
+    subqueries exactly as #558 made it pre-evaluate [having]'s and [proj]'s.
+    The two are resolved against different rows and that is the whole
+    subtlety: [having]/[proj] are evaluated per aggregate OUTPUT row, so a
+    correlated one there can only reference a GROUP BY column, while an
+    ARGUMENT is evaluated per INPUT row, so a correlated one there resolves
+    against the child's own scan the way a correlated projection does.  The
+    #247 fast path gives such a query up to [stream_aggregate] rather than
+    evaluating it in its own pure loop, exactly as it already did for a
+    subquery-bearing projection.
 
     **#665: #568's SUM/AVG type check reaches an expression argument too.**
     [agg_numeric_check] keys off a stored column's declared type and a computed
@@ -1426,8 +1389,6 @@ and bind_agg_arg
      | Ok co -> Ok (co, None))
   | Some e when expr_has_agg e ->
     Error (Unsupported "aggregate function calls may not be nested")
-  | Some e when expr_has_subquery_ast e ->
-    Error (Unsupported "subqueries are not supported inside an aggregate argument")
   | Some e ->
     let arg_resolver =
       { resolver with
