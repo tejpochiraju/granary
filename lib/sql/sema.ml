@@ -1042,45 +1042,6 @@ let rec expr_col_refs = function
   | Ast.E_fts_snippet _ -> []
 ;;
 
-(** Check if any subquery node appears anywhere in an AST [expr].  The
-    [bound_expr] equivalent is [expr_has_subquery] below; this one exists
-    because #488's aggregate-argument binder has to decide {i before} binding
-    (see [bind_agg_arg]), and unlike the bound form it must also look inside
-    [E_exists]/[E_subquery] rather than treat them as opaque leaves. *)
-let rec expr_has_subquery_ast = function
-  | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ -> true
-  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
-  | Ast.E_agg (_, arg) -> Option.fold ~none:false ~some:expr_has_subquery_ast arg
-  (* #491: a DISTINCT aggregate's argument is an argument like any other, so
-     #488's subquery refusal must see through it too — otherwise
-     [SUM(DISTINCT qty * (SELECT 2))] would bind a [P_subquery] that nothing
-     resolves and read NULL, which is the quiet wrong answer #488 refused. *)
-  | Ast.E_agg_distinct (_, arg) -> expr_has_subquery_ast arg
-  | Ast.E_binop (_, a, b) -> expr_has_subquery_ast a || expr_has_subquery_ast b
-  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
-    expr_has_subquery_ast e
-  | Ast.E_between (x, lo, hi) ->
-    expr_has_subquery_ast x || expr_has_subquery_ast lo || expr_has_subquery_ast hi
-  | Ast.E_in (x, vals) ->
-    expr_has_subquery_ast x || List.exists expr_has_subquery_ast vals
-  | Ast.E_func (_, args) -> List.exists expr_has_subquery_ast args
-  | Ast.E_case { scrutinee; branches; else_ } ->
-    Option.fold ~none:false ~some:expr_has_subquery_ast scrutinee
-    || List.exists
-         (fun (c, r) -> expr_has_subquery_ast c || expr_has_subquery_ast r)
-         branches
-    || Option.fold ~none:false ~some:expr_has_subquery_ast else_
-  | Ast.E_cast (e, _) -> expr_has_subquery_ast e
-  | Ast.E_collate (e, _) -> expr_has_subquery_ast e
-  | Ast.E_window { args; _ } ->
-    (* The window SPEC's own expressions are not walked: a window function
-       inside an aggregate argument is refused outright by [bind_expr_agg]
-       ("window functions not yet supported in aggregate context"), so the only
-       caller of this function can never reach them. *)
-    List.exists expr_has_subquery_ast args
-  | Ast.E_fts_snippet _ -> false
-;;
-
 (* #568: SUM/AVG over a TEXT or BLOB column is rejected at bind time.  This
    used to live only in [project_agg] (the binder for a *bare* aggregate
    projection item), so wrapping the same aggregate in any expression —
@@ -1089,20 +1050,105 @@ let rec expr_has_subquery_ast = function
    only if a row actually reached the accumulator (an empty group succeeded).
    Granary's strict column typing is a deliberate divergence from SQLite, so a
    check a pair of parentheses can turn off is worse than no check: it now
-   lives on the single ordinal-resolution path every binder shares. *)
+   lives on the single ordinal-resolution path every binder shares.
+
+   #665: #488 then added a THIRD spelling — an aggregate over an arbitrary
+   expression — which has no column ordinal at all and so escaped this
+   entirely.  [agg_numeric_ty_check] below is the shared verdict and
+   [agg_arg_static_ty] is the expression spelling's type source. *)
+let agg_numeric_ty_check (func : Ast.agg_func) (ty : Row.ty option)
+  : (unit, error) result
+  =
+  (* #665: the type half of the check, factored out so the ORDINAL spelling (a
+     bare column, whose type comes from the catalog) and the EXPRESSION
+     spelling (#488, whose type is inferred by [agg_arg_static_ty] below) reach
+     the same verdict through the same function rather than through two that
+     can drift.  [None] — a type that is not statically known — is always
+     [Ok]: this fires only on a type it is sure of, and the runtime
+     accumulator stays the backstop for the rest. *)
+  match func, ty with
+  | (Ast.Agg_sum | Ast.Agg_avg), Some (Row.Integer | Row.Real) -> Ok ()
+  | (Ast.Agg_sum | Ast.Agg_avg), Some t ->
+    Error (Type_mismatch { expected = Row.Real; got = t })
+  | _ -> Ok ()
+;;
+
 let agg_numeric_check
       ~(col_ty : int -> Row.ty option)
       (func : Ast.agg_func)
       (co : int option)
   : (unit, error) result
   =
-  match func, co with
-  | (Ast.Agg_sum | Ast.Agg_avg), Some i ->
-    (match col_ty i with
-     | None -> Ok () (* ordinal out of range: leave it to the caller's own error *)
-     | Some (Row.Integer | Row.Real) -> Ok ()
-     | Some t -> Error (Type_mismatch { expected = Row.Real; got = t }))
-  | _ -> Ok ()
+  (* An ordinal out of range answers [None], which is [Ok]: the caller's own
+     resolution error is the better one to report. *)
+  agg_numeric_ty_check func (Option.bind co col_ty)
+;;
+
+(* #665: the static type of an aggregate's EXPRESSION argument (#488), where
+   one can be determined at all.
+
+   This is deliberately NOT [infer_type], for two reasons:
+
+   - [infer_type] indexes a [Row.column list]; [bind_agg_arg] has only the
+     resolver's [agg_arg_col_ty] ordinal lookup, which is the same mapping in
+     function form and answers [None] out of range instead of raising.
+   - it descends into [BE_case], which [infer_type] must not.  [infer_type]'s
+     other caller is [bind_update_assignments], where a CASE arm would newly
+     reject [UPDATE t SET r = CASE WHEN c THEN 1 ELSE 2 END] on a REAL column.
+     #665 is about the aggregate argument, so the descent lives here — and the
+     issue's own headline shape is exactly a CASE, so without it option 1
+     would not catch the case it was filed for.
+
+   Every arm that cannot be sure answers [None], and [agg_numeric_ty_check]
+   treats [None] as [Ok], so this can only ever move a failure EARLIER — from
+   the runtime accumulator to bind time.  It can never reject a query that
+   would have produced an answer. *)
+let rec agg_arg_static_ty ~(col_ty : int -> Row.ty option) (e : bound_expr)
+  : Row.ty option
+  =
+  let self = agg_arg_static_ty ~col_ty in
+  match e with
+  | BE_lit l -> lit_ty l
+  | BE_col i -> col_ty i
+  | BE_neg x | BE_collate (x, _) -> self x
+  | BE_cast (_, ty) ->
+    Some
+      (match ty with
+       | Ast.Ty_int -> Row.Integer
+       | Ast.Ty_text -> Row.Text
+       | Ast.Ty_real -> Row.Real
+       | Ast.Ty_blob -> Row.Blob)
+  | BE_binop (Concat, _, _) -> Some Row.Text
+  | BE_binop ((Add | Sub | Mul | Div), a, b) ->
+    (match self a, self b with
+     | Some Row.Integer, Some Row.Integer -> Some Row.Integer
+     | Some Row.Real, _ | _, Some Row.Real -> Some Row.Real
+     | _ -> None)
+  | BE_binop
+      ( ( Eq | Ne | Lt | Le | Gt | Ge | And | Or | Bit_and | Bit_or | Lshift | Rshift
+        | Mod | Like | Glob )
+      , _
+      , _ ) -> Some Row.Integer
+  | BE_not _
+  | BE_is_null _
+  | BE_is_not_null _
+  | BE_bitnot _
+  | BE_between _
+  | BE_in _
+  | BE_match _
+  | BE_exists _
+  | BE_in_select _ -> Some Row.Integer
+  | BE_case { scrutinee = _; branches; else_ } ->
+    (* The type every arm agrees on, or [None].  A missing ELSE contributes
+       nothing: its implicit NULL is skipped by SUM and AVG exactly as a NULL
+       row value is, so it cannot make a TEXT branch legal — the same reading
+       under which [SUM(text_col)] is refused on an empty table. *)
+    let arms = List.map (fun (_, r) -> self r) branches @ List.map self (Option.to_list else_) in
+    (match arms with
+     | [] -> None
+     | t :: rest -> if List.for_all (fun u -> u = t) rest then t else None)
+  | BE_func _ | BE_param _ | BE_subquery _ | BE_excluded_col _ | BE_window_slot _
+  | BE_out_col _ -> None
 ;;
 
 (** Resolve the column ordinal of an aggregate-function argument (the input-row
@@ -1240,8 +1286,9 @@ let rec bind_expr_agg
          Ok (BE_col (add_agg { func; col_ord; arg_expr; distinct = false })))
     (* #491 x #488: a DISTINCT argument goes through the SAME [bind_agg_arg] as
        a plain one, so it gets the expression form, the nested-aggregate
-       refusal and the subquery refusal for free — [COUNT(DISTINCT a * b)] is
-       bound exactly like [COUNT(a * b)], with one bit set. *)
+       refusal and (since #664) subquery evaluation for free —
+       [COUNT(DISTINCT a * b)] is bound exactly like [COUNT(a * b)], with one
+       bit set. *)
     | Ast.E_agg_distinct (func, arg) ->
       (match bind_agg_arg ~param_counter ~named_params ~resolver func (Some arg) with
        | Error e -> Error e
@@ -1297,31 +1344,36 @@ let rec bind_expr_agg
     (a GROUP BY projection and HAVING both restrict bare column refs to grouped
     columns; the argument must not inherit that).
 
-    Two shapes are refused here rather than left to fall out of the generic
-    binder, because in both cases the generic binder would ACCEPT them and the
-    engine would then answer something that is not what was asked:
+    One shape is refused here rather than left to fall out of the generic
+    binder, because the generic binder would ACCEPT it and the engine would
+    then answer something that is not what was asked: a nested aggregate
+    ([SUM(SUM(x))]) would be registered as a second, separate aggregate over
+    the input rows.
 
-    - A nested aggregate ([SUM(SUM(x))]) would be registered as a second,
-      separate aggregate over the input rows.
-    - A subquery ([SUM(qty * (SELECT 2))]) binds as a leaf (the #558 arms of
-      [bind_expr_agg]) and becomes a [P_subquery] that nothing ever resolves:
-      [stream_aggregate] pre-evaluates subqueries in [having] and [proj] only,
-      the #247 fast path does it for the filter predicate only, and
-      [Exec.eval_expr] answers [Row.V_null] for a surviving [P_subquery].  So
-      [SELECT SUM(qty * (SELECT 2)) FROM li] would read NULL and
-      [COUNT(price * (SELECT 1))] would read 0, with no error at all.  Before
-      #488 the whole shape was refused as "not a column reference", so this is
-      newly reachable; a visible error beats a quiet wrong answer (the same
-      call #566 made).  Resolving it properly — pre-evaluating an aggregate
-      ARGUMENT's subqueries the way #558 does for the projection — is #664.
+    **#664: a SUBQUERY in the argument is no longer refused, it is evaluated.**
+    It binds as a leaf (the #558 arms of [bind_expr_agg]) and becomes a
+    [P_subquery]; [Exec.stream_aggregate] now pre-evaluates an argument's
+    subqueries exactly as #558 made it pre-evaluate [having]'s and [proj]'s.
+    The two are resolved against different rows and that is the whole
+    subtlety: [having]/[proj] are evaluated per aggregate OUTPUT row, so a
+    correlated one there can only reference a GROUP BY column, while an
+    ARGUMENT is evaluated per INPUT row, so a correlated one there resolves
+    against the child's own scan the way a correlated projection does.  The
+    #247 fast path gives such a query up to [stream_aggregate] rather than
+    evaluating it in its own pure loop, exactly as it already did for a
+    subquery-bearing projection.
 
-    **#568's SUM/AVG type check does not reach an expression argument**, and
-    that is a deliberate limit rather than an oversight: [agg_numeric_check]
-    keys off a stored column's declared type, and a computed expression has
-    none.  The consequence is that [SUM(CASE WHEN … THEN 'a' ELSE 'b' END)]
-    fails at RUNTIME with [failwith "SUM on non-numeric value"] mid-scan
-    instead of at bind time, i.e. an expression argument is a third spelling
-    checked differently from the two #568 unified.  Tracked as #665. *)
+    **#665: #568's SUM/AVG type check reaches an expression argument too.**
+    [agg_numeric_check] keys off a stored column's declared type and a computed
+    expression has none, so until #665 an expression argument was a third
+    spelling checked differently from the two #568 unified:
+    [SUM(CASE WHEN … THEN 'a' ELSE 'b' END)] failed at RUNTIME with
+    [failwith "SUM on non-numeric value"] mid-scan, and succeeded outright on
+    an empty table.  [agg_arg_static_ty] now infers the argument's type where
+    it can and hands it to the same [agg_numeric_ty_check] the ordinal
+    spelling uses.  An argument whose type is statically indeterminate — a
+    scalar function, a bound parameter — still reaches the runtime
+    accumulator, which is the only honest answer for it. *)
 and bind_agg_arg
       ~param_counter
       ~named_params
@@ -1337,8 +1389,6 @@ and bind_agg_arg
      | Ok co -> Ok (co, None))
   | Some e when expr_has_agg e ->
     Error (Unsupported "aggregate function calls may not be nested")
-  | Some e when expr_has_subquery_ast e ->
-    Error (Unsupported "subqueries are not supported inside an aggregate argument")
   | Some e ->
     let arg_resolver =
       { resolver with
@@ -1350,7 +1400,19 @@ and bind_agg_arg
        bind_expr_agg ~param_counter ~named_params ~resolver:arg_resolver ~offset:0 e
      with
      | Error er -> Error er
-     | Ok (be, _) -> Ok (None, Some be))
+     | Ok (be, _) ->
+       (* #665: the same SUM/AVG numeric verdict the bare-column spelling gets
+          from [agg_col_ord], reached through the same [agg_numeric_ty_check]
+          — the expression's type is inferred rather than read off the
+          catalog, and an expression whose type is statically indeterminate is
+          left alone. *)
+       (match
+          agg_numeric_ty_check
+            func
+            (agg_arg_static_ty ~col_ty:resolver.agg_arg_col_ty be)
+        with
+        | Error er -> Error er
+        | Ok () -> Ok (None, Some be)))
 ;;
 
 (** Check if any subquery node appears anywhere in a [bound_expr]. *)
@@ -4608,8 +4670,48 @@ let bind_seq_insert ~columns ~values ~on_conflict ~returning ~upsert_update =
 (* ALTER TABLE                                                          *)
 (* ------------------------------------------------------------------ *)
 
+(* #661: is this ADD COLUMN adding a VIRTUAL generated column?
+
+   The NOT NULL gate below exists because existing rows decode SHORT: they were
+   written without the new column, so it would read back as a stored NULL, and
+   a DEFAULT is the only thing that can supply a value for them.  That reason
+   holds for a plain column and for a STORED generated one, which likewise has
+   no read-side recompute for rows written before the ALTER.
+
+   It does not hold for a VIRTUAL one.  There is no stored cell at all —
+   [column_of_col_def] carries [generated_as] through, and
+   [Exec.compute_virtual_generated_cols] recomputes the column on every read,
+   including for pre-existing rows — so the NULL the rule guards against cannot
+   occur.  Refusing it demanded a DEFAULT for a column that can never use one.
+
+   Same shape as #629 itself: a check judging a placeholder rather than the
+   value the column will actually hold, one gate along from where #629 fixed
+   it.  And it is #629 that makes the exemption safe rather than merely
+   permissive — since [Exec.not_null_violation] recomputes the virtuals before
+   judging a row, a NOT NULL VIRTUAL column is genuinely ENFORCED at write
+   time, so exempting it here relaxes when the constraint is checked and not
+   whether. *)
+let add_column_is_virtual_generated (col_def : Ast.column_def) =
+  match col_def.Ast.generated_as with
+  | Some (_, `Virtual) -> true
+  | Some (_, `Stored) | None -> false
+;;
+
 (* Validate an ALTER TABLE ADD COLUMN: reject duplicate columns, PRIMARY KEY,
-   NOT NULL without a usable DEFAULT, and unresolved REFERENCES targets. *)
+   NOT NULL without a usable DEFAULT (except for a VIRTUAL generated column,
+   which cannot need one — see [add_column_is_virtual_generated]), and
+   unresolved REFERENCES targets.
+
+   Pre-existing rows whose generated expression evaluates to NULL are NOT
+   validated during the ALTER, deliberately (#661).  The binder has no store
+   access, so the check would have to move into the exec ALTER path and would
+   turn an O(1) metadata-only DDL into a full table scan.  It also matches how
+   the engine treats pre-existing constraint violations generally: they are
+   reported by [PRAGMA not_null_check], not rejected at DDL time.  The
+   consequence, which is the trade being made: such a row reads its NULL
+   without complaint and only fails on the next UPDATE that rewrites it, where
+   [write_row_rekeyed] -> [enforce_not_null] recomputes the virtual and
+   raises. *)
 let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.column_def) =
   let col_name = col_def.Ast.name in
   let exists =
@@ -4632,6 +4734,7 @@ let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.co
   else if
     col_def.Ast.not_null
     && (col_def.Ast.default = None || col_def.Ast.default = Some Ast.L_null)
+    && not (add_column_is_virtual_generated col_def)
   then
     Lwt.return
       (Error (Unsupported "ADD COLUMN with NOT NULL requires a non-NULL DEFAULT"))

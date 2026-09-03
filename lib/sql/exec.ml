@@ -9797,6 +9797,53 @@ let agg_subquery_refusal () =
    values, and nothing else of the input rows."
 ;;
 
+(** #665: the message the SUM/AVG accumulators fail with when a value that is
+    not a number reaches them.
+
+    [Sema.agg_arg_static_ty] now refuses at BIND time every SUM/AVG argument
+    whose type is statically known to be TEXT or BLOB, in all three spellings
+    — a bare column, a wrapped aggregate, and #488's expression argument.  What
+    still reaches here is an argument whose type could not be known until a row
+    arrived: a scalar function, a bound parameter, a subquery, or a CASE whose
+    arms disagree.  For those the offending value's storage class is the whole
+    diagnostic the caller gets, so it is named rather than left to be guessed.
+
+    Defined at the top level rather than inside the accumulator's [let rec]
+    group on purpose: it returns ['a] and is instantiated at three different
+    types (the [int64] and [float] SUM folds, and [unit] in
+    [make_agg_acc_over_values]), which monomorphic recursion inside the group
+    would not allow. *)
+let agg_non_numeric_failure (what : string) (v : Row.value) =
+  let cls =
+    match v with
+    | Row.V_null -> "NULL"
+    | Row.V_int _ -> "INTEGER"
+    | Row.V_real _ -> "REAL"
+    | Row.V_text _ -> "TEXT"
+    | Row.V_blob _ -> "BLOB"
+  in
+  failwith (Printf.sprintf "%s on non-numeric value (%s)" what cls)
+;;
+
+(** #664: the message used when a subquery inside an aggregate ARGUMENT cannot
+    be resolved.
+
+    Deliberately distinct from {!agg_subquery_refusal}, because the two are
+    about different rows.  A subquery in [having] or [proj] is evaluated per
+    aggregate OUTPUT row, which carries only the grouped columns and the
+    aggregate values — so only a GROUP BY column can be its outer reference.
+    An ARGUMENT is evaluated per INPUT row, before any grouping, so any column
+    the child carries is fair game and this fires only when the child's base
+    tables cannot be located at all, or the reference names none of their
+    columns.  Reporting the group-by message for an argument would send the
+    reader to a rule that does not apply to it. *)
+let agg_arg_subquery_refusal () =
+  "Exec: a correlated subquery in an aggregate argument cannot be resolved — its outer \
+   column reference has no source in the rows being aggregated (#664). Rewrite it as an \
+   uncorrelated subquery, or qualify the outer column with the table name or alias it is \
+   in scope under (#635)."
+;;
+
 (** #558: bind outer column references appearing in an aggregate projection or
     HAVING against one aggregate {i output} row, whose leading
     [List.length group_cols] slots hold the grouped columns in order.  [metas]
@@ -11945,7 +11992,7 @@ and agg_sum (vals : Row.value list) : Row.value =
            | Row.V_null -> acc
            | Row.V_int n -> acc +. Int64.to_float n
            | Row.V_real f -> acc +. f
-           | _ -> failwith "SUM on non-numeric value")
+           | v -> agg_non_numeric_failure "SUM" v)
         0.0
         vals
     in
@@ -11957,7 +12004,7 @@ and agg_sum (vals : Row.value list) : Row.value =
            match v with
            | Row.V_null -> acc
            | Row.V_int n -> Int64.add acc n
-           | _ -> failwith "SUM on non-numeric value")
+           | v -> agg_non_numeric_failure "SUM" v)
         0L
         vals
     in
@@ -12014,7 +12061,7 @@ and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.va
            | Row.V_null -> s, n
            | Row.V_int x -> s +. Int64.to_float x, n + 1
            | Row.V_real f -> s +. f, n + 1
-           | _ -> failwith "AVG on non-numeric value")
+           | v -> agg_non_numeric_failure "AVG" v)
         (0.0, 0)
         vals
     in
@@ -12213,7 +12260,7 @@ and make_agg_acc_over_values (func : Ast.agg_func)
           any_nn := true;
           any_real := true;
           sf := !sf +. f
-        | _ -> failwith "SUM on non-numeric value")
+        | v -> agg_non_numeric_failure "SUM" v)
     , fun () ->
         if not !any_nn
         then Row.V_null
@@ -12232,7 +12279,7 @@ and make_agg_acc_over_values (func : Ast.agg_func)
         | Row.V_real f ->
           sf := !sf +. f;
           incr n
-        | _ -> failwith "AVG on non-numeric value")
+        | v -> agg_non_numeric_failure "AVG" v)
     , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
   | Ast.Agg_min ->
     let best = ref Row.V_null in
@@ -12291,6 +12338,19 @@ and aggregate_fast_path
   if not (agg_fastpath_enabled ())
   then Lwt.return None
   else if group_cols <> [] || having <> None || agg_windows <> []
+  then Lwt.return None
+  else if
+    (* #664: an aggregate ARGUMENT may now carry a subquery.  This loop is
+       pure and [eval_expr] answers [Row.V_null] for an unresolved
+       [P_subquery], so accumulating over one here would silently sum NULLs —
+       the same reason the projection test below gives up.  [stream_aggregate]
+       resolves it; give the query up to it. *)
+    List.exists
+      (fun (s : Plan.agg_spec) ->
+         match s.Plan.arg_expr with
+         | Some e -> plan_expr_has_subquery e
+         | None -> false)
+      aggs
   then Lwt.return None
   else if
     not
@@ -12871,6 +12931,29 @@ and stream_aggregate
           | other -> Lwt.return other)
         proj
     in
+    (* #664: an aggregate's ARGUMENT is an expression too (#488), so it can
+       carry a subquery, and until #664 [Sema.bind_agg_arg] refused the shape
+       outright because nothing here resolved it — a surviving [P_subquery]
+       reads [Row.V_null], so [SUM(qty * (SELECT 2))] would have answered NULL
+       and [COUNT(price * (SELECT 1))] 0, with no error.  An uncorrelated one
+       resolves once, here, exactly as [having] and [proj] do just above. *)
+    let* aggs =
+      Lwt_list.map_s
+        (fun (spec : Plan.agg_spec) ->
+           match spec.Plan.arg_expr with
+           | None -> Lwt.return spec
+           | Some e ->
+             let+ e' = pre_eval_subquery clock store params cat e in
+             { spec with Plan.arg_expr = Some e' })
+        aggs
+    in
+    (* An ARGUMENT's subquery that survives that is correlated against the
+       INPUT row — the argument is evaluated once per scanned row, before any
+       grouping — so it resolves the way [stream_expr_project] resolves a
+       correlated projection, and NOT the way [resolve] below resolves
+       [having]/[proj] against the aggregate output row.  Two different rules
+       for two different rows; see [agg_arg_subquery_refusal]. *)
+    let* rows, aggs = resolve_correlated_agg_args clock params store mode cat ~s_opt child rows aggs in
     (* What survives is correlated. Its only possible source in the aggregate
        output row is a grouped column; [binding_of_group_cols] maps those back
        to their table and column, and anything else is refused rather than
@@ -12971,6 +13054,164 @@ and stream_aggregate
           with_windows
     in
     Lwt.return (Lwt_stream.of_list final_rows)
+
+(* #664: resolve the subqueries that survive [pre_eval_subquery] in an
+   aggregate ARGUMENT.  The identity on both inputs unless one actually
+   survived — which is the uncommon case, so the ordinary aggregate pays one
+   [List.exists] over the spec list and nothing else.
+
+   Such a subquery is correlated against the INPUT row, so its correlation
+   source is the child's own scan metas and the resolution runs per input row:
+   [stream_expr_project]'s treatment of a correlated projection, not
+   [stream_aggregate]'s per-group one.
+
+   The resolved ARGUMENT VALUE is parked in a hidden trailing slot appended to
+   its row, and the spec's [arg_expr] is rewritten to read that slot.  Doing it
+   once up front rather than inside the accumulator is what keeps the subquery
+   evaluated exactly once per row: #491's DISTINCT filter and [aggregate_one]
+   both read the argument through [agg_arg_getter], and a [P_subquery] left in
+   place would have had to be resolved separately by each.
+
+   Widening the row is safe because everything that indexes an input row here
+   indexes a PREFIX of it — [group_cols] are child ordinals — and the aggregate
+   OUTPUT row is built as [group_key @ agg_vals], so no hidden slot can escape
+   into a result. *)
+and resolve_correlated_agg_args
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      ~s_opt
+      child
+      (rows : Row.t list)
+      (aggs : Plan.agg_spec list)
+  : (Row.t list * Plan.agg_spec list) Lwt.t
+  =
+  if not (List.exists agg_arg_is_correlated aggs)
+  then Lwt.return (rows, aggs)
+  else (
+    match get_outer_scan_metas child with
+    (* Checked before the empty-[rows] shortcut below: an unresolvable
+       correlation must be refused on an empty table too, or the refusal would
+       depend on the data. *)
+    | None -> Lwt.fail_with (agg_arg_subquery_refusal ())
+    | Some metas ->
+      widen_rows_for_agg_args clock params store mode cat ~s_opt ~metas rows aggs)
+
+and agg_arg_is_correlated (s : Plan.agg_spec) : bool =
+  match s.Plan.arg_expr with
+  | Some e -> plan_expr_has_subquery e
+  | None -> false
+
+and widen_rows_for_agg_args
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      ~s_opt
+      ~(metas : outer_input list)
+      (rows : Row.t list)
+      (aggs : Plan.agg_spec list)
+  : (Row.t list * Plan.agg_spec list) Lwt.t
+  =
+  match rows with
+  (* No row ever reaches [agg_arg_getter], so there is no argument to
+     evaluate and nothing to widen.  The specs keep their [P_subquery], which
+     is unreachable rather than wrong. *)
+  | [] -> Lwt.return (rows, aggs)
+  | first :: _ ->
+    (* Rows from one child are uniform in width, as everywhere else here. *)
+    let width = Array.length first in
+    let corr =
+      List.filter_map
+        (fun (s : Plan.agg_spec) ->
+           if agg_arg_is_correlated s then s.Plan.arg_expr else None)
+        aggs
+    in
+    (* #493: the same parameterize-and-cache treatment [stream_expr_project]
+       gets, and for the same reason — the cardinality here is the INPUT rows,
+       which is that issue's hot path.  ([stream_aggregate]'s own [resolve]
+       passes [cache:None] because it runs per GROUP, which is bounded much
+       lower.) *)
+    let parameterized = not (List.exists plan_expr_subqueries_use_param corr) in
+    let cache = if parameterized then Some (Hashtbl.create 4) else None in
+    let base = Array.length params in
+    let* rows' =
+      Lwt_list.map_s
+        (fun (row : Row.t) ->
+           let bnd =
+             if parameterized
+             then param_binding_of_metas ~base ~row_len:(Array.length row) metas
+             else binding_of_metas metas row
+           in
+           let row_params = if parameterized then Array.append params row else params in
+           let+ vals =
+             Lwt_list.map_s
+               (resolve_agg_arg_for_row
+                  clock
+                  params
+                  store
+                  mode
+                  cat
+                  ~s_opt
+                  ~cache
+                  ~bnd
+                  ~row_params
+                  row)
+               corr
+           in
+           Array.append row (Array.of_list vals))
+        rows
+    in
+    Lwt.return (rows', rewrite_agg_arg_slots width aggs)
+
+(* One correlated argument, one input row: substitute the outer references from
+   that row, resolve, and evaluate to the value the accumulator will consume.
+   A subquery that survives the substitution named an outer column no input
+   carries, or an ambiguous one; refuse rather than let [eval_expr] answer NULL
+   for it, exactly as [stream_expr_project] does. *)
+and resolve_agg_arg_for_row
+      clock
+      params
+      store
+      mode
+      (cat : Cat.t option)
+      ~s_opt
+      ~cache
+      ~bnd
+      ~row_params
+      (row : Row.t)
+      (e : Plan.expr)
+  : Row.value Lwt.t
+  =
+  let e_subst = substitute_outer_in_plan_expr ~cat bnd e in
+  let* resolved =
+    with_pull_context ~stats:s_opt ~mode ~cache (fun () ->
+      pre_eval_subquery clock store row_params cat e_subst)
+  in
+  if plan_expr_has_subquery resolved
+  then Lwt.fail_with (agg_arg_subquery_refusal ())
+  else Lwt.return (eval_expr clock params row resolved)
+
+(* The specs' half of [widen_rows_for_agg_args]: each correlated argument reads
+   the hidden slot its value was appended to.  Iterates [aggs] in the same
+   order, under the same predicate, as the [corr] list the values were computed
+   from — that correspondence is what makes the slot numbers line up, so the
+   two must not be given separate filters. *)
+and rewrite_agg_arg_slots (width : int) (aggs : Plan.agg_spec list)
+  : Plan.agg_spec list
+  =
+  let slot = ref (width - 1) in
+  List.map
+    (fun (s : Plan.agg_spec) ->
+       if not (agg_arg_is_correlated s)
+       then s
+       else (
+         incr slot;
+         { s with Plan.arg_expr = Some (Plan.P_col !slot) }))
+    aggs
 
 and read_fts_content_rows store mode (fts_meta : Cat.fts_table_meta)
   : (int64 * string list) list Lwt.t

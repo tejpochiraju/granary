@@ -291,29 +291,57 @@ let nested_aggregates_are_rejected () =
     rejected db "SELECT SUM(price + SUM(qty)) FROM li" ~needle:"nested")
 ;;
 
-(* Review finding on PR #658, and the reason it was blocking: making the
-   argument a general expression makes SUBQUERIES bindable there, and nothing
-   ever resolves one for an agg spec — [stream_aggregate] pre-evaluates
-   subqueries in HAVING and the projection, the #247 fast path does it for the
-   filter, and [eval_expr] answers NULL for a surviving [P_subquery].  So these
-   would have returned NULL (or 0 for COUNT) with no error whatsoever, in a
-   shape that was refused outright before #488.  They must be refused at BIND
-   time — the error arrives from [Db.query] before a single row is read, so it
-   cannot depend on the data.  Resolving them properly is #664. *)
-let subqueries_in_an_aggregate_argument_are_rejected () =
+(* Review finding on PR #658: making the argument a general expression makes
+   SUBQUERIES bindable there, and nothing resolved one for an agg spec — a
+   surviving [P_subquery] reads NULL, so these answered NULL (or 0 for COUNT)
+   with no error whatsoever, in a shape that was refused outright before #488.
+   #658 contained that with a bind-time refusal; #664 replaced the refusal with
+   the evaluation it was standing in for, so this case now asserts the ANSWER.
+
+   The same six spellings are kept, exactly so that the conversion is visible
+   in the diff rather than looking like a deleted test. Their end-to-end
+   coverage — correlated arguments, DISTINCT, the fast-path give-up, the
+   refusal that remains for an unresolvable correlation — lives in
+   test_agg_arg_subquery_664.ml. *)
+let subqueries_in_an_aggregate_argument_are_evaluated () =
   with_db (fun db ->
     seed db;
-    List.iter
-      (fun sql -> rejected db sql ~needle:"subquer")
-      [ "SELECT SUM(qty * (SELECT 2)) FROM li"
-      ; "SELECT COUNT(price * (SELECT 1)) FROM li"
-      ; "SELECT SUM(CASE WHEN EXISTS (SELECT 1 FROM li) THEN qty ELSE 0 END) FROM li"
-      ; "SELECT SUM(CASE WHEN qty IN (SELECT qty FROM li) THEN 1 ELSE 0 END) FROM li"
-      ; (* HAVING and ORDER BY route through the same binder, so the refusal
-           must reach them too *)
-        "SELECT k FROM li GROUP BY k HAVING SUM(qty * (SELECT 2)) > 0"
-      ; "SELECT k FROM li GROUP BY k ORDER BY SUM(qty * (SELECT 2)) DESC"
-      ])
+    let one sql = num (rows db sql |> List.hd).(0) in
+    (* qty sums to 15; price counts 5 rows. *)
+    Alcotest.(check (float 1e-9))
+      "SUM(qty * (SELECT 2))"
+      30.0
+      (one "SELECT SUM(qty * (SELECT 2)) FROM li");
+    Alcotest.(check (float 1e-9))
+      "COUNT(price * (SELECT 1))"
+      5.0
+      (one "SELECT COUNT(price * (SELECT 1)) FROM li");
+    Alcotest.(check (float 1e-9))
+      "EXISTS inside the argument"
+      15.0
+      (one "SELECT SUM(CASE WHEN EXISTS (SELECT 1 FROM li) THEN qty ELSE 0 END) FROM li");
+    Alcotest.(check (float 1e-9))
+      "IN (SELECT ...) inside the argument"
+      5.0
+      (one "SELECT SUM(CASE WHEN qty IN (SELECT qty FROM li) THEN 1 ELSE 0 END) FROM li");
+    (* HAVING and ORDER BY route through the same binder, so the evaluation
+       must reach them too. Revenue per k: a 300, b 350, c 10. *)
+    Alcotest.(check (list string))
+      "HAVING over a subquery-bearing argument"
+      [ "a"; "b"; "c" ]
+      (List.sort
+         compare
+         (List.map
+            (fun r -> text r.(0))
+            (rows db "SELECT k FROM li GROUP BY k HAVING SUM(qty * (SELECT 2)) > 0")));
+    Alcotest.(check (list string))
+      "ORDER BY over a subquery-bearing argument"
+      [ "b"; "a"; "c" ]
+      (List.map
+         (fun r -> text r.(0))
+         (rows
+            db
+            "SELECT k FROM li GROUP BY k ORDER BY SUM(price * (SELECT 1)) DESC")))
 ;;
 
 (* ---------------------------------------------------------------- #495 *)
@@ -518,9 +546,9 @@ let () =
             `Quick
             nested_aggregates_are_rejected
         ; Alcotest.test_case
-            "a subquery in the argument is rejected at bind time"
+            "a subquery in the argument is evaluated (#664)"
             `Quick
-            subqueries_in_an_aggregate_argument_are_rejected
+            subqueries_in_an_aggregate_argument_are_evaluated
         ] )
     ; ( "#495 ORDER BY over an aggregate"
       , [ Alcotest.test_case
