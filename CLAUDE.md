@@ -718,8 +718,9 @@ EOF
   column on a `USING COLUMNSTORE` table (#660) — which is what makes the ordering
   question not arise at those two sites, rather than a claim that it was already
   answered there. Wiring the computation into the write arms alone was rejected:
-  it fixes STORED and leaves VIRTUAL reading NULL, deepening the asymmetry. If
-  #660 lifts the refusal, both halves are owed at once.
+  it fixes STORED and leaves VIRTUAL reading NULL, deepening the asymmetry.
+  #660 has since decided to **keep** that refusal — see the next entry — so if
+  it is ever lifted, both halves are owed at once.
 
   Consequences worth knowing: a generated expression that genuinely evaluates to
   NULL is still rejected — on INSERT (skipped under `OR IGNORE`, per #599, since
@@ -728,6 +729,50 @@ EOF
   form). `not_null_scan_cols` (`PRAGMA not_null_check`/`repair`) deliberately did
   **not** follow — it reports on cells already on disk whose only repair is to
   rewrite them, which is meaningless for a column never read from disk. Pinned by
+  `test/test_not_null_629.ml`.
+- **A GENERATED column on a `USING COLUMNSTORE` table stays refused at DDL
+  (#660, decided 2026-09-03).** This closes the question the #629 entry above
+  leaves open: the refusal *is* the answer, not a placeholder for wiring the
+  computation in. `Sema.bind_create`'s `using_columnstore` branch scans the
+  column definitions for `generated_as <> None` and returns `Unsupported
+  "GENERATED column '<c>' in a COLUMNSTORE table (the columnar path never
+  computes one; it would read NULL forever)"`. It is the only entry point that
+  needs a guard: `Sema.bind_alter_table` refuses **every** `ALTER TABLE` on a
+  columnar table outright, so `ADD COLUMN ... GENERATED` cannot reach one by
+  the back door.
+
+  **Wiring it up was rejected because it is two changes, and either one alone
+  is worse than the refusal.** Supporting generated columns here needs both of:
+  - STORED — `compute_stored_generated_cols` called on both columnar write
+    arms, `Op_insert` and `Op_insert_select` in `Exec.execute_with_count`, which
+    build the row with `Array.make n_cols Row.V_null`, fill only the
+    caller-supplied ordinals, and hand it straight to `Col_store.insert_rows`;
+  - VIRTUAL — a recompute on the read side, since `Exec.stream_col_seq_scan`
+    returns `Col_store.to_row_seq` rows verbatim.
+
+  Doing the write half alone fixes STORED and leaves VIRTUAL reading NULL on
+  every scan: the asymmetry deepened rather than removed, and still a silent
+  wrong answer rather than an error. The refusal, by contrast, makes #629's
+  enumerated NOT NULL invariant hold at the two columnar enforcement sites
+  vacuously — with no generated column reachable there, "STORED is materialised
+  before the check" is true because there is nothing to materialise.
+
+  **What the refusal costs, against what the silence cost.** Before #629 nothing
+  rejected the DDL, so such a column read NULL forever in *both* storage
+  classes with no error ever surfaced, and a `NOT NULL` one made the table
+  uninsertable. There is no migration concern for existing databases: any such
+  table already held nothing but NULLs in those columns.
+
+  **What a future implementer owes if the refusal is lifted.** Both halves in
+  the same change — not the write arms first — plus any other columnar path
+  that hands rows out. The columnar store has no per-row decode hook to hang a
+  recompute on, so every read site has to opt in individually, which is the
+  "enumerate the sites, do not state a rule" trap #567 documented and the reason
+  a partial implementation is not an improvement on refusing. `RETURNING` is
+  *not* one of those sites today: all three columnar `RETURNING` arms in
+  `Exec.to_stream` fail with `"RETURNING is not supported on columnar tables"`,
+  so it owes nothing while that stands — and joins the list the day it does not.
+  Pinned by `columnstore_refuses_generated_columns` in
   `test/test_not_null_629.ml`.
 - **An explicit `ON CONFLICT` target beats the statement's conflict-resolution
   modifier, for the index it names (#639, decided 2026-08-06).** The modifier
