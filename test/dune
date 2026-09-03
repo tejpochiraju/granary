@@ -1773,3 +1773,18 @@
  (name test_compound_order_by_662)
  (modules test_compound_order_by_662)
  (libraries granary alcotest lwt.unix))
+
+; #613: a freshly created WAL draws its (salt, seed) generation marker from a
+; real entropy source, not from an un-self-init'd Random whose state is the same
+; in every process.
+
+(test
+ (name test_wal_salt_613)
+ (modules test_wal_salt_613)
+ (libraries
+  granary.storage
+  alcotest
+  lwt.unix
+  cstruct
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))

@@ -16,7 +16,10 @@ val provider : Granary.Db.file_provider
 
 (** Install the process-wide file provider (see
     {!Granary.Db.set_file_provider}) so ATTACH and VACUUM can touch the local
-    filesystem.  Idempotent; also called automatically by {!open_file} /
+    filesystem, and seed the process-wide [Mirage_crypto_rng] from the default
+    Unix entropy source (#613) so a freshly created WAL gets a per-file
+    generation marker rather than the one every un-self-init'd [Random] hands
+    out. Idempotent; also called automatically by {!open_file} /
     {!open_file_wal}. *)
 val install : unit -> unit
 
