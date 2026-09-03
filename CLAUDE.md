@@ -2924,6 +2924,98 @@ property (including a rolled-back `CREATE`), and `Db.plan`; the removal itself
 is not testable — it is a compile-time property, checked by every consumer that
 builds.
 
+### An FTS `rank` projection scores the whole match set (#689)
+
+`Exec.fts_score_matches` runs over the FULL, deduplicated match set before the
+sort that LIMIT/OFFSET slices, and it has to: BM25 needs every score before any
+window can be chosen. That is the difference from #687, which could move the
+content fetch *after* the slice because content is not an input to the score.
+So the work here is made cheaper, never truncated.
+
+**The issue's own premise did not survive measurement, and that is the main
+thing to know before touching this again.** #689 was filed against the per-match
+`S.get` for `doc_length`. That call is real and exactly one per match, but on a
+4 000-match single-term rank query it accounted for ~0.9 ms of a 288.8 ms query.
+The other 99% was `List.assoc_opt rowid term_pl` inside the score fold — a linear
+probe of the term's posting list, once per match, i.e. O(matches x postings x
+terms), quadratic in the match count and allocating nothing to show for it. It is
+now a hashtable, built from the reversed list with `Hashtbl.replace` so the FIRST
+entry for a rowid wins exactly as `List.assoc_opt` did.
+
+Measured (`Gc.minor_words` around the query, plus wall time; allocation is the
+load-insensitive half):
+
+| dense rank query, 4 000 matches | before | after |
+|---|---|---|
+| in-memory, wall | 288.8 ms | 10.4 ms |
+| file-backed, wall | 442.2 ms | 17.1 ms |
+| file-backed, minor words | 4 370 993 | 2 555 495 |
+
+Per-query allocation is now exactly linear in the match count (641 825 /
+1 283 014 / 2 555 495 words at 1 000 / 2 000 / 4 000 file-backed matches — 2.00x
+then 1.99x per doubling). The residual wall-clock superlinearity on disk is the
+pager working set, not the algorithm.
+
+**The `doc_length` fetch itself is now gated on selectivity, and the gate is
+computed for free.** `Exec.fts_doc_lengths` picks between one point `S.get` per
+match (`fts_doclen_by_get`) and ONE cursor walk across the doc-length key region
+(`fts_doclen_by_scan`). The region is contiguous — `fts_doclen_prefix` is
+`"\x00\x01"`, the stats key `"\x00\x00"` sorts below it and every posting key
+`term ++ "\x00" ++ rowid` above it — and holds exactly one entry per indexed
+document. Both strategies read the same keys with the same value decoder and the
+same "absent means length 1" default, so they are interchangeable and the choice
+is purely about cost.
+
+`Exec.fts_doclen_scan_ratio` (default 5, overridden by
+`Exec.set_fts_doclen_scan_ratio`) is the threshold, derived rather than guessed: a point `S.get` for one doc length costs ~573 minor words on the B-tree
+backend against ~112 for a `seek_next` step, so the walk wins while it crosses
+fewer than ~5.1 entries per match. Both sides of that trade are real and were
+measured — 3 matches among 4 000 documents cost 642 663 minor words walking
+against 19 325 point-fetching (33x worse), while 4 000 matches among 4 000 cost
+2 555 506 walking against 4 399 003 (1.7x better). The estimate the gate uses is
+`min(rowid span, total_docs)`, an UPPER bound on the entries a walk would cross,
+and both halves are already in hand — `total_docs` from the `read_fts_stats` the
+function already does, the bounds from a fold over an in-memory list — so the
+walk is taken only when even its worst case is cheaper, at no I/O cost to decide.
+
+**On the `Mem` backend the two strategies measure the same** (324.9 vs 323.4
+words per match, observed), because `S.get` there is a `Bytes_map` lookup rather
+than a root-to-leaf descent. Any measurement of this must be **file-backed** or
+it reports that the change does nothing;
+`test/test_fts_doclen_689.ml`'s `measure_words_per_match` is (963.9 -> 646.7
+words per match at 800 documents). That measurement **prints and does not
+assert** unless `GRANARY_FTS_DOCLEN_MAX_WORDS_PER_MATCH` is set, and it is armed
+in **no** workflow — one box and one backend is not enough to put a ceiling on
+every PR, which is the convention `test_scan_borrow_481` establishes. It is not
+in the gate tables above because it is not a gate anywhere.
+
+The rest of that file is load-insensitive by construction: every case runs the
+same statement over the same data twice, once with `set_fts_doclen_scan_ratio 0`
+(never walk) and once with it forced high, and requires byte-identical output —
+same rows, same order, same rank floats. That setter exists for exactly that and
+production never calls it. The deletion case matters: `fts_deindex_document`
+removes a doc-length key, so the walk crosses a HOLE the point path simply never
+asks about.
+
+**Two things in the issue text are wrong and should not be carried forward.**
+There is no `ORDER BY rank`: `Sema.bind_select` refuses **any** `ORDER BY` on an
+FTS table ("FTS tables do not support this query form"), and a bare `MATCH` does
+**not** sort by score — `include_rank` is false there and no scoring runs at all.
+The only spelling that reaches this code is projecting the virtual `rank` column,
+`SELECT body, rank FROM doc WHERE doc MATCH '...'`, which implicitly sorts by
+score descending.
+
+**What was NOT done, deliberately.** The issue's option 1 — storing `doc_length`
+inline with every posting entry — is still an on-disk format change needing a
+version tag on `fts_table_meta` (there is none) plus a migration, and the
+measurement no longer justifies it: after the two fixes above, the doc-length
+fetch is a minority of a query that is 25x faster than when the issue was
+written. And `fts_execute_query`'s `FQ_and` intersection is still
+`List.mem r ids` over rowid lists, so a MULTI-term `MATCH` is still quadratic
+(0.974 s -> 0.185 s at 4 000 matches from the score-fold fix alone, but still
+~4x per doubling). That is the same defect class in a different function and is
+tracked separately.
+
 ### One `Db.t`, one explicit transaction (#555)
 
 A `Db.t` carries a single explicit-transaction slot and every statement resolves

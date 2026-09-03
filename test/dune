@@ -2162,3 +2162,14 @@
  (name test_reactive_view_compound_750)
  (modules test_reactive_view_compound_750)
  (libraries granary alcotest lwt.unix))
+
+(test
+ (name test_fts_doclen_689)
+ (modules test_fts_doclen_689)
+ (libraries
+  granary
+  granary.sql
+  granary.unix
+  granary.encoding
+  alcotest
+  lwt.unix))
