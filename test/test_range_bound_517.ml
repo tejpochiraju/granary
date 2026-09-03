@@ -503,15 +503,23 @@ let null_between_bound_matches_nothing () =
    equal in BOTH directions, so the predicate was true for every row while the
    equivalent inequalities were right all along.
 
-   Both halves of that sentence are HISTORY now, and in different ways.
-   [compare_values] stopped answering 0 for cross-type pairs in #579 — it
-   orders by storage class. The predicate path is [cmp_result], which still
-   ends in a catch-all answering false for every cross-CLASS pair (#734), so
-   what these cases pin is unchanged; the attribution to [compare_values] was
-   the imprecise part. Each case pins
-   the [BETWEEN] against both other spellings of the same test: the inequality
-   pair it must equal, and the unoptimizable foil that takes no seek path, so
-   neither the evaluator nor the seek can drift on its own. *)
+   That sentence is HISTORY, in three stages. [compare_values] stopped
+   answering 0 for cross-type pairs in #579 — it orders by storage class — but
+   the predicate path is [cmp_result], which kept its own catch-all answering
+   false for every cross-CLASS pair until #734 routed it through
+   [compare_values] too. So a cross-class end is now ORDERED: on an integer
+   column every number is below every text, which makes [o <= 'x'] true for
+   every row and [o >= 'x'] false for every row. The [~expect] on the
+   "one text end" case below moved from 0 to 201 for exactly that reason.
+
+   {b Granary applies no column affinity to a comparison operand}, so a text
+   literal against an integer column stays text; sqlite3 would coerce '119' to
+   119 and answer 20 there. That divergence is pre-existing and unchanged in
+   kind by #734 — only the granary-side number moved.
+
+   Each case pins the [BETWEEN] against both other spellings of the same test:
+   the inequality pair it must equal, and the unoptimizable foil that takes no
+   seek path, so neither the evaluator nor the seek can drift on its own. *)
 let cross_type_between_agrees_with_inequalities () =
   with_db (fun db ->
     seed db;
@@ -527,8 +535,10 @@ let cross_type_between_agrees_with_inequalities () =
       (* #527: how much of the 300-row group the seek had to read. *)
       Alcotest.(check int) (name ^ " : examined") expect_examined (examined db between)
     in
-    (* Text ends against an integer column: no row compares in range, and there
-       is nothing to promote a text bound into, so the whole group is read. *)
+    (* Text ends against an integer column: the lower end is decisively false
+       (every number sorts below every text, #734), so no row is in range even
+       though the upper end is true for all of them. There is nothing to promote
+       a text bound into, so the whole group is read. *)
     check
       "text ends"
       ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN '100' AND '119'"
@@ -543,14 +553,17 @@ let cross_type_between_agrees_with_inequalities () =
       ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100.5 AND o <= 119.5"
       ~expect:19
       ~expect_examined:19;
-    (* One end the column's type, the other not: the mismatched end alone must
-       still be able to reject a row.  Only the integer end bounds the seek, so
-       the walk runs to the end of the group. *)
+    (* One end the column's type, the other not: the mismatched end must be
+       evaluated on its own terms rather than folded away.  Since #734 it is
+       ORDERED — [o <= '119'] is true for every integer — so the integer end
+       alone decides, and 100..300 comes back.  Only that end bounds the seek,
+       so the walk runs to the end of the group and examines the same 201.
+       Before #734 this returned 0 rows out of the same 201 keys. *)
     check
       "one text end"
       ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND '119'"
       ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100 AND o <= '119'"
-      ~expect:0
+      ~expect:201
       ~expect_examined:201;
     check
       "one real end"
@@ -865,23 +878,31 @@ let real_bound_narrows_an_integer_column () =
 (* The regime the 1..300 cases above cannot reach: integer keys above 2^53,
    where a float ULP exceeds 1 and [Int64.to_float] stops being injective.
 
-   The residual predicate does NOT compare an integer column against a real
-   bound exactly — [cmp_result] promotes the integer with [Int64.to_float] —
-   so it admits every key whose ROUNDED value satisfies the bound, including
-   keys strictly on the wrong side of it.
+   {b #733 changed what these cases pin, and it is worth knowing which half.}
 
-   Naming [cmp_result] here is load-bearing since #579, not pedantry.
-   [compare_values] now compares int-vs-real EXACTLY ([cmp_int_real]), and
-   [cmp_result] handles that pair in its own arm without ever reaching
-   [compare_values] — which is exactly why #579 did not disturb the widening
-   below. If #733 makes [cmp_result] exact too, this widening and these cases
-   have to be revisited in the same change: an exact predicate is NARROWER than
-   the seek, which is the safe direction only for as long as a residual
-   actually runs over the seek's output.  A seek built with plain
-   [ceil]/[floor] sorts past exactly those keys and drops their rows, which is
-   a regression against the declined-bound scan.  The promotion therefore
-   widens by one float step first, and these cases are what pin that: each has
-   at least one row the naive rounding excludes and the foil returns.
+   Until #733 the residual predicate did NOT compare an integer column against
+   a real bound exactly: [cmp_result] promoted the integer with
+   [Int64.to_float] and so admitted every key whose ROUNDED value satisfied the
+   bound, including keys strictly on the wrong side of it.  The [pred]/[succ]
+   widening in [range_bound_key] existed to keep the seek a superset of THAT,
+   and each case here had at least one row plain [ceil]/[floor] would have
+   dropped.
+
+   [cmp_result] now delegates to [compare_values], which compares exactly
+   ([cmp_int_real]), so those rows are gone from the expectations — the
+   ROW-agreement halves below no longer discriminate the widening, because both
+   the bounded query and the foil reject the same keys.  The [expect_examined]
+   halves still do: the seek visits the widened span and the residual then
+   rejects what it must, so removing the widening would change the counts
+   (2 -> 1 at the 2^62 lower bound) without changing a single row.  That is the
+   whole point — the widening is now a deliberate over-approximation, safe
+   because [Planner.range_for_index] never marks a range conjunct consumed, so
+   a residual always runs.  Do not "fix" a count here by deleting the widening
+   without reading [range_bound_key]'s own comment first.
+
+   End-to-end agreement with sqlite3 for this regime lives in
+   {!test/test_cmp_result_733.ml}, which asserts absolute rows rather than
+   bounded-vs-foil.
 
    The grid values, all chosen so that the stored key and its float image
    straddle the bound:
@@ -1318,11 +1339,16 @@ let prop_cross_type_range_bound_matches_foil =
 ;;
 
 (* #527: the same agreement, but drawn from the regime where a float ULP exceeds
-   1 and [Int64.to_float] stops being injective — which is the only place the
-   [pred]/[succ] widening does any work.  The property above draws [o] in 1..12,
-   so it would pass with plain [ceil]/[floor]; this one fails on every base
-   without the widening, and exists so the coverage cannot decay if someone
-   later edits the rounding.
+   1 and [Int64.to_float] stops being injective.  The property above draws [o]
+   in 1..12, where the promotion is exact and nothing interesting happens.
+
+   #733: this used to fail on every base without the [pred]/[succ] widening,
+   because the residual predicate was itself inexact and admitted keys plain
+   [ceil]/[floor] sought past.  The residual is exact now, so this property
+   compares two exact spellings and would pass without the widening too — what
+   it still guards is that the SEEK cannot go narrower than the predicate,
+   which is the direction that loses rows.  The examined counts in
+   {!real_bound_on_a_huge_integer_column} are what pin the widening itself.
 
    Both neighbourhoods are on their own grid: at 2^53 the ULP is 2, at 2^62 it
    is 1024, and the stored keys straddle the representable points either way.

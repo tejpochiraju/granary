@@ -227,14 +227,13 @@ let row_value_to_index_value : Row.value -> Index_key.value = function
    index-key comparison cannot disagree about which CLASS sorts first.  They
    still disagree about INTEGER vs REAL *within* the numeric class, because the
    encoding gives them separate tags and therefore puts every integer before
-   every real — but that disagreement is pre-existing and already true of
-   [cmp_result], the predicate comparator, which promotes numerically.
+   every real — but that disagreement is pre-existing.
 
-   Within the numeric class, making [compare_values] promote reduces the number
-   of distinct answers in the engine rather than adding one.  Across classes it
-   does NOT: [cmp_result] answers false for every cross-class predicate, so
-   this change trades a cross-numeric disagreement for a cross-class one.  See
-   #734, and the note on [compare_values] itself. *)
+   #733/#734: [cmp_result], the WHERE-predicate comparator, now delegates to
+   [compare_values] outright, so this rank order is the one the ordering
+   operators apply too.  It briefly was not — #579 gave [compare_values] a
+   class order while [cmp_result] still answered false for every cross-class
+   predicate — and that gap is what those two issues closed. *)
 let value_class_rank (v : Row.value) : int =
   match v with
   | Row.V_null -> 0
@@ -312,18 +311,15 @@ let cmp_int_real (x : int64) (y : float) : int =
      [NULL < NaN < every number] — NULL is a lower CLASS, so both halves hold);
    - across classes, order by {!value_class_rank}.
 
-   Only the FIRST of those is a rule [cmp_result] already applied, and it
-   applies it in a weaker form.  Do not read this comment as saying the two
-   comparators now agree — they do not, in two separate ways, and both are
-   filed:
-
-   - [cmp_result] promotes int-vs-real through [Int64.to_float], so above 2^53
-     it still answers equal for pairs this function now separates.  #733.
-   - [cmp_result] ends in [| _ -> Row.V_int 0L], i.e. EVERY cross-class
-     predicate is false — it applies no class order at all.  So after this
-     change [ORDER BY] says [5 < 'abc'] while [WHERE] says that is false.
-     That WHERE/sort disagreement is NEW in the cross-class direction, traded
-     for removing the cross-numeric one this issue is about.  #734.
+   #733/#734: [cmp_result] — the [<]/[<=]/[>]/[>=] half of a WHERE predicate —
+   is now this function plus three-valued NULL handling, so an ORDER BY and a
+   WHERE can no longer disagree about where a value sits.  For one release they
+   did, in two separate ways: [cmp_result] promoted int-vs-real through
+   [Int64.to_float] (inexact above 2^53, #733) and ended in
+   [| _ -> Row.V_int 0L], applying no class order at all (#734).  Both are
+   gone.  What is NOT routed through here is [Eq]/[Ne], whose cross-NUMERIC
+   answers still differ from this function's — see {!cmp_result} and #738 for
+   why that one cannot move without the index equality path moving with it.
 
    DISTINCT is deliberately NOT routed through this: it dedups on [row_key]'s
    string rendering, where [1] and [1.0] are different keys.  So DISTINCT and
@@ -340,10 +336,9 @@ let compare_values (a : Row.value) (b : Row.value) : int =
   | Row.V_real x, Row.V_real y -> Float.compare x y
   | Row.V_text x, Row.V_text y -> String.compare x y
   | Row.V_blob x, Row.V_blob y -> Bytes.compare x y
-  (* #579: numeric promotion, but EXACT — see {!cmp_int_real}.  [cmp_result]
-     promotes through [Int64.to_float] instead and is therefore still inexact
-     above 2^53; that residual is #733, and it is why the claim below is about
-     this function rather than about the engine. *)
+  (* #579: numeric promotion, but EXACT — see {!cmp_int_real}.  #733 routed
+     [cmp_result] through here, so the WHERE predicate is exact at these
+     magnitudes too. *)
   | Row.V_int x, Row.V_real y -> cmp_int_real x y
   | Row.V_real x, Row.V_int y -> -cmp_int_real y x
   (* #579: everything left is a genuine cross-CLASS pair (number/text/blob in
@@ -351,8 +346,7 @@ let compare_values (a : Row.value) (b : Row.value) : int =
 
      With the exact numeric arm above, this function IS a total order — every
      pair of values is related, antisymmetrically and transitively — for every
-     input, with no magnitude caveat.  That claim is about THIS function only;
-     see the note above for the two ways [cmp_result] still differs. *)
+     input, with no magnitude caveat. *)
   | _, _ -> Int.compare (value_class_rank a) (value_class_rank b)
 ;;
 
@@ -1792,7 +1786,23 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
     else if (not ln) && not rn
     then Row.V_int 0L
     else Row.V_null
-  (* NULL compared with anything yields NULL (3-valued logic). Cross-type → false. *)
+  (* NULL compared with anything yields NULL (3-valued logic).
+
+     [Eq] and [Ne] do NOT go through {!cmp_result}, and that is deliberate:
+     [cmp_result] delegates to {!compare_values}, which since #579 compares an
+     int64 against a float EXACTLY and would therefore make [1 = 1.0] true —
+     while {!index_lookup_values} still answers "matches nothing" for that pair
+     and the access path CONSUMES an equality conjunct.  The two would then
+     disagree about which rows a seek covers, which loses rows.  The
+     cross-NUMERIC arms below keep the pre-existing (SQLite-divergent) "false"
+     answer until both levels move together; that is #738.
+
+     Cross-CLASS is settled, though, and both arms now say what sqlite3 says:
+     values of different storage classes are never equal, so [=] is false and
+     [<>] is TRUE.  [<>] answering false as well (the old shared catch-all) was
+     not a divergence so much as an incoherence — [5 = 'abc'] and [5 <> 'abc']
+     were both 0.  No access path recognises a [<>] conjunct, so unlike [=]
+     this half has no index-side counterpart to move with it (#734). *)
   | Plan.Eq ->
     (match lv, rv with
      | Row.V_null, _ | _, Row.V_null -> Row.V_null
@@ -1803,6 +1813,8 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
        if Float.equal x y then Row.V_int 1L else Row.V_int 0L
      | Row.V_blob x, Row.V_blob y ->
        if Bytes.equal x y then Row.V_int 1L else Row.V_int 0L
+     (* #738: cross-numeric, pending the index-side change.  Cross-class: never
+        equal, which is also sqlite3's answer. *)
      | _ -> Row.V_int 0L)
   | Plan.Ne ->
     (match lv, rv with
@@ -1814,7 +1826,11 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
        if Float.equal x y then Row.V_int 0L else Row.V_int 1L
      | Row.V_blob x, Row.V_blob y ->
        if Bytes.equal x y then Row.V_int 0L else Row.V_int 1L
-     | _ -> Row.V_int 0L)
+     (* #738: cross-numeric keeps its pre-existing answer, so that this change
+        moves exactly the cross-class case and nothing else. *)
+     | Row.V_int _, Row.V_real _ | Row.V_real _, Row.V_int _ -> Row.V_int 0L
+     (* #734: different storage classes are never equal, so they always differ. *)
+     | _ -> Row.V_int 1L)
   | Plan.Lt -> cmp_result lv rv (fun c -> c < 0)
   | Plan.Le -> cmp_result lv rv (fun c -> c <= 0)
   | Plan.Gt -> cmp_result lv rv (fun c -> c > 0)
@@ -1874,22 +1890,47 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
        Row.V_int (if glob_match pat 0 str 0 then 1L else 0L)
      | _ -> Row.V_null)
 
+(* #733/#734: the ordering half of a WHERE predicate ([<], [<=], [>], [>=]) is
+   {!compare_values} with three-valued logic layered on top, and nothing else.
+
+   It used to be a third comparator with its own two disagreements:
+
+   - it promoted int-vs-real through [Int64.to_float], so above 2^53 the
+     PREDICATE answered equal for pairs the ORDERING separated (#733).
+     sqlite3 answers 1 for [9007199254740993 > 9007199254740992.0]; this
+     answered 0.
+   - it ended in [| _ -> Row.V_int 0L], applying no cross-CLASS order at all,
+     so [ORDER BY] said [5 < 'abc'] while [WHERE] said that was false
+     (#734).  sqlite3 answers 1, and NUMBER < TEXT < BLOB is exactly
+     {!value_class_rank}'s order and exactly
+     {!Granary_encoding.Index_key.encode_value}'s tag-byte order — so
+     [cmp_result] was the wrong half of the disagreement, not [compare_values].
+
+   NULL stays a separate arm above the delegation and must: [compare_values]
+   ORDERS NULL below everything (it is a total order, so it has to answer
+   something), whereas a predicate over a NULL is UNKNOWN.  Routing NULL
+   through it would make [WHERE x < 5] true for a NULL [x].
+
+   {b The index path is unaffected and the reason is worth keeping.}
+   {!range_bound_key}'s [pred]/[succ] widening was written to compensate for
+   the inexact promotion this removes, so the seek is now WIDER than the
+   predicate needs rather than exactly as wide.  That is the safe direction:
+   {!Granary_sql.Planner.range_for_index} never marks a range conjunct
+   consumed, so a residual filter runs over every row a seek yields.  See
+   {!range_bound_key}'s own comment for the full argument.
+
+   [Eq] and [Ne] are deliberately NOT routed through here — they have their own
+   arms in {!eval_binop}, and their cross-CLASS answers (false / true) already
+   agree with both sqlite3 and the class order.  Their cross-NUMERIC hole
+   ([1 = 1.0] answers 0, [1 <> 2.0] answers 0) is a separate defect that cannot
+   be fixed here alone: an equality conjunct IS consumed by the access path, so
+   {!index_lookup_values} and {!stream_rowid_lookup} would have to learn the
+   cross-numeric case in the same change or rows would be lost.  Tracked
+   as #738. *)
 and cmp_result lv rv pred =
   match lv, rv with
   | Row.V_null, _ | _, Row.V_null -> Row.V_null
-  | Row.V_int _, Row.V_int _
-  | Row.V_text _, Row.V_text _
-  | Row.V_real _, Row.V_real _
-  | Row.V_blob _, Row.V_blob _ ->
-    if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
-  (* Cross-type numeric comparisons: promote int to float *)
-  | Row.V_real a, Row.V_int b ->
-    let c = Float.compare a (Int64.to_float b) in
-    if pred c then Row.V_int 1L else Row.V_int 0L
-  | Row.V_int a, Row.V_real b ->
-    let c = Float.compare (Int64.to_float a) b in
-    if pred c then Row.V_int 1L else Row.V_int 0L
-  | _ -> Row.V_int 0L (* cross-type comparisons are false *)
+  | _, _ -> if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
 
 and arith_op lv rv int_f float_f =
   match lv, rv with
@@ -3101,23 +3142,41 @@ let two_pow_63 = 9.2233720368547758e18
     runs on every yielded row, so no strictness has to be tracked.
 
     On an integer column the rounding is {b widened by one float step first}
-    ([ceil (pred f)], [floor (succ f)]), and that step is load-bearing.  Plain
-    [ceil]/[floor] would be exact under {i exact} int-vs-real comparison — but
-    that is not the semantics the residual predicate uses.  [compare_values]
-    compares [V_int a] against [V_real b] as [Float.compare (Int64.to_float a)
-    b], so it admits every int64 whose {i rounded} float value satisfies the
-    bound.  Above 2^53, where a float ULP exceeds 1, many integers strictly
-    below a lower bound [f] round up onto [f] and so qualify; [ceil f] would
-    seek past all of them and drop those rows (256 of them at 2^62, ~1024 near
-    2^63).  One [pred]/[succ] step covers the whole gap, because it moves the
-    bound by exactly one ULP — the same grid spacing that creates it — while
-    below 2^53 it moves by less than 1 and so changes nothing after the
-    [ceil]/[floor]: [ceil (pred 100.5) = 101], [ceil (pred 280.0) = 280],
-    [floor (succ 119.5) = 119], [floor (succ 280.0) = 280].  The seek is thus a
-    superset of the predicate under the predicate's own semantics, at a cost of
-    at most one extra key below 2^53.  Above it the widening admits up to a
-    whole ULP of extra keys (512 at 2^62), but those are not waste: they are
-    exactly the keys the predicate accepts, which is why the widening exists.
+    ([ceil (pred f)], [floor (succ f)]).  {b Read the history before touching
+    it: the widening is now a deliberate over-approximation, not a
+    requirement.}
+
+    It was written against the {i inexact} residual predicate that existed
+    until #733.  [cmp_result] then compared [V_int a] against [V_real b] as
+    [Float.compare (Int64.to_float a) b], so it admitted every int64 whose
+    {i rounded} float value satisfied the bound.  Above 2^53, where a float ULP
+    exceeds 1, many integers strictly below a lower bound [f] rounded up onto
+    [f] and so qualified; [ceil f] would have sought past all of them and
+    dropped those rows (256 of them at 2^62, ~1024 near 2^63).  One
+    [pred]/[succ] step covers exactly that gap, moving the bound by one ULP —
+    the same grid spacing that creates it — while below 2^53 it moves by less
+    than 1 and so changes nothing after the [ceil]/[floor]:
+    [ceil (pred 100.5) = 101], [ceil (pred 280.0) = 280],
+    [floor (succ 119.5) = 119], [floor (succ 280.0) = 280].
+
+    Since #733 the residual predicate compares exactly ({!cmp_int_real}), so
+    plain [ceil]/[floor] {i would} now be the tight boundary and the widening
+    buys at most one ULP of keys the predicate then rejects (512 at 2^62, one
+    key below 2^53).  It is kept, for two reasons:
+
+    - the seek stays a {b superset} of the qualifying set under {i both} the
+      old and the new predicate semantics.  A widened seek plus an exact
+      residual is safe (superset in, correct filter after); a tightened seek is
+      only safe while the predicate stays exact, so keeping the widening means
+      no future change to {!cmp_result} can silently turn this into a rows-lost
+      bug.
+    - the safety of tightening it rests entirely on
+      {!Granary_sql.Planner.range_for_index} never marking a range conjunct
+      consumed, i.e. on a residual filter always running over the seek's
+      output.  That holds today and is asserted there, but it is a property of
+      another module; over-approximating here does not depend on it.
+
+    Tightening it is a separable performance change, not a correctness one.
 
     The result must be an [IK_int] on an integer column, not the real as given:
     {!Granary_encoding.Index_key.encode_value} emits a distinct leading type tag
@@ -3138,9 +3197,11 @@ let two_pow_63 = 9.2233720368547758e18
     A NaN is deliberately {i not} declined: it goes through as [IK_real nan],
     which {!Granary_encoding.Index_key.encode_value} writes as its own
     single-byte [0x01] tag (#578), sorting below every INTEGER/REAL key but
-    above NULL's [0x00].  That matches the residual predicate, whose
-    [Float.compare] also orders NaN below every number, and is the existing
-    behaviour for a same-type NaN bound — see [range_seek_bounds]. *)
+    above NULL's [0x00].  That matches the residual predicate, which since
+    #733 orders NaN below every number through {!cmp_int_real} (#536's decided
+    rule) rather than through [Float.compare]'s accident — the same answer, now
+    by construction — and is the existing behaviour for a same-type NaN bound —
+    see [range_seek_bounds]. *)
 let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
   : Index_key.value option
   =
@@ -3213,7 +3274,8 @@ let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
     The mirror case is a NaN {i bound}, which encodes to its own one byte and
     so makes [past_end] fire on the very first key whose tag is [0x02] or
     above — the seek returns nothing, which agrees with the residual
-    predicate, whose [Float.compare] also orders NaN below every number.
+    predicate, which also orders NaN below every number (#536, via
+    {!cmp_int_real} since #733).
 
     #527: an end whose type is not the column's is not simply dropped — a
     numeric one is promoted across the int/real boundary by {!range_bound_key},

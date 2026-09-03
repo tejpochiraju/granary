@@ -336,8 +336,11 @@ EOF
   no rows. Granary instead keeps NaN as a real value in a total order, and
   diverges from SQLite in **both** directions — `o >= NaN` returns every row,
   `o <= NaN` returns none. Two mechanisms have to agree for that to be sound:
-  - `Exec.cmp_result` promotes cross-type numeric operands with `Float.compare`,
-    whose total order puts NaN below `neg_infinity`.
+  - `Exec.cmp_result`, the WHERE-predicate comparator, orders NaN below every
+    number. It used to get that from `Float.compare`'s total order, which puts
+    NaN below `neg_infinity`; since #733 it delegates to `Exec.compare_values`,
+    whose `cmp_int_real` states the rule explicitly instead. Same answer, now by
+    construction rather than by coincidence.
   - `Index_key.encode_value` gives NaN its own single-byte tag `0x01` — below
     INTEGER's `0x02` and REAL's `0x03`, above NULL's `0x00` — so it also sorts
     below every other number, and *distinctly from* NULL.
@@ -421,27 +424,72 @@ EOF
   every input, with no magnitude caveat** — but that claim is about that
   function, not about the engine.
 
-  **`cmp_result`, the WHERE-predicate comparator, is NOT the same function and
-  differs in two filed ways.** Do not restate the rule as "the two comparators
-  now agree":
-  - it promotes int-vs-real through `Int64.to_float`, so above 2^53 a
-    *predicate* still answers equal for a pair the *ordering* separates
+  **`cmp_result`, the WHERE-predicate comparator, IS that function now — #733
+  and #734 (both fixed, 2026-09-03).** For one release it was a third
+  comparator differing in two filed ways, and the fix was to delete both
+  differences rather than to reconcile them:
+  - it promoted int-vs-real through `Int64.to_float`, so above 2^53 a
+    *predicate* answered equal for a pair the *ordering* separated
     (**#733**);
-  - it ends in `| _ -> Row.V_int 0L`, so every cross-class predicate is false —
-    it applies no class order at all. After #579, `ORDER BY` says `5 < 'abc'`
-    while `WHERE` says that is false. sqlite3 answers `1`, so `cmp_result` is
-    the wrong half (**#734**). This WHERE/sort disagreement is *new* in the
-    cross-class direction and was traded for removing the cross-numeric one.
+  - it ended in `| _ -> Row.V_int 0L`, so every cross-class predicate was
+    false — it applied no class order at all. After #579, `ORDER BY` said
+    `5 < 'abc'` while `WHERE` said that was false. sqlite3 answers `1`, so
+    `cmp_result` was the wrong half (**#734**).
 
-  **Why #579 did not disturb the index path, which is the thing to check before
-  touching this again.** `range_bound_key`'s `pred`/`succ` widening exists to
-  compensate for an *inexact* residual predicate, and its doc comment is
-  written against exactly that. It is unaffected because the residual runs
-  through `cmp_result`, which handles int-vs-real in its own arm and never
-  reaches `compare_values` for that pair. If #733 makes `cmp_result` exact, the
-  widening and `test_range_bound_517`'s above-2^53 cases are owed the same
-  change: an exact predicate is *narrower* than the seek, which is safe only
-  for as long as a residual actually runs over the seek's output.
+  `cmp_result` is now `compare_values` with three-valued logic layered on top:
+
+  ```ocaml
+  and cmp_result lv rv pred =
+    match lv, rv with
+    | Row.V_null, _ | _, Row.V_null -> Row.V_null
+    | _, _ -> if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
+  ```
+
+  **The NULL arm must stay above the delegation.** `compare_values` *orders*
+  NULL below everything, because a total order has to answer something; a
+  predicate over a NULL is UNKNOWN. Routing NULL through it would make
+  `WHERE x < 5` true for a NULL `x`.
+
+  **`=` and `<>` are not routed through it, and that is the remaining
+  residual (#738).** They keep their own arms in `eval_binop`. Across classes
+  they now agree with everything else — never equal, therefore always
+  different, which is sqlite3's answer and which `<>` did *not* give before
+  #734 (it shared `=`'s catch-all, so `5 = 'abc'` and `5 <> 'abc'` were both
+  false). Across the two *numeric* types they still answer false in both
+  directions: `1 = 1.0` is `0` and `1 <> 2.0` is `0`, where sqlite3 says `1`
+  and `1`. **That one cannot be fixed alone.** An equality conjunct *is*
+  consumed by the access path, and both `Exec.index_lookup_values` and
+  `Exec.stream_rowid_lookup` answer "matches nothing" for a cross-numeric
+  pair; making `=` exact without moving them loses rows silently. #738 has the
+  full scope.
+
+  **Why the index path survived #733, which is the thing to check before
+  touching this again.** `range_bound_key`'s `pred`/`succ` widening was written
+  to compensate for the *inexact* residual predicate — below it,
+  `ceil`/`floor` sought past keys that qualified under rounding. An exact
+  predicate is *narrower* than the seek, which is safe only for as long as a
+  residual actually runs over the seek's output. **It does, and the reason is
+  load-bearing: `Planner.range_for_index` never marks a range conjunct
+  consumed** (an *equality* conjunct is — see #738 above, which is the same
+  distinction seen from the other side). So the widening is now a deliberate
+  over-approximation: kept, not removed, because a widened seek is sound under
+  *both* the old and the new predicate semantics, and tightening it would make
+  soundness depend on that planner property holding forever. Tightening it is a
+  separable performance change worth at most one ULP of keys.
+
+  What that cost the tests: `test_range_bound_517`'s
+  `real_bound_on_a_huge_integer_column` compares a seeked query against an
+  unoptimizable foil, and **both sides moved together**, so its row assertions
+  no longer discriminate the widening — its `expect_examined` counts still do
+  (2 → 1 at the 2^62 lower bound without it). Absolute, sqlite3-checked rows for
+  that regime live in `test/test_cmp_result_733.ml` instead. One expectation in
+  that file genuinely inverted: `cross_type_between_agrees_with_inequalities`'s
+  "one text end" case (`o BETWEEN 100 AND '119'`) went from 0 rows to 201,
+  because `o <= '119'` is now true for every integer instead of false. **Granary
+  applies no column affinity to a comparison operand**, so a text literal stays
+  text where sqlite3 would coerce `'119'` to `119` and answer 20; that
+  divergence is pre-existing and unchanged in kind — only the granary-side
+  number moved.
 
   **Unremarked improvement, recorded so nobody finds it by bisect.**
   `compare_values` is not only an ordering function: nine call sites read
@@ -456,12 +504,13 @@ EOF
   **DISTINCT is deliberately not routed through it** and still dedups on
   `row_key`'s string rendering, where `1` and `1.0` are different keys. So
   DISTINCT and GROUP BY still disagree about whether an int and a numerically
-  equal real are one key. That is the residual: there are still four
-  independent value comparators in the tree (`compare_values`, `cmp_result`,
-  `row_key`'s string rendering, and `Reactive_view.value_compare` — the last of
-  which orders all ints before all reals) and they do not all agree. Folding
-  them into one is what #579's own "Note" asks for and is not what that fix
-  did. Pinned by `test/test_compare_values_579.ml`. Two of its cases carry the
+  equal real are one key. That is the residual, and #733/#734 narrowed it
+  rather than closing it: `cmp_result` is no longer an independent comparator,
+  so the count is down from four to three (`compare_values`, `row_key`'s string
+  rendering, and `Reactive_view.value_compare` — the last of which orders all
+  ints before all reals), plus `eval_binop`'s own `=`/`<>` arms, which still
+  differ from `compare_values` across the numeric types (#738). Folding them
+  into one is what #579's own "Note" asks for and is still not done. Pinned by `test/test_compare_values_579.ml`. Two of its cases carry the
   weight: `the_falsifying_triple_is_ordered_exactly` pins the three >2^53
   comparisons directly, and the QCheck `compare_values is transitive over
   random triples` property fuzzes for the same class of defect. **That
