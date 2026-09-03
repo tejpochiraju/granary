@@ -2056,3 +2056,24 @@
   alcotest
   lwt.unix
   unix))
+
+; #486: comma-separated FROM lists and derived tables. The parser desugars a
+; comma into an INNER join on the literal 1 and a derived table into a
+; non-recursive CTE; the planner recognises that literal and borrows an
+; equi-join key from WHERE so an implicit join is not a cartesian product.
+; Needs granary.catalog / granary.store / granary.encoding / granary.sql for
+; the plan-shape assertions, which build a catalog and call Planner.plan
+; directly.
+
+(test
+ (name test_from_list_derived_486)
+ (modules test_from_list_derived_486)
+ (libraries
+  granary
+  granary.encoding
+  granary.store
+  granary.catalog
+  granary.sql
+  alcotest
+  lwt.unix
+  unix))

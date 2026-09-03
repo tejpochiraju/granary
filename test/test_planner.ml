@@ -1169,7 +1169,17 @@ let plan_rollback () =
 ;;
 
 (** recognise_eq_col_col fallback (line 46): inputs that are NOT BE_col = BE_col
-    return None. We verify by giving plan_join an ON that is a literal. *)
+    return None. We verify by giving plan_join an ON that is a literal.
+
+    #486: [ON 1] is now the {i specific} literal a comma-separated FROM item
+    and a CROSS JOIN desugar to, so [Planner.on_is_trivially_true] recognises
+    it and {!Planner.general_on_join} no longer wraps the cartesian join in an
+    [Op_filter] evaluating the constant [1] once per row.  With no WHERE clause
+    there is no equi-join key to borrow either, so this stays the cartesian
+    hash join ([left_key = -1]) it always was — only the useless filter is
+    gone.  [plan_join_general_on] above still pins the [Op_filter] for a
+    general ON predicate that is not trivially true, which is the arm this one
+    used to stand in for. *)
 let plan_join_on_literal () =
   let cat = make_join_cat () in
   let stmt =
@@ -1195,8 +1205,9 @@ let plan_join_on_literal () =
   in
   let bound = bind cat stmt in
   match Planner.plan ~cat bound with
-  | Plan.Op_project { child = Plan.Op_filter { child = Plan.Op_hash_join _; _ }; _ } -> ()
-  | _ -> Alcotest.fail "expected Op_filter wrapping Op_hash_join for literal ON"
+  | Plan.Op_project { child = Plan.Op_hash_join { left_key = -1; right_key = -1; _ }; _ }
+    -> ()
+  | _ -> Alcotest.fail "expected an unfiltered cartesian Op_hash_join for literal ON"
 ;;
 
 (* ------------------------------------------------------------------ *)

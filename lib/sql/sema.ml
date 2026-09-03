@@ -1829,6 +1829,26 @@ let reject_reserved_name name =
   else Ok ()
 ;;
 
+(* #486: a derived table in FROM position desugars to an [S_with_cte] wrapper
+   around the SELECT.  A plain [CREATE VIEW] is fine with that -- its body is
+   re-bound on every use -- but a REACTIVE view is not:
+   [Reactive_view.base_tables_of] reads the base tables off the [S_select] at
+   the root of the body and answers [] for anything else, so the view would be
+   registered with no base table, no write would ever invalidate it, and it
+   would serve its first snapshot forever.  Refuse rather than register a view
+   that silently stops tracking.  Lifting this means teaching
+   [base_tables_of] to look through the wrapper AND collect the CTE
+   definition's own tables -- both halves, or the same silence comes back. *)
+let reject_reactive_derived_table (query : Ast.stmt) =
+  match query with
+  | Ast.S_with_cte _ ->
+    Error
+      (Unsupported
+         "CREATE REACTIVE VIEW does not support a derived table in FROM (#486): the view \
+          would never be invalidated")
+  | _ -> Ok ()
+;;
+
 let bind_create
       cat
       ~name
@@ -5653,7 +5673,10 @@ and bind_expanded ~views ~named_params ~param_counter cat stmt =
         | Error e -> Lwt.return (Error e)
         | Ok _ -> Lwt.return (Ok (BS_create_view { name; query }))))
   | Ast.S_create_reactive_view { name; query; refresh } ->
-    (match reject_reserved_name name with
+    (match
+       Result.bind (reject_reserved_name name) (fun () ->
+         reject_reactive_derived_table query)
+     with
      | Error e -> Lwt.return (Error e)
      | Ok () ->
        let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in

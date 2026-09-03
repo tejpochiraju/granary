@@ -520,6 +520,53 @@ let recognise_eq_col_col = function
   | _ -> None
 ;;
 
+(** #486: is this ON predicate the trivially-true literal that
+    [Parser.cross_join_on] gives a comma-separated FROM item and a
+    [CROSS JOIN]?
+
+    Recognising it by value rather than by a third [Ast.join_kind] is what
+    keeps every other consumer of [Ast.join_clause] correct by construction. A
+    hand-written [JOIN b ON 1] is indistinguishable from the sugar and is
+    treated identically, which is right: both say the pairing is unrestricted
+    at this level. *)
+let on_is_trivially_true = function
+  | Sema.BE_lit (Ast.L_int 1L) -> true
+  | _ -> false
+;;
+
+(** #486: an equi-join key for an unrestricted INNER join, taken from the WHERE
+    clause.
+
+    [FROM a, b WHERE a.x = b.y] is an unrestricted join whose restriction sits
+    in WHERE, and {!general_on_join} would build the whole cartesian product
+    and filter it afterwards — the shape the issue warns about, and O(N*M) on
+    the TPC-H queries this exists for. Handing the join one WHERE equality that
+    spans the two sides makes it a hash join or a nested-loop probe instead.
+
+    {b Why this cannot change the answer, and why it is INNER-only.} The ON
+    predicate is true for every pair, so the join emits the cartesian product
+    and [chain_joins] then applies the whole WHERE clause above it. Joining on
+    a conjunct of that same WHERE clause emits a subset of the same product,
+    and every pair removed is one the filter above would have removed anyway —
+    NULL keys included, since [a.x = b.y] is unknown, hence false, on them. For
+    a [`Left] join the ON predicate {i is} the match test, so narrowing it
+    would suppress null-extended rows that must be emitted; this is never
+    consulted there.
+
+    The chosen conjunct stays in the WHERE clause, so it is evaluated twice.
+    That is deliberate: it costs one comparison per surviving row and removes
+    any need to reason about which conjuncts the join consumed. *)
+let where_join_key ~n_left ~right_offset ~n_right_cols conjuncts =
+  let spans a b = a < n_left && b >= right_offset && b < right_offset + n_right_cols in
+  List.find_map
+    (fun c ->
+       match recognise_eq_col_col c with
+       | Some (a, b) when spans a b -> Some (a, b - right_offset)
+       | Some (a, b) when spans b a -> Some (b, a - right_offset)
+       | _ -> None)
+    conjuncts
+;;
+
 (* Negative [tree_id]s are sentinels for synthesized scans with no real B-tree:
    -1 = CTE, -2 = sqlite_master, -3 = sqlite_sequence.  Each is materialized by a
    dedicated plan op rather than a [Op_seq_scan] over a stored tree. *)
@@ -2038,7 +2085,10 @@ let general_on_join ~left_op ~right_op ~on ~join_kind ~right_offset ~n_right_col
   in
   match join_kind with
   | `Left -> cart
-  | `Inner -> Plan.Op_filter { pred; child = cart }
+  | `Inner ->
+    (* #486: a comma-separated FROM item's ON predicate is the literal [1], so
+       the filter would be a per-row evaluation of a constant. *)
+    if on_is_trivially_true on then cart else Plan.Op_filter { pred; child = cart }
 ;;
 
 (** Plan a JOIN.  [left_op] produces left-table rows; we wrap it with
@@ -2173,13 +2223,23 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
         ; n_right_cols
         }
   in
+  (* #486: an unrestricted INNER join borrows an equi-join key from the WHERE
+     clause rather than building the cartesian product. *)
+  let implicit_key () =
+    if on_is_trivially_true bj.on && join_kind = `Inner
+    then where_join_key ~n_left ~right_offset ~n_right_cols where_conjuncts
+    else None
+  in
   match recognise_eq_col_col bj.on with
   | Some (a, b) when a < n_left && b >= right_offset ->
     mk_with_left_col_right_col a (b - right_offset)
   | Some (a, b) when b < n_left && a >= right_offset ->
     mk_with_left_col_right_col b (a - right_offset)
   | _ ->
-    general_on_join ~left_op ~right_op ~on:bj.on ~join_kind ~right_offset ~n_right_cols
+    (match implicit_key () with
+     | Some (left_col, right_col) -> mk_with_left_col_right_col left_col right_col
+     | None ->
+       general_on_join ~left_op ~right_op ~on:bj.on ~join_kind ~right_offset ~n_right_cols)
 ;;
 
 let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
