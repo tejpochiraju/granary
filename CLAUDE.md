@@ -271,6 +271,24 @@ functions that merlint *requires*; the two linters collide there. Full
 instructions, the current baseline, and the OCaml 5.4 fork pin are in
 `docs/DEAD_CODE.md`.
 
+**Some exports exist only so a guard can hold onto them, and pruning one breaks
+nothing — which is what makes it dangerous (#619).**
+`Granary_encoding.Sql_ident.sql_keywords` / `.is_sql_keyword` /
+`.ident_needs_quoting` have no caller in `lib/` outside their own module: the
+engine reaches for `quote_ident` alone. Their consumer is the `lexer.mll` drift
+guard in `test/test_ident_quoting_572.ml`, which re-derives the keyword table
+from the lexer and fails when the two have drifted — the only thing binding the
+list to the lexer now that they live in different libraries. Delete them and
+nothing goes red; the guard simply stops guarding, and the next reserved word
+added to the lexer corrupts stored SQL again (#577's failure mode through the
+back door). `docs/DEAD_CODE.md` carries the never-prune list, and each such
+value carries the reason in its own `.mli`.
+
+Until #619 the guard held that handle one indirection further out, through
+`Ast.sql_keywords` / `Ast.is_sql_keyword` / `Ast.ident_needs_quoting`, which had
+**no** consumers in `lib/` at all. Those three aliases are gone; `Ast.quote_ident`
+stays, because `Ast.expr_to_sql` calls it and `Exec.quote_ident` re-exports it.
+
 ### Coverage
 
 `dune runtest --instrument-with bisect_ppx` works (verified on 5.4). Two

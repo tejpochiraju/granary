@@ -61,6 +61,28 @@ triaging first are:
 | `Wal.frame.frame_idx` | |
 | `Ast.binop_to_sql`, `Ast.func_to_sql` | |
 
+## Never prune: exports whose only consumer is a guard
+
+Some exported values exist so that a *test* can hold onto something the engine
+itself never calls. `dead_code_analyzer` cannot see that, and reports them like
+any other unused export — but deleting them does not fail anything, which is
+exactly what makes them dangerous to prune: the guard stops guarding and
+nothing says so.
+
+| Symbol | Why it must stay |
+|---|---|
+| `Granary_encoding.Sql_ident.sql_keywords`, `.is_sql_keyword`, `.ident_needs_quoting` | The handle the `lexer.mll` drift guard in `test/test_ident_quoting_572.ml` holds. That guard re-derives the keyword table from `lexer.mll` and fails when it and `sql_keywords` have drifted apart — the only thing binding the two now that they live in different libraries. Delete them and the next reserved word added to the lexer corrupts stored SQL again (#577, #572, #619). |
+
+Before triaging a finding on this list, read the `(** ... *)` note at the top
+of the owning `.mli`. Anything added here owes itself the same note next to the
+values, not only a row in this table — the table is the index, the `.mli` is
+where the reader actually is (#619).
+
+Note that the 2026-07-31 baseline above was taken before #619 removed the three
+`Granary_sql.Ast` aliases (`sql_keywords`, `is_sql_keyword`,
+`ident_needs_quoting`) that used to forward to these, so a rerun should report
+up to three fewer unused exports.
+
 ## Why it is not a gate
 
 **It collides with merlint.** merlint's `pp`-for-abstract-`type t` rule

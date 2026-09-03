@@ -21,11 +21,20 @@
       live by watching it reject a bad row, not merely by watching a good row
       succeed);
     - a drift guard that re-derives the reserved-word list from [lexer.mll],
-      since a keyword added there and not here reopens the whole class. *)
+      since a keyword added there and not here reopens the whole class.
+
+    #619: that drift guard reads the keyword list from
+    {!Granary_encoding.Sql_ident} directly. It used to go through aliases in
+    [Granary_sql.Ast], which had no consumer in [lib/] at all and which a
+    [dead_code_analyzer] pruning pass would therefore have deleted — taking the
+    only binding between the keyword list and the lexer with them, silently.
+    Naming the owning module here keeps the "do not prune" note (at the top of
+    [sql_ident.mli]) next to the values it is about. *)
 
 open Lwt.Syntax
 open Granary_sql
 module Db = Granary.Db
+module Sql_ident = Granary_encoding.Sql_ident
 
 let run = Lwt_main.run
 
@@ -137,7 +146,7 @@ let interesting_names =
 let test_roundtrip_interesting () = List.iter roundtrip_col interesting_names
 
 (* Every reserved word, not just a hand-picked handful. *)
-let test_roundtrip_every_keyword () = List.iter roundtrip_col Ast.sql_keywords
+let test_roundtrip_every_keyword () = List.iter roundtrip_col Sql_ident.sql_keywords
 
 let test_roundtrip_tbl_col () =
   let e = parse_check "\"my tbl\".\"my col\" > 0" in
@@ -469,18 +478,18 @@ let test_keyword_list_matches_lexer () =
   | None -> Alcotest.skip ()
   | Some kws ->
     Alcotest.(check bool) "lexer.mll yielded keywords" true (List.length kws > 100);
-    let missing = List.filter (fun k -> not (Ast.is_sql_keyword k)) kws in
+    let missing = List.filter (fun k -> not (Sql_ident.is_sql_keyword k)) kws in
     if missing <> []
     then
       Alcotest.failf
-        "lexer.mll has keywords Ast.sql_keywords does not: %s — add them, or a column \
-         with one of those names silently loses its quoting again (#572)"
+        "lexer.mll has keywords Sql_ident.sql_keywords does not: %s — add them, or a \
+         column with one of those names silently loses its quoting again (#572)"
         (String.concat ", " missing);
     (* and nothing in our list that the lexer does not actually reserve: a
        stale entry only costs cosmetic over-quoting, so this is a warning-grade
        check kept honest by the same source of truth. *)
-    let extra = List.filter (fun k -> not (List.mem k kws)) Ast.sql_keywords in
-    Alcotest.(check (list string)) "no stale entries in Ast.sql_keywords" [] extra
+    let extra = List.filter (fun k -> not (List.mem k kws)) Sql_ident.sql_keywords in
+    Alcotest.(check (list string)) "no stale entries in Sql_ident.sql_keywords" [] extra
 ;;
 
 let () =

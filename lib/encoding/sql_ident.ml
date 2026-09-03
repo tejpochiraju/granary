@@ -19,7 +19,14 @@
    there is one implementation, not three.
 
    [test_ident_quoting_572.ml] re-derives {!sql_keywords} from [lexer.mll] and
-   fails if the two have drifted apart. *)
+   fails if the two have drifted apart.
+
+   #619: that guard is the ONLY consumer of [sql_keywords], [is_sql_keyword]
+   and [ident_needs_quoting] outside this module, so [dead_code_analyzer] flags
+   all three.  Do not prune them — see the note at the top of [sql_ident.mli].
+   Deleting them does not fail anything; it silently unbinds the keyword list
+   from the lexer, which is #577's failure mode reintroduced through the back
+   door. *)
 
 (* #572: every word the lexer maps to a keyword token instead of [IDENT].  A
    column or table with one of these names can only ever have been spelled
