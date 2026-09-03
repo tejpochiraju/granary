@@ -1773,3 +1773,14 @@
  (name test_compound_order_by_662)
  (modules test_compound_order_by_662)
  (libraries granary alcotest lwt.unix))
+
+; #665: #568's SUM/AVG numeric check now reaches #488's EXPRESSION argument —
+; the third spelling, which had no column ordinal and so escaped it entirely.
+; Pins the bind-time refusal, the empty-table half a runtime check cannot have,
+; and the deliberate boundary where a statically indeterminate argument still
+; fails at runtime.
+
+(test
+ (name test_agg_numeric_665)
+ (modules test_agg_numeric_665)
+ (libraries granary alcotest lwt.unix))

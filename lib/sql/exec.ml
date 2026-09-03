@@ -9772,6 +9772,34 @@ let agg_subquery_refusal () =
    values, and nothing else of the input rows."
 ;;
 
+(** #665: the message the SUM/AVG accumulators fail with when a value that is
+    not a number reaches them.
+
+    [Sema.agg_arg_static_ty] now refuses at BIND time every SUM/AVG argument
+    whose type is statically known to be TEXT or BLOB, in all three spellings
+    — a bare column, a wrapped aggregate, and #488's expression argument.  What
+    still reaches here is an argument whose type could not be known until a row
+    arrived: a scalar function, a bound parameter, a subquery, or a CASE whose
+    arms disagree.  For those the offending value's storage class is the whole
+    diagnostic the caller gets, so it is named rather than left to be guessed.
+
+    Defined at the top level rather than inside the accumulator's [let rec]
+    group on purpose: it returns ['a] and is instantiated at three different
+    types (the [int64] and [float] SUM folds, and [unit] in
+    [make_agg_acc_over_values]), which monomorphic recursion inside the group
+    would not allow. *)
+let agg_non_numeric_failure (what : string) (v : Row.value) =
+  let cls =
+    match v with
+    | Row.V_null -> "NULL"
+    | Row.V_int _ -> "INTEGER"
+    | Row.V_real _ -> "REAL"
+    | Row.V_text _ -> "TEXT"
+    | Row.V_blob _ -> "BLOB"
+  in
+  failwith (Printf.sprintf "%s on non-numeric value (%s)" what cls)
+;;
+
 (** #558: bind outer column references appearing in an aggregate projection or
     HAVING against one aggregate {i output} row, whose leading
     [List.length group_cols] slots hold the grouped columns in order.  [metas]
@@ -11920,7 +11948,7 @@ and agg_sum (vals : Row.value list) : Row.value =
            | Row.V_null -> acc
            | Row.V_int n -> acc +. Int64.to_float n
            | Row.V_real f -> acc +. f
-           | _ -> failwith "SUM on non-numeric value")
+           | v -> agg_non_numeric_failure "SUM" v)
         0.0
         vals
     in
@@ -11932,7 +11960,7 @@ and agg_sum (vals : Row.value list) : Row.value =
            match v with
            | Row.V_null -> acc
            | Row.V_int n -> Int64.add acc n
-           | _ -> failwith "SUM on non-numeric value")
+           | v -> agg_non_numeric_failure "SUM" v)
         0L
         vals
     in
@@ -11989,7 +12017,7 @@ and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.va
            | Row.V_null -> s, n
            | Row.V_int x -> s +. Int64.to_float x, n + 1
            | Row.V_real f -> s +. f, n + 1
-           | _ -> failwith "AVG on non-numeric value")
+           | v -> agg_non_numeric_failure "AVG" v)
         (0.0, 0)
         vals
     in
@@ -12188,7 +12216,7 @@ and make_agg_acc_over_values (func : Ast.agg_func)
           any_nn := true;
           any_real := true;
           sf := !sf +. f
-        | _ -> failwith "SUM on non-numeric value")
+        | v -> agg_non_numeric_failure "SUM" v)
     , fun () ->
         if not !any_nn
         then Row.V_null
@@ -12207,7 +12235,7 @@ and make_agg_acc_over_values (func : Ast.agg_func)
         | Row.V_real f ->
           sf := !sf +. f;
           incr n
-        | _ -> failwith "AVG on non-numeric value")
+        | v -> agg_non_numeric_failure "AVG" v)
     , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
   | Ast.Agg_min ->
     let best = ref Row.V_null in

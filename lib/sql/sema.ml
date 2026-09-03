@@ -1089,20 +1089,105 @@ let rec expr_has_subquery_ast = function
    only if a row actually reached the accumulator (an empty group succeeded).
    Granary's strict column typing is a deliberate divergence from SQLite, so a
    check a pair of parentheses can turn off is worse than no check: it now
-   lives on the single ordinal-resolution path every binder shares. *)
+   lives on the single ordinal-resolution path every binder shares.
+
+   #665: #488 then added a THIRD spelling — an aggregate over an arbitrary
+   expression — which has no column ordinal at all and so escaped this
+   entirely.  [agg_numeric_ty_check] below is the shared verdict and
+   [agg_arg_static_ty] is the expression spelling's type source. *)
+let agg_numeric_ty_check (func : Ast.agg_func) (ty : Row.ty option)
+  : (unit, error) result
+  =
+  (* #665: the type half of the check, factored out so the ORDINAL spelling (a
+     bare column, whose type comes from the catalog) and the EXPRESSION
+     spelling (#488, whose type is inferred by [agg_arg_static_ty] below) reach
+     the same verdict through the same function rather than through two that
+     can drift.  [None] — a type that is not statically known — is always
+     [Ok]: this fires only on a type it is sure of, and the runtime
+     accumulator stays the backstop for the rest. *)
+  match func, ty with
+  | (Ast.Agg_sum | Ast.Agg_avg), Some (Row.Integer | Row.Real) -> Ok ()
+  | (Ast.Agg_sum | Ast.Agg_avg), Some t ->
+    Error (Type_mismatch { expected = Row.Real; got = t })
+  | _ -> Ok ()
+;;
+
 let agg_numeric_check
       ~(col_ty : int -> Row.ty option)
       (func : Ast.agg_func)
       (co : int option)
   : (unit, error) result
   =
-  match func, co with
-  | (Ast.Agg_sum | Ast.Agg_avg), Some i ->
-    (match col_ty i with
-     | None -> Ok () (* ordinal out of range: leave it to the caller's own error *)
-     | Some (Row.Integer | Row.Real) -> Ok ()
-     | Some t -> Error (Type_mismatch { expected = Row.Real; got = t }))
-  | _ -> Ok ()
+  (* An ordinal out of range answers [None], which is [Ok]: the caller's own
+     resolution error is the better one to report. *)
+  agg_numeric_ty_check func (Option.bind co col_ty)
+;;
+
+(* #665: the static type of an aggregate's EXPRESSION argument (#488), where
+   one can be determined at all.
+
+   This is deliberately NOT [infer_type], for two reasons:
+
+   - [infer_type] indexes a [Row.column list]; [bind_agg_arg] has only the
+     resolver's [agg_arg_col_ty] ordinal lookup, which is the same mapping in
+     function form and answers [None] out of range instead of raising.
+   - it descends into [BE_case], which [infer_type] must not.  [infer_type]'s
+     other caller is [bind_update_assignments], where a CASE arm would newly
+     reject [UPDATE t SET r = CASE WHEN c THEN 1 ELSE 2 END] on a REAL column.
+     #665 is about the aggregate argument, so the descent lives here — and the
+     issue's own headline shape is exactly a CASE, so without it option 1
+     would not catch the case it was filed for.
+
+   Every arm that cannot be sure answers [None], and [agg_numeric_ty_check]
+   treats [None] as [Ok], so this can only ever move a failure EARLIER — from
+   the runtime accumulator to bind time.  It can never reject a query that
+   would have produced an answer. *)
+let rec agg_arg_static_ty ~(col_ty : int -> Row.ty option) (e : bound_expr)
+  : Row.ty option
+  =
+  let self = agg_arg_static_ty ~col_ty in
+  match e with
+  | BE_lit l -> lit_ty l
+  | BE_col i -> col_ty i
+  | BE_neg x | BE_collate (x, _) -> self x
+  | BE_cast (_, ty) ->
+    Some
+      (match ty with
+       | Ast.Ty_int -> Row.Integer
+       | Ast.Ty_text -> Row.Text
+       | Ast.Ty_real -> Row.Real
+       | Ast.Ty_blob -> Row.Blob)
+  | BE_binop (Concat, _, _) -> Some Row.Text
+  | BE_binop ((Add | Sub | Mul | Div), a, b) ->
+    (match self a, self b with
+     | Some Row.Integer, Some Row.Integer -> Some Row.Integer
+     | Some Row.Real, _ | _, Some Row.Real -> Some Row.Real
+     | _ -> None)
+  | BE_binop
+      ( ( Eq | Ne | Lt | Le | Gt | Ge | And | Or | Bit_and | Bit_or | Lshift | Rshift
+        | Mod | Like | Glob )
+      , _
+      , _ ) -> Some Row.Integer
+  | BE_not _
+  | BE_is_null _
+  | BE_is_not_null _
+  | BE_bitnot _
+  | BE_between _
+  | BE_in _
+  | BE_match _
+  | BE_exists _
+  | BE_in_select _ -> Some Row.Integer
+  | BE_case { scrutinee = _; branches; else_ } ->
+    (* The type every arm agrees on, or [None].  A missing ELSE contributes
+       nothing: its implicit NULL is skipped by SUM and AVG exactly as a NULL
+       row value is, so it cannot make a TEXT branch legal — the same reading
+       under which [SUM(text_col)] is refused on an empty table. *)
+    let arms = List.map (fun (_, r) -> self r) branches @ List.map self (Option.to_list else_) in
+    (match arms with
+     | [] -> None
+     | t :: rest -> if List.for_all (fun u -> u = t) rest then t else None)
+  | BE_func _ | BE_param _ | BE_subquery _ | BE_excluded_col _ | BE_window_slot _
+  | BE_out_col _ -> None
 ;;
 
 (** Resolve the column ordinal of an aggregate-function argument (the input-row
@@ -1315,13 +1400,17 @@ let rec bind_expr_agg
       call #566 made).  Resolving it properly — pre-evaluating an aggregate
       ARGUMENT's subqueries the way #558 does for the projection — is #664.
 
-    **#568's SUM/AVG type check does not reach an expression argument**, and
-    that is a deliberate limit rather than an oversight: [agg_numeric_check]
-    keys off a stored column's declared type, and a computed expression has
-    none.  The consequence is that [SUM(CASE WHEN … THEN 'a' ELSE 'b' END)]
-    fails at RUNTIME with [failwith "SUM on non-numeric value"] mid-scan
-    instead of at bind time, i.e. an expression argument is a third spelling
-    checked differently from the two #568 unified.  Tracked as #665. *)
+    **#665: #568's SUM/AVG type check reaches an expression argument too.**
+    [agg_numeric_check] keys off a stored column's declared type and a computed
+    expression has none, so until #665 an expression argument was a third
+    spelling checked differently from the two #568 unified:
+    [SUM(CASE WHEN … THEN 'a' ELSE 'b' END)] failed at RUNTIME with
+    [failwith "SUM on non-numeric value"] mid-scan, and succeeded outright on
+    an empty table.  [agg_arg_static_ty] now infers the argument's type where
+    it can and hands it to the same [agg_numeric_ty_check] the ordinal
+    spelling uses.  An argument whose type is statically indeterminate — a
+    scalar function, a bound parameter — still reaches the runtime
+    accumulator, which is the only honest answer for it. *)
 and bind_agg_arg
       ~param_counter
       ~named_params
@@ -1350,7 +1439,19 @@ and bind_agg_arg
        bind_expr_agg ~param_counter ~named_params ~resolver:arg_resolver ~offset:0 e
      with
      | Error er -> Error er
-     | Ok (be, _) -> Ok (None, Some be))
+     | Ok (be, _) ->
+       (* #665: the same SUM/AVG numeric verdict the bare-column spelling gets
+          from [agg_col_ord], reached through the same [agg_numeric_ty_check]
+          — the expression's type is inferred rather than read off the
+          catalog, and an expression whose type is statically indeterminate is
+          left alone. *)
+       (match
+          agg_numeric_ty_check
+            func
+            (agg_arg_static_ty ~col_ty:resolver.agg_arg_col_ty be)
+        with
+        | Error er -> Error er
+        | Ok () -> Ok (None, Some be)))
 ;;
 
 (** Check if any subquery node appears anywhere in a [bound_expr]. *)
