@@ -312,9 +312,18 @@ type bt_state =
        auto path only): this also excludes the manual [checkpoint] path, which
        that flag never did.
 
-       Lock ORDER is [ckpt_mutex] then [t.lock], never the reverse.  Nothing
-       else in this file takes [ckpt_mutex], and no path holds [t.lock] while
-       reaching for it. *)
+       Lock ORDER is [ckpt_mutex] then [t.lock], never the reverse, and nothing
+       else in this file takes [ckpt_mutex].
+
+       ONE caller can arrive already holding [t.lock]: [PRAGMA wal_checkpoint]
+       issued inside an explicit transaction, whose [rw_begin] holds the writer
+       lock for the whole transaction.  [Rwlock] is not re-entrant, so that
+       statement parks forever — as it did before #719, at the [acquire_write]
+       the checkpoint used to take first.  What is new is only that it now
+       wedges holding [ckpt_mutex] as well, so every later checkpoint queues
+       behind it instead of latching on [autockpt_in_flight]; the connection was
+       already unusable either way.  Tracked as #740.  Do not "fix" it by
+       reversing the lock order. *)
   }
 
 let default_wal_autocheckpoint_threshold = 1000
@@ -1861,7 +1870,20 @@ let rec wait_for_readers_past
 
    Honored unconditionally, like its counterpart in [wait_for_readers_past]: a
    local reader always eventually fires [ro_end]'s broadcast, and there is no
-   equivalent of a dead standby to time out. *)
+   equivalent of a dead standby to time out.
+
+   {b The invariant has ONE hole, and it is not this gate's to close.}
+   [Rwlock.acquire_read] never blocks, so a snapshot can register at any yield
+   inside a pass — and on a store in FOLLOWER mode [ro_begin_at] registers at
+   [min committed_frames follower_ack_position], which can be BELOW the target
+   this gate just cleared.  A follower can therefore still observe a migrated
+   page through its main-file fall-through.  Pre-existing (the pre-#719
+   migration yielded with [ro_begin] equally lock-free) and unreachable from the
+   auto path, since [rw_begin] refuses writes in follower mode and only a manual
+   [checkpoint] gets there; #719 widens the window rather than opening it.  The
+   real fix is not a bigger gate — a snapshot registering below the target
+   defeats any gate — but making follower registration participate in the
+   checkpoint's exclusion.  Tracked as #739. *)
 let rec wait_for_ro_readers_past (st : bt_state) ~target =
   if st.closing
   then Lwt.return_unit
@@ -1930,11 +1952,38 @@ let rec wait_for_ro_readers_past (st : bt_state) ~target =
      one needed. *)
 
 (* #719: how many migration passes run OUTSIDE the writer lock before the
-   remainder is finished under it.  Each pass only has to cover what the
-   previous pass's concurrent commits appended, so the passes shrink fast — the
-   bound exists to guarantee termination against a writer that never stops, not
-   because convergence is expected to need it. *)
-let max_unlocked_ckpt_passes = 4
+   remainder is finished under it.
+
+   {b It is 1, and that is a MEASURED number, not a conservative guess.}  The
+   design this started from assumed the passes converge — each pass only has to
+   cover what the previous pass's concurrent commits appended, so they should
+   shrink geometrically.  They do not.  A migration pass and a committing writer
+   proceed at comparable rates (both are a stream of small yielding I/Os), so
+   pass k+1 is about as long as pass k, and every extra pass is simply more time
+   for the WAL to grow before [Wal.reset] finally runs.  The growth is LINEAR in
+   the pass count, not geometric in the other direction.
+
+   Measured with [test_wal_autocheckpoint]'s [low threshold keeps WAL bounded]
+   — 500 sequential single-key commits at [wal_autocheckpoint = 10], reading the
+   WAL's high-water mark in frames:
+
+     pre-#719 (migration under the lock)   5 frames
+     1 unlocked pass                      20 frames
+     2 unlocked passes                    80 frames
+     4 unlocked passes                   195 frames
+
+   The pre-#719 number is small precisely BECAUSE the migration held the lock:
+   no commit could append during it.  So a WAL high-water above the threshold is
+   the unavoidable price of #719, and the only question is the multiple.  One
+   pass costs 2x the threshold, which is a trigger rather than a cap and is the
+   same order the threshold already overshoots by; four costs 20x, which would
+   turn [wal_autocheckpoint = 1000] into an 80 MB WAL and a correspondingly slow
+   recovery — the unbounded-WAL failure mode #638 exists to make visible.
+
+   Keep it at 1 unless a measurement says otherwise.  Raising it does not buy a
+   smaller locked catch-up: the catch-up is whatever the LAST unlocked pass let
+   through, and every pass lets through about the same amount. *)
+let max_unlocked_ckpt_passes = 1
 
 (* Copy one WAL frame into the main file.  Split out of [migrate_ckpt_pass] so
    the pass's own loop stays flat; the two [Lwt.fail_with] messages are the ones
@@ -2363,6 +2412,22 @@ let commit_prepare_btree
    time; here we additionally persist the latest root_page for each
    touched tree into the meta-tree (whose own root we then commit via
    the header alternating-pages protocol). *)
+(* #719: the body of the background autocheckpoint fiber, named rather than
+   inlined so [maybe_autockpt_after_commit] stays within the nesting budget.
+
+   #638: [checkpoint_body] has already recorded and emitted any failure, at the
+   one place that knows the target.  Swallowing it HERE is the #638 asymmetry:
+   nobody awaits this fiber, and the commit that dispatched it has already
+   succeeded — so the failure is surfaced, never raised. *)
+let autockpt_attempt t (st : bt_state) : unit Lwt.t =
+  Lwt.catch
+    (fun () ->
+       match st.wal with
+       | None -> Lwt.return_unit
+       | Some wal -> checkpoint_body t st wal ~site:Lock_stats.Autocheckpoint)
+    (fun _exn -> Lwt.return_unit)
+;;
+
 (* After a WAL group-commit, the drainer kicks off an async autocheckpoint if
    the WAL has grown past the threshold and none is already in flight. *)
 (* #719: the dispatch guard, lifted out of [maybe_autockpt_after_commit] so that
@@ -2377,19 +2442,6 @@ let autockpt_should_skip st =
         | None -> assert false)
      < st.wal_autocheckpoint_threshold
   || st.autockpt_in_flight
-;;
-
-(* #638: [checkpoint_body] has already recorded and emitted the failure, at the
-   one place that knows the target.  Swallowing it HERE is the #638 asymmetry:
-   nobody awaits this fiber, and the commit that dispatched it has already
-   succeeded — so the failure is surfaced, never raised. *)
-let autockpt_attempt t st =
-  Lwt.catch
-    (fun () ->
-       match st.wal with
-       | None -> Lwt.return_unit
-       | Some wal -> checkpoint_body t st wal ~site:Lock_stats.Autocheckpoint)
-    (fun _exn -> Lwt.return_unit)
 ;;
 
 let autockpt_release st =

@@ -1739,6 +1739,33 @@ consistent as of `P`, with some orphaned pages. The argument is in
 `checkpoint`'s header comment in `store.ml`; anything that makes a commit write
 a page **in place** would break it.
 
+**The unlocked phase is ONE pass, and that is a measured number.** The design
+this started from assumed the passes converge — each covers only what the
+previous pass's commits appended, so they should shrink geometrically. **They do
+not.** A migration pass and a committing writer proceed at comparable rates
+(both are streams of small yielding I/Os), so pass k+1 is about as long as pass
+k and every extra pass is just more time for the WAL to grow before `Wal.reset`
+runs. Growth is *linear in the pass count*. Measured with
+`test_wal_autocheckpoint`'s `low threshold keeps WAL bounded` — 500 sequential
+commits at `wal_autocheckpoint = 10`, WAL high-water in frames:
+
+| unlocked passes | WAL peak |
+|---|---|
+| pre-#719 (migration under the lock) | 5 |
+| 1 | 20 |
+| 2 | 80 |
+| 4 | 195 |
+
+The pre-#719 number is small **precisely because** the migration held the lock:
+no commit could append during it. So a WAL high-water above the threshold is the
+unavoidable price of #719 and the only question is the multiple — one pass costs
+2x, which is the same order the threshold already overshoots by; four costs 20x,
+which would turn `wal_autocheckpoint = 1000` into an ~80 MB WAL and a
+correspondingly slow recovery, i.e. the unbounded-WAL failure mode #638 exists to
+make visible. `max_unlocked_ckpt_passes` is 1. Raising it does **not** buy a
+smaller locked catch-up — the catch-up is whatever the last unlocked pass let
+through, and every pass lets through about the same amount.
+
 **Accepted trade, recorded so it is not found by surprise:** the locked gate now
 runs against the *caught-up* target rather than the announced one, so an RO
 snapshot that registered during the migration, at a frame below that final
@@ -1748,12 +1775,27 @@ to tolerate an unbalanced `Checkpoint_begin`; it is now also true that the
 `Checkpoint_end` which does arrive may have recycled **more** frames than the
 begin announced.
 
-**Not fixed, and pre-existing:** a *follower*'s `ro_begin_at` registers at
-`min(committed_frames, follower_ack_position)`, which can be *below* the
-checkpoint's target, so a follower reader that registers after the gate is not
-covered by it. That was true before this change (the gate has always raced
-reader registration, since `Rwlock` readers never block) and a follower never
-runs the auto path, because `rw_begin` rejects writes in follower mode.
+**Two things are NOT fixed, both pre-existing, both found by an independent
+review of this change rather than by a test:**
+
+- **#739** — a *follower*'s `ro_begin_at` registers at
+  `min(committed_frames, follower_ack_position)`, which can be *below* the
+  checkpoint's target, so a follower snapshot opened after the gate is not
+  covered by it and can observe a migrated page through its main-file
+  fall-through. True before this change (the gate has always raced reader
+  registration — `Rwlock` readers never block), and unreachable from the auto
+  path because `rw_begin` refuses writes in follower mode, so only a manual
+  `checkpoint` gets there. #719 widens the window rather than opening it. The
+  fix is not a bigger gate — a snapshot registering *below* the target defeats
+  any gate — but making follower registration participate in the checkpoint's
+  exclusion.
+- **#740** — `PRAGMA wal_checkpoint` inside an explicit transaction
+  self-deadlocks: `rw_begin` holds the writer lock for the whole transaction and
+  `Rwlock` is not re-entrant. It deadlocked identically before #719, at the
+  `acquire_write` the checkpoint used to take first. What is new is only that it
+  now wedges holding `ckpt_mutex` too, so later checkpoints queue behind it
+  instead of latching on `autockpt_in_flight`; the connection was already
+  unusable either way. **Do not "fix" it by reversing the lock order.**
 
 Pinned by `test/test_autocheckpoint_lock_719.ml`, which is **file-backed and
 WAL-mode** for the reason the #718 section gives. Its first two cases **hook the
