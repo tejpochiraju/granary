@@ -1330,8 +1330,10 @@ EOF
   external cache and is safe; a stale `record_change` delta is a phantom row for
   a reactive view whose base table the trigger wrote to. **Neither is a
   regression** — autocommit's `S.rollback` never cleared them either — but the
-  invariant above is about `Store` and `Schema_cache` state only. Tracked as
-  #666. The undo used to be `if owned then S.rollback`,
+  invariant above is about `Store` and `Schema_cache` state only. That was
+  #666, and **the delta half is now fixed; the name half is deliberately
+  not** — see the separate section below. The undo used to be
+  `if owned then S.rollback`,
   keyed on *who owns the transaction* rather than on *what the statement
   decided*, so the same statement left a trace or not depending on whether the
   caller had opened a `BEGIN`. It is now a statement-level savepoint
@@ -1423,6 +1425,85 @@ EOF
   holds row 3 — in its qualified spelling, `CREATE VIEW v2 AS SELECT t.a FROM
   other AS t` — as known behaviour pinned rather than endorsed. Change it as a
   decision, not to make a fix pass.
+- **A rolled-back statement's #417 row-level deltas are reverted with the store;
+  its #240 dirty NAMES are not (#666, decided 2026-09-03).** One accumulator,
+  two halves, two different answers — that asymmetry is the decision, not an
+  oversight, and the two are pinned side by side in
+  `test/test_rollback_deltas_666.ml`.
+
+  The delta log is a statement of **fact about rows**. `Db.drive_reactive`
+  installs a change accumulator around every statement, `rv_absorb_changes`
+  consumes it, and the maintenance applies each delta to the materialisation
+  `_rv_<name>`. So a delta describing a write the store had *undone* became a
+  **phantom row in a materialised reactive view** — a row the view reports and
+  the base table does not hold. That is a wrong answer, so it is reverted.
+
+  The name set is an **invalidation hint**. A superfluous entry costs an
+  external cache one miss; a missing one is a stale read. Reverting it would
+  buy nothing and would newly depend on this revert accounting for every
+  `mark_dirty` site — a much larger and more scattered set than the delta
+  log's, and a site missed there fails in the *unsafe* direction. Note that
+  `record_change` marks the name as well as recording the delta, so reverting
+  the delta and keeping the name lands on exactly the safe side by
+  construction. Anyone "completing" the fix by reverting the names too is
+  trading a free safety margin for a new failure mode.
+
+  **The extent is deliberately wider than #631's savepoint, and that is the
+  part that is easy to get wrong.** That savepoint is taken only inside a
+  narrow intersection (borrowed transaction + a BEFORE INSERT trigger +
+  `CA_ignore`). The stale-delta hole is just as real in **autocommit**, where
+  no savepoint is ever pushed and the skip arms of `execute_insert_write` /
+  `execute_upsert_update` roll the whole per-row transaction back instead —
+  and the accumulator rides Lwt sequence-associated storage straight across
+  that rollback. So `execute_insert` takes an unconditional delta mark
+  (`Exec.changes_mark`, `Cm_none` and one predicted branch when nobody is
+  capturing) and `stmt_savepoint_finish` restores it when the row did not
+  write **and** something actually reverted the store — `owned`, or a
+  savepoint was taken. With neither, nothing was reverted and the deltas must
+  stay: dropping them would lose a real trigger write, which is the same class
+  of wrong answer with the sign flipped.
+
+  Three properties of the mark are load-bearing:
+
+  - It is per **ROW**, not per statement: a multi-row `VALUES` list is one
+    `execute_insert` (and, in autocommit, one transaction) per row, so a
+    statement-level snapshot would restore over its siblings' real writes.
+  - It is **O(tables touched), never O(rows)**. The log is prepend-only per
+    table and each table's `ref` is created once and never replaced, so the
+    mark is each table's current list — which later prepends leave as the tail
+    — and the restore is an assignment back to it plus the removal of tables
+    absent at mark time. Anything proportional to the deltas already recorded
+    would make a multi-row INSERT quadratic.
+  - It is restored on the autocommit **exception** path too, for the same
+    reason (`S.rollback` undoes the store), and **not** on the borrowed one,
+    where #631 already decided the savepoint is released rather than rolled
+    back because a raising statement's partial effects survive.
+
+  `Db`'s `ROLLBACK` and `ROLLBACK TO` handlers needed nothing: #427 already
+  clears `rv_pending` on the former and sets `rv_resync` on the latter.
+
+  **Known residual, opposite direction, not fixed here.**
+  `Db.drive_reactive` drops the whole accumulator on an `Error` result. In
+  autocommit that is right — the statement's transaction was rolled back. In a
+  **borrowed** transaction a raising statement's partial writes *survive*, so
+  their deltas are dropped while the rows remain: a materialised view that is
+  missing rows rather than inventing them. It is unobservable through today's
+  public surfaces (`execute_with_changes` / `execute_with_dirty` return the
+  `Error` and never read the accumulator), and fixing it means deciding what
+  `Error` should mean for #427's feed, which is a different question from
+  #666's. Tracked as #737.
+
+  **#737's fix owes marks to more sites than #666 took.** The autocommit
+  exception handlers of `execute_update_op`, `execute_delete_op`, the FTS
+  arms and the two columnar `Op_insert` arms all `S.rollback` the statement's
+  own transaction and leave their deltas behind — today that is harmless
+  *because* `drive_reactive` drops the accumulator on `Error`. Stop dropping
+  it and every one of those becomes a phantom-row site. `execute_insert`'s
+  exception path already restores (it is the one #666 touched); the others do
+  not. The `n = 0` early-outs in `execute_update_op` / `execute_delete_op` are
+  **not** among them: they roll back before any row is processed or any
+  trigger fires, so no delta can exist yet.
+
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
 ### A failing autocheckpoint is surfaced, never raised (#638)

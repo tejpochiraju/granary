@@ -1932,3 +1932,13 @@
  (name test_outer_ref_732)
  (modules test_outer_ref_732)
  (libraries granary alcotest lwt.unix))
+
+; #666: a rolled-back statement's #417 row-level deltas are reverted with the
+; store, so an OR IGNORE skip whose BEFORE INSERT trigger wrote cannot leave a
+; phantom row in a materialised reactive view. The #240 dirty NAMES are
+; deliberately not reverted — over-invalidation is the safe direction.
+
+(test
+ (name test_rollback_deltas_666)
+ (modules test_rollback_deltas_666)
+ (libraries granary alcotest lwt.unix))
