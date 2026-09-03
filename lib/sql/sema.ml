@@ -678,12 +678,30 @@ let bind_case ~bind ~scrutinee ~branches ~else_ =
                { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else })))
 ;;
 
-let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = function
+(* #741: [excluded] is a SCOPE, not a shape.  It is set only while binding a
+   DO UPDATE assignment RHS and it is threaded through every recursive call, so
+   an [excluded.<col>] reference resolves to the proposed INSERT row wherever it
+   sits in the expression — nested in arithmetic, inside CASE, inside a function
+   call, on either side of a binop.  Before this it was matched only at the ROOT
+   of the RHS ([bind_upsert_rhs_expr]); anything nested fell through to the
+   [E_tbl_col] single-table fallback below, which ignores the qualifier, so
+   [SET v = excluded.v + 1000] silently read the TARGET row's [v].
+
+   The flag must NOT be widened into a default: [excluded.x] has to stay
+   unresolvable in a plain SELECT/WHERE/UPDATE, which is what sqlite3 does
+   ("no such column: excluded.v"). *)
+let rec bind_expr ?(excluded = false) ~param_counter ~named_params (meta : Cat.table_meta)
+  = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
     (match col_index meta.columns name with
      | None -> Error (Unknown_column { table = meta.name; column = name })
      | Some i -> Ok (BE_col i))
+  | Ast.E_tbl_col (tbl, name)
+    when excluded && String.equal (String.uppercase_ascii tbl) "EXCLUDED" ->
+    (match col_index meta.columns name with
+     | None -> Error (Unknown_column { table = "excluded"; column = name })
+     | Some i -> Ok (BE_excluded_col i))
   | Ast.E_tbl_col (_tbl, name) ->
     (* Single-table fallback: callers that own table_alias should prefer
        [bind_expr_join] with a one-element [tables] so qualified column
@@ -695,43 +713,43 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
      | Some i -> Ok (BE_col i))
   | Ast.E_binop (op, a, b) ->
     (match
-       ( bind_expr ~param_counter ~named_params meta a
-       , bind_expr ~param_counter ~named_params meta b )
+       ( bind_expr ~excluded ~param_counter ~named_params meta a
+       , bind_expr ~excluded ~param_counter ~named_params meta b )
      with
      | Ok ba, Ok bb -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
      | Error e, _ -> Error e
      | Ok _, Error e -> Error e)
   | Ast.E_not e ->
-    (match bind_expr ~param_counter ~named_params meta e with
+    (match bind_expr ~excluded ~param_counter ~named_params meta e with
      | Ok be -> Ok (BE_not be)
      | Error e -> Error e)
   | Ast.E_is_null e ->
-    (match bind_expr ~param_counter ~named_params meta e with
+    (match bind_expr ~excluded ~param_counter ~named_params meta e with
      | Ok be -> Ok (BE_is_null be)
      | Error e -> Error e)
   | Ast.E_is_not_null e ->
-    (match bind_expr ~param_counter ~named_params meta e with
+    (match bind_expr ~excluded ~param_counter ~named_params meta e with
      | Ok be -> Ok (BE_is_not_null be)
      | Error e -> Error e)
   | Ast.E_neg e ->
-    (match bind_expr ~param_counter ~named_params meta e with
+    (match bind_expr ~excluded ~param_counter ~named_params meta e with
      | Ok be -> Ok (BE_neg be)
      | Error e -> Error e)
   | Ast.E_bitnot e ->
-    (match bind_expr ~param_counter ~named_params meta e with
+    (match bind_expr ~excluded ~param_counter ~named_params meta e with
      | Ok be -> Ok (BE_bitnot be)
      | Error e -> Error e)
   | Ast.E_between (x, lo, hi) ->
     (match
-       ( bind_expr ~param_counter ~named_params meta x
-       , bind_expr ~param_counter ~named_params meta lo
-       , bind_expr ~param_counter ~named_params meta hi )
+       ( bind_expr ~excluded ~param_counter ~named_params meta x
+       , bind_expr ~excluded ~param_counter ~named_params meta lo
+       , bind_expr ~excluded ~param_counter ~named_params meta hi )
      with
      | Ok bx, Ok blo, Ok bhi -> Ok (BE_between (bx, blo, bhi))
      | Error e, _, _ | _, Error e, _ | _, _, Error e -> Error e)
   | Ast.E_in (x, vals) ->
-    let bx = bind_expr ~param_counter ~named_params meta x in
-    let bvals = List.map (bind_expr ~param_counter ~named_params meta) vals in
+    let bx = bind_expr ~excluded ~param_counter ~named_params meta x in
+    let bvals = List.map (bind_expr ~excluded ~param_counter ~named_params meta) vals in
     let errors =
       List.filter_map
         (function
@@ -754,27 +772,27 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
   | Ast.E_param p -> Ok (BE_param (resolve_param ~param_counter ~named_params p))
   | Ast.E_agg _ | Ast.E_agg_distinct _ -> Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
-    bind_func ~bind:(bind_expr ~param_counter ~named_params meta) func args
+    bind_func ~bind:(bind_expr ~excluded ~param_counter ~named_params meta) func args
   | Ast.E_match _ ->
     Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
   | Ast.E_subquery inner -> Ok (BE_subquery inner)
   | Ast.E_exists inner -> Ok (BE_exists inner)
   | Ast.E_in_select (x, inner) ->
-    (match bind_expr ~param_counter ~named_params meta x with
+    (match bind_expr ~excluded ~param_counter ~named_params meta x with
      | Error e -> Error e
      | Ok bx -> Ok (BE_in_select (bx, inner)))
   | Ast.E_case { scrutinee; branches; else_ } ->
     bind_case
-      ~bind:(bind_expr ~param_counter ~named_params meta)
+      ~bind:(bind_expr ~excluded ~param_counter ~named_params meta)
       ~scrutinee
       ~branches
       ~else_
   | Ast.E_cast (e, ty) ->
-    (match bind_expr ~param_counter ~named_params meta e with
+    (match bind_expr ~excluded ~param_counter ~named_params meta e with
      | Ok be -> Ok (BE_cast (be, ty))
      | Error e -> Error e)
   | Ast.E_collate (e, c) ->
-    (match bind_expr ~param_counter ~named_params meta e with
+    (match bind_expr ~excluded ~param_counter ~named_params meta e with
      | Ok be -> Ok (BE_collate (be, c))
      | Error e -> Error e)
   | Ast.E_window _ ->
@@ -2051,18 +2069,17 @@ let bind_returning_exprs
     exprs
 ;;
 
+(* #741: the whole RHS is bound in the [excluded] scope, so every occurrence of
+   [excluded.<col>] becomes a [BE_excluded_col] — not just one sitting at the
+   root.  [Exec.substitute_excluded] already recurses through the whole plan
+   expression, so the executor needed no change; the gap was here. *)
 let bind_upsert_rhs_expr
       ~param_counter
       ~named_params
       (meta : Cat.table_meta)
       (e : Ast.expr)
   =
-  match e with
-  | Ast.E_tbl_col (tbl, col) when String.equal (String.uppercase_ascii tbl) "EXCLUDED" ->
-    (match col_index meta.columns col with
-     | None -> Error (Unknown_column { table = "excluded"; column = col })
-     | Some i -> Ok (BE_excluded_col i))
-  | other -> bind_expr ~param_counter ~named_params meta other
+  bind_expr ~excluded:true ~param_counter ~named_params meta e
 ;;
 
 (* #547: DO UPDATE SET is an UPDATE of an existing row, so it enforces the same

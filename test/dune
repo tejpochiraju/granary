@@ -2027,3 +2027,12 @@
  (name test_insert_select_upsert_653)
  (modules test_insert_select_upsert_653)
  (libraries granary alcotest lwt.unix))
+
+; #741: excluded.<col> nested inside a DO UPDATE assignment RHS resolved to the
+; TARGET row, silently. In-memory is sufficient — the defect is entirely in the
+; binder's scope handling, not in storage.
+
+(test
+ (name test_nested_excluded_741)
+ (modules test_nested_excluded_741)
+ (libraries granary granary.encoding alcotest lwt.unix))

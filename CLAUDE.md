@@ -1507,6 +1507,78 @@ EOF
   3 where sqlite3 says 2 (**#742**, the accepted "too HIGH merely skips ids"
   direction #632 names). Pinned by `test/test_insert_select_upsert_653.ml`.
 
+- **`excluded` is a SCOPE, not a shape (#741, fixed 2026-09-03).**
+  `Sema.bind_upsert_rhs_expr` recognised `excluded.<col>` only when the
+  `E_tbl_col ("EXCLUDED", c)` sat at the **root** of a DO UPDATE assignment
+  RHS. Anything nested fell through to `bind_expr`, whose `E_tbl_col` arm
+  ignores the qualifier entirely — the documented single-table fallback shared
+  by INSERT/UPDATE/DELETE/CHECK/DEFAULT — so `SET v = excluded.v + 1000` read
+  the **target** row's `v` and answered 1005 where sqlite3 3.45.1 answers 1010.
+  A silent wrong answer, and it bit exactly the idioms the feature exists for
+  (`SET n = n + excluded.n`, a `CASE` over `excluded`), because the bare
+  `SET v = excluded.v` spelling was the one shape that worked.
+
+  **The Exec side was already correct and needed no change.**
+  `Plan.P_excluded_col` is a general expression leaf and
+  `Exec.substitute_excluded` recurses through the whole plan expression before
+  `eval_expr`. The gap was purely that nested occurrences never became
+  `BE_excluded_col`. `bind_expr` now carries `?(excluded = false)`, threaded
+  through **every** one of its own recursive calls (including the `~bind`
+  callbacks it hands `bind_func` and `bind_case`), and `bind_upsert_rhs_expr`
+  is just `bind_expr ~excluded:true`. Threading the flag rather than
+  hand-writing a second recursive walker over `Ast.expr` is the point: the
+  resolution is exhaustive **by construction**, where a parallel walker's
+  missing arm would silently fall back to the very fallback that caused the
+  bug. A walker is the shape #670 already warns about for the four
+  outer-reference walkers.
+
+  **The flag must not become a default.** `excluded.x` has to stay
+  unresolvable outside a DO UPDATE — `SELECT excluded.v FROM t` is refused
+  ("unknown table: excluded"), matching sqlite3, and widening `bind_expr`'s
+  fallback would resolve it to the target's own column everywhere.
+
+  **Accepted residual, pinned rather than fixed:** a plain
+  `UPDATE t SET v = excluded.v` binds with the flag unset, hits that same
+  single-table fallback, and resolves to the target's own `v`, where sqlite3
+  errors. #741 deliberately did not touch the fallback — it is shared by five
+  statement kinds and narrowing it is a separate decision with a much wider
+  blast radius. `plain_update_still_takes_the_single_table_fallback` in
+  `test/test_nested_excluded_741.ml` holds it as known behaviour, not as an
+  endorsement.
+
+  There is no DO UPDATE `WHERE` clause to extend this to: `opt_upsert` in
+  `parser.mly` is `ON CONFLICT (cols) DO UPDATE SET assigns` and nothing else.
+  Pinned by `test/test_nested_excluded_741.ml`, whose every expected value was
+  oracle-checked against sqlite3 3.45.1; verified by mutation (restoring the
+  root-only match fails 8 of its 14 cases).
+
+- **A discarded INSERT row burns the rowid `execute_insert` allocated for it
+  (#742, ACCEPTED, decided 2026-09-03).** `Exec.execute_insert` calls
+  `insert_rowid` before it resolves the conflict, so a row that is then
+  discarded — by a DO UPDATE, or by an `OR IGNORE` skip — leaves its
+  allocation behind. In autocommit each row is its own committed transaction,
+  so the bump is durable and the next row gets 3 where sqlite3 gives 2.
+
+  **Deferring the allocation past conflict resolution was considered and
+  rejected**, because two things documented above read the row *after*
+  `insert_rowid` has written the auto-assigned `INTEGER PRIMARY KEY` value back
+  into it: #639's NOT NULL check (which must run before conflict resolution,
+  and whose column is NOT NULL since #530) and the `row_for_idx` extraction
+  that feeds `check_insert_unique`. Deferring makes an ordinary auto-assigned
+  PK read NULL at that check and raise on the commonest INSERT shape — a wrong
+  answer traded for a cosmetic one. Handing the allocation back instead is the
+  "too LOW" direction #632 and #706 forbid; a skipped id is the "too HIGH"
+  residual those same writeups already accept.
+
+  **The issue's framing is narrower than the behaviour, and that matters for
+  anyone who reopens it.** The burn is not specific to the upsert branch:
+  `INSERT OR IGNORE` on a secondary UNIQUE index burns identically, with no
+  upsert clause in sight and predating #639 entirely. A fix scoped to the
+  upsert branch would leave the same divergence reachable through the older
+  spelling. Both spellings are pinned by
+  `burnt_rowid_on_a_discarded_insert_row` in
+  `test/test_nested_excluded_741.ml`.
+
 - **A skipped `INSERT` leaves nothing behind in the STORE and the CATALOG,
   including its BEFORE INSERT trigger's nested DML, in an explicit transaction
   as well as in autocommit (#631, fixed 2026-08-06).** Read the scope literally:
