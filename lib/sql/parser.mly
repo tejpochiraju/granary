@@ -757,19 +757,37 @@ insert_col:
   | id = any_ident { id }
   | ROWID          { "rowid" }
 
+(* #653: [INSERT ... SELECT] carries the same [opt_upsert] the VALUES arms do.
+
+   SQLite has a documented parsing ambiguity here — it cannot tell the upsert's
+   [ON] from a join's, so its manual tells you to separate the two with a
+   [WHERE true].  Granary does NOT need that, and the difference is structural
+   rather than lucky: [join_clause] requires the [JOIN] keyword before its [ON],
+   so once the join list is complete no [ON] can be shifted into it and the
+   trailing [ON] can only start the upsert.  Verified: adding [opt_upsert] to
+   these three arms leaves menhir's conflict counts unchanged (35 states / 290
+   conflicts, before and after), and
+   [INSERT INTO t SELECT k, v FROM src ON CONFLICT(k) DO UPDATE ...] — a parse
+   error in sqlite3 — resolves correctly here, as does the same statement with a
+   join carrying its own [ON].  Accepting more than the oracle is safe in a way
+   that accepting less is not; a caller who writes SQLite's [WHERE true] form
+   also works unchanged. *)
 insert:
   (* INSERT INTO t (cols) SELECT ... *)
   | INSERT oc = opt_conflict INTO table = any_ident
       LPAREN cols = separated_nonempty_list(COMMA, insert_col) RPAREN
-      sel = compound_select
-    { Ast.S_insert_select { table; columns = cols; on_conflict = oc; select = sel } }
+      sel = compound_select upsert = opt_upsert
+    { Ast.S_insert_select { table; columns = cols; on_conflict = oc; select = sel;
+                            upsert_update = upsert } }
   (* INSERT INTO t SELECT ... / INSERT INTO t WITH ... SELECT ... *)
   | INSERT oc = opt_conflict INTO table = any_ident
-      sel = compound_select
-    { Ast.S_insert_select { table; columns = []; on_conflict = oc; select = sel } }
+      sel = compound_select upsert = opt_upsert
+    { Ast.S_insert_select { table; columns = []; on_conflict = oc; select = sel;
+                            upsert_update = upsert } }
   | INSERT oc = opt_conflict INTO table = any_ident
-      sel = with_cte
-    { Ast.S_insert_select { table; columns = []; on_conflict = oc; select = sel } }
+      sel = with_cte upsert = opt_upsert
+    { Ast.S_insert_select { table; columns = []; on_conflict = oc; select = sel;
+                            upsert_update = upsert } }
   (* existing VALUES alternatives *)
   | INSERT oc = opt_conflict INTO table = any_ident
       LPAREN cols = separated_nonempty_list(COMMA, insert_col) RPAREN

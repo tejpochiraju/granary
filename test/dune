@@ -1965,3 +1965,14 @@
   alcotest
   lwt.unix
   unix))
+
+; #653: INSERT ... SELECT ... ON CONFLICT (cols) DO UPDATE SET ... — the clause
+; had no grammar at all, so the statement was a parse error. It is threaded
+; through grammar/AST/Sema/Plan to the one Exec call site that already drove the
+; source stream through execute_insert per row, so the VALUES form's #639/#599/
+; #667 behaviour applies by construction rather than by a second implementation.
+
+(test
+ (name test_insert_select_upsert_653)
+ (modules test_insert_select_upsert_653)
+ (libraries granary alcotest lwt.unix))

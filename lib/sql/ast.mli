@@ -327,6 +327,10 @@ and stmt =
       ; columns : string list (** empty = all non-generated columns *)
       ; on_conflict : conflict_action option
       ; select : stmt
+      ; upsert_update : upsert_update option
+        (** #653: [ON CONFLICT (cols) DO UPDATE SET ...], the same clause the
+            VALUES form carries.  It must never be parsed and then dropped —
+            that is #639 in a new place — so every layer below carries it. *)
       }
   | S_select of
       { distinct : bool

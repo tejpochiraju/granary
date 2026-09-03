@@ -2899,12 +2899,16 @@ let indexes_of cat (table_meta : Cat.table_meta) =
   | None -> []
 ;;
 
+(* #653: shared by both INSERT shapes, so a future change to how an upsert's
+   assignments are planned cannot reach one spelling and miss the other. *)
+let plan_upsert_update upsert_update =
+  match upsert_update with
+  | None -> None
+  | Some (cols, assigns) -> Some (cols, List.map (fun (i, e) -> i, plan_expr e) assigns)
+;;
+
 let plan_insert ~table_meta ~ordinals ~values ~on_conflict ~returning ~upsert_update =
-  let plan_upsert =
-    match upsert_update with
-    | None -> None
-    | Some (cols, assigns) -> Some (cols, List.map (fun (i, e) -> i, plan_expr e) assigns)
-  in
+  let plan_upsert = plan_upsert_update upsert_update in
   Plan.Op_insert
     { table_meta
     ; ordinals
@@ -3198,8 +3202,14 @@ let rec plan ?cat = function
       ; without_rowid
       ; autoincrement
       }
-  | Sema.BS_insert_select { table_meta; ordinals; source; on_conflict } ->
-    Plan.Op_insert_select { table_meta; ordinals; source = plan ?cat source; on_conflict }
+  | Sema.BS_insert_select { table_meta; ordinals; source; on_conflict; upsert_update } ->
+    Plan.Op_insert_select
+      { table_meta
+      ; ordinals
+      ; source = plan ?cat source
+      ; on_conflict
+      ; upsert_update = plan_upsert_update upsert_update
+      }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }
     -> plan_insert ~table_meta ~ordinals ~values ~on_conflict ~returning ~upsert_update
   | Sema.BS_select

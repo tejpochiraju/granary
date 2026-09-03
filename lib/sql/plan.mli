@@ -190,6 +190,10 @@ type op =
       ; ordinals : int list
       ; source : op
       ; on_conflict : Ast.conflict_action option
+      ; upsert_update : (string list * (int * expr) list) option
+        (** #653: the [ON CONFLICT (cols) DO UPDATE SET ...] clause, carried so
+            [Exec] can hand it to the same per-row [execute_insert] the VALUES
+            form uses. *)
       }
   | Op_seq_scan of
       { table_meta : Cat.table_meta

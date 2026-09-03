@@ -8040,6 +8040,7 @@ let execute_insert_select_op
       ~ordinals
       ~source
       ~on_conflict
+      ~upsert_update
   : int Lwt.t
   =
   let n_cols = List.length table_meta.Cat.columns in
@@ -8061,12 +8062,18 @@ let execute_insert_select_op
        List.iteri
          (fun i ord -> if i < Array.length src_row then row_arr.(ord) <- src_row.(i))
          ordinals;
+       (* #653: the SELECT form is the VALUES form one row at a time — the
+          upsert clause is handed to the SAME [execute_insert], so #639's target
+          pass, the rowid-alias pre-probe, the NOT NULL ordering and #667's
+          pre-write uniqueness check all apply here by construction rather than
+          by a second implementation agreeing with the first. *)
        let* inserted =
          execute_insert
            ~mode
            ~params
            ~clock
            ~on_conflict
+           ~upsert_update
            ~before_hook:bh
            ~after_hook:ah
            ~on_replace_delete_before
@@ -8750,8 +8757,12 @@ let execute_with_count
       ~values
       ~on_conflict
       ~upsert_update
-  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict }
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict; upsert_update = _ }
     when Cat.is_columnar table_meta ->
+    (* #653: [upsert_update] is [None] here by construction —
+       [Sema.bind_upsert_clause] refuses an ON CONFLICT ... DO UPDATE on a
+       COLUMNSTORE table, because the columnar write path probes for no conflict
+       and the clause could only ever be dropped. *)
     let col_store = col_store_of_meta table_meta in
     let n_cols = List.length table_meta.Cat.columns in
     let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
@@ -8781,7 +8792,7 @@ let execute_with_count
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.fail exn)
-  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict; upsert_update } ->
     execute_insert_select_op
       store
       cat
@@ -8798,6 +8809,7 @@ let execute_with_count
       ~ordinals
       ~source
       ~on_conflict
+      ~upsert_update
   | Plan.Op_create_index
       { name
       ; table

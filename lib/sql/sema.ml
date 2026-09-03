@@ -233,6 +233,7 @@ type bound_stmt =
       ; ordinals : int list
       ; source : bound_stmt
       ; on_conflict : Ast.conflict_action option
+      ; upsert_update : (string list * (int * bound_expr) list) option
       }
   | BS_select of
       { distinct : bool
@@ -2297,6 +2298,40 @@ let conflict_target_matches_constraint
     idxs
 ;;
 
+(* #653: the one place an [ON CONFLICT ... DO UPDATE] clause is bound, shared by
+   the VALUES form ([finalize_insert]) and the SELECT form
+   ([bind_insert_select]).  Deliberately ONE function rather than two: the whole
+   point of #639 is that a second copy of this logic drifts, and a divergence
+   here is invisible — a clause that binds but resolves against a different
+   target is a silently-wrong answer, not an error. *)
+let bind_upsert_clause cat ~param_counter ~named_params ~(meta : Cat.table_meta) upsert
+  : ((string list * (int * bound_expr) list) option, error) result
+  =
+  match upsert with
+  | None -> Ok None
+  | Some Ast.{ conflict_cols; assignments } ->
+    (* A columnstore table enforces no uniqueness at all — its two write arms
+       hand the row straight to [Col_store.insert_rows], so nothing ever probes
+       for a conflict and the clause could only ever be parsed and dropped.
+       Refuse it rather than accept it inertly (#639's rule; cf. #660, which
+       refuses a GENERATED column on the same table kind for the same reason). *)
+    if Cat.is_columnar meta
+    then
+      Error
+        (Unsupported
+           "ON CONFLICT ... DO UPDATE on a COLUMNSTORE table: the columnar write path \
+            detects no conflict, so the clause could only ever be dropped")
+    else if not (conflict_target_matches_constraint cat meta conflict_cols)
+    then
+      Error
+        (Unsupported
+           "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint")
+    else (
+      match bind_upsert_assignments ~param_counter ~named_params meta assignments with
+      | Error e -> Error e
+      | Ok bound_assigns -> Ok (Some (conflict_cols, bound_assigns)))
+;;
+
 (* Assemble a bound INSERT from already-bound rows: bind RETURNING and any
    UPSERT assignments, then build BS_insert. *)
 let finalize_insert
@@ -2314,18 +2349,7 @@ let finalize_insert
   | Error e -> Lwt.return (Error e)
   | Ok ret_bound ->
     let upsert_result =
-      match upsert_update with
-      | None -> Ok None
-      | Some Ast.{ conflict_cols; assignments } ->
-        if not (conflict_target_matches_constraint cat meta conflict_cols)
-        then
-          Error
-            (Unsupported
-               "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint")
-        else (
-          match bind_upsert_assignments ~param_counter ~named_params meta assignments with
-          | Error e -> Error e
-          | Ok bound_assigns -> Ok (Some (conflict_cols, bound_assigns)))
+      bind_upsert_clause cat ~param_counter ~named_params ~meta upsert_update
     in
     (match upsert_result with
      | Error e -> Lwt.return (Error e)
@@ -5505,7 +5529,7 @@ and bind_expanded ~views ~named_params ~param_counter cat stmt =
       ~on_conflict
       ~returning
       ~upsert_update
-  | Ast.S_insert_select { table; columns; on_conflict; select } ->
+  | Ast.S_insert_select { table; columns; on_conflict; select; upsert_update } ->
     bind_insert_select
       ~views
       ~named_params
@@ -5515,6 +5539,7 @@ and bind_expanded ~views ~named_params ~param_counter cat stmt =
       ~columns
       ~on_conflict
       ~select
+      ~upsert_update
   | Ast.S_select
       { distinct
       ; proj
@@ -5655,6 +5680,7 @@ and bind_insert_select
       ~columns
       ~on_conflict
       ~select
+      ~upsert_update
   =
   let* table_meta_opt = Cat.find_table cat ~name:table in
   match table_meta_opt with
@@ -5693,13 +5719,37 @@ and bind_insert_select
     (match ordinals_result with
      | Error e -> Lwt.return (Error e)
      | Ok ordinals ->
-       let* source_result =
-         bind_internal ~views ~named_params ~param_counter cat select
-       in
-       (match source_result with
+       (* #653: bind the upsert clause through the SAME helper the VALUES form
+          uses, so the conflict-target validation and the DO UPDATE assignment
+          rules (#547's NOT NULL check, #629's generated-column refusal,
+          [excluded.<col>] resolution) cannot differ between the two spellings.
+          Bound BEFORE the source so a bad clause is reported even when the
+          source itself would also fail to bind. *)
+       (match
+          bind_upsert_clause
+            cat
+            ~param_counter
+            ~named_params
+            ~meta:table_meta
+            upsert_update
+        with
         | Error e -> Lwt.return (Error e)
-        | Ok source ->
-          Lwt.return (Ok (BS_insert_select { table_meta; ordinals; source; on_conflict }))))
+        | Ok bound_upsert ->
+          let* source_result =
+            bind_internal ~views ~named_params ~param_counter cat select
+          in
+          (match source_result with
+           | Error e -> Lwt.return (Error e)
+           | Ok source ->
+             Lwt.return
+               (Ok
+                  (BS_insert_select
+                     { table_meta
+                     ; ordinals
+                     ; source
+                     ; on_conflict
+                     ; upsert_update = bound_upsert
+                     })))))
 
 and bind_with_cte ~views ~named_params ~param_counter cat ~name ~def ~query ~recursive =
   (* For recursive CTEs the def is UNION ALL [base; recursive_arm]; the
