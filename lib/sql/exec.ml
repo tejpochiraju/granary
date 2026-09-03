@@ -12365,7 +12365,15 @@ and stream_index_lookup
    and an integral REAL addresses the rowid it names — the same answer
    [index_lookup_values] gives for an indexed column, via the shared
    [rowid_lookup_key] (#738). *)
-and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.table_meta) =
+and stream_rowid_lookup
+      ?project
+      clock
+      params
+      store
+      mode
+      lookup_val
+      (table_meta : Cat.table_meta)
+  =
   let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
   match rowid_lookup_key v with
@@ -12381,6 +12389,17 @@ and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.tab
      | Some vbytes ->
        incr_examined s_opt;
        let row = decode_with_virtual clock params table_meta vbytes in
+       (* #416: [project] is the ordinal list of an [Op_project] fused into
+          this lookup by {!to_stream}.  A point lookup yields at most one row,
+          so applying the projection here is exactly what wrapping the result
+          in [Lwt_stream.map (project_row ords)] would have computed —
+          [project_row] is a pure array-index selection — while saving the
+          second [Lwt_stream] layer that wrapping costs. *)
+       let row =
+         match project with
+         | None -> row
+         | Some ords -> project_row ords row
+       in
        Lwt.return (Lwt_stream.of_list [ row ]))
   | None -> Lwt.return (Lwt_stream.of_list [])
 
@@ -15106,6 +15125,16 @@ and to_stream
   | Plan.Op_col_seq_scan { table_meta; _ } ->
     stream_col_seq_scan clock params store mode table_meta
   | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
+  | Plan.Op_project
+      { ordinals; child = Plan.Op_rowid_lookup { table_meta; lookup_val; _ } } ->
+    (* #416: fuse the projection into the point lookup.  [Lwt_stream.map] builds
+       a whole second [Lwt_stream] over the one the lookup already returns, and
+       its source is the ASYNC [Lwt_stream.from] one, so draining a single row
+       through it costs a promise chain per element on top of the stream record
+       itself — measured at ~230 words per warm point lookup, ~16% of the total.
+       Applying the (pure) ordinal selection to the at-most-one row the lookup
+       produces is observationally identical and pays none of it. *)
+    stream_rowid_lookup ~project:ordinals clock params store mode lookup_val table_meta
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
