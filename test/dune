@@ -1773,3 +1773,13 @@
  (name test_compound_order_by_662)
  (modules test_compound_order_by_662)
  (libraries granary alcotest lwt.unix))
+
+; #475: the internal [DROP TABLE _rv_<name>] guard is keyed on the table the
+; driver is currently dropping, not on a "the driver is busy" flag. The flag
+; stayed set across every await of a refresh, so a user drop interleaving into
+; that window destroyed an unrelated live view's materialisation.
+
+(test
+ (name test_reactive_view_drop_guard_475)
+ (modules test_reactive_view_drop_guard_475)
+ (libraries granary alcotest lwt.unix))

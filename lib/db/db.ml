@@ -110,9 +110,30 @@ type t =
     (** #427: base-table row changes accumulated since the last reactive-view
         flush, keyed by base-table name (newest-appended, application order).
         Flushed on autocommit / COMMIT, dropped on ROLLBACK. *)
-  ; mutable rv_refreshing : bool
-    (** #427: re-entrancy guard — true while the driver writes [_rv_…] tables,
-        so those writes do not themselves drive reactive views. *)
+  ; mutable rv_depth : int
+    (** #427/#475: re-entrancy nesting DEPTH — positive while the driver writes
+        [_rv_…] tables, so those writes do not themselves drive reactive views.
+
+        #475: this was a bare [bool] and the four (now five) driver entry points
+        that set it nest: [rv_flush]'s refresh can be entered while [rv_create]
+        holds the flag, and whichever finished first cleared it for everybody,
+        re-arming reactive driving in the middle of the outer operation's own
+        internal writes.  A counter incremented and decremented under
+        [Lwt.finalize] ({!rv_guard}) is monotone under nesting, so the guard is
+        released exactly once, by the outermost entry. *)
+  ; rv_internal_tables : (string, int) Hashtbl.t
+    (** #475: counted set of [_rv_<name>] materialisation tables the driver is
+        *currently* dropping on its own behalf, so {!execute_control_op}'s
+        internal-table [DROP TABLE] guard can let those through while refusing
+        every user drop.
+
+        This is deliberately NOT [rv_depth]: the depth stays positive across the
+        whole of [rv_flush] / [rv_create] / [rv_load], each of which awaits the
+        store repeatedly, and Lwt being cooperative a *user*
+        [DROP TABLE _rv_<other>] scheduled into one of those windows used to
+        bypass the guard entirely and destroy an unrelated live view's
+        materialisation.  Suppression is therefore keyed on the table name the
+        driver is actually dropping, not on whether the driver is busy. *)
   ; mutable rv_resync : bool
     (** #427: set when a savepoint rollback made the accumulated deltas
         untrustworthy; the next flush full-resyncs every affected view. *)
@@ -344,7 +365,8 @@ let open_in_memory ?clock () =
     ; active_schema = "main"
     ; reactive_views = Hashtbl.create 4
     ; rv_pending = Hashtbl.create 4
-    ; rv_refreshing = false
+    ; rv_depth = 0
+    ; rv_internal_tables = Hashtbl.create 1
     ; rv_resync = false
     ; txn_scope = None
     }
@@ -436,7 +458,8 @@ let of_store ?clock ?durability ?file_path ?cohort store =
     ; active_schema = "main"
     ; reactive_views = Hashtbl.create 4
     ; rv_pending = Hashtbl.create 4
-    ; rv_refreshing = false
+    ; rv_depth = 0
+    ; rv_internal_tables = Hashtbl.create 1
     ; rv_resync = false
     ; txn_scope = None
     }
@@ -1847,6 +1870,49 @@ let rv_owned_table top tbl =
   && Hashtbl.mem top.reactive_views (String.sub tbl 4 (String.length tbl - 4))
 ;;
 
+(* #475: bracket the driver's internal work.  [rv_depth] is a nesting COUNTER,
+   not a flag: [rv_flush] can be entered while [rv_create] or [rv_load] is still
+   running, and a bool cleared by whichever finished first re-armed reactive
+   driving in the middle of the outer operation's own [_rv_…] writes.  The
+   decrement runs under [Lwt.finalize] so an exception cannot strand the
+   guard. *)
+let rv_guard top f =
+  top.rv_depth <- top.rv_depth + 1;
+  Lwt.finalize f (fun () ->
+    top.rv_depth <- top.rv_depth - 1;
+    Lwt.return_unit)
+;;
+
+(* #475: is the driver currently in the middle of a re-entrant write of its own?
+   Only consulted by [drive_reactive]'s fast path — the [DROP TABLE] guard uses
+   {!rv_internal_drop_permitted}, which is narrower. *)
+let rv_in_driver top = top.rv_depth > 0
+
+(* #475: may [tbl] be dropped without the internal-table refusal?  True only
+   while the driver itself is executing a [DROP TABLE] for exactly that table
+   ({!rv_dropping_internal}).  A COUNTED set rather than a plain one, because
+   the same materialisation can be re-typed by a nested refresh. *)
+let rv_internal_drop_permitted top tbl = Hashtbl.mem top.rv_internal_tables tbl
+
+(* #475: run [f] with [tbl] marked as an internally-driven drop target.  Held
+   for the extent of the driver's own [DROP TABLE] statement and no longer, so a
+   user drop of any OTHER [_rv_…] table interleaving into the surrounding
+   refresh window is still refused. *)
+let rv_dropping_internal top tbl f =
+  let bump d =
+    match Hashtbl.find_opt top.rv_internal_tables tbl with
+    | None -> if d > 0 then Hashtbl.replace top.rv_internal_tables tbl 1
+    | Some k ->
+      if k + d <= 0
+      then Hashtbl.remove top.rv_internal_tables tbl
+      else Hashtbl.replace top.rv_internal_tables tbl (k + d)
+  in
+  bump 1;
+  Lwt.finalize f (fun () ->
+    bump (-1);
+    Lwt.return_unit)
+;;
+
 (* Handle non-DML control / DDL ops (txn control, ATTACH/DETACH, schema
    switch, CREATE/DROP VIEW/TRIGGER, VACUUM).  Returns [Some result] for ops
    it owns and [None] for DML / catch-all ops the caller routes to
@@ -1984,9 +2050,17 @@ let execute_control_op top t sql op =
     (* No rows produced via execute; use [query]/[Db.query] to read. *)
     Some (Lwt.return (Ok ()))
   | Sql.Plan.Op_drop_table { table_meta; _ }
-    when t == top && (not top.rv_refreshing) && rv_owned_table top table_meta.Cat.name ->
-    (* #469: the driver's own teardown/re-type drops run with [rv_refreshing]
-       set and pass straight through. *)
+    when t == top
+         && rv_owned_table top table_meta.Cat.name
+         && not (rv_internal_drop_permitted top table_meta.Cat.name) ->
+    (* #469: the driver's own teardown/re-type drops pass straight through.
+       #475: the permission is per TABLE NAME and held only for the extent of
+       the driver's own [DROP TABLE] statement, not for the whole refresh.  The
+       old [not top.rv_refreshing] test was open for the entire duration of
+       [rv_flush] / [rv_create] / [rv_load] — each of which awaits the store
+       repeatedly — so a user [DROP TABLE _rv_<other>] scheduled into one of
+       those windows bypassed this guard and destroyed an unrelated live view's
+       materialisation. *)
     let tbl = table_meta.Cat.name in
     let view = String.sub tbl 4 (String.length tbl - 4) in
     Some
@@ -2277,7 +2351,7 @@ let execute_change_count_core top sql =
    materialisations; inside an explicit transaction they accumulate until COMMIT.
    The fast path (no reactive views, or re-entrant [_rv_…] writes) is unchanged. *)
 let drive_reactive top ~core =
-  if Hashtbl.length top.reactive_views = 0 || top.rv_refreshing
+  if Hashtbl.length top.reactive_views = 0 || rv_in_driver top
   then core ()
   else
     let* result, acc =
@@ -3653,9 +3727,12 @@ let rv_refresh_full top entry =
       | Error _ as e -> Lwt.return e
       | Ok old_rows ->
         let* dr =
-          execute
-            top
-            (Printf.sprintf "DROP TABLE %s" (rv_quote (rv_table_name entry.rv_name)))
+          (* #475: permission to bypass the internal-table guard is scoped to
+             THIS statement and THIS table name, not to the whole refresh. *)
+          rv_dropping_internal top (rv_table_name entry.rv_name) (fun () ->
+            execute
+              top
+              (Printf.sprintf "DROP TABLE %s" (rv_quote (rv_table_name entry.rv_name))))
         in
         (match dr with
          | Error _ as e -> Lwt.return e
@@ -3742,17 +3819,20 @@ let rv_flush_inner top =
     (fun () ->
        Hashtbl.reset top.rv_pending;
        top.rv_resync <- false;
-       top.rv_refreshing <- false;
        Lwt.return_unit)
 ;;
 
 let rv_flush top =
-  top.rv_refreshing <- true;
-  (* #427 review: the flush writes [_rv_<name>] via internal DML.  If a caller's
-     change-capturing accumulator is still bound (e.g. [execute_with_changes]),
-     those derived writes would surface as user changes.  Shadow it with a
-     throwaway non-capturing accumulator for the flush's extent. *)
-  Sql.Exec.with_dirty (Sql.Exec.make_dirty_acc ()) (fun () -> rv_flush_inner top)
+  (* #475: the guard is taken and released by the SAME function.  It used to be
+     set here and cleared inside [rv_flush_inner]'s finalizer, which is how a
+     nested flush released it on behalf of an enclosing [rv_create]/[rv_load]. *)
+  rv_guard top (fun () ->
+    (* #427 review: the flush writes [_rv_<name>] via internal DML.  If a
+       caller's change-capturing accumulator is still bound (e.g.
+       [execute_with_changes]), those derived writes would surface as user
+       changes.  Shadow it with a throwaway non-capturing accumulator for the
+       flush's extent. *)
+    Sql.Exec.with_dirty (Sql.Exec.make_dirty_acc ()) (fun () -> rv_flush_inner top))
 ;;
 
 let rv_ordinal cols name =
@@ -3831,109 +3911,104 @@ let rv_create top ~sql ~name query refresh =
     match decided with
     | Error e -> Lwt.return (Error (Runtime e))
     | Ok choice ->
-      top.rv_refreshing <- true;
-      Lwt.finalize
-        (fun () ->
-           let register ~provisional mode out_cols =
-             let entry =
-               { rv_name = name
-               ; rv_query = query
-               ; rv_base_tables = base_tables
-               ; rv_out_cols = out_cols
-               ; rv_mode = mode
-               ; rv_provisional = provisional
-               ; rv_callbacks = []
-               }
+      rv_guard top (fun () ->
+        let register ~provisional mode out_cols =
+          let entry =
+            { rv_name = name
+            ; rv_query = query
+            ; rv_base_tables = base_tables
+            ; rv_out_cols = out_cols
+            ; rv_mode = mode
+            ; rv_provisional = provisional
+            ; rv_callbacks = []
+            }
+          in
+          Hashtbl.replace top.reactive_views name entry;
+          Cat.persist_reactive_view top.store ~name ~sql
+        in
+        match choice with
+        | `Delta (group_ord, measure) ->
+          let base = List.hd base_tables in
+          let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
+          (match er with
+           | Error _ as e -> Lwt.return e
+           | Ok engine ->
+             let out_cols =
+               match cls.out_cols with
+               | Some c -> c
+               | None -> [ "grp"; "agg" ]
              in
-             Hashtbl.replace top.reactive_views name entry;
-             Cat.persist_reactive_view top.store ~name ~sql
-           in
-           match choice with
-           | `Delta (group_ord, measure) ->
-             let base = List.hd base_tables in
-             let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
-             (match er with
+             let coltypes = [ rv_group_col_ty top base group_ord; "INTEGER" ] in
+             let* cr = rv_create_table top name out_cols coltypes in
+             (match cr with
               | Error _ as e -> Lwt.return e
-              | Ok engine ->
-                let out_cols =
-                  match cls.out_cols with
-                  | Some c -> c
-                  | None -> [ "grp"; "agg" ]
+              | Ok () ->
+                let init_rows = Rv.Agg_engine.snapshot engine in
+                let* ir =
+                  rv_insert_rows
+                    top
+                    (rv_quote (rv_table_name name))
+                    (List.length out_cols)
+                    init_rows
                 in
-                let coltypes = [ rv_group_col_ty top base group_ord; "INTEGER" ] in
-                let* cr = rv_create_table top name out_cols coltypes in
-                (match cr with
+                (match ir with
                  | Error _ as e -> Lwt.return e
                  | Ok () ->
-                   let init_rows = Rv.Agg_engine.snapshot engine in
-                   let* ir =
-                     rv_insert_rows
-                       top
-                       (rv_quote (rv_table_name name))
-                       (List.length out_cols)
-                       init_rows
+                   let* () =
+                     register
+                       ~provisional:false
+                       (RV_delta { group_ord; measure; engine })
+                       out_cols
                    in
-                   (match ir with
-                    | Error _ as e -> Lwt.return e
-                    | Ok () ->
-                      let* () =
-                        register
-                          ~provisional:false
-                          (RV_delta { group_ord; measure; engine })
-                          out_cols
-                      in
-                      Lwt.return (Ok ()))))
-           | `Full ->
-             let* nr = rv_query_ast top query in
-             (match nr with
-              | Error _ as e -> Lwt.return e
-              | Ok new_rows ->
-                let arity =
-                  match new_rows with
-                  | r :: _ -> Array.length r
-                  | [] ->
-                    (match cls.out_cols with
-                     | Some c -> List.length c
-                     | None -> 0)
-                in
-                if arity = 0
-                then
-                  Lwt.return
-                    (Error
-                       (Runtime
-                          (Printf.sprintf
-                             "reactive view '%s': cannot determine columns (empty result \
-                              and SELECT *); use an explicit projection"
-                             name)))
-                else (
-                  let out_cols =
-                    match cls.out_cols with
-                    | Some c when List.length c = arity -> c
-                    | _ -> List.init arity (fun i -> Printf.sprintf "c%d" i)
-                  in
-                  (* No rows yet → placeholder all-TEXT schema, re-typed on the
-                     first non-empty refresh. *)
-                  let provisional = new_rows = [] in
-                  let coltypes =
-                    if provisional
-                    then List.init arity (fun _ -> "TEXT")
-                    else rv_infer_full_types new_rows arity
-                  in
-                  let* cr = rv_create_table top name out_cols coltypes in
-                  match cr with
+                   Lwt.return (Ok ()))))
+        | `Full ->
+          let* nr = rv_query_ast top query in
+          (match nr with
+           | Error _ as e -> Lwt.return e
+           | Ok new_rows ->
+             let arity =
+               match new_rows with
+               | r :: _ -> Array.length r
+               | [] ->
+                 (match cls.out_cols with
+                  | Some c -> List.length c
+                  | None -> 0)
+             in
+             if arity = 0
+             then
+               Lwt.return
+                 (Error
+                    (Runtime
+                       (Printf.sprintf
+                          "reactive view '%s': cannot determine columns (empty result \
+                           and SELECT *); use an explicit projection"
+                          name)))
+             else (
+               let out_cols =
+                 match cls.out_cols with
+                 | Some c when List.length c = arity -> c
+                 | _ -> List.init arity (fun i -> Printf.sprintf "c%d" i)
+               in
+               (* No rows yet → placeholder all-TEXT schema, re-typed on the
+                  first non-empty refresh. *)
+               let provisional = new_rows = [] in
+               let coltypes =
+                 if provisional
+                 then List.init arity (fun _ -> "TEXT")
+                 else rv_infer_full_types new_rows arity
+               in
+               let* cr = rv_create_table top name out_cols coltypes in
+               match cr with
+               | Error _ as e -> Lwt.return e
+               | Ok () ->
+                 let* ir =
+                   rv_insert_rows top (rv_quote (rv_table_name name)) arity new_rows
+                 in
+                 (match ir with
                   | Error _ as e -> Lwt.return e
                   | Ok () ->
-                    let* ir =
-                      rv_insert_rows top (rv_quote (rv_table_name name)) arity new_rows
-                    in
-                    (match ir with
-                     | Error _ as e -> Lwt.return e
-                     | Ok () ->
-                       let* () = register ~provisional RV_full out_cols in
-                       Lwt.return (Ok ())))))
-        (fun () ->
-           top.rv_refreshing <- false;
-           Lwt.return_unit))
+                    let* () = register ~provisional RV_full out_cols in
+                    Lwt.return (Ok ()))))))
 ;;
 
 (* #469: erase a reactive view's persistent state: catalog row first, then the
@@ -3959,7 +4034,10 @@ let rv_create top ~sql ~name query refresh =
    toward an orphan table too. *)
 let rv_erase_persistent top ~name =
   let* () = Cat.remove_reactive_view top.store ~name in
-  execute top (Printf.sprintf "DROP TABLE IF EXISTS %s" (rv_quote (rv_table_name name)))
+  (* #475: as in [rv_refresh_full] — the guard bypass covers this one statement
+     and this one table name. *)
+  rv_dropping_internal top (rv_table_name name) (fun () ->
+    execute top (Printf.sprintf "DROP TABLE IF EXISTS %s" (rv_quote (rv_table_name name))))
 ;;
 
 (* #469 review: the registry is the authority for *live* views, but #437
@@ -3980,8 +4058,9 @@ let rv_drop_unloadable top ~name ~if_exists =
 
 (* #469: retire a reactive view — erase its persistent state via
    [rv_erase_persistent] (see there for the ordering argument), then deregister
-   it.  Runs with [rv_refreshing] set so the internal [DROP TABLE] is not
-   rejected by the internal-table guard in [execute_control_op].
+   it.  The internal [DROP TABLE] is admitted past the internal-table guard in
+   [execute_control_op] by [rv_dropping_internal] (#475), which names the one
+   table being dropped rather than opening the guard for the whole operation.
 
    #477 review: the persistent work happens FIRST and the in-memory mutations
    (registry removal, [rv_pending] pruning) only on [Ok], so a failed drop
@@ -4007,8 +4086,8 @@ let rv_drop_unloadable top ~name ~if_exists =
    a store/catalog fault whether or not the view is live.  The unloadable branch
    needs the cover just as much: [rv_drop_unloadable] raises from
    [Cat.load_all_reactive_views] as well as from [rv_erase_persistent].  The
-   [Lwt.catch] stays INSIDE the [Lwt.finalize] so [rv_refreshing] is restored on
-   every path. *)
+   [Lwt.catch] stays INSIDE [rv_guard] so the re-entrancy depth (#475) is
+   restored on every path. *)
 let rv_drop top ~name ~if_exists =
   (* #473: [Cat.remove_reactive_view] below always writes through its own
      fresh writer transaction ([borrow_or_autocommit ?txn:None] ->
@@ -4031,26 +4110,21 @@ let rv_drop top ~name ~if_exists =
     (* Live in the registry?  Decided once, up front: it selects the erase
        strategy and, below, whether there is any in-memory state to drop. *)
     let live = Hashtbl.mem top.reactive_views name in
-    top.rv_refreshing <- true;
     let* r =
-      Lwt.finalize
-        (fun () ->
-           Lwt.catch
-             (fun () ->
-                if live
-                then rv_erase_persistent top ~name
-                else rv_drop_unloadable top ~name ~if_exists)
-             (function
-               (* Deliberately narrower than the [Op_vacuum] arm above, which
-                  converts every exception: cancellation and the two resource
-                  exhaustions are not drop failures, and turning [Lwt.Canceled]
-                  into an [Error] would report a spurious failed drop. *)
-               | (Lwt.Canceled | Stack_overflow | Out_of_memory) as e -> Lwt.fail e
-               | Failure msg -> Lwt.return (Error (Runtime msg))
-               | e -> Lwt.return (Error (Runtime (Printexc.to_string e)))))
-        (fun () ->
-           top.rv_refreshing <- false;
-           Lwt.return_unit)
+      rv_guard top (fun () ->
+        Lwt.catch
+          (fun () ->
+             if live
+             then rv_erase_persistent top ~name
+             else rv_drop_unloadable top ~name ~if_exists)
+          (function
+            (* Deliberately narrower than the [Op_vacuum] arm above, which
+               converts every exception: cancellation and the two resource
+               exhaustions are not drop failures, and turning [Lwt.Canceled]
+               into an [Error] would report a spurious failed drop. *)
+            | (Lwt.Canceled | Stack_overflow | Out_of_memory) as e -> Lwt.fail e
+            | Failure msg -> Lwt.return (Error (Runtime msg))
+            | e -> Lwt.return (Error (Runtime (Printexc.to_string e)))))
     in
     match r with
     | Error _ as e -> Lwt.return e
@@ -4080,78 +4154,72 @@ let rv_drop top ~name ~if_exists =
    table stale forever (and future deltas would stack on a wrong base). *)
 let rv_load top =
   let* pairs = Cat.load_all_reactive_views top.store in
-  top.rv_refreshing <- true;
-  Lwt.finalize
-    (fun () ->
-       let* () =
-         Lwt_list.iter_s
-           (fun (name, sql) ->
-              match parse sql with
-              | Ok (Sql.Ast.S_create_reactive_view { query; _ }) ->
-                let cls = Rv.classify query in
-                let out_cols =
-                  match Cat.find_table_cached top.catalog ~name:(rv_table_name name) with
-                  | Some meta ->
-                    List.map (fun (c : Row.column) -> c.name) meta.Cat.columns
-                  | None ->
-                    (match cls.out_cols with
-                     | Some c -> c
-                     | None -> [])
-                in
-                let register mode =
-                  Hashtbl.replace
-                    top.reactive_views
-                    name
-                    { rv_name = name
-                    ; rv_query = query
-                    ; rv_base_tables = cls.base_tables
-                    ; rv_out_cols = out_cols
-                    ; rv_mode = mode
-                    ; rv_provisional = false
-                    ; rv_callbacks = []
-                    };
-                  Lwt.return_unit
-                in
-                (match cls.kind with
-                 | Rv.Delta { group_col; agg } ->
-                   (match rv_build_delta top cls.base_tables group_col agg with
-                    | Error _ -> register RV_full
-                    | Ok (group_ord, measure) ->
-                      let base = List.hd cls.base_tables in
-                      let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
-                      (match er with
-                       | Ok engine -> register (RV_delta { group_ord; measure; engine })
-                       | Error _ -> register RV_full))
-                 | Rv.Full -> register RV_full)
-              (* #437: a view we cannot re-load leaves its [_rv_<name>] table in
-                 the catalog with no registry entry.  Say so — silently skipping
-                 it makes {!register_view_callback} report [`Unknown_view] with
-                 no clue why. *)
-              | Ok _ ->
-                Printf.eprintf
-                  "warning: skipping non-reactive-view SQL for reactive view '%s'\n%!"
-                  name;
-                Lwt.return_unit
-              | Error e ->
-                Printf.eprintf
-                  "warning: failed to parse reactive view SQL for '%s': %s\n%!"
-                  name
-                  (Format.asprintf "%a" pp_error e);
-                Lwt.return_unit)
-           pairs
-       in
-       (* Reconcile each persisted materialisation against recomputed state.  For
-          a cleanly-closed db this diff is empty (no writes); after a crash it
-          self-heals the stale [_rv_…] rows.  Best-effort: a failure here must not
-          block opening the database. *)
-       Lwt_list.iter_s
-         (fun (_, e) ->
-            let* _ = rv_refresh_one top e ~resync:true in
-            Lwt.return_unit)
-         (Hashtbl.fold (fun k e acc -> (k, e) :: acc) top.reactive_views []))
-    (fun () ->
-       top.rv_refreshing <- false;
-       Lwt.return_unit)
+  rv_guard top (fun () ->
+    let* () =
+      Lwt_list.iter_s
+        (fun (name, sql) ->
+           match parse sql with
+           | Ok (Sql.Ast.S_create_reactive_view { query; _ }) ->
+             let cls = Rv.classify query in
+             let out_cols =
+               match Cat.find_table_cached top.catalog ~name:(rv_table_name name) with
+               | Some meta -> List.map (fun (c : Row.column) -> c.name) meta.Cat.columns
+               | None ->
+                 (match cls.out_cols with
+                  | Some c -> c
+                  | None -> [])
+             in
+             let register mode =
+               Hashtbl.replace
+                 top.reactive_views
+                 name
+                 { rv_name = name
+                 ; rv_query = query
+                 ; rv_base_tables = cls.base_tables
+                 ; rv_out_cols = out_cols
+                 ; rv_mode = mode
+                 ; rv_provisional = false
+                 ; rv_callbacks = []
+                 };
+               Lwt.return_unit
+             in
+             (match cls.kind with
+              | Rv.Delta { group_col; agg } ->
+                (match rv_build_delta top cls.base_tables group_col agg with
+                 | Error _ -> register RV_full
+                 | Ok (group_ord, measure) ->
+                   let base = List.hd cls.base_tables in
+                   let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
+                   (match er with
+                    | Ok engine -> register (RV_delta { group_ord; measure; engine })
+                    | Error _ -> register RV_full))
+              | Rv.Full -> register RV_full)
+           (* #437: a view we cannot re-load leaves its [_rv_<name>] table in
+              the catalog with no registry entry.  Say so — silently skipping it
+              makes {!register_view_callback} report [`Unknown_view] with no clue
+              why. *)
+           | Ok _ ->
+             Printf.eprintf
+               "warning: skipping non-reactive-view SQL for reactive view '%s'\n%!"
+               name;
+             Lwt.return_unit
+           | Error e ->
+             Printf.eprintf
+               "warning: failed to parse reactive view SQL for '%s': %s\n%!"
+               name
+               (Format.asprintf "%a" pp_error e);
+             Lwt.return_unit)
+        pairs
+    in
+    (* Reconcile each persisted materialisation against recomputed state.  For a
+       cleanly-closed db this diff is empty (no writes); after a crash it
+       self-heals the stale [_rv_…] rows.  Best-effort: a failure here must not
+       block opening the database. *)
+    Lwt_list.iter_s
+      (fun (_, e) ->
+         let* _ = rv_refresh_one top e ~resync:true in
+         Lwt.return_unit)
+      (Hashtbl.fold (fun k e acc -> (k, e) :: acc) top.reactive_views []))
 ;;
 
 (* #437: accessors over the in-memory registry.  A caller wiring hooks from
