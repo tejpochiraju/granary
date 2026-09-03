@@ -508,7 +508,19 @@ val with_transaction : t -> (t -> 'a Lwt.t) -> ('a, error) result Lwt.t
 val in_transaction_scope : t -> bool
 
 (** Execute a DDL or DML statement (CREATE TABLE, INSERT, UPDATE, ...).
-    Returns [Ok ()] on success, [Error e] on failure. *)
+    Returns [Ok ()] on success, [Error e] on failure.
+
+    {b [PRAGMA not_null_repair] is a write and belongs here (#588).} It DELETEs
+    rows, but it used to be dispatched as a query, so this call answered
+    ["use Exec.query for read operations"] and deleted nothing — the natural
+    call for a mutating statement did nothing but error, while the read API was
+    the one that destroyed data. Both entry points now perform it: [execute]
+    (and {!execute_change_count}) reports the number of rows DELETED as the
+    statement's change count, while {!query} streams the per-column
+    [(table, column, count)] report. Its read-only half,
+    [PRAGMA not_null_check], stays on {!query} alone, and a repair reached under
+    {!query_as_of} — or any read-only snapshot — is refused at the statement
+    level rather than failing inside the storage layer. *)
 val execute : t -> string -> (unit, error) result Lwt.t
 
 (** Like [execute], but returns the rows-affected count.  For DDL the
