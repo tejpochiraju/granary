@@ -30,9 +30,25 @@ jobs:
       - name: Cache opam packages
         uses: actions/cache@v4
         with:
-          path: ~/.opam
-          key: opam-5.4-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
-          restore-keys: opam-5.4-
+          # #735: NOT `~/.opam`.  This job runs its container with
+          # `--user root`, so `HOME` is `/root` and `~/.opam` resolves to
+          # `/root/.opam` — a path opam never writes, because the job-level
+          # `OPAMROOT` above points at `/home/opam/.opam`.  The cache therefore
+          # stored and restored nothing, and this job paid a full `opam install`
+          # on every run.  The `.forgejo/` copy of this step is deliberately
+          # NOT the same: the self-hosted runner sets no `--user root` and no
+          # `OPAMROOT`, so its `~/.opam` already IS the opam root.  This step is
+          # not in check-workflow-parity.sh's SHARED_STEPS, so the divergence is
+          # intended and unguarded — like the runner labels around it.
+          path: ${{ env.OPAMROOT }}
+          # Prefix bumped `opam-5.4-` -> `opam-5.4-gh2-` alongside the path fix:
+          # the first run under a working path populates an entry that every
+          # later run inherits through `restore-keys`, so it must not be able to
+          # inherit anything written under the broken path.  `restore-keys` is a
+          # prefix match, so bench-nightly.yml's `opam-5.4-` still finds this
+          # entry.
+          key: opam-5.4-gh2-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
+          restore-keys: opam-5.4-gh2-
 
       - name: Install opam packages
         run: |
@@ -109,7 +125,10 @@ jobs:
       - name: Cache opam packages
         uses: actions/cache@v4
         with:
-          path: ~/.opam
+          # #735: NOT `~/.opam` — see the build-and-test job's copy of this step
+          # for why, and for why the `.forgejo/` copy legitimately still says
+          # `~/.opam`.
+          path: ${{ env.OPAMROOT }}
           # #728: the prefix was bumped `lint` -> `lint2` to EVICT the poisoned
           # entry rather than only cope with it.  `actions/cache` skips its save
           # step when the primary key hits, and that key is a hash of two rarely
@@ -117,8 +136,13 @@ jobs:
           # every future run via `restore-keys`, forever.  The cleanup in the
           # next step is still the belt: it covers a cache that gets poisoned
           # again, which a one-time key bump cannot.
-          key: opam-5.4-lint2-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
-          restore-keys: opam-5.4-lint2-
+          #
+          # #735: bumped again `lint2` -> `lint3` for the path fix above.  Until
+          # now this job's cache never stored anything, so the first run under a
+          # working path is the first real entry — and it must not start life by
+          # restoring whatever `lint2` did or did not hold.
+          key: opam-5.4-lint3-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
+          restore-keys: opam-5.4-lint3-
 
       - name: Install opam packages + merlint
         run: |
