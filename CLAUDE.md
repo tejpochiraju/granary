@@ -1148,6 +1148,64 @@ EOF
   conflict states; the state count is unchanged at 35. Like sqlite3, `CROSS` is
   reserved in bare-alias position (`FROM a cross` is a syntax error in both)
   but usable as a table name and after `AS`.
+- **A reactive view must project explicitly; `SELECT *` is refused
+  unconditionally (#747, decided 2026-09-03).** This is a **behaviour break**:
+  `CREATE REACTIVE VIEW v AS SELECT * FROM t` used to be *accepted* whenever `t`
+  had at least one row, and anybody relying on that must now name the columns.
+
+  The old guard lived at runtime in `Db.rv_create`: the view's arity was read
+  off the first row of the initial result, and only an arity of **zero** — an
+  empty result — was refused, with a message that said "empty result and
+  SELECT *; use an explicit projection". So the guard *read* as "star is
+  refused" while really being "star is refused when we cannot guess a shape",
+  and the accepted case degraded badly: the view froze its column list at
+  creation time, thereafter silently dropped any column a later `ALTER TABLE …
+  ADD COLUMN` added, and fired on **every** write to the base table including
+  writes that were idempotent for the columns it actually projects. A
+  downstream consumer (camel's hook loader) documented the engine as refusing
+  `SELECT *` and had a tripwire test that only exercised the empty case, so it
+  believed it was protected against something it was not.
+
+  The refusal is now **static** — `Sema.reject_reactive_star`, alongside
+  `reject_reactive_derived_table` and running *after* it, so #486's more
+  specific message keeps precedence for a derived-table body. Consulting the
+  data was the defect, so nothing in the check does.
+
+  **What it covers, and what it deliberately does not.** The walk
+  (`Sema.reactive_projects_star`) follows the statement's **output**
+  projection: an `S_select` whose `proj` is `` `All ``, either arm of an
+  `S_compound`, and an `S_with_cte`'s body. It does **not** descend into a CTE
+  *definition* or a subquery, because a star there does not determine the
+  view's own arity — `SELECT a FROM (SELECT * FROM t) d` yields exactly one
+  column whatever `t` grows, and `WHERE EXISTS (SELECT * FROM u)` is a row
+  test. A **qualified** star (`t.*`) needs no arm: the grammar has no
+  `DOT STAR` production at all, so it is a parse error in every statement,
+  reactive or not (verified against the engine's own CLI; sqlite3 is not an
+  oracle here — reactive views are granary-specific).
+
+  **A plain `CREATE VIEW … AS SELECT *` is untouched, and that is the whole
+  basis of the decision.** It is not maintained; its body is re-bound on every
+  use, so it widens with the base table on the next read. Pinned by
+  `a_plain_create_view_with_a_star_is_unaffected` in
+  `test/test_reactive_view_star_747.ml`, which asserts the widening rather than
+  assuming it.
+
+  Two residuals, both deliberate:
+
+  - **`Db.rv_load` is not gated.** It re-parses the persisted `CREATE REACTIVE
+    VIEW` text directly and never goes through `Sema`, so a star view created
+    before this fix still loads and behaves exactly as it did. Gating it would
+    brick *opening* the database rather than fixing the view; `DROP REACTIVE
+    VIEW` is the repair.
+  - **The arity-zero guard in `Db.rv_create` stays**, but its message no longer
+    mentions emptiness or `SELECT *`, because emptiness stopped being the
+    criterion. With the star refused it is unreachable for an `S_select` root
+    (`Reactive_view.out_cols_of_proj` answers `Some` for both non-star
+    projections); it remains reachable for an `S_compound` root, whose
+    `proj_of` answers `None`. Such a view is already inert for a different
+    reason — `base_tables_of` answers `[]` for a compound, so nothing ever
+    invalidates it — which is #486's shape in a second place and is not fixed
+    here.
 - **A view is resolved at EVERY FROM position, and each subquery carries its own
   expansion (#496/#497, fixed 2026-09-03).** A view reference is desugared into
   a CTE wrapped around the statement that names it. That rewrite used to be

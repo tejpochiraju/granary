@@ -2130,3 +2130,13 @@
  (name test_bool_literal_744)
  (modules test_bool_literal_744)
  (libraries granary granary.encoding alcotest lwt.unix))
+
+; #747: CREATE REACTIVE VIEW refuses SELECT * unconditionally. The old guard
+; was runtime and data-dependent (only an EMPTY result was refused), so a star
+; view over a non-empty table was accepted and froze its arity. In-memory is
+; enough: this is bind-time behaviour with no durability dimension.
+
+(test
+ (name test_reactive_view_star_747)
+ (modules test_reactive_view_star_747)
+ (libraries granary alcotest lwt.unix))
