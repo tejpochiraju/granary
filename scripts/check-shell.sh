@@ -65,7 +65,7 @@ if [ "${1:-}" = "--list" ]; then
   exit 0
 fi
 
-# shellcheck lives in the dev image and in the CI lint job's apt packages.  If
+# The linter lives in the dev image and in the CI lint job's apt packages.  If
 # it is not on PATH we are on a bare host: re-exec this same script inside the
 # container, where it IS on PATH, so there is no re-exec loop.  In CI the `if`
 # is false and nothing is wrapped — which is what keeps the gate independent of
@@ -110,7 +110,9 @@ self_test() {
   # A violation shellcheck reports at default severity in POSIX-sh mode:
   # SC2086, an unquoted expansion that word-splits.  Chosen because it is the
   # mechanism behind PR #582's fail-open, and because it is stable across
-  # shellcheck versions.
+  # releases of the linter.  (Worded to avoid starting a comment line with the
+  # directive prefix, which the linter parses as a malformed directive --
+  # SC1073.  This gate found that in its own source on its first run.)
   cat >"$st_root/dirty.sh" <<'EOF'
 #!/bin/sh
 target=$1

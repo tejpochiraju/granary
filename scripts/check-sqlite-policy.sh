@@ -436,6 +436,12 @@ reject_glob_entries() {
   rge_bad=0
   set -f
   for rge_p in $2; do
+    # SC1003 wants '\'' in the branch below, but that is a GLOB PATTERN,
+    # not an echo: *'\'* matches an allowlist entry containing a literal
+    # backslash, which is exactly what this guard rejects. Escaping it
+    # would change what the pattern matches. Directives are only valid in
+    # front of a complete command (SC1124), hence above the whole case.
+    # shellcheck disable=SC1003
     case $rge_p in
       *'*'* | *'?'* | *'['* | *']'* | *'\'*)
         echo "FAIL: the $rge_label allowlist entry '$rge_p' contains a glob"
