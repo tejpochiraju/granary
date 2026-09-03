@@ -1773,3 +1773,21 @@
  (name test_compound_order_by_662)
  (modules test_compound_order_by_662)
  (libraries granary alcotest lwt.unix))
+
+; #719: the checkpoint's page migration no longer runs under the writer lock —
+; only the final catch-up + Wal.reset does. File-backed and WAL-mode (the Mem
+; backend has no WAL), and the first two cases hook the main file's write_page
+; so the migration can be parked and the interleaving forced rather than raced.
+
+(test
+ (name test_autocheckpoint_lock_719)
+ (modules test_autocheckpoint_lock_719)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  cstruct
+  alcotest
+  lwt.unix
+  unix))

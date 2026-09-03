@@ -159,17 +159,18 @@ let no_reader_gate ~target:_ = Lwt.return_unit
 
 (** Migrate the latest version of every page in the WAL index to the main
     DB, sync, then reset the WAL (bumping its epoch).  Mirrors the engine's
-    [Store.checkpoint_unlocked] spine: [iter -> flush -> sync -> gate -> reset].
+    [Store.ckpt_install] spine: [iter -> flush -> sync -> gate -> reset].
 
-    Unlike [checkpoint_unlocked] the reader gate is called {e after} the main
-    flush and sync rather than before it.  This is safe because during the
-    flush window the WAL index stays intact --- a concurrent RO snapshot
-    resolves pages from the WAL, not from the freshly-flushed main page.  Only
-    [Wal.reset] (which {e is} gated) switches resolution to main.  The ordering
-    divergence from [checkpoint_unlocked] is benign provided the gate always
-    fires before [Wal.reset].
+    The reader gate is called {e after} the main flush and sync rather than
+    before it.  This is safe because during the flush window the WAL index stays
+    intact --- a concurrent RO snapshot resolves pages from the WAL, not from
+    the freshly-flushed main page.  Only [Wal.reset] (which {e is} gated)
+    switches resolution to main.  The ordering is benign provided the gate
+    always fires before [Wal.reset].  #719 adopted the same ordering in the
+    engine, and for the same reason: it is what lets the migration run outside
+    the writer lock.
 
-    The following engine concerns from [checkpoint_unlocked] are intentionally
+    The following engine concerns from [ckpt_install] are intentionally
     omitted for a leaf standby (revisit for cascading replication #208):
 
     - No {!Store.close} abort (#338): [~reader_gate]'s implementation

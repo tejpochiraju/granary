@@ -401,9 +401,17 @@ let the_background_autocheckpoint_is_charged_to_its_own_site () =
        caller has returned.  That is not a defect, it is the mechanism #716
        named as its candidate, observed directly for the first time; the report
        is only stable once the fiber drains.  Bounded, so a checkpoint that
-       never releases fails here rather than hanging the suite. *)
+       never releases fails here rather than hanging the suite.
+
+       #719: "nobody holds the lock" is no longer sufficient to conclude the
+       fiber has run.  Since the migration moved OUT of the critical section, a
+       dispatched checkpoint spends most of its life holding nothing at all, so
+       the very first sample would see [held = None] and prove nothing.  Drain
+       until an [Autocheckpoint] acquisition has actually been recorded AND the
+       lock is free again. *)
     let rec drain n =
-      if n = 0 || (Store.lock_stats st).LS.held = None
+      let r = Store.lock_stats st in
+      if n = 0 || ((stat_of r LS.Autocheckpoint).LS.acquisitions > 0 && r.LS.held = None)
       then n
       else (
         run (Lwt.pause ());
