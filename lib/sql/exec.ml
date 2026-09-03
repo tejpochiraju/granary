@@ -14768,9 +14768,9 @@ and to_stream
       | S.Wal_replay_no_evidence ->
         ( "no_evidence"
         , "The frames WAL recovery replayed at this open showed no generation \
-           regression.  This is not a clean bill of health: a pre-#636 stale replay \
-           from an EARLIER open is already in the main file, leaves a structurally \
-           valid database, and is not detectable here or by PRAGMA integrity_check." )
+           regression.  This is not a clean bill of health: a pre-#636 stale replay from \
+           an EARLIER open is already in the main file, leaves a structurally valid \
+           database, and is not detectable here or by PRAGMA integrity_check." )
       | S.Wal_replay_not_examined ->
         ( "not_examined"
         , "Nothing to examine: no WAL, or fewer than two header-page frames were \

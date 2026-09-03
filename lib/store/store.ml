@@ -2887,7 +2887,9 @@ type wal_replay_check =
    detector, so a walk with less than two header frames to compare answers
    [Wal_replay_not_examined] instead. *)
 let wal_replay_check (t : t) : wal_replay_check =
-  let not_examined = { status = Wal_replay_not_examined; frames_walked = 0; header_frames = 0 } in
+  let not_examined =
+    { status = Wal_replay_not_examined; frames_walked = 0; header_frames = 0 }
+  in
   match t.backend with
   | Mem _ -> not_examined
   | Btree st ->
@@ -2900,7 +2902,9 @@ let wal_replay_check (t : t) : wal_replay_check =
          | Some (frame_idx, previous_txn_id, frame_txn_id) ->
            Wal_replay_stale_generation { frame_idx; previous_txn_id; frame_txn_id }
          | None ->
-           if r.Wal.header_frames >= 2 then Wal_replay_no_evidence else Wal_replay_not_examined
+           if r.Wal.header_frames >= 2
+           then Wal_replay_no_evidence
+           else Wal_replay_not_examined
        in
        { status
        ; frames_walked = r.Wal.frames_walked

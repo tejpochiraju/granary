@@ -202,10 +202,10 @@ let generation w ~first_txn ~n =
   let rec go k =
     if k >= n
     then Lwt.return_unit
-    else
+    else (
       let txn = Int64.add first_txn (Int64.of_int k) in
       let* () = commit_batch w ~txn_id:txn ~data_page:(Int64.of_int (2 + k)) in
-      go (k + 1)
+      go (k + 1))
   in
   go 0
 ;;
@@ -243,21 +243,6 @@ let a_stale_generation_is_detected () =
         i "detected at the first frame of the stale remainder" 6 idx;
         Alcotest.(check int64) "after the successor's last txn_id" 102L prev;
         is_true "on a frame carrying an older txn_id" (Int64.compare txn prev <= 0));
-     Lwt.return_unit)
-;;
-
-(* The store-level status, which is what the PRAGMA renders. *)
-let the_store_reports_stale_generation () =
-  run
-    (let d = mk_dev () in
-     let* w = open_on d in
-     let* () = generation w ~first_txn:1L ~n:12 in
-     let* w2 = open_on ~size_bytes:(Int64.of_int Wal.header_size_bytes) d in
-     let* () = generation w2 ~first_txn:100L ~n:3 in
-     let* w3 = open_on d in
-     (match (Wal.replay_check w3).Wal.stale_generation with
-      | Some _ -> ()
-      | None -> Alcotest.fail "precondition: no stale generation built");
      Lwt.return_unit)
 ;;
 
@@ -299,6 +284,42 @@ let a_longer_successor_leaves_no_remainder () =
      Lwt.return_unit)
 ;;
 
+(* The false-alarm control, and the reason the detector looks at the COMMITTED
+   prefix rather than at everything it walked.  A frame checksum covers
+   [(salt, seed, page_id, flags, page)] and not the frame's index, so leftovers
+   from an earlier, longer write verify wherever they sit — including the tail
+   of a batch a crash tore in half before its commit frame was written.  Such a
+   tail is walked and then thrown away for want of a commit, so the database is
+   correct and must not be reported as corrupt.
+
+   Built by taking the corrupt fixture above and cutting the device off one
+   frame into the stale remainder, so what survives is a lone header frame with
+   no commit behind it.  Without the [last_commit_idx] restriction this case
+   reports [stale_generation]; with it, [None]. *)
+let an_unapplied_stale_tail_is_not_reported () =
+  run
+    (let d = mk_dev () in
+     let* w = open_on d in
+     let* () = generation w ~first_txn:1L ~n:12 in
+     (* Derive the frame stride from the device rather than hardcoding it. *)
+     let hdr = Int64.of_int Wal.header_size_bytes in
+     let frame = Int64.div (Int64.sub (dev_size d) hdr) 24L in
+     let* w2 = open_on ~size_bytes:hdr d in
+     let* () = generation w2 ~first_txn:100L ~n:3 in
+     (* Six successor frames, then exactly one frame of the older generation:
+        its commit frame is beyond the cut, so nothing of it is applied. *)
+     dev_set_len d (Int64.to_int (Int64.add hdr (Int64.mul 7L frame)));
+     let* w3 = open_on d in
+     let c = Wal.replay_check w3 in
+     i "the walk consumed the successor plus the orphan frame" 7 c.Wal.frames_walked;
+     i "the successor's last commit is the mark" 6 (Wal.committed_frames w3);
+     Alcotest.(check bool)
+       "an unapplied leftover is not a stale replay"
+       true
+       (c.Wal.stale_generation = None);
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* 3. "No evidence" is not "clean", and the PRAGMA says so.             *)
 (* ------------------------------------------------------------------ *)
@@ -334,6 +355,18 @@ let exec db sql =
   | Error e -> Alcotest.failf "error in %S: %a" sql Db.pp_error e
 ;;
 
+let read_file path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () -> really_input_string ic (in_channel_length ic))
+;;
+
+let write_file path s =
+  let oc = open_out_bin path in
+  Fun.protect ~finally:(fun () -> close_out oc) (fun () -> output_string oc s)
+;;
+
 let replay_row db =
   match run (Db.query db "PRAGMA wal_replay_check") with
   | Error e -> Alcotest.failf "PRAGMA wal_replay_check: %a" Db.pp_error e
@@ -342,6 +375,74 @@ let replay_row db =
      | [ [| Db.V_text status; Db.V_int walked; Db.V_int hdrs; Db.V_text detail |] ] ->
        status, Int64.to_int walked, Int64.to_int hdrs, detail
      | _ -> Alcotest.fail "PRAGMA wal_replay_check: unexpected row shape")
+;;
+
+(* The end-to-end reproduction of the pre-#636 physical state, on a real file in
+   WAL mode.  Everything up to the surgery is ordinary SQL; the surgery is two
+   byte-level writes to the [-wal] file that put it back into the state a
+   pre-#636 [reset] used to leave it in, which the fixed code cannot be talked
+   into producing.
+
+   The shape: a LONG generation A is committed and checkpointed (so its pages
+   are in the main file), then generation A's 24-byte header — its [(salt,
+   seed)] marker, the thing #636 rotates and the old code did not — is restored
+   over the truncated WAL with an empty frame area, so the next writer starts at
+   frame 0 under the SAME marker.  A SHORT generation B is written there, and
+   generation A's tail is spliced back on behind it.  Every one of those tail
+   frames still verifies, so recovery walks straight out of B and into them.
+   That is the defect, byte for byte.
+
+   Note what is asserted and what is not: the detector fires, and the database
+   still OPENS and ANSWERS.  That second half is the reason a detector is needed
+   at all — the row-loss variant of #636 is not structurally broken, so nothing
+   else in the engine has anything to say about it.  The post-replay row
+   CONTENT is deliberately not pinned: which of the two generations wins for a
+   given page depends on where its frames happen to land, and pinning that would
+   be pinning an artefact of the fixture rather than the defect. *)
+let a_pre_636_file_is_detected_end_to_end () =
+  with_wal_path (fun path ->
+    let wal = path ^ "-wal" in
+    let db = open_db path in
+    exec db "PRAGMA wal_autocheckpoint = 0";
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    for k = 1 to 200 do
+      exec db (Printf.sprintf "INSERT INTO t VALUES (%d, 'v%d')" k k)
+    done;
+    run (Db.close db);
+    let gen_a = read_file wal in
+    let db = open_db path in
+    exec db "PRAGMA wal_checkpoint";
+    run (Db.close db);
+    (* The pre-#636 [reset]: in-memory frame count dropped, marker NOT rotated,
+       file NOT truncated.  Restoring the header alone is how the next writer is
+       made to start at frame 0 under generation A's marker. *)
+    write_file wal (String.sub gen_a 0 Wal.header_size_bytes);
+    let db = open_db path in
+    exec db "PRAGMA wal_autocheckpoint = 0";
+    exec db "UPDATE t SET b = 'B' WHERE a = 1";
+    exec db "INSERT INTO t VALUES (201, 'B')";
+    run (Db.close db);
+    let gen_b = read_file wal in
+    let la = String.length gen_a
+    and lb = String.length gen_b in
+    is_true "the successor generation is the shorter one" (lb < la);
+    (* Generation A's tail, still physically present and still verifying. *)
+    write_file wal (gen_b ^ String.sub gen_a lb (la - lb));
+    let db2 = open_db path in
+    let status, walked, hdrs, detail = replay_row db2 in
+    Alcotest.(check string) "status" "stale_generation" status;
+    is_true "the walk ran past the successor generation" (walked > 0);
+    is_true "with header frames to compare" (hdrs >= 2);
+    is_true "and the detail names a repair" (contains ~needle:"backup" detail);
+    (* It opens, and it answers.  That is the silent variant. *)
+    (match run (Db.query db2 "SELECT COUNT(*) FROM t") with
+     | Error e -> Alcotest.failf "count: %a" Db.pp_error e
+     | Ok stream ->
+       (match run (Lwt_stream.to_list stream) with
+        | [ [| Db.V_int n |] ] ->
+          is_true "the database answers queries as if nothing were wrong" (n > 0L)
+        | _ -> Alcotest.fail "count: unexpected shape"));
+    run (Db.close db2))
 ;;
 
 (* The claim that must not be over-read. A freshly created database has an empty
@@ -421,14 +522,13 @@ let a_checkpointed_and_rewritten_database_is_not_false_positived () =
 (* The in-memory backend has no WAL at all, so it must answer "nothing to
    examine" rather than anything that could read as a clean bill of health. *)
 let the_mem_backend_reports_not_examined () =
-  run
-    (let* st = Store.open_mem () in
-     let c = Store.wal_replay_check st in
-     Alcotest.(check bool)
-       "not examined"
-       true
-       (c.Store.status = Store.Wal_replay_not_examined);
-     Lwt.return_unit)
+  let st = Store.create () in
+  let c = Store.wal_replay_check st in
+  Alcotest.(check bool)
+    "not examined"
+    true
+    (c.Store.status = Store.Wal_replay_not_examined);
+  i "and nothing was walked" 0 c.Store.frames_walked
 ;;
 
 let () =
@@ -439,10 +539,6 @@ let () =
             "a stale generation is detected"
             `Quick
             a_stale_generation_is_detected
-        ; Alcotest.test_case
-            "the fabricated file really is stale"
-            `Quick
-            the_store_reports_stale_generation
         ] )
     ; ( "controls"
       , [ Alcotest.test_case "one generation is clean" `Quick one_generation_is_clean
@@ -450,9 +546,17 @@ let () =
             "a longer successor leaves no remainder"
             `Quick
             a_longer_successor_leaves_no_remainder
+        ; Alcotest.test_case
+            "an unapplied stale tail is not reported"
+            `Quick
+            an_unapplied_stale_tail_is_not_reported
         ] )
     ; ( "pragma"
       , [ Alcotest.test_case
+            "a pre-#636 file is detected end to end"
+            `Quick
+            a_pre_636_file_is_detected_end_to_end
+        ; Alcotest.test_case
             "an empty WAL reports not_examined, not clean"
             `Quick
             an_empty_wal_reports_not_examined_not_clean

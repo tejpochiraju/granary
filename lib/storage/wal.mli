@@ -114,7 +114,14 @@ val committed_frames : t -> int
     many of those carried a readable header [txn_id] — i.e. how much material
     the test actually had.  Both are reported because
     [stale_generation = None] with [header_frames < 2] means "nothing to compare",
-    which is not the same claim as "compared and clean". *)
+    which is not the same claim as "compared and clean".
+
+    Only a regression at or below the last commit frame is reported.  A frame
+    checksum does not cover the frame's INDEX, so leftovers from an earlier,
+    longer write verify wherever they sit — including the tail of a batch torn
+    by a crash and never committed.  Such a tail is walked but never applied, so
+    reporting it would be a false alarm; the stale frames #637 is about were
+    applied, and so sit within the committed prefix. *)
 type replay_check =
   { frames_walked : int
   ; header_frames : int

@@ -486,11 +486,24 @@ let recover_index t =
   | Error e -> Lwt.return_error e
   | Ok () ->
     t.committed_frames <- !last_commit_idx + 1;
+    (* #637: a regression PAST the last commit frame is discarded, and this is
+       the difference between a detector and a false alarm.  The frame checksum
+       covers [(salt, seed, page_id, flags, page)] and NOT the frame's index, so
+       any frame left over from an earlier, longer write at the same index still
+       verifies — including the tail of a batch that was torn by a crash and
+       never committed.  Such a tail is walked but never APPLIED (its pending
+       updates are dropped for want of a commit frame), so flagging it would
+       report corruption on a database that is entirely correct.  What #637 is
+       about is stale frames that WERE applied, and those necessarily sit at or
+       below [last_commit_idx].  Indices only increase, so if the first
+       regression is past the mark every later one is too. *)
+    let stale =
+      match !regression with
+      | Some (i, _, _) when i > !last_commit_idx -> None
+      | r -> r
+    in
     t.replay_check
-    <- { frames_walked = !idx
-       ; header_frames = !header_frames
-       ; stale_generation = !regression
-       };
+    <- { frames_walked = !idx; header_frames = !header_frames; stale_generation = stale };
     Lwt.return_ok ()
 ;;
 

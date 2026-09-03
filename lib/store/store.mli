@@ -484,6 +484,10 @@ val checkpoint_health : t -> checkpoint_health
       no header-page frame.  Recovery can consume such a fragment, and if it
       contains a commit-flagged frame the fragment is applied — undetected.  Any
       stale remainder spanning a whole old commit does contain a header frame.
+    - A stale remainder that recovery walked but never APPLIED, because no
+      commit frame followed it.  That is deliberately not reported: it is the
+      ordinary residue of a crash-torn write, harms nothing, and flagging it
+      would make the detector cry wolf on correct databases.
     - A database that will not open at all (#636's other outcome) never reaches
       this, but it is loud by construction.
 
@@ -494,17 +498,17 @@ val checkpoint_health : t -> checkpoint_health
     see how much material the test had. *)
 type wal_replay_status =
   | Wal_replay_not_examined
-    (** No WAL, or fewer than two header frames were walked: the check had
+  (** No WAL, or fewer than two header frames were walked: the check had
         nothing to compare.  Not a claim either way. *)
   | Wal_replay_no_evidence
-    (** The frames recovery walked at this open showed no generation
+  (** The frames recovery walked at this open showed no generation
         regression.  Not a clean bill of health for the database. *)
   | Wal_replay_stale_generation of
       { frame_idx : int
       ; previous_txn_id : int64
       ; frame_txn_id : int64
       }
-    (** Recovery walked into frames belonging to an older generation: at
+  (** Recovery walked into frames belonging to an older generation: at
         [frame_idx] a header page carried [frame_txn_id], no greater than the
         [previous_txn_id] already seen.  A database written by a pre-#636 binary
         has replayed stale data over newer data. *)
