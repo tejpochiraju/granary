@@ -554,6 +554,19 @@ let table_level_unique_survives_reopen () =
    own shape) and as a table-level [PRIMARY KEY (...)] clause ([wr2]).  The
    trailing WITHOUT ROWID has to survive with both, and so does the backing
    [__pk_] index's column list. *)
+(* #618: hoisted to the top level so the four surface tests stay inside
+   merlint's nesting budget — a [List.iter] over an [if ... then failf], inside a
+   [Fun.protect], inside [with_file_db], reaches depth 5. *)
+let expect_every_ddl_contains ~msg needles sqls =
+  let missing sql = List.find_opt (fun n -> not (lower_contains sql n)) needles in
+  List.iter
+    (fun sql ->
+       match missing sql with
+       | Some _ -> Alcotest.failf "%s: %s" msg sql
+       | None -> ())
+    sqls
+;;
+
 let without_rowid_survives_reopen () =
   with_file_db "wr" (fun open_it ->
     let create db =
@@ -589,19 +602,19 @@ let without_rowid_survives_reopen () =
            List.partition (fun sql -> lower_contains sql "create table") before
          in
          (* both CREATE TABLEs keep their delimiters and their WITHOUT ROWID *)
-         List.iter
-           (fun sql ->
-              if not (lower_contains sql "\"select\"" && lower_contains sql "\"order\"")
-              then Alcotest.failf "a reserved name lost its delimiters: %s" sql;
-              if not (lower_contains sql "without rowid")
-              then Alcotest.failf "the WITHOUT ROWID clause was lost: %s" sql)
+         expect_every_ddl_contains
+           ~msg:"a reserved name lost its delimiters"
+           [ "\"select\""; "\"order\"" ]
+           tables;
+         expect_every_ddl_contains
+           ~msg:"the WITHOUT ROWID clause was lost"
+           [ "without rowid" ]
            tables;
          (* and so do the two backing __pk_ indexes' column lists *)
          Alcotest.(check int) "two PK indexes" 2 (List.length indexes);
-         List.iter
-           (fun sql ->
-              if not (lower_contains sql "\"select\"")
-              then Alcotest.failf "the PK index lost its delimiters: %s" sql)
+         expect_every_ddl_contains
+           ~msg:"the PK index lost its delimiters"
+           [ "\"select\"" ]
            indexes;
          pk_is_live db "after reopen";
          expect_ok db "a different key after reopen" "INSERT INTO wr VALUES (2, 20)";
@@ -638,10 +651,9 @@ let rename_table_to_reserved_survives_reopen () =
       (fun () ->
          Alcotest.(check (list string)) "DDL is durable" before (all_ddl db);
          (* both the table's DDL and the index's must name it delimited *)
-         List.iter
-           (fun sql ->
-              if not (lower_contains sql "\"order\"")
-              then Alcotest.failf "the renamed table lost its delimiters: %s" sql)
+         expect_every_ddl_contains
+           ~msg:"the renamed table lost its delimiters"
+           [ "\"order\"" ]
            before;
          expect_ok db "renamed table after reopen" "INSERT INTO \"order\" VALUES (2, 1)";
          expect_constraint_violation

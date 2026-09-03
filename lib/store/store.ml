@@ -2365,40 +2365,47 @@ let commit_prepare_btree
    the header alternating-pages protocol). *)
 (* After a WAL group-commit, the drainer kicks off an async autocheckpoint if
    the WAL has grown past the threshold and none is already in flight. *)
+(* #719: the dispatch guard, lifted out of [maybe_autockpt_after_commit] so that
+   function stays inside merlint's nesting budget.  [st.closing] is #338: no
+   fresh checkpoint once [close] has signalled teardown. *)
+let autockpt_should_skip st =
+  st.closing
+  || st.wal_autocheckpoint_threshold <= 0
+  || Wal.committed_frames
+       (match st.wal with
+        | Some w -> w
+        | None -> assert false)
+     < st.wal_autocheckpoint_threshold
+  || st.autockpt_in_flight
+;;
+
+(* #638: [checkpoint_body] has already recorded and emitted the failure, at the
+   one place that knows the target.  Swallowing it HERE is the #638 asymmetry:
+   nobody awaits this fiber, and the commit that dispatched it has already
+   succeeded — so the failure is surfaced, never raised. *)
+let autockpt_attempt t st =
+  Lwt.catch
+    (fun () ->
+       match st.wal with
+       | None -> Lwt.return_unit
+       | Some wal -> checkpoint_body t st wal ~site:Lock_stats.Autocheckpoint)
+    (fun _exn -> Lwt.return_unit)
+;;
+
+let autockpt_release st =
+  st.autockpt_in_flight <- false;
+  (* #338: wake a [close] awaiting the in-flight checkpoint to drain. *)
+  Lwt_condition.broadcast st.reader_done_cond ();
+  Lwt.return_unit
+;;
+
 let maybe_autockpt_after_commit t st =
-  if
-    st.closing
-    (* #338: no fresh checkpoint once close has signalled teardown. *)
-    || st.wal_autocheckpoint_threshold <= 0
-    || Wal.committed_frames
-         (match st.wal with
-          | Some w -> w
-          | None -> assert false)
-       < st.wal_autocheckpoint_threshold
-    || st.autockpt_in_flight
+  if autockpt_should_skip st
   then Lwt.return_unit
   else (
     st.autockpt_in_flight <- true;
     Lwt.async (fun () ->
-      Lwt.finalize
-        (fun () ->
-           Lwt.catch
-             (fun () ->
-                match st.wal with
-                | None -> Lwt.return_unit
-                | Some wal -> checkpoint_body t st wal ~site:Lock_stats.Autocheckpoint)
-             (fun _exn ->
-                (* #638: [checkpoint_body] has already recorded and emitted the
-                   failure, at the one place that knows the target.  Swallowing
-                   it HERE is the #638 asymmetry: nobody awaits this fiber, and
-                   the commit that dispatched it has already succeeded — so the
-                   failure is surfaced, never raised. *)
-                Lwt.return_unit))
-        (fun () ->
-           st.autockpt_in_flight <- false;
-           (* #338: wake a [close] awaiting the in-flight checkpoint to drain. *)
-           Lwt_condition.broadcast st.reader_done_cond ();
-           Lwt.return_unit));
+      Lwt.finalize (fun () -> autockpt_attempt t st) (fun () -> autockpt_release st));
     Lwt.return_unit)
 ;;
 
