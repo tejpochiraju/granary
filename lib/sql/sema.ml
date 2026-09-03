@@ -690,12 +690,29 @@ let bind_case ~bind ~scrutinee ~branches ~else_ =
    The flag must NOT be widened into a default: [excluded.x] has to stay
    unresolvable in a plain SELECT/WHERE/UPDATE, which is what sqlite3 does
    ("no such column: excluded.v"). *)
+(* #744: [TRUE] and [FALSE] are bare identifiers that stand for the integers 1
+   and 0 when — and only when — nothing in scope answers to the name.  The rule
+   itself lives in {!Ast.bool_ident_lit}, which the parser and [Exec] share; see
+   its doc comment in [ast.mli] for why it is a resolution fallback rather than
+   a pair of lexer keywords. *)
+let bool_ident_lit = Ast.bool_ident_lit
+
+let or_bool_ident name mk err =
+  match bool_ident_lit name with
+  | Some l -> Ok (mk l)
+  | None -> Error err
+;;
+
 let rec bind_expr ?(excluded = false) ~param_counter ~named_params (meta : Cat.table_meta)
   = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
     (match col_index meta.columns name with
-     | None -> Error (Unknown_column { table = meta.name; column = name })
+     | None ->
+       or_bool_ident
+         name
+         (fun l -> BE_lit l)
+         (Unknown_column { table = meta.name; column = name })
      | Some i -> Ok (BE_col i))
   | Ast.E_tbl_col (tbl, name)
     when excluded && String.equal (String.uppercase_ascii tbl) "EXCLUDED" ->
@@ -840,7 +857,10 @@ let rec bind_expr_join
      | [ be ] -> Ok be
      | [] ->
        let tm0, _, _ = List.hd tables in
-       Error (Unknown_column { table = tm0.Cat.name; column = name })
+       or_bool_ident
+         name
+         (fun l -> BE_lit l)
+         (Unknown_column { table = tm0.Cat.name; column = name })
      | _ :: _ -> Error (Ambiguous_column name))
   | Ast.E_tbl_col (tbl, name) ->
     (match List.find_opt (fun t -> String.equal (from_ident t) tbl) tables with
@@ -1258,7 +1278,7 @@ let rec bind_expr_agg
     | Ast.E_lit l -> Ok (BE_lit l)
     | Ast.E_col name ->
       (match resolver.resolve_unqual name with
-       | Error e -> Error e
+       | Error e -> or_bool_ident name (fun l -> BE_lit l) e
        | Ok i -> Ok (BE_col i))
     | Ast.E_tbl_col (t, c) ->
       (match resolver.resolve_qual t c with
@@ -1829,6 +1849,104 @@ let reject_reserved_name name =
   else Ok ()
 ;;
 
+(* #486: a derived table in FROM position desugars to an [S_with_cte] wrapper
+   around the SELECT.  A plain [CREATE VIEW] is fine with that -- its body is
+   re-bound on every use -- but a REACTIVE view is not:
+   [Reactive_view.base_tables_of] reads the base tables off the [S_select] at
+   the root of the body and answers [] for anything else, so the view would be
+   registered with no base table, no write would ever invalidate it, and it
+   would serve its first snapshot forever.  Refuse rather than register a view
+   that silently stops tracking.  Lifting this means teaching
+   [base_tables_of] to look through the wrapper AND collect the CTE
+   definition's own tables -- both halves, or the same silence comes back. *)
+let reject_reactive_derived_table (query : Ast.stmt) =
+  match query with
+  | Ast.S_with_cte _ ->
+    Error
+      (Unsupported
+         "CREATE REACTIVE VIEW does not support a derived table in FROM (#486): the view \
+          would never be invalidated")
+  | _ -> Ok ()
+;;
+
+(* #750: an [S_compound] root -- UNION / UNION ALL / INTERSECT / EXCEPT -- is
+   refused for the same reason as #486 above, and by the same mechanism:
+   [Reactive_view.base_tables_of] reads the base tables off the [S_select] at
+   the root of the body and answers [] for anything else.  A compound view
+   therefore registered with NO base tables, so no write to either arm's table
+   ever marked it dirty: it materialised correctly once and then served that
+   first snapshot forever, with no error at any point.
+
+   This was the THIRD instance of one pattern -- a [Reactive_view] helper
+   matching [S_select] and answering a benign-looking default for everything
+   else -- after #486 ([base_tables_of], derived table) and #747 ([proj_of],
+   [SELECT *]).  All three are closed the same way: refuse the shape at bind
+   time, because a maintained view needs a statically determinable one.
+
+   Supporting it properly is a separate decision, not an omission.  It needs
+   [base_tables_of] to union both arms AND a correct incremental rule per set
+   operation, and neither UNION (distinct) nor EXCEPT is an additive merge over
+   Z-sets -- a row deleted from one arm may or may not leave the result
+   depending on the other arm's multiplicity.  Half of that -- the base tables
+   without the delta rule -- would replace a stale view with a wrong one. *)
+let reject_reactive_compound (query : Ast.stmt) =
+  match query with
+  | Ast.S_compound _ ->
+    Error
+      (Unsupported
+         "CREATE REACTIVE VIEW does not support UNION / UNION ALL / INTERSECT / EXCEPT \
+          as its body (#750): a maintained view's base tables must be statically \
+          determinable, and a compound body has none, so the view would never be \
+          invalidated")
+  | _ -> Ok ()
+;;
+
+(* #747: a reactive view is MAINTAINED, so its output shape has to be a
+   property of the statement rather than of the data that happened to be
+   present when it was created.  [SELECT *] is not: [Db.rv_create] derived the
+   arity from the first row of the initial result and froze it, so a star view
+   over a non-empty table was accepted and then (a) never grew a column added
+   later by [ALTER TABLE ... ADD COLUMN], silently dropping it from what the
+   view yields, and (b) fired on every write to the base table, including
+   writes that were idempotent for the columns it actually projects.  Only the
+   EMPTY case was refused, which made the guard read as "star is refused" while
+   really being "star is refused when we cannot guess a shape".
+
+   The refusal is now unconditional and static.  A plain [CREATE VIEW] is
+   deliberately unaffected: it is not maintained, its body is re-bound on every
+   use, and so it picks up an added column the way a bare [SELECT *] does.
+
+   The walk follows the statement's OUTPUT projection only -- through a
+   compound's arms and through a CTE wrapper's body -- and deliberately not
+   into a CTE definition or a subquery.  A star there does not determine the
+   view's own arity: [SELECT a FROM (SELECT * FROM t) d] still yields exactly
+   one column whatever [t] grows.  (The [S_with_cte] and [S_compound] arms are
+   unreachable today, since [reject_reactive_derived_table] and
+   [reject_reactive_compound] run first and refuse those roots outright; they
+   are written out so that lifting #486 or #750 does not silently reopen this
+   hole.)  A qualified star [t.*] is not in the grammar at all, so there is
+   no spelling of it to cover. *)
+let rec reactive_projects_star (query : Ast.stmt) =
+  match query with
+  | Ast.S_select { proj = `All; _ } -> true
+  | Ast.S_compound { left; right; _ } ->
+    reactive_projects_star left || reactive_projects_star right
+  | Ast.S_with_cte { query; _ } -> reactive_projects_star query
+  | _ -> false
+;;
+
+let reject_reactive_star (query : Ast.stmt) =
+  if reactive_projects_star query
+  then
+    Error
+      (Unsupported
+         "CREATE REACTIVE VIEW requires an explicit projection (#747): a reactive view \
+          is maintained, so its column list must be fixed by the statement; SELECT * \
+          would freeze the shape at creation time and silently drop any column added \
+          later by ALTER TABLE")
+  else Ok ()
+;;
+
 let bind_create
       cat
       ~name
@@ -2002,6 +2120,12 @@ let bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values =
     let synth_meta = fts_as_table_meta fts_meta in
     let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
       match e with
+      (* #744: a VALUES list has no row in scope, so a bare [true]/[false] is
+         the literal even on a table that has a column of that name — which is
+         what sqlite3 answers (oracle-checked).  Going through [bind_expr] would
+         consult the columns first and read the column instead. *)
+      | Ast.E_col n when Option.is_some (bool_ident_lit n) ->
+        Ok (BE_lit (Option.get (bool_ident_lit n)))
       | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
         bind_expr ~param_counter ~named_params synth_meta e
       | _ -> Error (Unsupported "complex expression in INSERT VALUES")
@@ -2142,6 +2266,11 @@ let bind_explicit_insert_cols
   (* Bind a single VALUES expr without column context. *)
   let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
     match e with
+    (* #744: see the note on the FTS twin above — a VALUES list has no row in
+       scope, so [true]/[false] is the literal here even on a table with a
+       column of that name. *)
+    | Ast.E_col n when Option.is_some (bool_ident_lit n) ->
+      Ok (BE_lit (Option.get (bool_ident_lit n)))
     | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
       bind_expr ~param_counter ~named_params meta e
     | _ -> Error (Unsupported "complex expression in INSERT VALUES")
@@ -2857,6 +2986,25 @@ let bind_unaggregated_proj
   (* Alias-aware multi-table binder, used even for single-table queries so
      qualified refs resolve only against in-scope tables/aliases. *)
   let bind_one e = bind_expr_join ~param_counter ~named_params ~tables e in
+  (* #744: [`Cols] is a [string list] and so cannot hold a literal, and the
+     parser emits it whenever EVERY projection item is a bare name — so
+     [SELECT true FROM z] arrives here as [`Cols ["true"]] and the ordinal
+     lookup below is the only thing that ever sees it.  Promote the whole
+     projection to [`Exprs] when a name is one the #744 fallback will answer,
+     keeping the name as the alias so the output column is still called [true].
+     Same shape, and the same conditionality, as [Exec.substitute_outer_proj]'s
+     #732 promotion: a projection with nothing to promote keeps the [`Cols]
+     shape the rest of the engine sees today. *)
+  let proj =
+    match proj with
+    | `Cols names
+      when List.exists
+             (fun n ->
+                Option.is_some (bool_ident_lit n)
+                && Result.is_error (select_proj_lookup ~tables ~meta n))
+             names -> `Exprs (List.map (fun n -> Ast.E_col n, Some n) names)
+    | p -> p
+  in
   let windows_queue : window_sema Queue.t = Queue.create () in
   let ords_result_lwt =
     match proj with
@@ -2935,7 +3083,7 @@ let bind_post_agg
     | Ast.E_lit l -> Ok (BE_lit l)
     | Ast.E_col name ->
       (match (select_proj_lookup ~tables ~meta) name with
-       | Error e -> Error e
+       | Error e -> or_bool_ident name (fun l -> BE_lit l) e
        | Ok i ->
          (match select_find_pos group_cols i with
           | Some pos -> Ok (BE_col pos)
@@ -3237,7 +3385,7 @@ let project_agg_item
   match e with
   | Ast.E_col name ->
     (match select_proj_lookup ~tables ~meta name with
-     | Error e -> Error e
+     | Error e -> or_bool_ident name (fun l -> AP_expr (BE_lit l)) e
      | Ok i ->
        (* Must appear in GROUP BY. *)
        (match select_find_pos group_cols i with
@@ -5653,7 +5801,12 @@ and bind_expanded ~views ~named_params ~param_counter cat stmt =
         | Error e -> Lwt.return (Error e)
         | Ok _ -> Lwt.return (Ok (BS_create_view { name; query }))))
   | Ast.S_create_reactive_view { name; query; refresh } ->
-    (match reject_reserved_name name with
+    (match
+       Result.bind (reject_reserved_name name) (fun () ->
+         Result.bind (reject_reactive_derived_table query) (fun () ->
+           Result.bind (reject_reactive_compound query) (fun () ->
+             reject_reactive_star query)))
+     with
      | Error e -> Lwt.return (Error e)
      | Ok () ->
        let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in

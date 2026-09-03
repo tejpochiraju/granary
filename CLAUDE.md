@@ -117,6 +117,8 @@ Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
 | `test_not_null_600` | #600 `PRAGMA not_null_check` retaining every violating row | marginal peak live heap < 4 words/row when the table doubles | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
 | `test_not_null_repair_630` | #630 `PRAGMA not_null_repair`'s **scan** draining the tree via `cursor_open` | same gate, but with the violation count held FIXED at 5 while the table doubles, so only the scan can move it | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
 | `test_correlated_exists_493` | #493 a correlated `EXISTS` leaking one RO snapshot per outer row | peak live RO snapshots does not grow when the outer rows go 100 → 400 | `GRANARY_MAX_LIVE_READERS` |
+| `test_agg_retention_423` | #423 the net-zero SUM-group retention in `Aggregate` growing per UPDATE rather than per distinct group, or costing more than one map node plus one record | marginal live heap < 16 words per retained group when the group count doubles, and quadrupling the churn over ONE key adds < 16 words total | `GRANARY_MEM_MAX_WORDS_PER_GROUP` |
+| `test_view_callback_746` | #746 `Db.register_view_callback` going back to an O(n^2) list append | doubling the registrations must not more than double the words allocated (< 2.5; linear is 2.0, the old `@` append measured 4.0) | `GRANARY_MEM_MAX_CALLBACK_SLOPE` |
 
 The first two are complements, not duplicates: #600's doubles the violations along
 with the table and so cannot tell a retaining scan from a retaining victim
@@ -137,6 +139,23 @@ same test makes. Reach for it only after ruling out the thing it guards: the
 measured slopes are ≈20-23 words/row retaining (19.61-23.52 across three runs;
 the 40 000-row point is the noisy one) and 1.6-1.9 counting, so a failure
 anywhere between those two bands is a regression, not a platform difference.
+
+**`test_agg_retention_423` gates on the SETTLED heap, not the sampled peak, and
+that is the opposite of the other three for a reason.** They bound a
+*transient* — a scan that must not retain what it walks — which only a peak can
+see. #423 bounds what *survives*, so the settled heap after a `full_major` with
+the operator still reachable is the figure that carries it, and the `Gc` alarm's
+asynchronous samples routinely all land below that (the alarm fires at
+major-slice boundaries, not on demand). The test prints `max sampled settled` as
+its peak so a peak below the settled heap is not mistaken for a smaller
+footprint. Its two measured numbers are **9.00 words per retained group** for the
+bare operator with an immediate key and **16.00 words** for
+`Reactive_view.Agg_engine`'s boxed-`INTEGER` key — exact, not approximate,
+because they are block layouts (one `Map` node at 6 words plus the `{ mult; aggv }`
+record at 3, plus 7 for the key) rather than allocator behaviour. The 16-word
+ceiling therefore has ~1.8x headroom over the bare operator and is far below the
+20+ any *element*-retaining regression would cost. It is armed on the first run
+that produced the number, which is what `test_scan_borrow_481` below asks for.
 
 `test_correlated_exists_493` measures a *count* — `Store.active_reader_count`,
 an integer folded from a refcount table — sampled between outer rows, so load
@@ -1024,6 +1043,238 @@ EOF
       change resolved it. #721 is that change and the case now asserts the
       answer. Full coverage lives in `test/test_outer_ref_721.ml` and
       `test/test_outer_ref_732.ml`.
+- **A comma in FROM is an INNER join on the literal `1`; a derived table is a
+  CTE (#486, decided 2026-09-03).** `SELECT * FROM a, b WHERE a.x = b.y` and
+  `SELECT * FROM (SELECT x FROM a) AS t` did not parse at all, and between them
+  they account for ~18 of the 20 TPC-H queries #482 could not run. Both are
+  closed **in the parser**, with no new `Ast` node and no new kind of FROM item
+  for the layers below to learn.
+
+  **The comma.** An implicit join has no ON clause of its own — its restriction
+  lives in WHERE — so at the join itself the pairing is unrestricted. That is
+  spelled as the literal `1` (`Parser.cross_join_on`) rather than as a third
+  `Ast.join_kind`, which keeps every existing consumer of `Ast.join_clause`
+  correct by construction. `CROSS JOIN` is the same production with the keyword
+  spelled out, and comes out free. A hand-written `JOIN b ON 1` is
+  indistinguishable from the sugar and is treated identically — right, because
+  both say the same thing.
+
+  **`FROM a, b WHERE a.x = b.y` must not become a cartesian product, and that
+  is a planner change, not a parser one.** `general_on_join` would have built
+  the whole product and filtered it above — O(N*M) on exactly the queries this
+  exists for. `Planner.on_is_trivially_true` recognises the literal and
+  `Planner.where_join_key` hands the join **one WHERE equality that spans its
+  two sides**, so the implicit spelling plans to the same keyed hash join (or
+  nested-loop probe) the explicit one does. It cannot change the answer: the ON
+  is true for every pair and `chain_joins` applies the whole WHERE above the
+  join anyway, so joining on a conjunct of that same WHERE emits a subset of
+  the same product and every pair removed is one the filter above would have
+  removed — NULL keys included, since `a.x = b.y` is unknown, hence false, on
+  them. The chosen conjunct **stays** in the WHERE clause and is evaluated
+  twice; that is deliberate, and removes any need to reason about which
+  conjuncts the join consumed.
+
+  **It is INNER-only and must stay so.** For a `Left` join the ON predicate
+  *is* the match test (#552), so narrowing it would suppress null-extended rows
+  that must be emitted. `where_join_key` is never consulted there.
+
+  With nothing to borrow, the join stays the cartesian product it genuinely is
+  — and `general_on_join` no longer wraps it in an `Op_filter` evaluating the
+  constant `1` once per row. `plan_join_on_literal` in `test/test_planner.ml`
+  used to pin that filter and now pins its absence; `plan_join_general_on`
+  beside it still pins the filter for an ON that is not trivially true, which
+  is the arm the literal case used to stand in for.
+
+  **The derived table.** `(SELECT …) AS t` desugars into a non-recursive CTE
+  wrapped around the SELECT that names it — the shape `Sema.expand_views`
+  already builds for a view named in FROM position (#496/#497), so nothing
+  downstream is new. **The alias becomes the CTE's NAME and the FROM item
+  carries no alias of its own**, which is the whole of the #635 scope story
+  here: a derived table has no underlying name for an alias to replace, so all
+  three levels (`Sema.from_ident`, `Exec.inner_scope_of`, `Exec.scan_ident` /
+  `get_outer_scan_metas`) answer the alias with no special case. Do not give
+  the FROM item both a name and an alias — that is the drift the #635 rule
+  exists to prevent.
+
+  An **unaliased** derived table is legal (sqlite3 accepts it) and is named
+  `__derived_<byte offset in the statement>`: unique within a statement, stable
+  across re-parses of the same text. It is nonetheless a plain identifier, so a
+  table literally called `__derived_12` would be shadowed for that statement.
+
+  Three things had to move with it, and each was a silent failure before:
+  - `lift_compound_tail` recurses through `S_with_cte`. The wrapper sits
+    OUTSIDE the `S_select`, so a compound's trailing ORDER BY is no longer at
+    the root of its right arm; without the recursion
+    `SELECT … UNION SELECT … FROM (…) t ORDER BY x` sorted only the right arm.
+  - `Ast.rename_view_columns` grew an `S_with_cte` arm. Its absence was
+    deliberate and correctly reasoned at the time — no view body could be an
+    `S_with_cte` — and stopped being true here. The prerequisite its comment
+    named, a matching arm in `Sema.col_names_of_ast_stmt`, has existed since
+    #491. An explicit `WITH` view body is still a syntax error; only the
+    desugaring reaches this.
+  - **`CREATE REACTIVE VIEW` over a derived table is REFUSED**
+    (`Sema.reject_reactive_derived_table`). `Reactive_view.base_tables_of`
+    reads the base tables off the `S_select` at the root of the body and
+    answers `[]` for anything else, so the view would be registered with
+    nothing to invalidate it and would serve its first snapshot forever, with
+    no error. A plain `CREATE VIEW` is unaffected — its body is re-bound on
+    every use. Lifting the refusal means teaching `base_tables_of` to look
+    through the wrapper **and** to collect the CTE definition's own tables;
+    both halves, or the same silence returns.
+
+  **Accepted limitation, and it is not new: a subquery correlated to a derived
+  table is refused.** `Exec.get_outer_scan_metas` resolves an outer input from
+  the *plan*, and a CTE scan is materialized into `Op_pragma_rows` before the
+  filter runs — an op carrying no `Cat.table_meta` and so no scope identifier.
+  A plain `WITH c AS (…) SELECT … WHERE EXISTS (… c.y …)` is refused
+  identically on the tree *before* #486, and
+  `a_subquery_correlated_to_a_derived_table_is_refused` in
+  `test/test_from_list_derived_486.ml` asserts the two refusals are the *same
+  message* so the pairing cannot drift. sqlite3 answers it. The refusal is loud
+  rather than a wrong answer, which is what keeps it a limitation; if
+  `Op_pragma_rows` ever learns its source, that test should start passing as an
+  answer and must be rewritten, not deleted.
+
+  **Two smaller divergences from sqlite3, both deliberate.** A column-alias
+  list on a derived table (`AS t(c1, c2)`) is a syntax error — so it is in the
+  sqlite3 in the dev image, oracle-checked, and TPC-H Q13's spec spelling needs
+  the same rewrite there. Nested parentheses in FROM (`FROM ((SELECT 1))`) are
+  a syntax error where sqlite3 accepts them; distinguishing `(a)` from
+  `(SELECT …)` at an arbitrary paren depth is not worth a FROM-position
+  conflict.
+
+  **Grammar cost.** The FROM productions add **zero** menhir conflicts. The
+  count moved 290 → 292 solely because `CROSS` joined `any_ident`, putting it
+  in the token set of two pre-existing `CREATE TABLE … DEFAULT <keyword>`
+  conflict states; the state count is unchanged at 35. Like sqlite3, `CROSS` is
+  reserved in bare-alias position (`FROM a cross` is a syntax error in both)
+  but usable as a table name and after `AS`.
+- **A reactive view must project explicitly; `SELECT *` is refused
+  unconditionally (#747, decided 2026-09-03).** This is a **behaviour break**:
+  `CREATE REACTIVE VIEW v AS SELECT * FROM t` used to be *accepted* whenever `t`
+  had at least one row, and anybody relying on that must now name the columns.
+
+  The old guard lived at runtime in `Db.rv_create`: the view's arity was read
+  off the first row of the initial result, and only an arity of **zero** — an
+  empty result — was refused, with a message that said "empty result and
+  SELECT *; use an explicit projection". So the guard *read* as "star is
+  refused" while really being "star is refused when we cannot guess a shape",
+  and the accepted case degraded badly: the view froze its column list at
+  creation time, thereafter silently dropped any column a later `ALTER TABLE …
+  ADD COLUMN` added, and fired on **every** write to the base table including
+  writes that were idempotent for the columns it actually projects. A
+  downstream consumer (camel's hook loader) documented the engine as refusing
+  `SELECT *` and had a tripwire test that only exercised the empty case, so it
+  believed it was protected against something it was not.
+
+  The refusal is now **static** — `Sema.reject_reactive_star`, alongside
+  `reject_reactive_derived_table` and running *after* it, so #486's more
+  specific message keeps precedence for a derived-table body. Consulting the
+  data was the defect, so nothing in the check does.
+
+  **What it covers, and what it deliberately does not.** The walk
+  (`Sema.reactive_projects_star`) follows the statement's **output**
+  projection: an `S_select` whose `proj` is `` `All ``, either arm of an
+  `S_compound`, and an `S_with_cte`'s body — the last two latent, since #750 and
+  #486 refuse those roots first. It does **not** descend into a CTE
+  *definition* or a subquery, because a star there does not determine the
+  view's own arity — `SELECT a FROM (SELECT * FROM t) d` yields exactly one
+  column whatever `t` grows, and `WHERE EXISTS (SELECT * FROM u)` is a row
+  test. A **qualified** star (`t.*`) needs no arm: the grammar has no
+  `DOT STAR` production at all, so it is a parse error in every statement,
+  reactive or not (verified against the engine's own CLI; sqlite3 is not an
+  oracle here — reactive views are granary-specific).
+
+  **A plain `CREATE VIEW … AS SELECT *` is untouched, and that is the whole
+  basis of the decision.** It is not maintained; its body is re-bound on every
+  use, so it widens with the base table on the next read. Pinned by
+  `a_plain_create_view_with_a_star_is_unaffected` in
+  `test/test_reactive_view_star_747.ml`, which asserts the widening rather than
+  assuming it.
+
+  Two residuals, both deliberate:
+
+  - **`Db.rv_load` is not gated.** It re-parses the persisted `CREATE REACTIVE
+    VIEW` text directly and never goes through `Sema`, so a star view created
+    before this fix still loads and behaves exactly as it did. Gating it would
+    brick *opening* the database rather than fixing the view; `DROP REACTIVE
+    VIEW` is the repair.
+  - **The arity-zero guard in `Db.rv_create` stays**, but its message no longer
+    mentions emptiness or `SELECT *`, because emptiness stopped being the
+    criterion. With the star refused it is unreachable for an `S_select` root
+    (`Reactive_view.out_cols_of_proj` answers `Some` for both non-star
+    projections), and #750 closed the `S_compound` root. **Exactly one spelling
+    still reaches it**, and it is worth knowing because it is not a compound: a
+    FROM-less `SELECT *` parses to `S_const_select { exprs = [] }`, which is
+    neither an `S_select` (so the star check never sees it) nor backed by a
+    table (so nothing could widen it). Verified against the engine's CLI.
+- **A compound-root reactive view (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) is
+  refused (#750, decided 2026-09-03).** Another behaviour break, and the one
+  with the worst pre-fix symptom of the three: the view was **created without
+  error, materialised correctly once, and then served that first snapshot
+  forever**. No error at any point.
+
+  `Reactive_view.base_tables_of` reads the base tables off the `S_select` at the
+  root of the body and answers `[]` for everything else, so a compound view
+  registered with **no base tables** and no write to either arm's table ever
+  marked it dirty. Reproduced, not merely reasoned about:
+
+  ```sql
+  CREATE REACTIVE VIEW cv AS SELECT a FROM t UNION SELECT b FROM u;
+  SELECT * FROM _rv_cv;   -- 1, 2
+  INSERT INTO t VALUES (99);
+  SELECT * FROM _rv_cv;   -- 1, 2      *** 99 silently missing ***
+  ```
+
+  **This was the third instance of one pattern, and naming the pattern is the
+  point**: a `Reactive_view` helper matches `S_select` and answers a
+  benign-looking default for every other constructor. #486 found it in
+  `base_tables_of` (derived table), #747 in `proj_of` (`SELECT *`), and this is
+  `base_tables_of` again. All three are closed the same way — refuse the shape
+  at bind time, because a maintained view needs a statically determinable one.
+  A **fourth** instance is the thing to look for if a new root constructor ever
+  becomes reachable as a view body.
+
+  **Supporting it properly is a separate decision, not an omission.** It needs
+  `base_tables_of` to union both arms **and** a correct incremental rule per set
+  operation, and neither `UNION` (distinct) nor `EXCEPT` is an additive merge
+  over Z-sets — whether a row leaves the result when one arm loses it depends on
+  the other arm's multiplicity. Doing the first half alone would replace a stale
+  view with a **wrong** one, which is worse.
+
+  **Precedence: body-shape refusals run before projection ones.** The chain in
+  `Sema`'s `S_create_reactive_view` arm is `reject_reserved_name` →
+  `reject_reactive_derived_table` (#486) → `reject_reactive_compound` (#750) →
+  `reject_reactive_star` (#747). A caller who hits an outer rule cannot fix it
+  by editing the inner one, so the outer message is the useful one:
+  `SELECT * FROM t UNION SELECT b FROM u` reports #750, not #747, and a derived
+  table inside a compound *arm* also reports #750 because the desugaring wraps
+  the arm and leaves `S_compound` at the root. Both directions of each boundary
+  are pinned, in `test/test_reactive_view_compound_750.ml` and in
+  `test/test_reactive_view_star_747.ml` — the #747 file's compound case was
+  **rewritten rather than deleted**, because it is the only thing pinning which
+  of the two messages a reader sees.
+
+  **`Db.rv_load` is still not gated, and that was verified rather than
+  assumed** — a database containing a compound reactive view was built against a
+  probe binary with the check disabled, then reopened against the fixed one. It
+  opens; the view is still there; `DROP REACTIVE VIEW` removes it. One detail
+  makes the pre-fix behaviour *harder* to diagnose than "always stale": `rv_load`
+  ends with a `rv_refresh_one ~resync:true` pass, so the materialisation
+  **self-heals at every open** and then goes stale again on the next write. A
+  user who restarts the process sees correct data and concludes the problem went
+  away.
+
+  **A plain `CREATE VIEW … AS SELECT … UNION SELECT …` is untouched**, for the
+  same reason as #747's plain-view carve-out: it is not maintained, its body is
+  re-bound on every use. Asserted, not assumed.
+
+  **What still reaches the `| _ -> []` / `| _ -> None` arm once compounds are
+  refused**: exactly one constructor, `S_const_select` — a FROM-less `SELECT`.
+  Both defaults are *correct* there rather than benign-looking, because such a
+  query is backed by no table: `[]` base tables is the truth and there is
+  nothing that can go stale. `CREATE REACTIVE VIEW k AS SELECT 1` is therefore
+  accepted and pinned as such.
 - **A view is resolved at EVERY FROM position, and each subquery carries its own
   expansion (#496/#497, fixed 2026-09-03).** A view reference is desugared into
   a CTE wrapped around the statement that names it. That rewrite used to be
@@ -1669,6 +1920,97 @@ EOF
   `burnt_rowid_on_a_discarded_insert_row` in
   `test/test_nested_excluded_741.ml`.
 
+- **`TRUE` and `FALSE` are aliases for 1 and 0, resolved as a NAME-RESOLUTION
+  FALLBACK rather than as keywords (#744, decided 2026-09-03).** Neither word
+  existed anywhere in the grammar, so both fell through to the identifier rule
+  and bound as column references: `SELECT TRUE` answered
+  `unknown column: __const__.TRUE`. The sharp consequence was that sqlite3 and
+  granary accepted **disjoint** spellings of an `INSERT ... SELECT` upsert —
+  sqlite3's grammar needs the disambiguating `WHERE true` (its bare form is
+  ambiguous with a join's `ON` and is a parse error), granary took only the bare
+  form (#653), and the intersection was empty. Both spellings now work here;
+  granary's permissive one is a deliberate superset and is unchanged.
+
+  Two decisions, and both are about what was NOT done:
+
+  - **They are aliases for the integers, not a boolean storage class.**
+    Oracle-checked: `SELECT TRUE + TRUE` is `2` and `typeof(TRUE)` is
+    `integer`. So `Exec.value_class_rank` and the #579/#733/#738 comparators
+    never hear about them — no comparator learns a new class, and none of that
+    work is disturbed.
+  - **Nothing was added to `lexer.mll`.** The rule lives in
+    `Ast.bool_ident_lit` and is consulted only where a column lookup has already
+    FAILED, which is exactly how SQLite resolves them
+    (`sqlite3ExprIdToTrueFalse`, reached from `lookupName` when the match count
+    is zero). Identifier context therefore wins by construction —
+    oracle-checked, `SELECT true FROM t` where `t` has a column named `true`
+    answers the column in both engines — and, because the keyword table did not
+    grow, #619's lexer/`Sql_ident` drift guard is untouched and no stored SQL
+    starts needing quoting it did not need before (#572). Adding a `TRUE` token
+    was rejected for the first reason alone: no token can defer to a column.
+
+  **`Ast.bool_ident_lit` is the single chokepoint and the reason a fallback this
+  diffuse is auditable.** Every site that can meet a bare `true`/`false` consults
+  it and none may grow a second opinion: the parser's `def_value` (a `DEFAULT` has no row in scope, so no
+  column can be meant); `Sema`'s five unqualified-column resolution failures
+  (`bind_expr`, `bind_expr_join`, the aggregate resolver, and the window and
+  projection arms over `select_proj_lookup`); its two `bind_value_expr`s — a
+  VALUES list has no row in scope either, so `INSERT INTO u VALUES (true, 2)`
+  stores `1` even when `u` HAS a column named `true`, oracle-checked; and
+  `Exec.ast_expr_to_plan_check`, the re-compiler for the SQL text the catalog
+  stores about itself (a CHECK, a GENERATED expression, a partial index's
+  WHERE), which is a different resolver from `Sema`'s and meets a bare `true` on
+  every write once one is written down.
+
+  Two of the sites are not obvious and would each have shipped a wrong answer:
+
+  - **The projection needed a `` `Cols `` promotion.** The parser emits
+    `` `Cols `` — a bare `string list`, which cannot hold a literal — whenever
+    EVERY select item is a plain name, so `SELECT true FROM q` took a path no
+    expression ever reaches and stayed an `unknown column` error. It is promoted
+    to `` `Exprs `` when a name is one the fallback answers, keeping the name as
+    the alias; the same promotion, and the same conditionality,
+    `Exec.substitute_outer_proj` already makes for #732.
+  - **`Exec.substitute_outer_in_expr` needed an arm, and this is the one that
+    would come back first.** #635's correlation detector runs that walker
+    against a binding that resolves NOTHING and records that it was asked, so
+    every `WHERE true` inside a subquery read as a free outer reference and the
+    subquery was misclassified as correlated: a scalar subquery counting rows
+    under `WHERE true` answered NULL — silently wrong — and the `IN` spelling
+    raised out of the executor. A bare `true`/`false` is never an outer column
+    reference, and the scope test already answers "owned" when the subquery's
+    own FROM has a column of that name, so the arm sits above it and is a
+    no-op in that case.
+
+  **`IS TRUE` / `IS NOT FALSE` are deliberately out of scope, and the important
+  half is that the fallback could not turn them into a silent wrong answer.**
+  They are truthiness, not equality — oracle-checked, `2 IS TRUE` is `1` while
+  `2 IS 1` is `0`, and `'1' IS TRUE` is `1` while `'1' IS 1` is `0`. Granary has
+  no general `x IS y` operator at all: `IS` appears only in the `IS NULL` /
+  `IS NOT NULL` productions, so `1 IS TRUE` was a PARSE error before #744 and
+  still is, pinned as such. Adding the productions is a separate gap.
+
+  Two recorded divergences, both narrower than the fix:
+
+  - **A QUOTED `true` is the literal here** — `"true"`, backticked or bracketed
+    — where sqlite3 keeps quoting semantically significant (it answers the TEXT
+    `'true'` for the double-quoted spelling through its double-quoted-string
+    misfeature, and an error for the other two). Distinguishing them needs an
+    `Ast.expr` constructor carrying quotedness, which granary has never had;
+    it already treats all four spellings of a non-keyword name as one
+    identifier everywhere else.
+  - **`GROUP BY true` is still refused**, where sqlite3 groups by the constant.
+    `Ast.group_by_item` is `string * string option`, a name and a qualifier, so
+    a constant group key is not expressible at all (`GROUP BY 1` is a parse
+    error too) — the same orthogonal gap #722's `GROUP BY x COLLATE NOCASE`
+    entry names, not a boolean one. It fails loudly.
+
+  The grammar is untouched apart from `def_value`'s semantic action, so menhir's
+  counts are unchanged either side of the fix: **35 states with shift/reduce
+  conflicts, 290 shift/reduce conflicts arbitrarily resolved**, and the same
+  four pre-existing warnings. Pinned by `test/test_bool_literal_744.ml`, whose
+  every expected value was read off sqlite3 3.45.1 rather than predicted.
+
 - **A skipped `INSERT` leaves nothing behind in the STORE and the CATALOG,
   including its BEFORE INSERT trigger's nested DML, in an explicit transaction
   as well as in autocommit (#631, fixed 2026-08-06).** Read the scope literally:
@@ -1899,6 +2241,51 @@ EOF
   of resyncing fails 4 — including the raising-AFTER-trigger case, which is the
   one that decides between the two fixes.
 
+- **The #240 name set covers DDL that changes a table's observable contents
+  (#405, decided 2026-09-03).** It used to be row-level DML only, so
+  `execute_with_dirty` answered `[]` for `DROP TABLE` and for every `ALTER
+  TABLE` form — including `DROP COLUMN`, which physically re-`put`s every row.
+  A name-keyed external cache went on serving a dropped table's rows, and rows
+  of the wrong arity after a column was added or dropped. The `db.mli` wording
+  ("pure-DDL … the list is empty") was the second half of the defect: it
+  implied `DROP COLUMN` was row-neutral, which it is not.
+
+  Marked: `DROP TABLE` (the table's name), and all four `ALTER TABLE` forms —
+  `DROP COLUMN`, `ADD COLUMN`, `RENAME COLUMN`, and `RENAME TABLE`, which marks
+  **both** the old name (it stops answering) and the new one (it starts
+  answering with rows it did not have before). `ADD COLUMN` writes no row byte
+  and is marked anyway: every row a reader sees gains a cell, so a cached
+  result has the wrong arity — the same failure mode as `DROP COLUMN`, reached
+  through the catalog instead of the tree.
+
+  **Not** marked, because no existing table's answers move: `CREATE TABLE` /
+  `CREATE VIRTUAL TABLE` (the new table is empty); `CREATE INDEX` / `DROP
+  INDEX` (a whole B-tree is written or discarded, but every query returns the
+  same rows — only the plan differs); view and trigger DDL; `VACUUM` (a
+  physical rebuild that preserves every row, and which anyway kills every
+  sibling handle, #634); `ATTACH` / `DETACH` (the signal carries bare names
+  with no schema qualification, so it could not express the change).
+
+  Two properties this rests on. The marks are taken **after** the DDL succeeds,
+  so a raising `ALTER` marks nothing — which agrees with `Db`'s `Error` arm
+  discarding the accumulator. And they are **names only**: `mark_dirty` does
+  not touch the #417 delta log, so `execute_with_changes` still reports no
+  row-level deltas for DDL, and a reactive view's `rv_absorb_changes` (which
+  reads `dirty_changes`, not `dirty_elements`) cannot pick up a phantom row
+  from a `DROP TABLE`. A consumer of both must invalidate from the name set;
+  "no deltas" does not mean "nothing changed". Pinned by the two new
+  `ddl in scope (#405)` / `ddl out of scope (#405)` groups in
+  `test/test_dirty_tables_240.ml`, which replace the two tests that asserted
+  the opposite.
+
+  One knock-on worth knowing: `DROP REACTIVE VIEW v` runs an internal
+  `DROP TABLE _rv_v` inside the caller's accumulator, so the materialisation's
+  own name now appears in the dirty list. That is not new noise — `CREATE
+  REACTIVE VIEW` populates `_rv_v` through the ordinary insert path and has
+  always reported it — and the two spellings now agreeing is pinned by
+  `reactive-view ddl marks materialisation`. The `rv_flush` path is unaffected:
+  it installs its own accumulator (`Db.rv_flush`), which shields the caller's.
+
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
 ### A failing autocheckpoint is surfaced, never raised (#638)
@@ -1981,6 +2368,132 @@ because the same SQL already parsed for the bind that produced
 `Unknown_table` — now propagate the real error instead of manufacturing a
 fresh bare one. Error quality must not depend on which entry point the caller
 used.
+
+### A net-zero SUM group is retained, with a stated ceiling (#423)
+
+`Aggregate.Make` drops a group from its `GMap` only when **both** `mult = 0` and
+`aggv = 0`. A SUM group whose row weights cancel to `mult = 0` while `aggv <> 0`
+is kept on purpose: `aggv` is not recoverable from the delta feed — the operator
+never sees a base row — so dropping it would silently compute the wrong total if
+the group later revived. #423 chose the third of its three options: **accept the
+retention and document a ceiling.** No compaction pass, no LRU/age cap. Do not
+add one without re-deciding; re-derivation on revival needs exactly the base
+access the operator does not have. The long form, with the measurement, is
+`docs/IVM_MEMORY.md`; the short form is in `lib/ivm/aggregate.mli` where an
+implementer meets it.
+
+The ceiling, in the terms an operator has:
+
+- **Bounded by DISTINCT groups, never by updates.** One map entry per group,
+  forever, so a view churning a fixed key set retains at most that key set.
+  Unbounded *key cardinality* — grouping on a session id, a request id, a
+  timestamp — is the hazard; a high update rate over a stable key set is not.
+  Measured: 50 000 and 200 000 net-zero rounds over one key both cost 27 words.
+- **9 words per retained group, plus the caller's key.** One `Map.Make` node
+  (6 words) plus the `{ mult; aggv }` record (3). `Reactive_view.Agg_engine`'s
+  key is a `Row.value array` of one element, so an `INTEGER`-grouped view costs
+  **16 words = 128 bytes** per retained group — ≈128 MB per million, which is
+  the figure to size a unikernel against. Both numbers measured exactly.
+- **It cannot arise without a NEGATIVE weight.** If every element of a group has
+  a non-negative cumulative weight, `Σ w = 0` forces every `w = 0` and hence
+  `aggv = 0`, which prunes. So a delta stream that only retracts what it has
+  inserted retains **nothing at all**, and the issue's "on a high-churn SUM view
+  such net-zero groups accumulate unboundedly" overstates it: signed weights are
+  the precondition. They reach the operator either from a composed Z-set
+  pipeline (the `granary.ivm` API is public) or from a retraction with no
+  matching insertion — which for the `Db` driver means a stale `record_change`
+  delta, i.e. the #666/#737 neighbourhood.
+- **It cannot arise unless the measure VARIES within one group.**
+  `aggv = Σ measure * weight`, so a constant measure `c` makes it `c * mult`.
+  **The issue's claim that COUNT never hits this is correct** — checked, not
+  repeated: it holds unconditionally, for arbitrary signed weights, and is
+  fuzzed as a QCheck property. The rule is about constancy, not about the
+  measure being 1: a SUM over a column constant within its group is equally
+  safe.
+
+**A live view's retention is not permanent.** `Db.rv_rebuild_engine` builds a
+*fresh* `Agg_engine` on a resync — scheduled by `ROLLBACK TO` (#427) and by a
+failed statement (#737) — so a rebuilt view starts from an empty map. That is
+the operator's escape hatch and it costs a full rebuild.
+
+`Aggregate.Make(S).retained_groups` and `Reactive_view.Agg_engine.retained_groups`
+report the live entry count including the invisible net-zero ones, so an
+embedding can watch its own ceiling instead of inferring it; comparing against
+`snapshot`'s length gives the net-zero count directly. Pinned by
+`test/test_agg_retention_423.ml`, whose allocation gate is armed by default —
+see the non-wall-clock gate table above.
+
+### A reactive-view callback can be detached, and registering one is O(1) (#746)
+
+`Db.register_view_callback` returns an opaque `Db.view_callback` handle, and
+`Db.unregister_view_callback : t -> view_callback -> bool` detaches the one
+callback it names. Two gaps, one shape — nothing ever removed a callback, and
+the append was `e.rv_callbacks <- e.rv_callbacks @ [ cb ]`, which copies the
+whole list per registration.
+
+**Neither was a correctness bug, and the commit message should not claim
+otherwise.** #469 had already given a *view* a removal path
+(`DROP REACTIVE VIEW`, which discards every callback on it), and the downstream
+consumer that filed this works around the missing per-callback one with a
+generation-token trampoline that measures correct — 1 notification on 1 change,
+every time. What it cost was **sustainability**: every re-wire leaked a dead
+closure that was still invoked on every change and had to decide for itself
+that it was stale, and *n* leaked closures are *n* invocations per change, so
+the quadratic append compounded it directly. Hot-reload is the workload that
+turns both into a ceiling on how often an app may edit its hooks.
+
+**Callback order is contractual as of #746, and that is a decision the O(1)
+rewrite forced.** Nothing had ever documented it, but registration order,
+sequentially awaited, was the observable behaviour of `@` plus `Lwt_list.iter_s`.
+The list is now held **newest-first** (prepend, O(1)) and reversed at the one
+firing site, so the order survives; the reverse is O(n) on a path that is about
+to invoke n callbacks, i.e. free. `callbacks_fire_in_registration_order` is what
+catches a future change that drops the reverse.
+
+**Mid-flush removal is a per-batch SNAPSHOT** — the question the issue flags,
+because `rv_flush_inner` snapshots the *view* list but read `entry.rv_callbacks`
+live. `rv_apply_and_notify` binds `cbs` once, where it computes `want_cb`, so
+`want_cb` and the fired set cannot disagree; `rv_callbacks` is an immutable list
+and both register and unregister *replace the field* rather than mutating cells,
+so an in-flight iteration is unaffected by construction. Concretely: a callback
+that unregisters itself always completes the invocation it is in and is silent
+from the next batch; a callback removed by an **earlier** callback in the same
+batch still runs for that batch; a registration made from inside a callback
+starts firing from the next batch, so it cannot make the current batch loop.
+A tombstone (skip immediately) and a refusal were both rejected — the snapshot
+is the only one of the three that needs no new state and no new error, and it is
+what the immutable list gives for free.
+
+**A growable vector was rejected for the same reason.** It buys O(1) removal
+where the list is O(n) filter, and costs the snapshot: iterating a mutable
+vector while a callback mutates it is exactly the undefined behaviour #746
+exists to remove. Removal is also the *rare* operation once it exists at all —
+the whole point is that the registry no longer grows without bound.
+
+**Handle identity.** Ids come from one process-global counter (`rv_cb_seq`), not
+a per-entry one, and the handle carries the view name — so there is no
+view-name argument to get wrong, and a handle presented to a different `Db.t`
+over the same store matches nothing rather than removing an unrelated callback.
+`unregister_view_callback` is idempotent and answers `false` for an already-
+removed handle, a dropped view, or a foreign one.
+
+**API break, deliberately.** `register_view_callback` returned
+`(unit, [ `Unknown_view of string ]) result` and now returns
+`(view_callback, …) result`. Adding a second registration function was
+rejected: it would leave the un-removable one as the shorter, default name
+forever. The migration is one line at each call site — `| Ok () ->` becomes
+`| Ok _ ->`, or bind the handle. In-tree, `test_reactive_view_427` gained an
+`attach` helper that maps the handle away so its `register_result` testable is
+unchanged.
+
+Measured in-repo before and after, by allocation rather than wall clock
+(`Gc.minor_words` over a fixed code path is deterministic, so a loaded box
+cannot move it): registering *n* callbacks cost 376 750 words at n=500 rising
+to 96 028 000 at n=8000 — **4.00x per doubling, at every step** — and now costs
+a flat 13 words per registration, i.e. exactly 2.00x. That is the gate in
+`test_view_callback_746`, armed by default (see the non-wall-clock table above)
+because the ceiling is backed by a measurement rather than predicted; verified
+by mutation, where restoring the `@` append reports slope 7.98 and fails.
 
 ### The writer lock is measured, and every acquisition goes through one door (#718)
 
@@ -2356,6 +2869,152 @@ next writer starts at frame 0 under the same marker, write a short successor
 there, and splice the old generation's tail back on behind it. The fixed code
 cannot be talked into producing that state, which is the point of #636; every
 spliced frame still verifies, which is the point of #637.
+
+### `Db` hands out a read-only schema projection, never the catalog (#433)
+
+`Db.catalog : t -> Catalog.t` is **gone**, replaced by
+`Db.schema : t -> Schema.t` (`lib/db/schema.mli`, module `Granary.Schema`).
+`Catalog.t` is a read-**write** surface — `create_table`, `drop_table`,
+`add_column`, `rename_table`, `set_index_stats`, `set_last_inserted_rowid`,
+`set_fk_enforcement`, and `Catalog.store` (which reaches the raw `Store.t`) all
+take a `t` — so handing it out let a consumer mutate the in-memory schema, or
+write to the store, **out of band from SQL DDL and the WAL**. The constraint
+used to live in the accessor's doc comment; it is now a type.
+
+**The projection is a live VIEW, not a snapshot, and that is the load-bearing
+part.** `Schema.t` *is* the handle's `Catalog.t` behind an abstract type
+(`Schema.of_catalog` is the identity; there is deliberately no inverse), so DDL
+run through SQL is visible through a projection taken before it. A copy would
+have been a second piece of catalog state that goes stale — the shape #589 and
+#633 are about — and this one would have gone stale silently, since nothing
+invalidates a value the caller is holding.
+
+**What it exposes**, and nothing else: `list_tables` / `find_table` (returning
+`Schema.table` = name, `Row.column list`, `fk_constraints`, `without_rowid`,
+`columnar`), `table_exists`, `indexes_for_table` / `find_index` (returning
+`Catalog.index_info`, an immutable record carrying #576's statistics),
+`index_exists`, plus `pp` / `pp_table`.
+
+`Schema.table` is a **projection, not `Catalog.table_meta`**, and the reason is
+not tidiness: `table_meta.storage`'s `Columnar` arm carries a
+`Col_store.t`, which is mutable, so re-exporting `table_meta` would have left a
+real out-of-band write path open under a type that claims to be read-only. Two
+residual sharp edges are accepted and documented rather than deep-copied around
+(a copy would be the snapshot this design rejects): `index_stats.range_histograms`
+and `histogram.boundaries` are `array`s, so their elements are assignable in
+place. They are planner statistics, not schema, and mutating one changes a cost
+estimate rather than what the engine believes the schema is.
+
+**`Db.plan : t -> string -> (Plan.op, error) result Lwt.t` is the other half of
+the change.** Planning a statement against a handle's own schema was the one
+legitimate use of the live catalog that a projection cannot serve — `Sema.bind`
+and `Planner.plan` both take a `Catalog.t` — and the planner's own tests
+(`test_range_histogram_576`) did exactly that. It parses, binds and plans
+without executing, opens no transaction and writes nothing, and routes the way
+`execute` does. **The alternative was worse**: a test could otherwise only reach
+a `Catalog.t` by opening a *second* one over the same store, which is the
+duplicated-catalog anti-pattern the #589/#633 sections exist to prevent.
+
+No deprecated alias was kept. A compatibility shim re-exposing the mutable
+handle under another name would defeat the whole change, and the only known
+consumer outside this repo is camel's hook type environment (`tej/camel#67`),
+which uses `list_tables` and per-table `columns` — both of which the projection
+carries. `test/test_readonly_catalog_433.ml` pins every accessor, the live-view
+property (including a rolled-back `CREATE`), and `Db.plan`; the removal itself
+is not testable — it is a compile-time property, checked by every consumer that
+builds.
+
+### An FTS `rank` projection scores the whole match set (#689)
+
+`Exec.fts_score_matches` runs over the FULL, deduplicated match set before the
+sort that LIMIT/OFFSET slices, and it has to: BM25 needs every score before any
+window can be chosen. That is the difference from #687, which could move the
+content fetch *after* the slice because content is not an input to the score.
+So the work here is made cheaper, never truncated.
+
+**The issue's own premise did not survive measurement, and that is the main
+thing to know before touching this again.** #689 was filed against the per-match
+`S.get` for `doc_length`. That call is real and exactly one per match, but on a
+4 000-match single-term rank query it accounted for ~0.9 ms of a 288.8 ms query.
+The other 99% was `List.assoc_opt rowid term_pl` inside the score fold — a linear
+probe of the term's posting list, once per match, i.e. O(matches x postings x
+terms), quadratic in the match count and allocating nothing to show for it. It is
+now a hashtable, built from the reversed list with `Hashtbl.replace` so the FIRST
+entry for a rowid wins exactly as `List.assoc_opt` did.
+
+Measured (`Gc.minor_words` around the query, plus wall time; allocation is the
+load-insensitive half):
+
+| dense rank query, 4 000 matches | before | after |
+|---|---|---|
+| in-memory, wall | 288.8 ms | 10.4 ms |
+| file-backed, wall | 442.2 ms | 17.1 ms |
+| file-backed, minor words | 4 370 993 | 2 555 495 |
+
+Per-query allocation is now exactly linear in the match count (641 825 /
+1 283 014 / 2 555 495 words at 1 000 / 2 000 / 4 000 file-backed matches — 2.00x
+then 1.99x per doubling). The residual wall-clock superlinearity on disk is the
+pager working set, not the algorithm.
+
+**The `doc_length` fetch itself is now gated on selectivity, and the gate is
+computed for free.** `Exec.fts_doc_lengths` picks between one point `S.get` per
+match (`fts_doclen_by_get`) and ONE cursor walk across the doc-length key region
+(`fts_doclen_by_scan`). The region is contiguous — `fts_doclen_prefix` is
+`"\x00\x01"`, the stats key `"\x00\x00"` sorts below it and every posting key
+`term ++ "\x00" ++ rowid` above it — and holds exactly one entry per indexed
+document. Both strategies read the same keys with the same value decoder and the
+same "absent means length 1" default, so they are interchangeable and the choice
+is purely about cost.
+
+`Exec.fts_doclen_scan_ratio` (default 5, overridden by
+`Exec.set_fts_doclen_scan_ratio`) is the threshold, derived rather than guessed: a point `S.get` for one doc length costs ~573 minor words on the B-tree
+backend against ~112 for a `seek_next` step, so the walk wins while it crosses
+fewer than ~5.1 entries per match. Both sides of that trade are real and were
+measured — 3 matches among 4 000 documents cost 642 663 minor words walking
+against 19 325 point-fetching (33x worse), while 4 000 matches among 4 000 cost
+2 555 506 walking against 4 399 003 (1.7x better). The estimate the gate uses is
+`min(rowid span, total_docs)`, an UPPER bound on the entries a walk would cross,
+and both halves are already in hand — `total_docs` from the `read_fts_stats` the
+function already does, the bounds from a fold over an in-memory list — so the
+walk is taken only when even its worst case is cheaper, at no I/O cost to decide.
+
+**On the `Mem` backend the two strategies measure the same** (324.9 vs 323.4
+words per match, observed), because `S.get` there is a `Bytes_map` lookup rather
+than a root-to-leaf descent. Any measurement of this must be **file-backed** or
+it reports that the change does nothing;
+`test/test_fts_doclen_689.ml`'s `measure_words_per_match` is (963.9 -> 646.7
+words per match at 800 documents). That measurement **prints and does not
+assert** unless `GRANARY_FTS_DOCLEN_MAX_WORDS_PER_MATCH` is set, and it is armed
+in **no** workflow — one box and one backend is not enough to put a ceiling on
+every PR, which is the convention `test_scan_borrow_481` establishes. It is not
+in the gate tables above because it is not a gate anywhere.
+
+The rest of that file is load-insensitive by construction: every case runs the
+same statement over the same data twice, once with `set_fts_doclen_scan_ratio 0`
+(never walk) and once with it forced high, and requires byte-identical output —
+same rows, same order, same rank floats. That setter exists for exactly that and
+production never calls it. The deletion case matters: `fts_deindex_document`
+removes a doc-length key, so the walk crosses a HOLE the point path simply never
+asks about.
+
+**Two things in the issue text are wrong and should not be carried forward.**
+There is no `ORDER BY rank`: `Sema.bind_select` refuses **any** `ORDER BY` on an
+FTS table ("FTS tables do not support this query form"), and a bare `MATCH` does
+**not** sort by score — `include_rank` is false there and no scoring runs at all.
+The only spelling that reaches this code is projecting the virtual `rank` column,
+`SELECT body, rank FROM doc WHERE doc MATCH '...'`, which implicitly sorts by
+score descending.
+
+**What was NOT done, deliberately.** The issue's option 1 — storing `doc_length`
+inline with every posting entry — is still an on-disk format change needing a
+version tag on `fts_table_meta` (there is none) plus a migration, and the
+measurement no longer justifies it: after the two fixes above, the doc-length
+fetch is a minority of a query that is 25x faster than when the issue was
+written. And `fts_execute_query`'s `FQ_and` intersection is still
+`List.mem r ids` over rowid lists, so a MULTI-term `MATCH` is still quadratic
+(0.974 s -> 0.185 s at 4 000 matches from the score-fold fix alone, but still
+~4x per doubling). That is the same defect class in a different function and is
+tracked separately.
 
 ### One `Db.t`, one explicit transaction (#555)
 

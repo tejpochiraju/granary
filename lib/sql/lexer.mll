@@ -120,6 +120,7 @@ rule token = parse
       | "IGNORE"     -> IGNORE
       | "FAIL"       -> FAIL
       | "JOIN"       -> JOIN
+      | "CROSS"      -> CROSS
       | "INNER"      -> INNER
       | "LEFT"       -> LEFT
       | "OUTER"      -> OUTER

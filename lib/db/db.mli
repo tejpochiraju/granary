@@ -211,16 +211,33 @@ val set_event_callback : t -> (Event.t -> unit) option -> unit
     monitor to filter page events by table (#385). *)
 val tree_of_table : t -> string -> int option
 
-(** [catalog t] is the active in-memory catalog backing [t], for read-only
-    schema/type projection — column names, types, and NOT NULL constraints via
-    {!Granary_catalog.Catalog.list_tables} / {!Granary_catalog.Catalog.find_table}.
-    The result reflects the schema at call time; the engine may swap its catalog
-    on recovery, so treat the returned handle as a snapshot rather than caching
-    it across a reopen. This is the {e live} handle: [Catalog.t] also exposes
-    mutators ([drop_table], [add_column], …), so "do not mutate it — schema
-    changes go through SQL DDL" is a caller contract, not enforced. See #433 for
-    a possible opaque read-only projection should this grow more consumers. *)
-val catalog : t -> Granary_catalog.Catalog.t
+(** [schema t] is a read-only projection of the active in-memory catalog backing
+    [t] — table names, column names/types/constraints, and index metadata. See
+    {!Schema} for the exposed surface.
+
+    #433: this replaces the former [catalog] accessor, which handed out the
+    {e live} {!Granary_catalog.Catalog.t}. That type is a read-write surface
+    ([create_table], [drop_table], [add_column], [set_last_inserted_rowid],
+    [store], …), so a consumer could mutate the schema — or reach the raw
+    store — out of band from SQL DDL and the WAL. "Do not mutate it" was a doc
+    comment, not a constraint; now it is a type.
+
+    The projection is a {e live view}, not a snapshot: it holds the same
+    catalog the handle executes against, so DDL run through SQL is visible
+    through it immediately. It does {e not} survive the catalog swap {!vacuum}
+    performs, so do not cache one across a VACUUM — every other handle over the
+    store is dead after that anyway (#634). *)
+val schema : t -> Schema.t
+
+(** [plan t sql] parses, binds and plans [sql] against [t]'s active schema
+    {e without executing it}. Read-only: nothing is written and no transaction
+    is opened. It exists because planning a statement against a handle's own
+    catalog was the one legitimate use of the removed [catalog] accessor that a
+    schema projection cannot serve (the binder and planner take a
+    [Catalog.t]) — the planner's tests inspect the chosen access path this way.
+    Routing follows {!execute}: the statement is planned against the handle its
+    active schema selects. *)
+val plan : t -> string -> (Granary_sql.Plan.op, error) result Lwt.t
 
 (** Rebuild the database file in place: copies every tree from the
     current file into a fresh sibling [path ^ ".vacuum-tmp"], then
@@ -588,22 +605,33 @@ val history_release : ?schema:string -> t -> unit
     @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
 val history_log : ?schema:string -> t -> Granary_store.History.record list Lwt.t
 
-(** #240: the set of user tables whose {e rows} a write statement actually
-    mutated, including tables touched indirectly by triggers and FK cascades.
-    Sorted and deduplicated; internal/system tables are excluded.  Enables an
-    external read cache to invalidate the tables whose row data changed.
+(** #240: the set of user tables whose {e observable contents} a statement
+    changed — including tables touched indirectly by triggers and FK cascades,
+    and (since #405) by row-rewriting or destructive DDL.  Sorted and
+    deduplicated; internal/system tables are excluded.  Enables an external read
+    cache to invalidate exactly the tables whose answers moved.
 
-    {b Scope: row-level DML only.}  This signal reports {!Db.execute}-style row
-    mutations (INSERT / UPDATE / DELETE, upserts, cascades, trigger bodies,
-    columnar and FTS writes).  It does {b not} report schema-changing or
-    destructive DDL — [DROP TABLE], and [ALTER TABLE] in all its forms
-    ([ADD]/[DROP]/[RENAME COLUMN], [RENAME TABLE]) — {e even when the DDL
-    physically rewrites every row} (e.g. [ALTER TABLE … DROP COLUMN], which
-    reshapes the stored rows).  Such a statement yields an {b empty} list here.
-    A consumer that caches query results MUST invalidate on schema changes
-    through a separate schema-version / fingerprint signal (cf. #174); an empty
-    result from a DDL statement therefore does {b not} imply the table's
-    observable contents are unchanged. *)
+    {b Reported.}
+
+    - Row-level DML: INSERT / UPDATE / DELETE, upserts, FK cascades, trigger
+      bodies, columnar and FTS writes, and [PRAGMA not_null_repair].
+    - [DROP TABLE] — marks the dropped table.
+    - [ALTER TABLE], in all four forms — [DROP COLUMN] (which physically
+      rewrites every stored row), [ADD COLUMN] (which leaves the bytes alone but
+      widens every row a reader sees, so a cached result has the wrong arity),
+      [RENAME COLUMN], and [RENAME TABLE] (which marks {e both} the old name and
+      the new one).
+
+    {b Not reported}, because no existing table's contents change: [CREATE
+    TABLE] and [CREATE VIRTUAL TABLE] (the new table is empty); [CREATE INDEX]
+    and [DROP INDEX] (query answers are identical — only plans differ); view
+    and trigger DDL; [VACUUM] (a physical rebuild that preserves every row);
+    [ATTACH] / [DETACH].
+
+    {b Over-approximate, deliberately.}  Like the rest of this accumulator the
+    marks are {e not} undone by a [ROLLBACK] (#666), so a rolled-back statement
+    may still report what it touched.  A superfluous invalidation costs one
+    re-read; a missing one serves a wrong answer from cache. *)
 type dirty_tables = string list
 
 (** #417 Phase 0: one row-level mutation in the delta feed.  [rowid] is the row's
@@ -626,15 +654,18 @@ type row_change = Granary_sql.Exec.row_change =
 
 (** #417: the per-table row-level deltas a write statement produced — [(table,
     changes)] pairs sorted by table name, each table's changes in application
-    order.  Same name/scope rules as {!dirty_tables}: user tables only, internal
-    [sqlite_…] objects excluded, DDL out of band. *)
+    order.  Same name/scope rules as {!dirty_tables} for user tables and internal
+    [sqlite_…] objects, but this feed carries {e row} deltas only: DDL is
+    reported by {e name} through {!dirty_tables} (#405) and contributes no
+    entries here. *)
 type table_changes = (string * row_change list) list
 
 (** Like {!execute}, but also returns the {!dirty_tables} the statement mutated.
     The list is empty for a no-op write (e.g. [INSERT OR IGNORE] that inserts
-    nothing) and for {e all} DDL (including row-rewriting DDL such as [ALTER
-    TABLE … DROP COLUMN] and [DROP TABLE]) — see the {!dirty_tables} scope note;
-    DDL invalidation is out of band. *)
+    nothing) and for DDL that leaves every existing table's contents alone
+    ([CREATE TABLE], [CREATE INDEX] / [DROP INDEX], view and trigger DDL); it is
+    {e non}-empty for [DROP TABLE] and every [ALTER TABLE] form.  See the
+    {!dirty_tables} scope note for the exact split. *)
 val execute_with_dirty : t -> string -> (dirty_tables, error) result Lwt.t
 
 (** Like {!execute_change_count}, but also returns the {!dirty_tables} the
@@ -646,8 +677,9 @@ val execute_change_count_with_dirty
 
 (** #417: like {!execute_with_dirty}, but returns the row-level {!table_changes}
     delta feed (rowid + old/new rows) instead of just the table names — the input
-    an incremental view-maintenance layer consumes.  Empty for no-op writes and
-    DDL, same as {!execute_with_dirty}.
+    an incremental view-maintenance layer consumes.  Empty for no-op writes, and
+    empty for DDL — which {!execute_with_dirty} reports by name (#405) but which
+    produces no row-level deltas.
 
     {b Phase 0 coverage.}  The feed covers ordinary rowid-table DML: INSERT,
     UPDATE, DELETE, REPLACE (delete-old + insert-new), UPSERT [DO UPDATE], and
@@ -671,6 +703,19 @@ val execute_change_count_with_dirty
     must fold deltas in order rather than assume one per rowid (#418). *)
 val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
 
+(** #746: an opaque handle for one registered reactive-view callback, returned
+    by {!register_view_callback} and consumed by {!unregister_view_callback}.
+
+    It carries the view it was registered against, so there is no view-name
+    argument to get wrong at removal time, and it is minted from a
+    process-global counter, so a handle presented to a different {!t} over the
+    same store matches nothing rather than removing an unrelated callback. *)
+type view_callback
+
+(** Render a handle as [view#id].  For logging and test failure messages; the
+    id is an opaque serial number with no meaning beyond identity. *)
+val pp_view_callback : Format.formatter -> view_callback -> unit
+
 (** #427: register [cb] to fire after every commit that changes reactive view
     [view_name]'s materialisation.  [cb] receives the native {!row_change} diffs
     applied to [_rv_<view_name>] (Deleted/Inserted pairs; a changed aggregate row
@@ -693,12 +738,55 @@ val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
 
     Callbacks are held by the registry entry, so [DROP REACTIVE VIEW] discards
     them: a callback registered against a dropped view stops firing, and
-    re-registering reports [`Unknown_view]. *)
+    re-registering reports [`Unknown_view].
+
+    {b #746: registration is O(1) and returns a handle.}  It used to append with
+    [@], copying the whole list per registration, so [n] registrations cost
+    O(n^2) — measured at 4.00x allocation per doubling of [n], and 3.4s for
+    20 000 registrations downstream.  The list is now held newest-first and
+    reversed at the firing site.
+
+    {b Callbacks fire in registration order, sequentially, and that is
+    contractual.}  It was already the observable behaviour and preserving it
+    across the O(1) rewrite is free, so a caller may rely on a callback
+    registered earlier running (and completing — the firing site awaits each in
+    turn) before one registered later on the same view.  Ordering between
+    {e different} views in one flush is not specified.
+
+    {b The returned handle is the only way to detach one callback.} Before #746
+    nothing removed a single callback: [DROP REACTIVE VIEW] was the only
+    removal path (#469), so a caller re-wiring callbacks from data — a hook
+    table, a config reload — leaked a dead closure per re-wire that was still
+    invoked on every change and had to decide for itself that it was stale. *)
 val register_view_callback
   :  t
   -> view_name:string
   -> (row_change list -> unit Lwt.t)
-  -> (unit, [ `Unknown_view of string ]) result
+  -> (view_callback, [ `Unknown_view of string ]) result
+
+(** #746: detach the callback [h] names.  Returns [true] if it was still
+    registered and has now been removed, [false] if it was not — because it was
+    already unregistered, because its view was dropped (which discards every
+    callback on it), or because [h] came from a different {!t}.  Idempotent:
+    unregistering twice is not an error, it just answers [false] the second
+    time.
+
+    {b Mid-flush semantics (#746).}  The set of callbacks a notification fires
+    is snapshotted when that view's notification batch begins.  So a callback
+    that unregisters itself — or another callback on the same view — from
+    inside its own invocation:
+
+    - always completes the invocation it is in;
+    - does not affect who else is invoked in {e that} batch: a callback removed
+      by an earlier callback in the same batch still runs for that batch;
+    - is not invoked again from the batch after it, in this flush or any later
+      one.
+
+    That is a snapshot, not a tombstone and not a refusal: removal is always
+    accepted and never raises, and the visible effect is simply deferred to the
+    next batch.  A registration made from inside a callback behaves the same
+    way — it starts firing from the next batch. *)
+val unregister_view_callback : t -> view_callback -> bool
 
 (** #437: the names of the live reactive views, sorted.  Read from the in-memory
     registry, so — unlike probing the catalog for [_rv_<name>] — a user table

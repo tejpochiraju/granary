@@ -75,6 +75,14 @@ module Agg_engine : sig
   (** [snapshot st] is the full current materialization (one row per live
       group). *)
   val snapshot : state -> Row.value array list
+
+  (** [retained_groups st] is the number of group keys [st] holds state for.
+      This can exceed the length of {!snapshot}: a SUM group whose row weights
+      cancel while its total does not is retained deliberately, since its total
+      is not recoverable from the delta feed.  Bounded by the distinct group
+      keys the view has ever seen, never by the number of updates; see the
+      retention ceiling in [Granary_ivm.Aggregate] and [docs/IVM_MEMORY.md]. *)
+  val retained_groups : state -> int
 end
 
 (** Total order over value-array rows; exposed for the driver's diffing. *)

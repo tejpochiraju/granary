@@ -2066,3 +2066,110 @@
  (name test_cmp_eq_738)
  (modules test_cmp_eq_738)
  (libraries granary alcotest lwt.unix))
+
+; #486: comma-separated FROM lists and derived tables. The parser desugars a
+; comma into an INNER join on the literal 1 and a derived table into a
+; non-recursive CTE; the planner recognises that literal and borrows an
+; equi-join key from WHERE so an implicit join is not a cartesian product.
+; Needs granary.catalog / granary.store / granary.encoding / granary.sql for
+; the plan-shape assertions, which build a catalog and call Planner.plan
+; directly.
+
+(test
+ (name test_from_list_derived_486)
+ (modules test_from_list_derived_486)
+ (libraries
+  granary
+  granary.encoding
+  granary.store
+  granary.catalog
+  granary.sql
+  alcotest
+  lwt.unix
+  unix))
+
+; #423: the net-zero SUM-group retention in [Aggregate] has a stated ceiling.
+; Pure in-memory operator state plus a peak-live-major-heap measurement of what
+; one retained group costs — no store, no WAL, no durability dimension. The
+; allocation gate is armed by default (GRANARY_MEM_MAX_WORDS_PER_GROUP is the
+; escape hatch) because it measures allocation, not wall clock.
+
+(test
+ (name test_agg_retention_423)
+ (modules test_agg_retention_423)
+ (libraries
+  granary
+  granary.ivm
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest))
+
+; #433: [Db.catalog] handed out the live mutable [Catalog.t]; it is replaced by
+; [Db.schema], an opaque read-only projection ([Granary.Schema]). In-memory is
+; enough — this is an API-surface and catalog-visibility property, with no WAL
+; or durability dimension.
+
+(test
+ (name test_readonly_catalog_433)
+ (modules test_readonly_catalog_433)
+ (libraries
+  granary
+  granary.catalog
+  granary.encoding
+  granary.sql
+  alcotest
+  lwt.unix))
+
+; #744: TRUE/FALSE as boolean literals — a name-resolution fallback, not lexer
+; keywords, so identifier context still wins and the #619 drift guard is
+; untouched. In-memory is enough: this is parser/binder behaviour with no
+; durability dimension.
+
+(test
+ (name test_bool_literal_744)
+ (modules test_bool_literal_744)
+ (libraries granary granary.encoding alcotest lwt.unix))
+
+; #747: CREATE REACTIVE VIEW refuses SELECT * unconditionally. The old guard
+; was runtime and data-dependent (only an EMPTY result was refused), so a star
+; view over a non-empty table was accepted and froze its arity. In-memory is
+; enough: this is bind-time behaviour with no durability dimension.
+
+(test
+ (name test_reactive_view_star_747)
+ (modules test_reactive_view_star_747)
+ (libraries granary alcotest lwt.unix))
+
+; #746: per-callback removal for reactive views plus the O(1) registration.
+; In-memory is enough: the registry is process state, not durable state.  The
+; allocation gate here is deterministic (Gc.minor_words over a fixed code
+; path), so it is armed by default; GRANARY_MEM_MAX_CALLBACK_SLOPE raises it.
+
+(test
+ (name test_view_callback_746)
+ (modules test_view_callback_746)
+ (libraries granary alcotest lwt.unix))
+
+; #750: a compound-root CREATE REACTIVE VIEW is refused. base_tables_of
+; answered [] for an S_compound root, so the view registered with no base
+; tables and served its creation-time snapshot forever with no error. Carries
+; its own control (a supported view that DOES track writes) so the refusal
+; tests cannot pass vacuously. In-memory is enough: bind-time behaviour plus
+; in-process view maintenance, no durability dimension.
+
+(test
+ (name test_reactive_view_compound_750)
+ (modules test_reactive_view_compound_750)
+ (libraries granary alcotest lwt.unix))
+
+(test
+ (name test_fts_doclen_689)
+ (modules test_fts_doclen_689)
+ (libraries
+  granary
+  granary.sql
+  granary.unix
+  granary.encoding
+  alcotest
+  lwt.unix))

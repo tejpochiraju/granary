@@ -32,6 +32,7 @@
 
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
+module Schema = Granary.Schema
 
 let run = Lwt_main.run
 
@@ -638,8 +639,8 @@ let roundtrip_after_rename_preserves_the_key () =
 (* ------------------------------------------------------------------ *)
 
 (* Names of the indexes of [table] whose [idx_columns] still mention [col]. *)
-let indexes_naming cat ~table ~col =
-  Cat.indexes_for_table cat ~table
+let indexes_naming sch ~table ~col =
+  Schema.indexes_for_table sch ~table
   |> List.filter (fun (i : Cat.index_info) -> List.mem col i.Cat.idx_columns)
   |> List.map (fun (i : Cat.index_info) -> i.Cat.idx_name)
 ;;
@@ -648,19 +649,19 @@ let catalog_index_columns_are_remapped () =
   with_db (fun db ->
     exec db "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
     exec db "ALTER TABLE c RENAME COLUMN j TO jj";
-    let cat = Db.catalog db in
+    let sch = Db.schema db in
     Alcotest.(check bool)
       "the table has its implicit PK index"
       true
-      (Cat.indexes_for_table cat ~table:"c" <> []);
+      (Schema.indexes_for_table sch ~table:"c" <> []);
     Alcotest.(check (list string))
       "no index still names the old column"
       []
-      (indexes_naming cat ~table:"c" ~col:"j");
+      (indexes_naming sch ~table:"c" ~col:"j");
     Alcotest.(check bool)
       "and one names the new one"
       true
-      (indexes_naming cat ~table:"c" ~col:"jj" <> []))
+      (indexes_naming sch ~table:"c" ~col:"jj" <> []))
 ;;
 
 (* ------------------------------------------------------------------ *)

@@ -78,6 +78,7 @@ let sql_keywords =
   ; "COS"
   ; "COUNT"
   ; "CREATE"
+  ; "CROSS"
   ; "DATABASE"
   ; "DATE"
   ; "DATETIME"

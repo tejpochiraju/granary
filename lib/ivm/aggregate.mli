@@ -13,7 +13,40 @@
     maintainable from a delta (this covers [COUNT], [SUM], and [AVG] as
     sum-with-count).  Order-sensitive aggregates ([MIN]/[MAX]) cannot be
     expressed this way — a retraction can lower the current extremum, which needs
-    the full group, not a running scalar — and are out of scope here. *)
+    the full group, not a running scalar — and are out of scope here.
+
+    {2 Memory: the net-zero retention ceiling (#423)}
+
+    A group is dropped from the operator's internal map only when {e both} its
+    total weight and its running value reach zero.  A group whose weights cancel
+    to zero while its value does not is kept on purpose: the value is not
+    recoverable from the delta feed, so dropping it would silently corrupt the
+    group if it later revives.  #423 decided to accept that retention and state
+    its bound rather than compact or age it out; [docs/IVM_MEMORY.md] carries the
+    long form and the measurement.  In summary:
+
+    - {b The bound is on distinct groups, not on updates.}  The map holds at most
+      one entry per group, so retention is bounded by the number of distinct
+      groups the operator has ever been shown.  A view churning a fixed key set
+      forever retains at most that key set; only unbounded {e key cardinality} is
+      unbounded memory.
+    - {b The cost is 9 words per retained group}, plus whatever the caller's
+      [group] value costs — 72 bytes on a 64-bit target for an immediate key,
+      measured, and stable because it is one map node plus one two-field record.
+    - {b Retention needs a negative weight.}  If every element of a group carries
+      a non-negative cumulative weight, a total weight of zero forces every
+      individual weight to zero and hence a value of zero, which prunes.  So an
+      input stream that only ever retracts what it has inserted — which is what
+      a base-table change feed produces — never retains anything.  Signed
+      weights, as produced by a composed operator or by a retraction with no
+      matching insertion, are what reach this state.
+    - {b Retention needs two measures in one group.}  The value is
+      [Σ measure * weight]; if [measure] is constant [c] across the group, that
+      is [c * Σ weight], which is zero exactly when the total weight is.  COUNT
+      ([measure = fun _ -> 1]) therefore never retains, whatever the weights.
+
+    {!Make.retained_groups} reports the live count, so a long-running embedding
+    can observe its own ceiling rather than infer it. *)
 
 (** What to aggregate: the input/output Z-set domains, the grouping key, the
     per-element measure, and how to render a [(group, value)] result row. *)
@@ -57,4 +90,12 @@ module Make (S : SPEC) : sig
 
   (** The current materialized [(group, value)] relation. *)
   val output : t -> S.Out.t
+
+  (** [retained_groups t] is the number of groups [t] is holding state for,
+      including the net-zero groups that contribute no output row (see the
+      retention ceiling above).  It is always at least the number of rows in
+      {!output}, and never exceeds the number of distinct groups [t] has been
+      shown.  Introspection for memory accounting; it costs one map traversal
+      and reads no aggregate values. *)
+  val retained_groups : t -> int
 end
