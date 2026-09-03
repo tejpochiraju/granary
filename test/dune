@@ -1987,6 +1987,7 @@
  (name test_collate_722)
  (modules test_collate_722)
  (libraries granary alcotest lwt.unix))
+
 ; #740: PRAGMA wal_checkpoint inside an explicit transaction self-deadlocked
 ; (Rwlock is not re-entrant); it is now refused up front. File-backed and
 ; WAL-mode — the Mem backend has no WAL, so there is no second acquisition to
