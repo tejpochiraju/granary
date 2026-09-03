@@ -1783,3 +1783,11 @@
  (name test_reactive_view_drop_guard_475)
  (modules test_reactive_view_drop_guard_475)
  (libraries granary alcotest lwt.unix))
+
+; #474: the reactive-view driver's own SQL is pinned to the schema the view
+; lives on, instead of re-entering routing and following active_database.
+
+(test
+ (name test_reactive_view_schema_pin_474)
+ (modules test_reactive_view_schema_pin_474)
+ (libraries granary granary.unix alcotest lwt.unix unix))

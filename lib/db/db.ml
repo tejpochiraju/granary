@@ -743,12 +743,26 @@ let resolve_target_ast (top : t) (ast : Sql.Ast.stmt) : t =
 
 (** Parse, route, bind, plan.  Returns the compiled op alongside the
     handle it was bound against — callers must use that handle for any
-    downstream execution / state mutation. *)
-let compile_routed (top : t) (sql : string) : (Sql.Plan.op, error) result Lwt.t * t =
+    downstream execution / state mutation.
+
+    #474: [?on] PINS the statement to a given handle, bypassing
+    {!resolve_target_ast} entirely.  It exists for the engine's own internal SQL
+    — the reactive-view driver's writes against [_rv_<name>] — which belongs to
+    a specific schema and must not follow [top.active_schema].  It is not a
+    routing statement and never mutates routing state, so it is not a second way
+    for a caller to move their own routing (#598): the caller cannot reach it,
+    and nothing it does is observable as a schema switch. *)
+let compile_routed ?on (top : t) (sql : string)
+  : (Sql.Plan.op, error) result Lwt.t * t
+  =
   match parse sql with
-  | Error e -> Lwt.return (Error e), top
+  | Error e -> Lwt.return (Error e), Option.value on ~default:top
   | Ok ast ->
-    let target = resolve_target_ast top ast in
+    let target =
+      match on with
+      | Some t -> t
+      | None -> resolve_target_ast top ast
+    in
     let promise =
       let* bound = Sql.Sema.bind ~views:target.views target.catalog ast in
       match bound with
@@ -2090,23 +2104,32 @@ let execute_control_op top t sql op =
        Lwt.return (Ok ()))
   | Sql.Plan.Op_create_reactive_view { name; query; refresh } ->
     (* #427: classify, materialise [_rv_<name>], build any delta engine, and
-       persist the definition.  Reactive views live on the top-level handle. *)
+       persist the definition.  Reactive views live on the top-level handle, and
+       since #474 the driver's own internal SQL is pinned there too — before
+       that, a CREATE issued under [PRAGMA active_database = aux] registered the
+       view on [main] while creating and filling its [_rv_<name>] table in
+       [aux]. *)
     Some (!rv_create_hook top ~sql ~name query refresh)
   | Sql.Plan.Op_drop_reactive_view { name; if_exists } when t == top ->
     (* #469: deregister, drop [_rv_<name>], and forget the persisted
        definition.  Like CREATE, this is immediate rather than staged. *)
     Some (!rv_drop_hook top ~name ~if_exists)
   | Sql.Plan.Op_drop_reactive_view { name; _ } ->
-    (* #469 review: reactive views live on [top] only, but [rv_drop]'s internal
-       [DROP TABLE IF EXISTS _rv_<name>] re-enters [compile_routed], which
-       routes by [top.active_schema].  Under [PRAGMA active_database = aux] it
-       would therefore aim at [aux] and silently no-op, removing the registry
-       entry and main's catalog row while leaving main's [_rv_<name>] table
-       behind — after which re-CREATEing the view fails with "table already
-       exists".  Falling through to [top] would be just as surprising (the
-       statement would silently ignore the active schema), so refuse and say
-       what to do instead.  Fires under IF EXISTS too: the statement is
-       misrouted regardless of whether the view exists. *)
+    (* #469 review: reactive views live on [top] only, so a DROP issued while
+       another schema is active names an object that schema does not have.
+
+       #474 NOTE: the ORIGINAL reason for this refusal is gone.  It was that
+       [rv_drop]'s internal [DROP TABLE IF EXISTS _rv_<name>] re-entered
+       [compile_routed] and routed by [top.active_schema], so under
+       [PRAGMA active_database = aux] it aimed at [aux], silently no-opped, and
+       left main's [_rv_<name>] table orphaned behind a removed registry entry.
+       The driver's internal SQL is now pinned ({!rv_execute}), so that
+       corruption cannot happen.  The refusal is KEPT on the remaining half of
+       #469's argument, which #474 does not touch: falling through to [top]
+       would silently ignore the active schema, and a DDL statement that ignores
+       the schema the caller selected is a surprise worth an error.  Fires under
+       IF EXISTS too — the statement is misdirected regardless of whether the
+       view exists. *)
     Some
       (Lwt.return
          (Error
@@ -2291,8 +2314,10 @@ let execute_dml_op_count t op =
     else Lwt.return (Ok n))
 ;;
 
-let execute_core top sql =
-  let op_promise, t = compile_routed top sql in
+(* #474: [?on] pins the statement to a handle regardless of [active_schema] —
+   see {!compile_routed}. *)
+let execute_core ?on top sql =
+  let op_promise, t = compile_routed ?on top sql in
   let* op = op_promise in
   match op with
   (* #634: ahead of everything, including the INSTEAD OF path below, which
@@ -2546,8 +2571,8 @@ let execute_with_changes top sql =
    [Sql.Exec.query] with no [~stats] — byte-for-byte the pre-#239 read path
    (no [with_value], no [Lwt_stream.map] wrapper), so existing callers pay
    nothing. *)
-let query_impl ?stats ?mode top sql =
-  let op_promise, t = compile_routed top sql in
+let query_impl ?stats ?mode ?on top sql =
+  let op_promise, t = compile_routed ?on top sql in
   let* op = op_promise in
   match op with
   (* #634: a read on a handle invalidated by a sibling's VACUUM would descend
@@ -2790,7 +2815,10 @@ let query_columns top sql =
 (* Prepared statement API                                               *)
 (* ------------------------------------------------------------------ *)
 
-let prepare top sql =
+(* #474: [?on] pins the prepared statement's [db_ref] to a handle regardless of
+   [active_schema] — see {!compile_routed}.  [run] resolves everything from
+   [db_ref], so pinning here pins the whole prepared-statement lifecycle. *)
+let prepare_impl ?on top sql =
   (* #634: fail at prepare rather than handing back a statement whose [db_ref]
      is already dead. *)
   if is_stale top
@@ -2799,7 +2827,11 @@ let prepare top sql =
     match parse sql with
     | Error e -> Lwt.return (Error e)
     | Ok ast ->
-      let t = resolve_target_ast top ast in
+      let t =
+        match on with
+        | Some t -> t
+        | None -> resolve_target_ast top ast
+      in
       let* bound = Sql.Sema.bind_returning_params ~views:t.views t.catalog ast in
       (match bound with
        | Error e -> Lwt.return (Error (Sema e))
@@ -2808,6 +2840,7 @@ let prepare top sql =
          Lwt.return (Ok { db_ref = t; plan; param_names = names; finalized = false })))
 ;;
 
+let prepare top sql = prepare_impl top sql
 let param_slot st name = List.assoc_opt name st.param_names
 
 let params_of_named st named =
@@ -3456,6 +3489,28 @@ module Rv = Reactive_view
 
 let rv_table_name name = "_rv_" ^ name
 
+(* #474: every statement the driver issues on its own behalf is PINNED to the
+   handle the reactive view lives on.
+
+   The driver used to reach the engine through the plain [execute] / [query] /
+   [prepare] entry points, which route through {!resolve_target_ast} and
+   therefore obey [top.active_schema].  Reactive views live on the top-level
+   handle only, so under [ATTACH … AS aux; PRAGMA active_database = aux] every
+   internal statement — the [CREATE TABLE _rv_<name>], the materialisation's
+   INSERTs and DELETEs, the [SELECT * FROM _rv_<name>] the diff is computed
+   against, and the teardown [DROP TABLE] — was aimed at [aux] instead of at the
+   schema that owns the view.  #469 pinned its own [DROP REACTIVE VIEW] arm by
+   hand and [rv_query_ast] was already pinned (it binds against [top.catalog]
+   directly), but the rest of the driver was not.
+
+   Pinning happens once here rather than at each call site, so a new driver
+   statement is pinned by construction.  Note this is NOT a routing statement
+   and mutates no routing state: it cannot move the CALLER's active schema, so
+   it is not a second door of the kind #598 closed. *)
+let rv_execute top sql = drive_reactive top ~core:(fun () -> execute_core ~on:top top sql)
+let rv_query top sql = query_impl ~on:top top sql
+let rv_prepare top sql = prepare_impl ~on:top top sql
+
 (* [rv_quote] / [rv_sql_name] are defined further up, next to [rv_owned_table],
    because {!execute_control_op}'s DROP guards need them. *)
 
@@ -3485,7 +3540,7 @@ let rec rv_iter_ok f = function
 
 (* Read all rows of a SQL query into a list. *)
 let rv_query_sql top sql =
-  let* r = query top sql in
+  let* r = rv_query top sql in
   match r with
   | Error e -> Lwt.return (Error e)
   | Ok stream ->
@@ -3521,7 +3576,7 @@ let rv_current_rows top entry =
 let rv_insert_rows top tbl ncols rows =
   let phs = String.concat ", " (List.init ncols (fun _ -> "?")) in
   let sql = Printf.sprintf "INSERT INTO %s VALUES (%s)" tbl phs in
-  let* pr = prepare top sql in
+  let* pr = rv_prepare top sql in
   match pr with
   | Error e -> Lwt.return (Error e)
   | Ok st ->
@@ -3569,7 +3624,7 @@ let rv_apply_and_notify top entry out_delta =
       let del_sql =
         Printf.sprintf "DELETE FROM %s WHERE %s LIMIT 1" tbl (String.concat " AND " conds)
       in
-      let* pr = prepare top del_sql in
+      let* pr = rv_prepare top del_sql in
       match pr with
       | Error e -> Lwt.return (Error e)
       | Ok st ->
@@ -3586,7 +3641,7 @@ let rv_apply_and_notify top entry out_delta =
     | Ok () ->
       let phs = String.concat ", " (List.init ncols (fun _ -> "?")) in
       let ins_sql = Printf.sprintf "INSERT INTO %s VALUES (%s)" tbl phs in
-      let* pins = prepare top ins_sql in
+      let* pins = rv_prepare top ins_sql in
       (match pins with
        | Error e -> Lwt.return (Error e)
        | Ok st ->
@@ -3684,7 +3739,7 @@ let rv_create_table top name out_cols coltypes =
   let sql =
     Printf.sprintf "CREATE TABLE %s (%s)" (rv_quote (rv_table_name name)) coldefs
   in
-  execute top sql
+  rv_execute top sql
 ;;
 
 (* Current SQL column types of [_rv_<name>], from the catalog. *)
@@ -3730,7 +3785,7 @@ let rv_refresh_full top entry =
           (* #475: permission to bypass the internal-table guard is scoped to
              THIS statement and THIS table name, not to the whole refresh. *)
           rv_dropping_internal top (rv_table_name entry.rv_name) (fun () ->
-            execute
+            rv_execute
               top
               (Printf.sprintf "DROP TABLE %s" (rv_quote (rv_table_name entry.rv_name))))
         in
@@ -4037,7 +4092,9 @@ let rv_erase_persistent top ~name =
   (* #475: as in [rv_refresh_full] — the guard bypass covers this one statement
      and this one table name. *)
   rv_dropping_internal top (rv_table_name name) (fun () ->
-    execute top (Printf.sprintf "DROP TABLE IF EXISTS %s" (rv_quote (rv_table_name name))))
+    rv_execute
+      top
+      (Printf.sprintf "DROP TABLE IF EXISTS %s" (rv_quote (rv_table_name name))))
 ;;
 
 (* #469 review: the registry is the authority for *live* views, but #437
