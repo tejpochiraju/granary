@@ -117,6 +117,7 @@ Three gates are **not** wall-clock and therefore **not** neutralized anywhere:
 | `test_not_null_600` | #600 `PRAGMA not_null_check` retaining every violating row | marginal peak live heap < 4 words/row when the table doubles | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
 | `test_not_null_repair_630` | #630 `PRAGMA not_null_repair`'s **scan** draining the tree via `cursor_open` | same gate, but with the violation count held FIXED at 5 while the table doubles, so only the scan can move it | `GRANARY_MEM_MAX_WORDS_PER_ROW` |
 | `test_correlated_exists_493` | #493 a correlated `EXISTS` leaking one RO snapshot per outer row | peak live RO snapshots does not grow when the outer rows go 100 → 400 | `GRANARY_MAX_LIVE_READERS` |
+| `test_agg_retention_423` | #423 the net-zero SUM-group retention in `Aggregate` growing per UPDATE rather than per distinct group, or costing more than one map node plus one record | marginal live heap < 16 words per retained group when the group count doubles, and quadrupling the churn over ONE key adds < 16 words total | `GRANARY_MEM_MAX_WORDS_PER_GROUP` |
 
 The first two are complements, not duplicates: #600's doubles the violations along
 with the table and so cannot tell a retaining scan from a retaining victim
@@ -137,6 +138,23 @@ same test makes. Reach for it only after ruling out the thing it guards: the
 measured slopes are ≈20-23 words/row retaining (19.61-23.52 across three runs;
 the 40 000-row point is the noisy one) and 1.6-1.9 counting, so a failure
 anywhere between those two bands is a regression, not a platform difference.
+
+**`test_agg_retention_423` gates on the SETTLED heap, not the sampled peak, and
+that is the opposite of the other three for a reason.** They bound a
+*transient* — a scan that must not retain what it walks — which only a peak can
+see. #423 bounds what *survives*, so the settled heap after a `full_major` with
+the operator still reachable is the figure that carries it, and the `Gc` alarm's
+asynchronous samples routinely all land below that (the alarm fires at
+major-slice boundaries, not on demand). The test prints `max sampled settled` as
+its peak so a peak below the settled heap is not mistaken for a smaller
+footprint. Its two measured numbers are **9.00 words per retained group** for the
+bare operator with an immediate key and **16.00 words** for
+`Reactive_view.Agg_engine`'s boxed-`INTEGER` key — exact, not approximate,
+because they are block layouts (one `Map` node at 6 words plus the `{ mult; aggv }`
+record at 3, plus 7 for the key) rather than allocator behaviour. The 16-word
+ceiling therefore has ~1.8x headroom over the bare operator and is far below the
+20+ any *element*-retaining regression would cost. It is armed on the first run
+that produced the number, which is what `test_scan_borrow_481` below asks for.
 
 `test_correlated_exists_493` measures a *count* — `Store.active_reader_count`,
 an integer folded from a refcount table — sampled between outer rows, so load
@@ -2132,6 +2150,60 @@ because the same SQL already parsed for the bind that produced
 `Unknown_table` — now propagate the real error instead of manufacturing a
 fresh bare one. Error quality must not depend on which entry point the caller
 used.
+
+### A net-zero SUM group is retained, with a stated ceiling (#423)
+
+`Aggregate.Make` drops a group from its `GMap` only when **both** `mult = 0` and
+`aggv = 0`. A SUM group whose row weights cancel to `mult = 0` while `aggv <> 0`
+is kept on purpose: `aggv` is not recoverable from the delta feed — the operator
+never sees a base row — so dropping it would silently compute the wrong total if
+the group later revived. #423 chose the third of its three options: **accept the
+retention and document a ceiling.** No compaction pass, no LRU/age cap. Do not
+add one without re-deciding; re-derivation on revival needs exactly the base
+access the operator does not have. The long form, with the measurement, is
+`docs/IVM_MEMORY.md`; the short form is in `lib/ivm/aggregate.mli` where an
+implementer meets it.
+
+The ceiling, in the terms an operator has:
+
+- **Bounded by DISTINCT groups, never by updates.** One map entry per group,
+  forever, so a view churning a fixed key set retains at most that key set.
+  Unbounded *key cardinality* — grouping on a session id, a request id, a
+  timestamp — is the hazard; a high update rate over a stable key set is not.
+  Measured: 50 000 and 200 000 net-zero rounds over one key both cost 27 words.
+- **9 words per retained group, plus the caller's key.** One `Map.Make` node
+  (6 words) plus the `{ mult; aggv }` record (3). `Reactive_view.Agg_engine`'s
+  key is a `Row.value array` of one element, so an `INTEGER`-grouped view costs
+  **16 words = 128 bytes** per retained group — ≈128 MB per million, which is
+  the figure to size a unikernel against. Both numbers measured exactly.
+- **It cannot arise without a NEGATIVE weight.** If every element of a group has
+  a non-negative cumulative weight, `Σ w = 0` forces every `w = 0` and hence
+  `aggv = 0`, which prunes. So a delta stream that only retracts what it has
+  inserted retains **nothing at all**, and the issue's "on a high-churn SUM view
+  such net-zero groups accumulate unboundedly" overstates it: signed weights are
+  the precondition. They reach the operator either from a composed Z-set
+  pipeline (the `granary.ivm` API is public) or from a retraction with no
+  matching insertion — which for the `Db` driver means a stale `record_change`
+  delta, i.e. the #666/#737 neighbourhood.
+- **It cannot arise unless the measure VARIES within one group.**
+  `aggv = Σ measure * weight`, so a constant measure `c` makes it `c * mult`.
+  **The issue's claim that COUNT never hits this is correct** — checked, not
+  repeated: it holds unconditionally, for arbitrary signed weights, and is
+  fuzzed as a QCheck property. The rule is about constancy, not about the
+  measure being 1: a SUM over a column constant within its group is equally
+  safe.
+
+**A live view's retention is not permanent.** `Db.rv_rebuild_engine` builds a
+*fresh* `Agg_engine` on a resync — scheduled by `ROLLBACK TO` (#427) and by a
+failed statement (#737) — so a rebuilt view starts from an empty map. That is
+the operator's escape hatch and it costs a full rebuild.
+
+`Aggregate.Make(S).retained_groups` and `Reactive_view.Agg_engine.retained_groups`
+report the live entry count including the invisible net-zero ones, so an
+embedding can watch its own ceiling instead of inferring it; comparing against
+`snapshot`'s length gives the net-zero count directly. Pinned by
+`test/test_agg_retention_423.ml`, whose allocation gate is armed by default —
+see the non-wall-clock gate table above.
 
 ### The writer lock is measured, and every acquisition goes through one door (#718)
 
