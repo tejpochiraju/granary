@@ -2066,3 +2066,13 @@
  (name test_cmp_eq_738)
  (modules test_cmp_eq_738)
  (libraries granary alcotest lwt.unix))
+
+; #744: TRUE/FALSE as boolean literals — a name-resolution fallback, not lexer
+; keywords, so identifier context still wins and the #619 drift guard is
+; untouched. In-memory is enough: this is parser/binder behaviour with no
+; durability dimension.
+
+(test
+ (name test_bool_literal_744)
+ (modules test_bool_literal_744)
+ (libraries granary granary.encoding alcotest lwt.unix))

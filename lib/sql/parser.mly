@@ -734,7 +734,14 @@ def_value:
   | MINUS n = INT_LIT        { L_int (Int64.neg n) }
   | MINUS n = INT_LIT_OVERFLOW { L_int (neg_int_overflow n) }
   | MINUS f = FLOAT_LIT      { L_real (-. f) }
-  | id = any_ident           { match String.uppercase_ascii id with
+  | id = any_ident           { (* #744: TRUE/FALSE are ordinary identifiers, not
+                                  tokens, so they arrive here as any_ident.  A
+                                  DEFAULT has no row in scope, so there is no
+                                  column they could mean instead. *)
+                               match bool_ident_lit id with
+                               | Some l -> l
+                               | None ->
+                               match String.uppercase_ascii id with
                                | "CURRENT_TIMESTAMP" -> L_current_timestamp
                                | "CURRENT_DATE"      -> L_current_date
                                | "CURRENT_TIME"      -> L_current_time
