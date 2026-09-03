@@ -721,6 +721,32 @@ EOF
   it fixes STORED and leaves VIRTUAL reading NULL, deepening the asymmetry. If
   #660 lifts the refusal, both halves are owed at once.
 
+  **#661 (fixed): `ALTER TABLE ... ADD COLUMN ... NOT NULL GENERATED ... VIRTUAL`
+  is no longer refused, and it is #629 that makes lifting the refusal safe.**
+  `Sema.bind_add_column`'s NOT NULL gate exists because existing rows decode
+  SHORT — they were written without the new column, so it reads back as a stored
+  NULL, and a DEFAULT is the only thing that can supply a value for them. That
+  reason holds for a plain column and for a **STORED** generated one, which has
+  no read-side recompute for rows written before the ALTER; both keep the
+  refusal. It does not hold for a **VIRTUAL** one, which has no stored cell at
+  all, so the exemption relaxes *when* the constraint is checked and not
+  *whether* — `not_null_violation` recomputes the virtuals before judging, so
+  the added column is genuinely enforced at write time.
+
+  **The ALTER deliberately does NOT validate the expression over EXISTING
+  rows** — the judgement call #661 leaves open. `bind_add_column` is a binder
+  with no store, so the check would have to move into the exec ALTER path and
+  would turn an O(1) metadata-only DDL into a full table scan; and it matches
+  how pre-existing constraint violations are treated generally, reported by
+  `PRAGMA not_null_check` rather than rejected at DDL time. **The residual is
+  real and has no repair surface of its own**: a row already on disk whose
+  generated expression is NULL reads its NULL silently and raises only on the
+  next write that rewrites it (`write_row_rekeyed` → `enforce_not_null`), and
+  `not_null_scan_cols` deliberately does not cover generated columns per the
+  paragraph above, so `PRAGMA not_null_check` will not report it either. Moving
+  the base column is the only repair. Both halves are pinned by
+  `test/test_alter_add_generated_661.ml`.
+
   Consequences worth knowing: a generated expression that genuinely evaluates to
   NULL is still rejected — on INSERT (skipped under `OR IGNORE`, per #599, since
   the row now reaches the runtime site that decides that), and on an UPDATE of
@@ -729,6 +755,80 @@ EOF
   **not** follow — it reports on cells already on disk whose only repair is to
   rewrite them, which is meaningless for a column never read from disk. Pinned by
   `test/test_not_null_629.ml`.
+- **An aggregate's ARGUMENT is an expression, and both rules that follow from
+  that are now settled (#665 and #664, 2026-09-03).** #488 made
+  `SUM(price * (1 - disc))` legal; these two are the consequences it did not
+  finish.
+
+  **#665: the SUM/AVG numeric check reaches the expression spelling.** #568 had
+  already unified the *bare* `SUM(text_col)` and the *wrapped*
+  `SUM(text_col) + 0` on one bind-time check, precisely so that a pair of
+  parentheses could not turn it off. #488's expression argument was a third
+  spelling with no column ordinal, so `agg_numeric_check` — which keys off a
+  stored column's declared type — never ran on it:
+  `SUM(CASE WHEN … THEN 'a' ELSE 'b' END)` failed at RUNTIME mid-scan, and
+  **succeeded outright on an empty table**, which is the exact defect #568 was
+  filed about. The verdict now lives in one function,
+  `Sema.agg_numeric_ty_check`, reached by both spellings.
+
+  **`Sema.agg_arg_static_ty` is deliberately NOT `Sema.infer_type`, and the
+  reason is a compatibility break avoided rather than a style preference.**
+  `infer_type` indexes a `Row.column list` where the binder has only the
+  resolver's `agg_arg_col_ty` ordinal lookup; more importantly it must not
+  descend into `BE_case`, because its other caller is `bind_update_assignments`
+  and Granary's typing there is strict (`ty_equal Integer Real = false`), so a
+  CASE arm would newly reject
+  `UPDATE t SET real_col = CASE WHEN c THEN 1 ELSE 2 END`. The CASE descent is
+  the whole point for #665 — the issue's headline shape is a CASE — so it lives
+  in the aggregate-only function. Every arm that cannot be sure answers `None`,
+  and `None` is `Ok`, so the check can only move a failure EARLIER; it can never
+  refuse a query that would have answered. The residual it does not close: an
+  argument whose type is statically indeterminate (a scalar function, a bound
+  parameter, a CASE whose arms disagree) still reaches the runtime accumulator,
+  and on an empty table still succeeds. Pinned by
+  `test/test_agg_numeric_665.ml`, whose
+  `indeterminate_argument_still_fails_at_runtime` is the boundary marker.
+
+  **#664: a subquery in the argument is evaluated, not refused — and it does
+  NOT follow #558's rule.** This is the part to read before touching either
+  path. #558 pre-evaluates subqueries in `having` and `proj`; those are
+  evaluated per aggregate **OUTPUT** row, whose only input-derived slots are the
+  grouped columns, hence #558's rule that a correlated subquery there may
+  reference a GROUP BY column and **nothing else**. An **ARGUMENT** is evaluated
+  per **INPUT** row, before any grouping, so its outer reference may name any
+  column the child carries; it is resolved the way `stream_expr_project`
+  resolves a correlated projection, against `get_outer_scan_metas child`, per
+  row. Two rules for two different rows. They have separate refusal messages
+  (`agg_subquery_refusal` vs `agg_arg_subquery_refusal`) for exactly that
+  reason: reporting the GROUP BY one for an argument sends the reader to a rule
+  that does not apply to it. **Unifying the two would be a silent wrong answer**,
+  not a simplification — `correlated_under_a_group_by_on_another_column` in
+  `test/test_agg_arg_subquery_664.ml` is a query #558's mechanism could not
+  answer at all.
+
+  Mechanically the resolved argument VALUE is parked in a hidden trailing slot
+  appended to its input row and the spec rewritten to `P_col slot` — the same
+  hidden-slot mechanism #495/#663 use. That is what keeps the subquery evaluated
+  exactly once per row: #491's DISTINCT filter and `aggregate_one` both read the
+  argument through `agg_arg_getter`, so a `P_subquery` left in place would have
+  had to be resolved separately by each. Widening is safe because everything
+  that indexes an input row there indexes a PREFIX of it, and the aggregate
+  output row is `group_key @ agg_vals`, so no hidden slot escapes into a result.
+
+  **The #247 fast path gives such a query up**, gated above its child dispatch
+  so both `run_aggregate_fast_path` and #674's `run_index_cover_walk` are
+  covered. Its loop is pure and `eval_expr` answers `V_null` for an unresolved
+  `P_subquery`, so keeping the query would silently fold NULLs — the same reason
+  #558 made it give up a subquery-bearing projection. Every scalar assertion in
+  #664's test runs with the fast path forced ON and forced OFF and must agree,
+  so a fast path that quietly kept such a query shows up as a disagreement
+  rather than as a plausible number.
+
+  `Sema.expr_has_subquery_ast` is gone with the refusal that was its only
+  caller. Three tests that asserted the refusal now assert the answer
+  (`test_agg_expr_495_488`, `test_agg_subquery_558`, `test_sema`); they were
+  converted rather than deleted so the moved boundary is visible in the diff.
+
 - **An explicit `ON CONFLICT` target beats the statement's conflict-resolution
   modifier, for the index it names (#639, decided 2026-08-06).** The modifier
   still governs every *other* index. Before this, `CA_ignore` matched above the

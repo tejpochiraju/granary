@@ -1796,3 +1796,15 @@
  (name test_agg_arg_subquery_664)
  (modules test_agg_arg_subquery_664)
  (libraries granary granary.encoding alcotest lwt.unix unix))
+
+; #661: ALTER TABLE ADD COLUMN NOT NULL GENERATED ... VIRTUAL is no longer
+; refused for lacking a DEFAULT it cannot need — a VIRTUAL generated column has
+; no stored cell, so the short-decode NULL the rule guards against cannot occur.
+; STORED and plain columns keep the refusal. Also pins the decision NOT to
+; validate the expression over existing rows during the ALTER, and the residual
+; that follows from it.
+
+(test
+ (name test_alter_add_generated_661)
+ (modules test_alter_add_generated_661)
+ (libraries granary alcotest lwt.unix))

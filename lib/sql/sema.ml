@@ -4670,8 +4670,48 @@ let bind_seq_insert ~columns ~values ~on_conflict ~returning ~upsert_update =
 (* ALTER TABLE                                                          *)
 (* ------------------------------------------------------------------ *)
 
+(* #661: is this ADD COLUMN adding a VIRTUAL generated column?
+
+   The NOT NULL gate below exists because existing rows decode SHORT: they were
+   written without the new column, so it would read back as a stored NULL, and
+   a DEFAULT is the only thing that can supply a value for them.  That reason
+   holds for a plain column and for a STORED generated one, which likewise has
+   no read-side recompute for rows written before the ALTER.
+
+   It does not hold for a VIRTUAL one.  There is no stored cell at all —
+   [column_of_col_def] carries [generated_as] through, and
+   [Exec.compute_virtual_generated_cols] recomputes the column on every read,
+   including for pre-existing rows — so the NULL the rule guards against cannot
+   occur.  Refusing it demanded a DEFAULT for a column that can never use one.
+
+   Same shape as #629 itself: a check judging a placeholder rather than the
+   value the column will actually hold, one gate along from where #629 fixed
+   it.  And it is #629 that makes the exemption safe rather than merely
+   permissive — since [Exec.not_null_violation] recomputes the virtuals before
+   judging a row, a NOT NULL VIRTUAL column is genuinely ENFORCED at write
+   time, so exempting it here relaxes when the constraint is checked and not
+   whether. *)
+let add_column_is_virtual_generated (col_def : Ast.column_def) =
+  match col_def.Ast.generated_as with
+  | Some (_, `Virtual) -> true
+  | Some (_, `Stored) | None -> false
+;;
+
 (* Validate an ALTER TABLE ADD COLUMN: reject duplicate columns, PRIMARY KEY,
-   NOT NULL without a usable DEFAULT, and unresolved REFERENCES targets. *)
+   NOT NULL without a usable DEFAULT (except for a VIRTUAL generated column,
+   which cannot need one — see [add_column_is_virtual_generated]), and
+   unresolved REFERENCES targets.
+
+   Pre-existing rows whose generated expression evaluates to NULL are NOT
+   validated during the ALTER, deliberately (#661).  The binder has no store
+   access, so the check would have to move into the exec ALTER path and would
+   turn an O(1) metadata-only DDL into a full table scan.  It also matches how
+   the engine treats pre-existing constraint violations generally: they are
+   reported by [PRAGMA not_null_check], not rejected at DDL time.  The
+   consequence, which is the trade being made: such a row reads its NULL
+   without complaint and only fails on the next UPDATE that rewrites it, where
+   [write_row_rekeyed] -> [enforce_not_null] recomputes the virtual and
+   raises. *)
 let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.column_def) =
   let col_name = col_def.Ast.name in
   let exists =
@@ -4694,6 +4734,7 @@ let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.co
   else if
     col_def.Ast.not_null
     && (col_def.Ast.default = None || col_def.Ast.default = Some Ast.L_null)
+    && not (add_column_is_virtual_generated col_def)
   then
     Lwt.return
       (Error (Unsupported "ADD COLUMN with NOT NULL requires a non-NULL DEFAULT"))
