@@ -6,6 +6,7 @@
 
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
+module Schema = Granary.Schema
 
 let run = Lwt_main.run
 
@@ -25,7 +26,7 @@ let exec db sql =
 ;;
 
 let idx_stats db name =
-  match Cat.find_index (Db.catalog db) ~name with
+  match Schema.find_index (Db.schema db) ~name with
   | None -> Alcotest.failf "index %S not found" name
   | Some i -> i.Cat.idx_stats
 ;;

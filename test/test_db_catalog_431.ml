@@ -1,11 +1,17 @@
-(** #431: [Db.catalog] exposes the live in-memory catalog for read-only
-    schema/type projection. A downstream consumer (camel's hook type
-    environment) projects every table's columns — name, type, NOT NULL — from
-    the catalog a [Db.t] already holds, so it needs an accessor to reach it. *)
+(** #431: the engine exposes a database's schema for read-only schema/type
+    projection. A downstream consumer (camel's hook type environment) projects
+    every table's columns — name, type, NOT NULL — from the catalog a [Db.t]
+    already holds, so it needs an accessor to reach it.
+
+    #433: that accessor used to be [Db.catalog], handing out the live mutable
+    [Catalog.t]; it is now [Db.schema], handing out the read-only
+    {!Granary.Schema.t}. This file keeps #431's own assertion — the projection
+    sees a table created through SQL, with its columns' names, types and NOT
+    NULL flags — against the new accessor. *)
 
 open Lwt.Syntax
 module Row = Granary_encoding.Row
-module Catalog = Granary_catalog.Catalog
+module Schema = Granary.Schema
 
 let run = Lwt_main.run
 
@@ -20,12 +26,10 @@ let test_catalog_sees_created_table () =
      (match r with
       | Ok () -> ()
       | Error e -> Alcotest.failf "create table: %a" Granary.Db.pp_error e);
-     let* tables = Catalog.list_tables (Granary.Db.catalog db) in
-     let users =
-       List.find_opt (fun (m : Catalog.table_meta) -> m.name = "users") tables
-     in
+     let* tables = Schema.list_tables (Granary.Db.schema db) in
+     let users = List.find_opt (fun (m : Schema.table) -> m.name = "users") tables in
      match users with
-     | None -> Alcotest.fail "catalog should list the created table"
+     | None -> Alcotest.fail "schema should list the created table"
      | Some m ->
        let names = List.map (fun (c : Row.column) -> c.name) m.columns in
        Alcotest.(check (list string)) "column names" [ "id"; "email" ] names;
@@ -40,7 +44,7 @@ let () =
     "db_catalog_431"
     [ ( "accessor"
       , [ Alcotest.test_case
-            "catalog sees created table"
+            "schema sees created table"
             `Quick
             test_catalog_sees_created_table
         ] )

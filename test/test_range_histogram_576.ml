@@ -22,9 +22,8 @@
 
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
-module Sema = Granary_sql.Sema
+module Schema = Granary.Schema
 module Plan = Granary_sql.Plan
-module Planner = Granary_sql.Planner
 
 let run = Lwt_main.run
 
@@ -44,24 +43,19 @@ let exec db sql =
 ;;
 
 let idx_stats db name =
-  match Cat.find_index (Db.catalog db) ~name with
+  match Schema.find_index (Db.schema db) ~name with
   | None -> Alcotest.failf "index %S not found" name
   | Some i -> i.Cat.idx_stats
 ;;
 
-let bind_and_plan cat sql =
-  let ast =
-    match
-      let lexbuf = Lexing.from_string sql in
-      Granary_sql.Parser.stmt_eof Granary_sql.Lexer.token lexbuf
-    with
-    | stmt -> stmt
-    | exception Granary_sql.Parser.Error -> Alcotest.failf "parse %S: syntax error" sql
-    | exception Failure msg -> Alcotest.failf "parse %S: %s" sql msg
-  in
-  match run (Sema.bind cat ast) with
-  | Error _ -> Alcotest.failf "bind %S failed" sql
-  | Ok b -> Planner.plan ~cat b
+(* #433: [Db.plan] parses, binds and plans against the handle's own catalog
+   without executing.  This file used to reach for [Db.catalog] and drive
+   [Sema.bind] / [Planner.plan] itself; that accessor handed out the live
+   mutable [Catalog.t] and is gone. *)
+let bind_and_plan db sql =
+  match run (Db.plan db sql) with
+  | Error e -> Alcotest.failf "plan %S: %a" sql Db.pp_error e
+  | Ok op -> op
 ;;
 
 (* [Op_hash_join]'s build side is its [right : op] field; [Op_nested_loop_join]'s
@@ -152,8 +146,7 @@ let wide_sql =
 let narrow_window_takes_the_nested_loop_probe () =
   with_db (fun db ->
     seed_and_index db;
-    let cat = Db.catalog db in
-    let op = bind_and_plan cat narrow_sql in
+    let op = bind_and_plan db narrow_sql in
     match top_join_shape op with
     | `Nested_loop_join -> ()
     | `Hash_join -> Alcotest.fail "expected a nested-loop probe for the narrow window"
@@ -174,8 +167,7 @@ let narrow_window_takes_the_nested_loop_probe () =
 let wide_window_flips_to_the_hash_join_via_the_histogram () =
   with_db (fun db ->
     seed_and_index db;
-    let cat = Db.catalog db in
-    let op = bind_and_plan cat wide_sql in
+    let op = bind_and_plan db wide_sql in
     match top_join_shape op with
     | `Hash_join -> ()
     | `Nested_loop_join ->
@@ -212,8 +204,7 @@ let wide_sql_bare_int_literals =
 let bare_int_literals_flip_to_the_hash_join_same_as_real_literals () =
   with_db (fun db ->
     seed_and_index db;
-    let cat = Db.catalog db in
-    let op = bind_and_plan cat wide_sql_bare_int_literals in
+    let op = bind_and_plan db wide_sql_bare_int_literals in
     match top_join_shape op with
     | `Hash_join -> ()
     | `Nested_loop_join ->
@@ -228,12 +219,11 @@ let bare_int_literals_flip_to_the_hash_join_same_as_real_literals () =
 let parameter_bound_range_is_unaffected () =
   with_db (fun db ->
     seed_and_index db;
-    let cat = Db.catalog db in
     let param_sql =
       "SELECT tgt.v FROM tgt JOIN drv ON tgt.payload = drv.v WHERE tgt.w = 0 AND tgt.v \
        BETWEEN 0.0 AND ?"
     in
-    let op = bind_and_plan cat param_sql in
+    let op = bind_and_plan db param_sql in
     match top_join_shape op with
     | `Nested_loop_join -> ()
     | `Hash_join ->
