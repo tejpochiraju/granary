@@ -404,7 +404,9 @@ EOF
     number. It used to get that from `Float.compare`'s total order, which puts
     NaN below `neg_infinity`; since #733 it delegates to `Exec.compare_values`,
     whose `cmp_int_real` states the rule explicitly instead. Same answer, now by
-    construction rather than by coincidence.
+    construction rather than by coincidence. Since #738 `=` and `<>` go through
+    it too, so `1 <> NaN` is true (it was false, sharing the cross-numeric
+    catch-all) and no comparison operator is outside the rule.
   - `Index_key.encode_value` gives NaN its own single-byte tag `0x01` — below
     INTEGER's `0x02` and REAL's `0x03`, above NULL's `0x00` — so it also sorts
     below every other number, and *distinctly from* NULL.
@@ -488,9 +490,10 @@ EOF
   every input, with no magnitude caveat** — but that claim is about that
   function, not about the engine.
 
-  **`cmp_result`, the WHERE-predicate comparator, IS that function now — #733
-  and #734 (both fixed, 2026-09-03).** For one release it was a third
-  comparator differing in two filed ways, and the fix was to delete both
+  **`cmp_result`, the WHERE-predicate comparator, IS that function now, and
+  since #738 it is the comparator behind ALL SIX comparison operators — #733,
+  #734 and #738 (all fixed, 2026-09-03).** For one release `cmp_result` was a
+  third comparator differing in two filed ways, and the fix was to delete both
   differences rather than to reconcile them:
   - it promoted int-vs-real through `Int64.to_float`, so above 2^53 a
     *predicate* answered equal for a pair the *ordering* separated
@@ -514,18 +517,98 @@ EOF
   predicate over a NULL is UNKNOWN. Routing NULL through it would make
   `WHERE x < 5` true for a NULL `x`.
 
-  **`=` and `<>` are not routed through it, and that is the remaining
-  residual (#738).** They keep their own arms in `eval_binop`. Across classes
-  they now agree with everything else — never equal, therefore always
-  different, which is sqlite3's answer and which `<>` did *not* give before
-  #734 (it shared `=`'s catch-all, so `5 = 'abc'` and `5 <> 'abc'` were both
-  false). Across the two *numeric* types they still answer false in both
-  directions: `1 = 1.0` is `0` and `1 <> 2.0` is `0`, where sqlite3 says `1`
-  and `1`. **That one cannot be fixed alone.** An equality conjunct *is*
-  consumed by the access path, and both `Exec.index_lookup_values` and
-  `Exec.stream_rowid_lookup` answer "matches nothing" for a cross-numeric
-  pair; making `=` exact without moving them loses rows silently. #738 has the
-  full scope.
+  **`=` and `<>` are routed through it too, and that took `eval_binop` plus
+  THREE index sites moving in one commit (#738, fixed 2026-09-03).** They used
+  to keep their own arms in `eval_binop`, each enumerating the four same-type
+  pairs and falling to a catch-all, so a cross-NUMERIC pair answered false in
+  *both* operators:
+  `1 = 1.0` was `0` **and** `1 <> 1.0` was `0`, while `1 <= 1.0` and
+  `1 >= 1.0` were both true. That is incoherent independently of sqlite3, which
+  answers `1|0|1` for `1 = 1.0, 1 <> 1.0, 1 <> 2.0` (oracle-checked). Both arms
+  are now one line each — `cmp_result lv rv (fun c -> c = 0)` and
+  `(fun c -> c <> 0)` — so no comparator survives that can answer `=` one way
+  and `<=`/`>=` another. Cross-class is unchanged (never equal, therefore
+  always different, #734's answer), and the exactness comes from
+  `cmp_int_real`, so `9007199254740993 = 9007199254740992.0` is still **false**
+  — the fix must never be spelled as an `Int64.to_float` promotion, which would
+  be #733 reintroduced inside `=`.
+
+  **The three index sites had to move with it, and must never be moved back
+  apart.** This is the reason #738 could not ride along with #733/#734. Unlike
+  a range conjunct, an **equality** conjunct *is* consumed by the access path
+  (`Planner.recognise_eq_col_lit` → `access_path_for_eqs`, whose `consumed`
+  positions `residual_filter` removes), so **no residual re-checks the rows a
+  seek yields** — the seek *is* the answer. Making `=` exact while those sites
+  still declined a cross-numeric probe would have made `WHERE i = 1.0` on an
+  indexed INTEGER column return nothing while the predicate says the row
+  qualifies: rows lost silently, the exact failure mode the NaN section's "a
+  seek and its residual may never disagree" rule exists to prevent. The three
+  index sites, all of them — the issue text named only the first two:
+
+  - `Exec.index_lookup_values` — a REAL probe on an INTEGER column becomes
+    `IK_int` when the float names an integer exactly, and a `V_int` probe on a
+    REAL column becomes `IK_real` only when `Int64.to_float` round-trips
+    exactly. Otherwise `None`, which still means *matches nothing* and is
+    *exactly right*: no integer equals `1.5`, and no double equals `2^53 + 1`.
+    Both directions go through the two shared helpers `Exec.int64_of_exact_real`
+    and `Exec.exact_real_of_int64`, the latter implemented by *asking*
+    `cmp_int_real`, so the key and the predicate agree by construction rather
+    than by two hand-written range checks.
+  - `Exec.stream_rowid_lookup` — the rowid-alias read path, which returned an
+    empty stream for anything but `V_int`.
+  - `Exec.seek_candidates`'s `Seek_rowid` arm — **the one #738's own issue text
+    does not list.** The DML seek is only a *restriction* (the
+    write path re-evaluates the whole predicate on every candidate), but a
+    declined probe drops the row before the predicate ever sees it, so
+    `DELETE FROM p WHERE id = 2.0` was a silent no-op. Both rowid sites now go
+    through the shared `Exec.rowid_lookup_key`.
+
+  `Exec.range_bound_key` is untouched and that is not luck: it intercepts both
+  numeric cross-type pairs in its own arms *above* the delegation to
+  `index_lookup_values`, so the widened bound it computes is unaffected by the
+  equality path learning them.
+
+  **NaN never reaches a seek as an "integral" real**, and the naive
+  integrality test would have let it: `Float.trunc nan` is `nan` and
+  `Float.equal nan nan` is true, so `Int64.of_float` would have been called
+  outside its specified domain. `int64_of_exact_real` declines NaN, every
+  infinity and everything outside int64 range *first*. At the value level
+  `NaN = NaN` is still true and `NaN <> NaN` still false (`Float.compare nan
+  nan = 0`, which is what `Float.equal` already was); the one NaN answer that
+  **moved** is `1 <> NaN`, from false to true — it was sharing the
+  cross-numeric catch-all, i.e. the same incoherence as `1 <> 1.0`, fixed by
+  the same change rather than by a NaN rule. #536's decided order is unchanged.
+
+  **What #738 does NOT close, and the reason for the split (#743).** A JOIN KEY
+  equality is consumed too, by a different mechanism and in two different
+  executors, and neither learned the cross-numeric case: the keyed
+  `Exec.stream_hash_join` arm hashes both sides on
+  `Index_key.encode_value (row_value_to_index_value v)`, and
+  `Exec.nlj_probe_left` encodes its probe the same way. So
+  `FROM l JOIN r ON l.a = r.b` (INTEGER vs REAL) answers no rows while
+  `ON 1 = 1 WHERE l.a = r.b` answers the row; sqlite3 answers the row for
+  **both** (oracle-checked). Both spellings answered *no rows* before #738, so
+  no answer regressed — what is new is that they disagree with each other.
+  Fixing the hash arm alone is easy (a canonical key: an integral real keys as
+  the int it names) and was deliberately **not** done, because the nested-loop
+  arm seeks a *typed* index and needs `Plan.probe_part` to carry the index
+  column types the way `Op_index_lookup`'s `keys` does — so a partial fix would
+  make the answer depend on whether a `CREATE INDEX` exists. Strict column
+  typing keeps this to cross-type joins only: one column can never hold both
+  `1` and `1.0`, which is also why the UNIQUE byte probe is unaffected.
+
+  Pinned by `test/test_cmp_eq_738.ml`. Its `*_seeks_*` cases are the point of
+  the file: each runs the seeking spelling **and** an unoptimizable foil
+  (`col + 0`, which no recogniser matches) and requires the two to agree, and
+  asserts `used_index` so a later planner change cannot make the agreement
+  vacuous by choosing a scan. Verified by mutation: reverting only the index
+  sites while leaving `=` exact fails 6 of its 15 cases, all of them
+  seek/residual disagreements. `test_cmp_result_733`'s
+  `cross_numeric_equality_is_unchanged_pending_738` — which pinned the hole so
+  #738 would have a test to invert — is now
+  `cross_numeric_equality_is_exact_738` and asserts the opposite, and
+  `a_cross_numeric_join_key_still_matches_nothing_743` pins #743's residual as
+  known behaviour rather than endorsed — change it as a decision.
 
   **Why the index path survived #733, which is the thing to check before
   touching this again.** `range_bound_key`'s `pred`/`succ` widening was written
@@ -535,7 +618,8 @@ EOF
   residual actually runs over the seek's output. **It does, and the reason is
   load-bearing: `Planner.range_for_index` never marks a range conjunct
   consumed** (an *equality* conjunct is — see #738 above, which is the same
-  distinction seen from the other side). So the widening is now a deliberate
+  distinction seen from the other side, and which had to move the seek itself
+  precisely because it has no residual to fall back on). So the widening is now a deliberate
   over-approximation: kept, not removed, because a widened seek is sound under
   *both* the old and the new predicate semantics, and tightening it would make
   soundness depend on that planner property holding forever. Tightening it is a
@@ -569,12 +653,18 @@ EOF
   `row_key`'s string rendering, where `1` and `1.0` are different keys. So
   DISTINCT and GROUP BY still disagree about whether an int and a numerically
   equal real are one key. That is the residual, and #733/#734 narrowed it
-  rather than closing it: `cmp_result` is no longer an independent comparator,
-  so the count is down from four to three (`compare_values`, `row_key`'s string
-  rendering, and `Reactive_view.value_compare` — the last of which orders all
-  ints before all reals), plus `eval_binop`'s own `=`/`<>` arms, which still
-  differ from `compare_values` across the numeric types (#738). Folding them
-  into one is what #579's own "Note" asks for and is still not done. Pinned by `test/test_compare_values_579.ml`. Two of its cases carry the
+  rather than closing it: `cmp_result` is no longer an independent comparator
+  and, since #738, neither are `eval_binop`'s `=`/`<>` arms, so the count is
+  down from four to **three** — `compare_values` (which all six WHERE
+  comparisons, ORDER BY, GROUP BY, PARTITION BY and MIN/MAX now share),
+  `row_key`'s string rendering, and `Reactive_view.value_compare`. The two
+  remaining outliers were re-checked as part of #738 and deliberately left:
+  `row_key` is a **dedup key**, not a predicate, so `1` and `1.0` are different
+  keys there and DISTINCT still disagrees with GROUP BY about whether they are
+  one; `Reactive_view.value_compare` is a row-identity ordering for the delta
+  log (it ranks `V_int` before `V_real` outright, so it is not even a numeric
+  comparator) and answers no user-visible question. Folding the three into one
+  is what #579's own "Note" asks for and is still not done. Pinned by `test/test_compare_values_579.ml`. Two of its cases carry the
   weight: `the_falsifying_triple_is_ordered_exactly` pins the three >2^53
   comparisons directly, and the QCheck `compare_values is transitive over
   random triples` property fuzzes for the same class of defect. **That

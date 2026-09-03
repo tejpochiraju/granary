@@ -355,6 +355,31 @@ let cmp_int_real (x : int64) (y : float) : int =
     else 0)
 ;;
 
+(* #738: the int64 a REAL is exactly equal to, or [None] when no integer is.
+
+   Declines a NaN, an infinity, anything outside int64 range (where
+   [Int64.of_float] is unspecified) and any value with a fraction.  Every
+   declined case is a genuine "no integer equals this", which is what lets an
+   equality seek turn [None] into an empty result rather than a wider scan. *)
+let int64_of_exact_real (f : float) : int64 option =
+  if Float.is_nan f || f >= two_pow_63_cmp || f < -.two_pow_63_cmp
+  then None
+  else if Float.equal f (Float.trunc f)
+  then Some (Int64.of_float f)
+  else None
+;;
+
+(* #738: the float an int64 is exactly equal to, or [None] when no REAL is.
+
+   [Int64.to_float] rounds to nearest, so above 2^53 the result names a
+   DIFFERENT integer; {!cmp_int_real} is the exact test for whether it landed on
+   [n] itself, and reusing it is what keeps this helper and the [=] predicate
+   from ever disagreeing. *)
+let exact_real_of_int64 (n : int64) : float option =
+  let f = Int64.to_float n in
+  if cmp_int_real n f = 0 then Some f else None
+;;
+
 (* #579: a TOTAL order over values, which is what every caller needs and what
    this did not used to be.
 
@@ -2054,51 +2079,28 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
     else if (not ln) && not rn
     then Row.V_int 0L
     else Row.V_null
-  (* NULL compared with anything yields NULL (3-valued logic).
+  (* NULL compared with anything yields NULL (3-valued logic), which
+     {!cmp_result}'s own first arm supplies.
 
-     [Eq] and [Ne] do NOT go through {!cmp_result}, and that is deliberate:
-     [cmp_result] delegates to {!compare_values}, which since #579 compares an
-     int64 against a float EXACTLY and would therefore make [1 = 1.0] true —
-     while {!index_lookup_values} still answers "matches nothing" for that pair
-     and the access path CONSUMES an equality conjunct.  The two would then
-     disagree about which rows a seek covers, which loses rows.  The
-     cross-NUMERIC arms below keep the pre-existing (SQLite-divergent) "false"
-     answer until both levels move together; that is #738.
+     #738: [Eq] and [Ne] go through {!cmp_result} like the four ordering
+     operators, so ALL SIX comparisons are {!compare_values} and there is no
+     longer a comparator that answers [=] one way and [<=]/[>=] another.  Before
+     it they enumerated the four same-type pairs and fell to a catch-all, so
+     [1 = 1.0] and [1 <> 1.0] were BOTH false while [1 <= 1.0] and [1 >= 1.0]
+     were both true.
 
-     Cross-CLASS is settled, though, and both arms now say what sqlite3 says:
-     values of different storage classes are never equal, so [=] is false and
-     [<>] is TRUE.  [<>] answering false as well (the old shared catch-all) was
-     not a divergence so much as an incoherence — [5 = 'abc'] and [5 <> 'abc']
-     were both 0.  No access path recognises a [<>] conjunct, so unlike [=]
-     this half has no index-side counterpart to move with it (#734). *)
-  | Plan.Eq ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int x, Row.V_int y -> if Int64.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_text x, Row.V_text y ->
-       if String.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_real x, Row.V_real y ->
-       if Float.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_blob x, Row.V_blob y ->
-       if Bytes.equal x y then Row.V_int 1L else Row.V_int 0L
-     (* #738: cross-numeric, pending the index-side change.  Cross-class: never
-        equal, which is also sqlite3's answer. *)
-     | _ -> Row.V_int 0L)
-  | Plan.Ne ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int x, Row.V_int y -> if Int64.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_text x, Row.V_text y ->
-       if String.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_real x, Row.V_real y ->
-       if Float.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_blob x, Row.V_blob y ->
-       if Bytes.equal x y then Row.V_int 0L else Row.V_int 1L
-     (* #738: cross-numeric keeps its pre-existing answer, so that this change
-        moves exactly the cross-class case and nothing else. *)
-     | Row.V_int _, Row.V_real _ | Row.V_real _, Row.V_int _ -> Row.V_int 0L
-     (* #734: different storage classes are never equal, so they always differ. *)
-     | _ -> Row.V_int 1L)
+     {b The three sites this rests on must never move apart again.}  Unlike a
+     range conjunct, an EQUALITY conjunct IS consumed by the access path
+     ([Planner.recognise_eq_col_lit] -> [access_path_for_eqs], whose [consumed]
+     positions [residual_filter] removes), so no residual re-checks a seek's
+     output.  Making this arm exact therefore required
+     {!index_lookup_values}, {!stream_rowid_lookup} and {!seek_candidates}'s
+     [Seek_rowid] arm to learn the same cross-numeric equality in the same
+     change — otherwise [WHERE i = 1.0] on an indexed INTEGER column returns
+     nothing while the predicate says the row qualifies.  Rows lost silently is
+     the failure mode; see #738. *)
+  | Plan.Eq -> cmp_result lv rv (fun c -> c = 0)
+  | Plan.Ne -> cmp_result lv rv (fun c -> c <> 0)
   | Plan.Lt -> cmp_result lv rv (fun c -> c < 0)
   | Plan.Le -> cmp_result lv rv (fun c -> c <= 0)
   | Plan.Gt -> cmp_result lv rv (fun c -> c > 0)
@@ -2158,8 +2160,9 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
        Row.V_int (if glob_match pat 0 str 0 then 1L else 0L)
      | _ -> Row.V_null)
 
-(* #733/#734: the ordering half of a WHERE predicate ([<], [<=], [>], [>=]) is
-   {!compare_values} with three-valued logic layered on top, and nothing else.
+(* #733/#734/#738: a WHERE predicate's comparison — all six of [=], [<>], [<],
+   [<=], [>], [>=] — is {!compare_values} with three-valued logic layered on
+   top, and nothing else.
 
    It used to be a third comparator with its own two disagreements:
 
@@ -2187,14 +2190,13 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
    consumed, so a residual filter runs over every row a seek yields.  See
    {!range_bound_key}'s own comment for the full argument.
 
-   [Eq] and [Ne] are deliberately NOT routed through here — they have their own
-   arms in {!eval_binop}, and their cross-CLASS answers (false / true) already
-   agree with both sqlite3 and the class order.  Their cross-NUMERIC hole
-   ([1 = 1.0] answers 0, [1 <> 2.0] answers 0) is a separate defect that cannot
-   be fixed here alone: an equality conjunct IS consumed by the access path, so
-   {!index_lookup_values} and {!stream_rowid_lookup} would have to learn the
-   cross-numeric case in the same change or rows would be lost.  Tracked
-   as #738. *)
+   #738 routed [Eq] and [Ne] through here too.  They used to enumerate the four
+   same-type pairs and fall to a catch-all, so [1 = 1.0] and [1 <> 1.0] were
+   both false while [1 <= 1.0] and [1 >= 1.0] were both true.  That could not be
+   fixed in {!eval_binop} alone: an equality conjunct IS consumed by the access
+   path, so {!index_lookup_values}, {!stream_rowid_lookup} and
+   {!seek_candidates}'s [Seek_rowid] arm learned the cross-numeric case in the
+   same change.  Do not move one of the four without the other three. *)
 and cmp_result lv rv pred =
   match lv, rv with
   | Row.V_null, _ | _, Row.V_null -> Row.V_null
@@ -3367,6 +3369,24 @@ let encode_index_key_prefix (ivs : Index_key.value list) : bytes * int =
       equal.  Note this must NOT become an [IK_null] prefix: that is a real seek
       key selecting the index's NULL entries, not an empty result.
 
+    #738: a value of the OTHER numeric type is the exception, and it has to be,
+    because the residual predicate no longer declines it.  [=] is
+    {!compare_values} now, so [i = 1.0] is TRUE for the stored integer [1] —
+    and an equality conjunct is CONSUMED by the access path
+    ([Planner.residual_filter]), so nothing re-checks the rows a seek yields.
+    Declining here would therefore lose them silently rather than merely
+    widening the scan.  The translation is exact in both directions and
+    [None] still means "matches nothing", never "seek wider":
+
+    - a REAL probe on an INTEGER column becomes [IK_int] when the float names
+      an integer exactly ({!int64_of_exact_real}); otherwise no integer equals
+      it, so [None] is the honest answer — [i = 1.5] genuinely matches nothing.
+      A NaN or an infinity is declined by the same helper, so neither can reach
+      the key as an "integral" real.
+    - an INTEGER probe on a REAL column becomes [IK_real] only when the
+      round-trip is exact ({!exact_real_of_int64}); above 2^53 [Int64.to_float]
+      names a different integer, and no stored double equals the one asked for.
+
     The read ([stream_index_lookup]) and write ([seek_index_candidates]) paths
     share this so they can never disagree about which rows a key matches. *)
 let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list option =
@@ -3379,9 +3399,34 @@ let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list 
        | Row.V_real f, Row.Real -> go (Index_key.IK_real f :: acc) rest
        | Row.V_blob b, Row.Blob -> go (Index_key.IK_blob b :: acc) rest
        | Row.V_null, _ -> None (* [col = NULL] never matches *)
+       (* #738: cross-numeric, exactly — see the note above. *)
+       | Row.V_real f, Row.Integer ->
+         (match int64_of_exact_real f with
+          | Some n -> go (Index_key.IK_int n :: acc) rest
+          | None -> None)
+       | Row.V_int n, Row.Real ->
+         (match exact_real_of_int64 n with
+          | Some f -> go (Index_key.IK_real f :: acc) rest
+          | None -> None)
        | _, _ -> None (* type mismatch: no stored key can equal this *))
   in
   go [] vs
+;;
+
+(** #738: the rowid an equality probe on the INTEGER PRIMARY KEY rowid alias
+    addresses, or [None] when no rowid can equal it.
+
+    The alias column IS the table key, so there is no index and no
+    [Index_key.value] — but the question is the same one {!index_lookup_values}
+    answers for an indexed column, and the answer must agree with it and with
+    [=]'s residual, which since #738 is {!compare_values}.  Both the read path
+    ({!stream_rowid_lookup}) and the DML path ({!seek_candidates}'s
+    [Seek_rowid] arm) go through here so they cannot drift apart. *)
+let rowid_lookup_key (v : Row.value) : int64 option =
+  match v with
+  | Row.V_int n -> Some n
+  | Row.V_real f -> int64_of_exact_real f
+  | Row.V_null | Row.V_text _ | Row.V_blob _ -> None
 ;;
 
 (* [2^63] as a float — exactly representable, and one past [Int64.max_int].  A
@@ -3508,7 +3553,11 @@ let range_bound_key ~(which : [ `Lo | `Hi ]) (v : Row.value) (ty : Row.ty)
        the two questions always coincide: the numeric arms above exist precisely
        because they do not.  If [index_lookup_values] ever changes which of
        these it accepts, re-check that the new answer is still a sound bound
-       rather than assuming it carries over. *)
+       rather than assuming it carries over.
+
+       #738 did change it — it taught the equality path the two numeric
+       cross-type pairs — and this function is untouched by that precisely
+       because both arms above intercept them before the delegation. *)
     (match index_lookup_values [ v, ty ] with
      | Some [ iv ] -> Some iv
      | Some _ | None -> None)
@@ -6679,11 +6728,15 @@ let seek_candidates
   =
   match seek with
   | Plan.Seek_rowid e ->
-    (match eval_expr clock params [||] e with
-     | Row.V_int n ->
+    (* #738: an integral REAL addresses the rowid it names, exactly as it does
+       on the index path — the DML seek is a restriction, but the residual it
+       restricts now says [id = 1.0] is true, so declining here would make
+       [DELETE ... WHERE id = 1.0] a silent no-op. *)
+    (match rowid_lookup_key (eval_expr clock params [||] e) with
+     | Some n ->
        let* () = emit_candidate ~stats ~emit n in
        Lwt.return_false
-     | _ -> Lwt.return_false (* NULL or non-integer matches no rowid *))
+     | None -> Lwt.return_false (* NULL, non-numeric or fractional: no rowid *))
   | Plan.Seek_index { idx_tree; keys; range } ->
     seek_index_candidates
       tx
@@ -12082,13 +12135,15 @@ and stream_index_lookup
 
 (* #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — the column IS
    the table key, so this is a single O(log n) table-tree seek, no index and no
-   second fetch.  A NULL or non-integer probe matches nothing, as it does on the
-   index path (see [index_lookup_values]). *)
+   second fetch.  A NULL, a non-numeric or a fractional probe matches nothing,
+   and an integral REAL addresses the rowid it names — the same answer
+   [index_lookup_values] gives for an indexed column, via the shared
+   [rowid_lookup_key] (#738). *)
 and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.table_meta) =
   let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
-  match v with
-  | Row.V_int n ->
+  match rowid_lookup_key v with
+  | Some n ->
     (* #262: read through the active txn so a primary-key point lookup sees the
        row when it was written earlier in the same open transaction. *)
     let* rh = rh_begin store mode in
@@ -12101,7 +12156,7 @@ and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.tab
        incr_examined s_opt;
        let row = decode_with_virtual clock params table_meta vbytes in
        Lwt.return (Lwt_stream.of_list [ row ]))
-  | _ -> Lwt.return (Lwt_stream.of_list [])
+  | None -> Lwt.return (Lwt_stream.of_list [])
 
 (* Probe the right index for one left row [lrow], appending matched (or a
    null-padded row for LEFT JOIN) combinations to [out]. *)

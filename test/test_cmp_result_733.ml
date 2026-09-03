@@ -19,9 +19,10 @@
 
     Every expectation is taken from the [sqlite3] in the dev image; both defects
     were divergences from it, not merely internal inconsistencies. The
-    exceptions, both flagged at their tests, are NaN — sqlite3 has none, binding
-    one as NULL — and the [=] / [<>] cross-NUMERIC hole this change deliberately
-    leaves in place.
+    exception, flagged at its test, is NaN — sqlite3 has none, binding one as
+    NULL. The [=] / [<>] cross-NUMERIC hole this file originally pinned as a
+    deliberate residual was closed by #738; the case that pinned it is now
+    inverted ([cross_numeric_equality_is_exact_738]).
 
     {1 The index path}
 
@@ -81,10 +82,9 @@ let check_rows ~label expected actual =
    test of [<] alone. *)
 let order_ops = [ "<"; "<="; ">"; ">=" ]
 
-(* The same, plus [=] and [<>]. Used only for cross-CLASS pairs: those two
-   operators have their own arms in [eval_binop] and are correct across classes
-   but NOT across the numeric types — see
-   [cross_numeric_equality_is_unchanged_pending_738]. *)
+(* The same, plus [=] and [<>]. Since #738 those two route through [cmp_result]
+   as well, so all six operators are one comparator — but the cross-CLASS pairs
+   are where this list is used, and it was introduced when they were not. *)
 let all_ops = order_ops @ [ "="; "<>" ]
 
 let select_ops ops a b =
@@ -484,24 +484,28 @@ let nan_still_sorts_below_every_number () =
           9007199254740993 < 0.0/0.0"))
 ;;
 
-(* The cross-NUMERIC hole in [=] and [<>], left deliberately. An equality
-   conjunct IS consumed by the access path, so [Exec.index_lookup_values] and
-   [Exec.stream_rowid_lookup] would have to learn the int-vs-real case in the
-   same change or rows would be lost. Pinned so the divergence is a recorded
-   decision rather than an oversight, and so #738 has a test to invert.
+(* #738 CLOSED this, and this case is the inverted form of the one that pinned
+   the hole. [=] and [<>] now route through [cmp_result] like the four ordering
+   operators, so all six are [compare_values].
 
-   sqlite3 answers 1|0|1 here; granary answers 0|0|0. *)
-let cross_numeric_equality_is_unchanged_pending_738 () =
+   sqlite3 answers 1|0|1 and granary now does too (oracle-checked 2026-09-03:
+   [SELECT 1 = 1.0, 1 <> 1.0, 1 <> 2.0;] -> [1|0|1]). Moving this arm required
+   [Exec.index_lookup_values], [Exec.stream_rowid_lookup] and
+   [Exec.seek_candidates]'s [Seek_rowid] arm to move with it, because an
+   equality conjunct IS consumed by the access path — see
+   [an_indexed_integer_column_seeks_for_a_real_literal] in
+   test_cmp_eq_738.ml. *)
+let cross_numeric_equality_is_exact_738 () =
   with_db (fun db ->
     check_rows
-      ~label:"1 = 1.0 and 1 <> 2.0 are both still false (#738)"
-      [ [ "0"; "0"; "0" ] ]
+      ~label:"1 = 1.0 is true, 1 <> 1.0 false, 1 <> 2.0 true (#738)"
+      [ [ "1"; "0"; "1" ] ]
       (rows_of db "SELECT 1 = 1.0, 1 <> 1.0, 1 <> 2.0"))
 ;;
 
-(* The ordering operators over the SAME pairs are exact, which is what makes the
-   case above a hole in [=] / [<>] specifically rather than a numeric gap in
-   general.
+(* The ordering operators over the SAME pairs. Before #738 this was the control
+   showing the hole was in [=] / [<>] specifically; it now shows the six
+   operators agreeing.
 
    sqlite3: 0|0|1|1 *)
 let the_ordering_operators_have_no_such_hole () =
@@ -586,9 +590,9 @@ let () =
             `Quick
             nan_still_sorts_below_every_number
         ; Alcotest.test_case
-            "cross_numeric_equality_is_unchanged_pending_738"
+            "cross_numeric_equality_is_exact_738"
             `Quick
-            cross_numeric_equality_is_unchanged_pending_738
+            cross_numeric_equality_is_exact_738
         ; Alcotest.test_case
             "the_ordering_operators_have_no_such_hole"
             `Quick
