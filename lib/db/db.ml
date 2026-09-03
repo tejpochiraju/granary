@@ -965,6 +965,47 @@ let routing_blocked_msg verb =
     verb
 ;;
 
+(* #740: [PRAGMA wal_checkpoint] issued inside an explicit transaction used to
+   SELF-DEADLOCK.  [begin_txn] -> [Store.rw_begin] takes the store's writer lock
+   and holds it for the whole transaction (only COMMIT/ROLLBACK release it);
+   [Store.checkpoint] takes the same lock for its install phase, and [Rwlock] is
+   deliberately not re-entrant ("a fiber that holds the writer lock must not call
+   [acquire_write] again"), so the fiber parked on itself and the connection was
+   unusable from that point on.  Pre-existing, and not a #719 regression: before
+   the phase split the checkpoint parked on the lock it took first, afterwards it
+   parks at [ckpt_finish]'s single [acquire_writer] — with [ckpt_mutex] held as
+   well, so every later checkpoint on the store queues behind the wedged one.
+
+   Refusing is the same shape as #473's [DROP REACTIVE VIEW] refusal and #598's
+   routing refusals: report the constraint up front rather than hang.  Making
+   [Rwlock] re-entrant is the alternative, and it is a much larger change that
+   interacts with #555/#585's transaction-ownership work.  sqlite3 also declines
+   [PRAGMA wal_checkpoint] mid-transaction (it reports SQLITE_LOCKED rather than
+   checkpointing), so this is not a divergence.
+
+   Scoped to the ROUTED handle's own slot, not [any_explicit_txn]: under ATTACH
+   each schema is its own [Db.t] over its own [Store.t] with its own writer lock,
+   so a transaction open on "aux" cannot deadlock a checkpoint of "main".  A
+   transaction held by a DIFFERENT handle over the SAME store (a
+   {!create_worker_handle} sibling) is not this bug either — that checkpoint
+   blocks and then proceeds, which is ordinary mutual exclusion. *)
+let wal_checkpoint_in_txn_msg =
+  "PRAGMA wal_checkpoint refused: an explicit transaction is open on this handle \
+   (#740).  The transaction holds the store's writer lock for its whole extent and the \
+   checkpoint must acquire that same lock, which is not re-entrant - issuing it here \
+   would deadlock the connection.  COMMIT or ROLLBACK first."
+;;
+
+(* #740: true when [op] is the checkpoint PRAGMA and [t] is the handle whose
+   transaction would deadlock it.  Consulted from {!execute_control_op} (the
+   one-shot path) and from {!run_core} (the prepared path, which bypasses
+   [execute_control_op] entirely). *)
+let wal_checkpoint_would_deadlock t op =
+  match op with
+  | Sql.Plan.Op_pragma_wal_checkpoint -> Option.is_some t.explicit_txn
+  | _ -> false
+;;
+
 let begin_txn t =
   match t.explicit_txn with
   | _ when is_poisoned t -> Lwt.return (Error (Runtime poisoned_msg))
@@ -2085,6 +2126,11 @@ let execute_control_op top t sql op =
   | Sql.Plan.Op_detach _ when any_explicit_txn top ->
     Some (Lwt.return (Error (Runtime (routing_blocked_msg "DETACH"))))
   | _ when is_poisoned t -> Some (Lwt.return (Error (Runtime poisoned_msg)))
+  (* #740: below the poison and staleness gates — a poisoned or stale handle has
+     a more urgent thing to tell the caller — and above the fall-through that
+     would route this to [Sql.Exec]'s [Store.checkpoint] and hang. *)
+  | Sql.Plan.Op_pragma_wal_checkpoint when wal_checkpoint_would_deadlock t op ->
+    Some (Lwt.return (Error (Runtime wal_checkpoint_in_txn_msg)))
   | Sql.Plan.Op_begin -> Some (begin_txn t)
   | Sql.Plan.Op_commit -> Some (commit_txn t)
   | Sql.Plan.Op_savepoint name -> Some (savepoint_txn t name)
@@ -2965,6 +3011,14 @@ let run_core st ~params =
              [st.db_ref] is already the routed handle — [prepare] resolved it. *)
     is_poisoned st.db_ref
   then Lwt.return (Error (Runtime poisoned_msg))
+  else if
+    (* #740: a PREPARED [PRAGMA wal_checkpoint] never reaches
+       [execute_control_op] — [run_core] hands [st.plan] straight to
+       [Sql.Exec.execute_with_count] — so the refusal is owed here too, or the
+       one-shot spelling is refused while the prepared spelling still
+       deadlocks. *)
+    wal_checkpoint_would_deadlock st.db_ref st.plan
+  then Lwt.return (Error (Runtime wal_checkpoint_in_txn_msg))
   else (
     let params_arr = Array.of_list params in
     let t = st.db_ref in

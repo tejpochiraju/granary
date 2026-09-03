@@ -1987,3 +1987,31 @@
  (name test_collate_722)
  (modules test_collate_722)
  (libraries granary alcotest lwt.unix))
+; #740: PRAGMA wal_checkpoint inside an explicit transaction self-deadlocked
+; (Rwlock is not re-entrant); it is now refused up front. File-backed and
+; WAL-mode — the Mem backend has no WAL, so there is no second acquisition to
+; deadlock on and an in-memory version would pass while proving nothing.
+
+(test
+ (name test_wal_checkpoint_txn_740)
+ (modules test_wal_checkpoint_txn_740)
+ (libraries granary granary.unix alcotest lwt.unix unix))
+
+; #739: a follower's RO snapshot could register below a checkpoint's target and
+; observe a migrated page. File-backed and WAL-mode (the Mem backend has no WAL,
+; so there is no snapshot horizon and no migration to observe), with the
+; migration parked through a hooked main-file write_page so the interleaving is
+; forced rather than raced.
+
+(test
+ (name test_follower_snapshot_739)
+ (modules test_follower_snapshot_739)
+ (libraries
+  granary
+  granary.unix
+  granary.store
+  granary.storage
+  cstruct
+  alcotest
+  lwt.unix
+  unix))

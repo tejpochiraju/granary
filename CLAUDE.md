@@ -1959,27 +1959,13 @@ to tolerate an unbalanced `Checkpoint_begin`; it is now also true that the
 `Checkpoint_end` which does arrive may have recycled **more** frames than the
 begin announced.
 
-**Two things are NOT fixed, both pre-existing, both found by an independent
-review of this change rather than by a test:**
+**Two neighbouring defects were found by an independent review of this change
+rather than by a test. Both were pre-existing and both are now FIXED — see the
+two sections below for what was decided.**
 
-- **#739** — a *follower*'s `ro_begin_at` registers at
-  `min(committed_frames, follower_ack_position)`, which can be *below* the
-  checkpoint's target, so a follower snapshot opened after the gate is not
-  covered by it and can observe a migrated page through its main-file
-  fall-through. True before this change (the gate has always raced reader
-  registration — `Rwlock` readers never block), and unreachable from the auto
-  path because `rw_begin` refuses writes in follower mode, so only a manual
-  `checkpoint` gets there. #719 widens the window rather than opening it. The
-  fix is not a bigger gate — a snapshot registering *below* the target defeats
-  any gate — but making follower registration participate in the checkpoint's
-  exclusion.
+- **#739** — a *follower*'s snapshot could register below a checkpoint's target.
 - **#740** — `PRAGMA wal_checkpoint` inside an explicit transaction
-  self-deadlocks: `rw_begin` holds the writer lock for the whole transaction and
-  `Rwlock` is not re-entrant. It deadlocked identically before #719, at the
-  `acquire_write` the checkpoint used to take first. What is new is only that it
-  now wedges holding `ckpt_mutex` too, so later checkpoints queue behind it
-  instead of latching on `autockpt_in_flight`; the connection was already
-  unusable either way. **Do not "fix" it by reversing the lock order.**
+  self-deadlocked.
 
 Pinned by `test/test_autocheckpoint_lock_719.ml`, which is **file-backed and
 WAL-mode** for the reason the #718 section gives. Its first two cases **hook the
@@ -1987,6 +1973,114 @@ main file's `write_page`** so the migration can be parked at a chosen page: the
 property under test is "the lock is free *during* the migration", and a test
 that merely sampled the accounting at a convenient moment would pass on the old
 code whenever it sampled outside a checkpoint.
+
+### A follower does not checkpoint its own WAL (#739)
+
+`Store.ro_begin_at` registers a snapshot at `Wal.committed_frames` — except on a
+**follower**, where it registers at `min(committed_frames, follower_ack_position)`
+so a reader never observes a frame past the last commit the replication apply
+loop has applied (#263). That cap is what made #719's RO gate unmaintainable
+there: `Rwlock.acquire_read` never blocks, so a snapshot registers whenever the
+application likes, and on a follower it can register *below* a target the gate
+has already cleared. It then resolves any page whose every WAL frame is at or
+above its horizon from the **main file** — which is exactly where the migration
+has just written newer content.
+
+**A bigger gate cannot fix this and neither can clamping the target**, and both
+dead ends are worth recording because both are the obvious next idea:
+
+- A gate excludes snapshots that *exist*. One that registers below the target
+  afterwards defeats a bigger, an earlier and a repeated gate equally.
+- Clamping the checkpoint's target to the ack floor would leave the frames above
+  it un-migrated, and this engine's checkpoint truncates the **whole** WAL
+  (`Wal.reset`) — so a clamped migration could not truncate and would not be a
+  checkpoint. The damage also outlives the checkpoint: once the overlay is
+  retired the migrated content is in the main file permanently, where the cap
+  cannot exclude it at all. The cap and a local checkpoint are *mutually
+  exclusive*, not merely racy.
+
+So the fix is a refusal, in the same spirit as `rw_begin`'s refusal of writes in
+follower mode, plus one backstop:
+
+- **`checkpoint_body` refuses when `st.follower`.** It fires before
+  `Checkpoint_begin` and outside the `Lwt.catch`, so nothing is recorded as a
+  checkpoint failure — the checkpoint never started. This makes the auto path
+  moot rather than needing its own guard: no commit is possible on a follower,
+  so no autocheckpoint is ever dispatched, and `Store.checkpoint` (reached from
+  `PRAGMA wal_checkpoint`) was already the only way in. `Standby` is unaffected —
+  it migrates through `Replication.checkpoint_wal_to_main`, a different path.
+- **`Store.ro_begin` / `ro_begin_as_of` refuse a snapshot below
+  `st.ckpt_migrated_through`**, the highest pass boundary any checkpoint has
+  migrated in the **current WAL generation**. Each pass publishes it *before*
+  writing a page (so a snapshot registering mid-pass is measured against it) and
+  `after_ckpt_reset` clears it (a new generation's frame indices mean something
+  else). It is deliberately **not** cleared on the failure path: a checkpoint
+  that failed before `Wal.reset` still left migrated pages in the main file.
+
+**The second half exists only because the first leaves one way in**, and it is
+a real one: follower mode switched ON while a checkpoint that started on a
+non-follower is still migrating — a store handed to `Standby.follow` may carry
+an autocheckpoint in flight from its last commit. Both refusals release the read
+lock before failing; a snapshot that is not registered must not leave it behind,
+or the checkpoint coordinator and `close` wait on a reader that will never
+drain.
+
+**The `ro_begin` refusal is inert for a non-follower, by construction and not by
+luck.** Its horizon is `Wal.committed_frames`, which only grows and is what each
+pass's `head` was read from, so it is at or above every published boundary. That
+is what keeps #719's whole point — reads and commits proceeding during the
+migration — intact, and
+`a_non_follower_snapshot_during_a_migration_is_served` asserts it directly.
+
+Reachability, precisely: pre-existing (the pre-#719 migration yielded too, and
+`ro_begin` was equally lock-free); #719 widens the window rather than opening
+it; unreachable from the auto path in both codebases; never on `Standby`'s own
+path. Pinned by `test/test_follower_snapshot_739.ml`, **file-backed and
+WAL-mode** with the migration parked through a hooked main-file `write_page`.
+Verified by mutation: stubbing either half red-lights its own case and leaves
+the other passing.
+
+### `PRAGMA wal_checkpoint` is refused inside an explicit transaction (#740)
+
+`BEGIN` → `Store.rw_begin` takes the store's writer lock and holds it for the
+whole transaction; `Store.checkpoint` takes the same lock for its install phase,
+and `Rwlock` is **not re-entrant** (`rwlock.mli` says so in as many words). The
+fiber parked on itself and the connection was unusable from that point.
+
+Pre-existing, not a #719 regression: before the phase split the checkpoint
+parked on the lock it took first; since #719 it parks at `ckpt_finish`'s single
+`acquire_writer`, **holding `ckpt_mutex`**, so every later checkpoint on the
+store queues behind the wedged one instead of latching on `autockpt_in_flight`.
+**Do not "fix" it by reversing the lock order** — `ckpt_mutex` → `t.lock` is
+what #719's checkpoint-vs-checkpoint exclusion rests on. Making `Rwlock`
+re-entrant is the other alternative and is a much larger change that interacts
+with #555/#585's ownership work.
+
+It is refused up front instead, the shape #473 (`DROP REACTIVE VIEW`) and #598
+(routing statements) already use. **Not a divergence**: sqlite3 declines the
+same statement (oracle-checked 2026-09-03 — `database table is locked (6)`), and
+in both engines the caller's transaction survives the refusal intact and
+commits.
+
+Two things about where the guard lives:
+
+- **Scoped to the ROUTED handle's own `explicit_txn`, not `any_explicit_txn`.**
+  Under ATTACH each schema is its own `Db.t` over its own `Store.t` with its own
+  writer lock, so a transaction open on `aux` cannot deadlock a checkpoint of
+  `main`. A transaction held by a *different handle over the same store* (a
+  `create_worker_handle` sibling) is not this bug either — that checkpoint blocks
+  and then proceeds, which is ordinary mutual exclusion.
+- **Both entry points are guarded.** `execute_control_op` covers the one-shot
+  spelling; `run_core` hands `st.plan` straight to `Sql.Exec.execute_with_count`
+  and never reaches `execute_control_op`, so a *prepared* `PRAGMA wal_checkpoint`
+  would otherwise still deadlock. The gate sits below the #634 staleness and
+  #555 poison gates: a poisoned or stale handle has a more urgent thing to say.
+
+The refusal does **not** poison the handle (nothing is doomed) and a bare
+`SAVEPOINT`'s auto-begin is caught by the same predicate. Pinned by
+`test/test_wal_checkpoint_txn_740.ml`, file-backed and WAL-mode. **On the
+unfixed code that test does not fail, it HANGS** — verified by mutation, and
+worth knowing before editing it.
 
 ### One `Db.t`, one explicit transaction (#555)
 

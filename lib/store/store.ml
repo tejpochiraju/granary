@@ -278,6 +278,22 @@ type bt_state =
        acquire.  Distinct from [autockpt_in_flight], which is dispatch-intent
        (coalescing) for the auto path only; cross-path exclusion is
        [ckpt_mutex]. *)
+  ; mutable ckpt_migrated_through : int
+    (* #739: the highest WAL frame boundary any checkpoint has migrated into the
+       MAIN FILE during the current WAL generation, or 0 when none has.  Set to
+       a pass's [head] at the start of every migration pass (including the ones
+       that run outside the writer lock) and cleared by [after_ckpt_reset],
+       because [Wal.reset] starts a fresh generation whose frame indices mean
+       something else.
+
+       It exists to make [ro_begin]'s snapshot horizon CHECKABLE rather than
+       merely argued.  A snapshot at frame [m] resolves a page through
+       [Wal.find_page_at ~max_frame:m] and falls through to the main file for
+       any page whose every frame is at or above [m] — so a snapshot is sound
+       exactly while [m >= ckpt_migrated_through].  For a non-follower that
+       holds by construction ([m] is [Wal.committed_frames], which is monotone
+       and is what each pass's [head] was read from), which is why this check
+       has no effect there.  On a FOLLOWER it does not, and that is #739. *)
   ; mutable last_checkpoint_error : string option
     (* #638: message of the most recent checkpoint failure, or [None] when no
        checkpoint has failed since the last one that completed.  Sticky across
@@ -850,6 +866,7 @@ let make_btree_store
     ; ckpt_mutex = Lwt_mutex.create ()
     ; closing = false
     ; ckpt_io_in_flight = 0
+    ; ckpt_migrated_through = 0
     ; last_checkpoint_error = None
     ; checkpoint_failures_total = 0
     ; consecutive_checkpoint_failures = 0
@@ -1372,20 +1389,59 @@ let open_block_wal
    committed-frames horizon: CoW never rewrites a retained page-id, so each
    retained page has exactly one WAL frame and "latest up to head" == the
    historical content (the floor/reader pin prevents reuse). *)
-let ro_begin_at t st ~snap_txn_id ~snap_meta_root =
+(* The WAL frame horizon a snapshot opened right now would register at.
+
+   #739: factored out of [ro_begin_at] so {!snapshot_below_ckpt_floor} can
+   consult exactly the number the registration will use, rather than a
+   re-derivation of it that could drift. *)
+let snapshot_frames (st : bt_state) =
   let committed_frames =
     match st.wal with
     | None -> 0
     | Some w -> Wal.committed_frames w
   in
-  let snap_frames =
-    if st.follower
-    then (
-      match st.follower_ack_position with
-      | Some n -> min committed_frames n
-      | None -> committed_frames)
-    else committed_frames
-  in
+  if st.follower
+  then (
+    match st.follower_ack_position with
+    | Some n -> min committed_frames n
+    | None -> committed_frames)
+  else committed_frames
+;;
+
+(* #739: would a snapshot opened now sit BELOW content a checkpoint has already
+   copied into the main file?  Such a snapshot resolves any page whose every
+   frame is at or above its horizon from the main file, so it would observe that
+   migrated content — the snapshot violation the RO gate exists to prevent, and
+   one no gate can prevent, because the registration happens after the gate has
+   already cleared ([Rwlock.acquire_read] never blocks).
+
+   For a NON-follower this is false by construction: the horizon is
+   [Wal.committed_frames], which only grows, and every pass's [head] was read
+   from it.  It can only fire on a follower whose ack position sits below a
+   migration that is in flight (or that failed before [Wal.reset]) — see
+   {!checkpoint_body}, which refuses to START a checkpoint in follower mode, so
+   the remaining way in is follower mode being switched ON underneath one. *)
+let snapshot_below_ckpt_floor (st : bt_state) =
+  snapshot_frames st < st.ckpt_migrated_through
+;;
+
+let ro_below_ckpt_floor_msg who (st : bt_state) =
+  Printf.sprintf
+    "%s: refusing a snapshot at frame %d, below the %d frames a checkpoint has already \
+     migrated into the main file (#739).  This store is in follower mode and its ack \
+     position (%s) sits below that boundary, so the snapshot would resolve migrated \
+     pages from the main file and observe data past the follower's last-applied commit.  \
+     Retry once the checkpoint has completed."
+    who
+    (snapshot_frames st)
+    st.ckpt_migrated_through
+    (match st.follower_ack_position with
+     | Some n -> string_of_int n
+     | None -> "unset")
+;;
+
+let ro_begin_at t st ~snap_txn_id ~snap_meta_root =
+  let snap_frames = snapshot_frames st in
   let count = Option.value ~default:0 (Hashtbl.find_opt st.active_readers snap_txn_id) in
   Hashtbl.replace st.active_readers snap_txn_id (count + 1);
   let frame_count =
@@ -1416,42 +1472,53 @@ let ro_begin t =
      checkpoint coordinator that wants to know "are any RO snapshots
      still in flight?" *)
   let* () = Rwlock.acquire_read t.lock in
-  let is_closing =
+  (* Both refusals are decided BEFORE the registration and released through the
+     one arm below, because a snapshot that is not registered must not leave the
+     read lock behind: the checkpoint coordinator and [close] both wait for the
+     reader count to drain, so a leaked read lock stalls them forever. *)
+  let refusal =
     match t.backend with
-    | Btree st -> st.closing
-    | Mem _ -> false
+    | Mem _ -> None
+    | Btree st ->
+      if st.closing
+      then
+        (* #338 (review r3): fail fast on a snapshot begun after [close]
+           signalled teardown — matches [rw_begin], avoiding an obscure pager
+           EBADF later. *)
+        Some "Store.ro_begin: store is closing — read transactions are rejected"
+      else if snapshot_below_ckpt_floor st
+      then Some (ro_below_ckpt_floor_msg "Store.ro_begin" st)
+      else None
   in
-  if is_closing
-  then (
-    (* #338 (review r3): fail fast on a snapshot begun after [close] signalled
-       teardown — matches [rw_begin], avoiding an obscure pager EBADF later. *)
+  match refusal with
+  | Some msg ->
     Rwlock.release_read t.lock;
-    Lwt.fail_with "Store.ro_begin: store is closing — read transactions are rejected")
-  else (
-    match t.backend with
-    | Mem trees ->
-      (* #178: snapshot every tree so RO reads never observe uncommitted
+    Lwt.fail_with msg
+  | None ->
+    (match t.backend with
+     | Mem trees ->
+       (* #178: snapshot every tree so RO reads never observe uncommitted
        writes from a concurrent writer that later rolls back.  The
        Btree backend gets snapshot isolation from the pager/WAL layer;
        the mem backend must provide it here. *)
-      let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
-      Lwt.return
-        (Ro
-           { rs_store = t
-           ; rs_snap_txn_id = 0L
-           ; rs_snap_meta_root = 0L
-           ; rs_snap_trees = Hashtbl.create 1
-           ; rs_snap_frames = 0
-           ; rs_pinned = Hashtbl.create 1
-           ; rs_mem_snap = Some snap
-           })
-    | Btree st ->
-      Lwt.return
-        (ro_begin_at
-           t
-           st
-           ~snap_txn_id:st.current_header.txn_id
-           ~snap_meta_root:st.current_header.root_page))
+       let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+       Lwt.return
+         (Ro
+            { rs_store = t
+            ; rs_snap_txn_id = 0L
+            ; rs_snap_meta_root = 0L
+            ; rs_snap_trees = Hashtbl.create 1
+            ; rs_snap_frames = 0
+            ; rs_pinned = Hashtbl.create 1
+            ; rs_mem_snap = Some snap
+            })
+     | Btree st ->
+       Lwt.return
+         (ro_begin_at
+            t
+            st
+            ~snap_txn_id:st.current_header.txn_id
+            ~snap_meta_root:st.current_header.root_page))
 ;;
 
 (* #266: as-of retention API + time-travel read path.  [History_error] carries
@@ -1528,6 +1595,12 @@ let ro_begin_as_of t (target : History.target) =
          then (
            Rwlock.release_read t.lock;
            Lwt.fail_with "Store.ro_begin_as_of: store is closing")
+         else if snapshot_below_ckpt_floor st
+         then (
+           (* #739: same horizon, same hazard — a retained historical root is
+              still resolved through [rs_snap_frames]. *)
+           Rwlock.release_read t.lock;
+           Lwt.fail_with (ro_below_ckpt_floor_msg "Store.ro_begin_as_of" st))
          else
            Lwt.return
              (ro_begin_at
@@ -1872,18 +1945,30 @@ let rec wait_for_readers_past
    local reader always eventually fires [ro_end]'s broadcast, and there is no
    equivalent of a dead standby to time out.
 
-   {b The invariant has ONE hole, and it is not this gate's to close.}
-   [Rwlock.acquire_read] never blocks, so a snapshot can register at any yield
-   inside a pass — and on a store in FOLLOWER mode [ro_begin_at] registers at
-   [min committed_frames follower_ack_position], which can be BELOW the target
-   this gate just cleared.  A follower can therefore still observe a migrated
-   page through its main-file fall-through.  Pre-existing (the pre-#719
-   migration yielded with [ro_begin] equally lock-free) and unreachable from the
-   auto path, since [rw_begin] refuses writes in follower mode and only a manual
-   [checkpoint] gets there; #719 widens the window rather than opening it.  The
-   real fix is not a bigger gate — a snapshot registering below the target
-   defeats any gate — but making follower registration participate in the
-   checkpoint's exclusion.  Tracked as #739. *)
+   {b This gate cannot close the whole invariant on its own, and #739 is why.}
+   [Rwlock.acquire_read] never blocks, so a snapshot registers whenever it likes
+   — including at a yield inside a pass this gate has already cleared.  For a
+   non-follower that is harmless: [ro_begin_at] registers at
+   [Wal.committed_frames], which only grows, so a late arrival is at or above
+   the target by construction.  On a store in FOLLOWER mode it registers at
+   [min committed_frames follower_ack_position], which can be BELOW it, and no
+   gate — bigger, earlier or repeated — can exclude a registration that has not
+   happened yet.
+
+   Two things close it instead, and both are outside this function:
+
+   - [checkpoint_body] refuses to START a checkpoint in follower mode.  A
+     follower's WAL belongs to the replication apply loop, and migrating past
+     the ack position writes unacked content into the main file PERMANENTLY —
+     after [Wal.reset] the overlay is gone, so the cap cannot exclude it any
+     more.  That is why clamping the target to the ack floor is not the answer
+     either: the truncation is all-or-nothing, so a clamped migration would have
+     to leave the WAL untruncated and would not be a checkpoint.
+   - [snapshot_below_ckpt_floor], consulted by [ro_begin]/[ro_begin_as_of],
+     refuses a snapshot below [st.ckpt_migrated_through] — the boundary the
+     passes publish.  That covers the one way in the refusal above leaves open:
+     follower mode being switched ON while a checkpoint started on a non-follower
+     is already migrating. *)
 let rec wait_for_ro_readers_past (st : bt_state) ~target =
   if st.closing
   then Lwt.return_unit
@@ -2040,6 +2125,11 @@ let migrate_ckpt_pass (st : bt_state) (wal : Wal.t) ~since ~(migrated : int ref)
   if st.closing
   then Lwt.return (head, 0)
   else (
+    (* #739: publish this pass's coverage boundary BEFORE writing a single page,
+       so a snapshot that registers at any yield inside the pass is measured
+       against it rather than sneaking in underneath it.  Monotone within the
+       generation: a later pass's [head] is at least this one's. *)
+    if head > st.ckpt_migrated_through then st.ckpt_migrated_through <- head;
     let pairs = ref [] in
     Wal.iter_index wal (fun pid idx ->
       if idx >= since && idx < head then pairs := (pid, idx) :: !pairs);
@@ -2107,6 +2197,13 @@ let after_ckpt_reset (st : bt_state) (wal : Wal.t) ~migrated =
   (* #638: the WAL has actually been truncated — clear the sticky failure
      signal. *)
   note_checkpoint_success st;
+  (* #739: the generation this floor described is gone.  The next generation
+     starts at frame 0 and its indices mean something else, so carrying the old
+     boundary forward would refuse every follower snapshot for no reason.  It is
+     cleared HERE and not on the failure path deliberately: a checkpoint that
+     failed before [Wal.reset] leaves the migrated pages in the main file, so the
+     floor still describes the device. *)
+  st.ckpt_migrated_through <- 0;
   (* #298/#1: checkpoint is a full-sync durability anchor — everything is now
      durable and the WAL starts a fresh epoch at frame 0.  Reset the sink ship
      counter (new epoch) and the batched durability counters so a long unsynced
@@ -2211,26 +2308,55 @@ let ckpt_finish t st wal ~(site : Lock_stats.site) ~since ~migrated ~synced_thro
    target, and then re-raised.  The auto path swallows it (nobody awaits that
    fiber and the commit that dispatched it has already succeeded); the explicit
    path lets it propagate, as it always did. *)
+(* #739: a follower does not checkpoint its own WAL.
+
+   The WAL of a store in follower mode is the replication apply loop's: the
+   loop appends the master's frames into it and records how far it has applied
+   through [set_follower_ack_position], and [ro_begin_at] caps every snapshot at
+   that position so a reader never observes a frame past the last applied
+   commit.  A checkpoint migrates frames into the MAIN FILE and then retires the
+   overlay, and the cap cannot exclude main-file content — so any checkpoint
+   past the ack position makes that guarantee permanently unenforceable, not
+   merely racy for the duration.  [Wal.reset] would also bump the local epoch
+   out from under [Standby]'s own [last_epoch] tracking.
+
+   It is the same shape as [rw_begin]'s refusal of writes in follower mode, and
+   it is what makes the auto path irrelevant here: no commit means no
+   autocheckpoint, so [Store.checkpoint] was already the only way in.  Nothing
+   in the tree checkpoints a follower — [Standby] migrates through
+   [Replication.checkpoint_wal_to_main], which is a different path with its own
+   reader gate. *)
+let follower_checkpoint_msg =
+  "Store.checkpoint: store is in follower mode — checkpoints are rejected (#739).  A \
+   follower's WAL belongs to the replication apply loop, and migrating it would write \
+   frames past this follower's last-applied commit into the main file, where the \
+   snapshot cap that excludes them cannot reach.  Promote the standby, or checkpoint \
+   through the replication path."
+;;
+
 let checkpoint_body t (st : bt_state) (wal : Wal.t) ~(site : Lock_stats.site) =
-  Lwt_mutex.with_lock st.ckpt_mutex (fun () ->
-    let target = Wal.committed_frames wal in
-    (* #382: [Checkpoint_begin] is a best-effort signal — if the checkpoint
+  if st.follower
+  then Lwt.fail_with follower_checkpoint_msg
+  else
+    Lwt_mutex.with_lock st.ckpt_mutex (fun () ->
+      let target = Wal.committed_frames wal in
+      (* #382: [Checkpoint_begin] is a best-effort signal — if the checkpoint
        aborts early (store closing, or an I/O error before [Wal.reset]), no
        matching [Checkpoint_end] is emitted.  Monitor consumers must tolerate an
        unbalanced begin. *)
-    emit_event st (Store_event.Checkpoint_begin { target_frames = target });
-    if st.closing
-    then Lwt.return_unit
-    else (
-      let migrated = ref 0 in
-      Lwt.catch
-        (fun () ->
-           let* since = ckpt_scan st wal ~migrated in
-           let synced_through = !migrated in
-           ckpt_finish t st wal ~site ~since ~migrated ~synced_through)
-        (fun exn ->
-           note_checkpoint_failure st ~target exn;
-           Lwt.fail exn)))
+      emit_event st (Store_event.Checkpoint_begin { target_frames = target });
+      if st.closing
+      then Lwt.return_unit
+      else (
+        let migrated = ref 0 in
+        Lwt.catch
+          (fun () ->
+             let* since = ckpt_scan st wal ~migrated in
+             let synced_through = !migrated in
+             ckpt_finish t st wal ~site ~since ~migrated ~synced_through)
+          (fun exn ->
+             note_checkpoint_failure st ~target exn;
+             Lwt.fail exn)))
 ;;
 
 (* Group-commit coordinator (#77, #151).  One fiber per [commit_queue]
