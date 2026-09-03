@@ -425,6 +425,11 @@ things that were tried and rejected) is usually the point.
 - **NaN sorts below every number, in both the comparator and the index
   encoding (#536).** Granary keeps NaN as a real, totally-ordered value and
   diverges from SQLite (which treats it as NULL) in both directions of `>=`/`<=`.
+- **A cross-numeric JOIN KEY equality matches, in both join executors
+  (#743).** #738 fixed this for `col = literal`; the hash join's canonical key
+  and the nested-loop probe's typed index seek closed the same gap for `ON
+  l.a = r.b`. The FK child-reference probe has the analogous bug, filed as
+  #755 and deliberately not fixed here.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.
@@ -541,6 +546,10 @@ things that were tried and rejected) is usually the point.
   the per-match `doc_length` fetch (#689).** Fixed with a hashtable (25x on a
   4 000-match benchmark); the doc-length fetch itself now picks point-fetch vs.
   cursor-scan by a measured selectivity threshold.
+- **The AUTOINCREMENT mirror write's cost is measured and accepted, not
+  optimised (#316).** The durable cost is two dirtied WAL pages, identical at
+  3 and 30 columns — not the blob size the issue suspected. 19-27% over a plain
+  rowid insert, confined to autocommit; closed as measured-and-acceptable.
 - **One `Db.t` holds one explicit transaction; a colliding `BEGIN` poisons the
   handle and `ROLLBACK` is the sole exit (#555).** `#584` and `#598` name
   residual gaps (a post-recovery contamination window; an ATTACH schema switch
@@ -554,74 +563,6 @@ things that were tried and rejected) is usually the point.
   same symptom as #589, reproducible under multi-terminal TPC-C — do not trust
   a multi-terminal run's output without checking its own consistency oracle
   until it's fixed.
-
-### The AUTOINCREMENT mirror write is measured, and it stays (#316, decided 2026-09-03)
-
-#314 made an AUTOINCREMENT table's sticky rowid high-water survive mirror
-reconstruction by having every counter bump rewrite that table's **mirror**
-entry (`Catalog.put_table_counter_tx` -> `put_mirror_tx`) alongside the primary
-`_sys_tables` row. The mirror entry re-encodes the FULL schema — name, tree id,
-fingerprint, every column, the FK block — so #316 recorded the worry that a
-write-heavy AUTOINCREMENT workload pays a serialize-and-`S.put` of the whole
-schema blob per allocated rowid, growing with the table's width. It was filed
-`deferred`, with "no action needed unless an AUTOINCREMENT-heavy write benchmark
-regresses".
-
-**Measured rather than optimised**, per that condition.
-`test/test_autoinc_mirror_316.ml` reports three quantities per inserted row —
-minor words, WAL bytes, and the mirror blob's own size — for a 3-column and a
-30-column table, plain rowid vs AUTOINCREMENT, in autocommit and inside an
-explicit transaction. Every figure is a count or an allocation, never a clock,
-so a loaded box does not move it; the numbers below were byte-identical across
-repeated runs (400 rows per point, WAL mode, on disk, autocheckpoint disabled
-for the measured window so the WAL only grows).
-
-| autocommit | minor words/row | WAL bytes/row | mirror blob |
-|---|---|---|---|
-| width 3, plain | 11 679.4 | 43 157.0 | 69 B |
-| width 3, AUTOINC | 13 988.0 | 51 397.0 | 71 B |
-| width 30, plain | 16 920.4 | 44 506.3 | 386 B |
-| width 30, AUTOINC | 21 401.6 | 52 746.3 | 388 B |
-| **explicit txn** (400 rows in one BEGIN/COMMIT) | | | |
-| width 30, plain | 7 311.9 | 164.8 | 386 B |
-| width 30, AUTOINC | 7 318.0 | 175.1 | 388 B |
-
-Three findings, and the decision rests on all three:
-
-- **The WAL delta is +8 240 bytes/row — exactly two 4 120-byte frames — and it
-  is IDENTICAL at 3 and at 30 columns.** The durable half of the cost is the two
-  pages the mirror `S.put` dirties, not the size of the blob it serialises. So
-  the issue's optimisation 1 (encode the counter as a small standalone record
-  keyed separately) would leave it **untouched**: a put of 8 bytes dirties the
-  same pages as a put of 388. That is the finding that matters most, because
-  option 1 was the "least semantically loaded" candidate and it turns out to
-  attack the minority half.
-- The allocation delta does grow with the width, 2 308.6 -> 4 481.2 words/row,
-  but only **1.94x for a 10x wider schema and a 5.5x bigger blob**. The
-  re-encode is a minority of it; the 4 KB page and WAL-frame machinery around
-  the put is the rest.
-- **Inside an explicit transaction the whole thing costs +6.1 words/row and
-  +10.3 bytes/row** — one extra WAL frame for the entire 400-row transaction —
-  because #347's `~defer_counter` already coalesces the counter write (primary
-  row AND #314 mirror) to COMMIT. That is the issue's optimisation 2, **already
-  in place wherever it can mean anything**; in autocommit "commit time" IS per
-  row, so there is nothing left for it to coalesce.
-
-Net: 19-27% over a plain rowid insert, confined to the autocommit single-row
-path, which already spends ~43 KB of WAL per row on per-statement transaction
-machinery before AUTOINCREMENT is mentioned. Only optimisation 3 (refresh the
-mirror counter every N bumps) would remove the 8 240 bytes, and it buys ~16% of
-an un-batched insert in exchange for a durability semantics change. **Closed as
-measured-and-acceptable; batch the inserts.** Anyone reopening this owes a
-workload where the cost is NOT dominated by autocommit's own per-statement
-transaction, and should note that the width-scaling premise the issue was filed
-on is the half that did not survive measurement.
-
-The same test pins the invariant the per-row write exists to guarantee, so a
-future optimisation cannot quietly trade it away: an AUTOINCREMENT high-water
-survives losing its `_sys_tables` row and being reconstructed from the mirror.
-That case must be **file-backed** — the Mem backend never exercises mirror
-reconstruction meaningfully.
 
 ## Repository structure
 

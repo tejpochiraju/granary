@@ -2180,3 +2180,13 @@
  (name test_autoinc_mirror_316)
  (modules test_autoinc_mirror_316)
  (libraries granary granary.store granary.unix alcotest lwt.unix))
+
+; #743: a cross-numeric JOIN KEY equality matches the rows [=] says are equal,
+; in BOTH join executors — the hash arm's canonical key and the nested-loop
+; arm's typed index probe. Split out of #738, which fixed the same defect for a
+; [col = literal] equality. In-memory: pure comparator/planner behaviour.
+
+(test
+ (name test_join_key_743)
+ (modules test_join_key_743)
+ (libraries granary alcotest lwt.unix))

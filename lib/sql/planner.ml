@@ -152,15 +152,21 @@ let index_is_seekable (i : Cat.index_info) =
   is_plain_cols && i.Cat.idx_where_sql = None
 ;;
 
-(** The ordinal of [name] in [meta]'s column list, if it has one. *)
-let col_ordinal (meta : Cat.table_meta) name =
+(** #743: the ordinal AND declared type of [name] in [meta]'s column list.
+
+    A nested-loop probe seeks a {i typed} index, so {!probe_key_for_index} needs
+    the column's type alongside its ordinal — see {!Plan.probe_part}. *)
+let col_ordinal_ty (meta : Cat.table_meta) name =
   let rec go n = function
     | [] -> None
     | (c : Row.column) :: rest ->
-      if String.equal c.Row.name name then Some n else go (n + 1) rest
+      if String.equal c.Row.name name then Some (n, c.Row.ty) else go (n + 1) rest
   in
   go 0 meta.Cat.columns
 ;;
+
+(** The ordinal of [name] in [meta]'s column list, if it has one. *)
+let col_ordinal (meta : Cat.table_meta) name = Option.map fst (col_ordinal_ty meta name)
 
 (** #516: build a nested-loop probe key for one candidate index of the join's
     right table, or [None] if the index cannot serve as a probe.
@@ -173,18 +179,22 @@ let col_ordinal (meta : Cat.table_meta) name =
 
     A key that pins no left-row value is rejected: every left row would read the
     same range, which is a constant restriction rather than a join probe, and
-    the ON predicate would go unenforced by the probe. *)
+    the ON predicate would go unenforced by the probe.
+
+    #743: each part carries the declared type of the index column it pins, so
+    [Exec.nlj_probe_values] can translate a probe value of the other numeric
+    type exactly, the way an [Op_index_lookup] key already does. *)
 let probe_key_for_index (right_meta : Cat.table_meta) ~join_col ~left_col ~right_eqs idx =
   let rec walk acc drives = function
     | [] -> acc, drives
     | name :: rest ->
-      (match col_ordinal right_meta name with
+      (match col_ordinal_ty right_meta name with
        | None -> acc, drives
-       | Some ord when ord = join_col ->
-         walk (Plan.Probe_from_left left_col :: acc) true rest
-       | Some ord ->
+       | Some (ord, ty) when ord = join_col ->
+         walk (Plan.Probe_from_left (left_col, ty) :: acc) true rest
+       | Some (ord, ty) ->
          (match List.assoc_opt ord right_eqs with
-          | Some e -> walk (Plan.Probe_const (plan_expr e) :: acc) drives rest
+          | Some e -> walk (Plan.Probe_const (plan_expr e, ty) :: acc) drives rest
           | None -> acc, drives))
   in
   if not (index_is_seekable idx)

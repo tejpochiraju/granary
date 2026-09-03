@@ -38,14 +38,15 @@
     decided order (NaN is a real value below every number) and are flagged
     where they appear.
 
-    {1 What is NOT closed}
+    {1 What #738 left open, since closed}
 
     A JOIN KEY equality is consumed by a different mechanism —
-    [Exec.stream_hash_join]'s keyed arm and [Exec.nlj_probe_left] — and neither
-    learned the cross-numeric case, so [ON l.a = r.b] and
-    [ON 1 = 1 WHERE l.a = r.b] now disagree. Tracked as #743 and pinned by
-    [a_cross_numeric_join_key_still_matches_nothing_743], which carries the
-    reasoning. *)
+    [Exec.stream_hash_join]'s keyed arm and [Exec.nlj_probe_left] — and #738
+    left both behind, so for one release [ON l.a = r.b] and
+    [ON 1 = 1 WHERE l.a = r.b] disagreed. That is #743, fixed 2026-09-03 by
+    moving both executors at once; [a_cross_numeric_join_key_matches_now_743]
+    below keeps the shape #738 filed, and [test/test_join_key_743.ml] carries
+    the per-executor coverage. *)
 
 module Db = Granary.Db
 
@@ -425,46 +426,48 @@ let all_six_operators_agree_on_one_row () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* The residual #738 does NOT close, pinned rather than endorsed        *)
+(* What #738 left open, since CLOSED by #743                            *)
 (* ------------------------------------------------------------------ *)
 
 (* A JOIN KEY equality is consumed too, by a different mechanism and in two
-   different executors, and NEITHER learned the cross-numeric case:
+   different executors, and #738 left BOTH of them behind:
 
-   - the keyed [Exec.stream_hash_join] arm hashes both sides on
+   - the keyed [Exec.stream_hash_join] arm hashed both sides on
      [Index_key.encode_value (row_value_to_index_value v)], where [1] and [1.0]
      are different bytes;
-   - [Exec.nlj_probe_left] encodes the probe the same way and seeks the right
+   - [Exec.nlj_probe_left] encoded the probe the same way and seeked the right
      table's index with it.
 
-   So [FROM l JOIN r ON l.a = r.b] answers no rows while [ON 1 = 1 WHERE l.a =
-   r.b] — a cartesian join whose predicate is an ordinary filter — answers the
+   So [FROM l JOIN r ON l.a = r.b] answered no rows while [ON 1 = 1 WHERE l.a =
+   r.b] — a cartesian join whose predicate is an ordinary filter — answered the
    row. sqlite3 answers the row for BOTH spellings (oracle-checked 2026-09-03,
    with [a INTEGER] / [b REAL] so the storage classes really do differ).
 
    Both spellings answered NO ROWS before #738, so nothing regressed in either
-   ANSWER; what is new is that they disagree with each other. It is left open
-   deliberately: fixing the hash arm alone is a canonical-key change and easy,
-   but the nested-loop arm seeks a typed index and would need the index column
-   types carried into [Plan.probe_part] the way [Op_index_lookup]'s [keys]
-   already carries them. Doing one and not the other would make the answer
-   depend on whether a [CREATE INDEX] exists — the "same query, two answers"
-   failure mode this area keeps filing issues about. Tracked as #743.
+   ANSWER; what was new is that they disagreed with each other. #743 closed
+   that, and had to move both executors in one change — fixing the hash arm
+   alone (a canonical key) while the nested-loop arm still seeked a typed index
+   with the raw value would have made the answer depend on whether a
+   [CREATE INDEX] exists, the "same query, two answers" failure mode this area
+   keeps filing issues about. [Plan.probe_part] now carries the index column's
+   declared type, the way [Op_index_lookup]'s [keys] always did.
 
-   Change this case as a decision, not to make a fix pass: if the join keys
-   learn the cross-numeric case, this expectation inverts to one row. *)
-let a_cross_numeric_join_key_still_matches_nothing_743 () =
+   This case keeps only the SHAPE #738 filed, as the seam between the two
+   issues. The executor-by-executor coverage — both arms asserted by
+   [used_index], the reversed operand order, above 2^53, NULL, NaN, LEFT JOIN
+   and #486's implicit key — lives in [test/test_join_key_743.ml]. *)
+let a_cross_numeric_join_key_matches_now_743 () =
   with_db (fun db ->
     exec db "CREATE TABLE l (a INTEGER)";
     exec db "CREATE TABLE r (b REAL)";
     exec db "INSERT INTO l VALUES (1)";
     exec db "INSERT INTO r VALUES (1.0)";
     check_rows
-      ~label:"the ON spelling still matches nothing (#743)"
-      []
+      ~label:"the ON spelling matches, as sqlite3 does (#743)"
+      [ [ "1" ] ]
       (rows_of db "SELECT l.a FROM l JOIN r ON l.a = r.b");
     check_rows
-      ~label:"while the filter spelling now matches, as sqlite3 does for both"
+      ~label:"and the filter spelling agrees with it"
       [ [ "1" ] ]
       (rows_of db "SELECT l.a FROM l JOIN r ON 1 = 1 WHERE l.a = r.b"))
 ;;
@@ -539,9 +542,9 @@ let () =
             `Quick
             all_six_operators_agree_on_one_row
         ; Alcotest.test_case
-            "a_cross_numeric_join_key_still_matches_nothing_743"
+            "a_cross_numeric_join_key_matches_now_743"
             `Quick
-            a_cross_numeric_join_key_still_matches_nothing_743
+            a_cross_numeric_join_key_matches_now_743
         ] )
     ]
 ;;

@@ -380,6 +380,56 @@ let exact_real_of_int64 (n : int64) : float option =
   if cmp_int_real n f = 0 then Some f else None
 ;;
 
+(* #743: the CANONICAL equality key of a join-key value.
+
+   A hash join has no index and no column type to translate towards — both
+   sides are just row values — so it needs a key that is equal for exactly the
+   values {!compare_values} calls equal.  Keying on the raw
+   [Index_key.encode_value] bytes is not that: [1] and [1.0] are different
+   bytes, so [FROM l JOIN r ON l.a = r.b] matched nothing across an INTEGER and
+   a REAL column while the same equality written as a WHERE filter matched
+   (#738 made [=] exact at the value level, and a join key is CONSUMED — the
+   key IS the match test, nothing re-checks the pairs it yields).
+
+   The rule: an integral REAL keys as the INTEGER it names, via the same
+   {!int64_of_exact_real} the index sites use.  That makes canonical-key
+   equality {b exactly} [compare_values … = 0] on non-NULL values, in every
+   direction:
+
+   - [1] and [1.0] canonicalise to the same [IK_int] and join;
+   - a non-integral REAL stays [IK_real] (tag [0x03]), which no [IK_int] (tag
+     [0x02]) can collide with, so no integer joins [1.5];
+   - above 2^53 the two directions stay apart, because
+     [int64_of_exact_real 9007199254740992.0] is [9007199254740992L] and not
+     the [9007199254740993L] it must not equal — this must never be spelled as
+     an [Int64.to_float] promotion, which would be #733 inside a join key;
+   - a NaN is declined by {!int64_of_exact_real} FIRST, so it can never reach
+     [Int64.of_float] as an "integral" real.  It stays [IK_real nan], whose
+     encoding is the single byte [0x01] (#578) — so all NaNs share one bucket
+     (matching [Float.compare nan nan = 0]) and none can collide with a number
+     or with NULL's [0x00];
+   - [-0.0] canonicalises to [IK_int 0], which is what makes it join [0.0] and
+     [0] alike — [Float.compare (-0.) 0. = 0], so [compare_values] agrees.  The
+     raw index encoding deliberately separates them ([-0.0 < +0.0], see
+     [Index_key.encode_value]), which is why the raw bytes could not be used;
+   - a cross-CLASS pair keeps distinct tag bytes and never joins, which is
+     [compare_values]' answer too.
+
+   NULL is never handed here: both the build side and the probe side drop a
+   NULL join key before keying, because [col = NULL] matches nothing under
+   three-valued logic. *)
+let join_key_value (v : Row.value) : Index_key.value =
+  match v with
+  | Row.V_real f ->
+    (match int64_of_exact_real f with
+     | Some n -> Index_key.IK_int n
+     | None -> Index_key.IK_real f)
+  | Row.V_int _ | Row.V_text _ | Row.V_blob _ | Row.V_null -> row_value_to_index_value v
+;;
+
+(* #743: the bytes a hash join buckets a non-NULL join key under. *)
+let join_key_bytes (v : Row.value) : bytes = Index_key.encode_value (join_key_value v)
+
 (* #579: a TOTAL order over values, which is what every caller needs and what
    this did not used to be.
 
@@ -410,9 +460,11 @@ let exact_real_of_int64 (n : int64) : float option =
    did, in two separate ways: [cmp_result] promoted int-vs-real through
    [Int64.to_float] (inexact above 2^53, #733) and ended in
    [| _ -> Row.V_int 0L], applying no class order at all (#734).  Both are
-   gone.  What is NOT routed through here is [Eq]/[Ne], whose cross-NUMERIC
-   answers still differ from this function's — see {!cmp_result} and #738 for
-   why that one cannot move without the index equality path moving with it.
+   gone.  #738 routed [Eq]/[Ne] through [cmp_result] too, so all six comparison
+   operators share this function; that took the three index equality sites with
+   it (see {!index_lookup_values}), and #743 then took the two JOIN KEY sites
+   (see {!join_key_value}), for the same reason in both cases — an equality is
+   CONSUMED by the access path, so nothing re-checks the rows it yields.
 
    DISTINCT is deliberately NOT routed through this: it dedups on [row_key]'s
    string rendering, where [1] and [1.0] are different keys.  So DISTINCT and
@@ -12337,20 +12389,26 @@ and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.tab
 (* #516: evaluate a probe key against one left row.  [None] means the key
    matches nothing — a NULL component can never equal a stored key under
    three-valued logic — and the caller null-extends or drops the row without
-   seeking, exactly as the single-column probe did for a NULL join key. *)
+   seeking, exactly as the single-column probe did for a NULL join key.
+
+   #743: the probe seeks a TYPED index, so each part is translated towards its
+   index column's declared type by {!index_lookup_values} — the very function
+   the [WHERE col = lit] seek uses, so a join key and a filter can never
+   disagree about which stored keys an equality covers.  That is what makes a
+   cross-numeric ON equality find its rows: an integral REAL addresses the
+   INTEGER key it names, and an INTEGER addresses the REAL key only when the
+   round-trip is exact.  Every other [None] it returns still means "matches
+   nothing" and never "seek wider" — a NULL, a fractional REAL against an
+   INTEGER column, a value above 2^53 with no exact double, a TEXT against a
+   numeric column. *)
 and nlj_probe_values clock params lrow (probe : Plan.probe_part list)
-  : Row.value list option
+  : Index_key.value list option
   =
   let rec go acc = function
-    | [] -> Some (List.rev acc)
-    | Plan.Probe_from_left i :: rest ->
-      (match lrow.(i) with
-       | Row.V_null -> None
-       | v -> go (v :: acc) rest)
-    | Plan.Probe_const e :: rest ->
-      (match eval_expr clock params [||] e with
-       | Row.V_null -> None
-       | v -> go (v :: acc) rest)
+    | [] -> index_lookup_values (List.rev acc)
+    | Plan.Probe_from_left (i, ty) :: rest -> go ((lrow.(i), ty) :: acc) rest
+    | Plan.Probe_const (e, ty) :: rest ->
+      go ((eval_expr clock params [||] e, ty) :: acc) rest
   in
   go [] probe
 
@@ -12375,9 +12433,7 @@ and nlj_probe_left
     then out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out;
     Lwt.return_unit
   | Some key_values ->
-    let prefix, plen =
-      encode_index_key_prefix (List.map row_value_to_index_value key_values)
-    in
+    let prefix, plen = encode_index_key_prefix key_values in
     (* #570: the probe key covers a leading prefix of the index, so a WHERE
        range on the column AFTER it narrows this walk exactly as it narrows
        [stream_index_lookup]'s — same two helpers, so the two paths cannot
@@ -12453,7 +12509,7 @@ and stream_nested_loop_join
   if
     List.exists
       (function
-        | Plan.Probe_const e -> expr_corr e
+        | Plan.Probe_const (e, _) -> expr_corr e
         | Plan.Probe_from_left _ -> false)
       probe
     || Option.fold ~none:false ~some:range_corr probe_range
@@ -12484,7 +12540,12 @@ and stream_nested_loop_join
   Lwt.return (Lwt_stream.of_list (List.rev !out))
 
 (* Build a hash table mapping each right row's join key to its rows; NULL keys
-   are excluded (they never match an equi-join probe). *)
+   are excluded (they never match an equi-join probe).
+
+   #743: buckets are keyed by {!join_key_bytes}, the CANONICAL key, not by the
+   raw encoding of the value — so an integral REAL lands in the same bucket as
+   the INTEGER it names and a cross-numeric equi-join joins the rows [=] says
+   are equal. *)
 and hash_build right_rows right_key : (bytes, Row.t list) Hashtbl.t =
   let tbl = Hashtbl.create 64 in
   List.iter
@@ -12492,7 +12553,7 @@ and hash_build right_rows right_key : (bytes, Row.t list) Hashtbl.t =
        match rrow.(right_key) with
        | Row.V_null -> ()
        | key_v ->
-         let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
+         let key_bytes = join_key_bytes key_v in
          let prev =
            try Hashtbl.find tbl key_bytes with
            | Not_found -> []
@@ -12678,7 +12739,9 @@ and stream_hash_join
          (match key_v with
           | Row.V_null -> ()
           | _ ->
-            let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
+            (* #743: the same canonical key the build side used, so the two
+               sides cannot disagree about which values are one key. *)
+            let key_bytes = join_key_bytes key_v in
             (match Hashtbl.find_opt tbl key_bytes with
              | None -> ()
              | Some rrows ->
