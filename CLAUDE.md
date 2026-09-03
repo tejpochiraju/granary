@@ -2357,6 +2357,60 @@ there, and splice the old generation's tail back on behind it. The fixed code
 cannot be talked into producing that state, which is the point of #636; every
 spliced frame still verifies, which is the point of #637.
 
+### `Db` hands out a read-only schema projection, never the catalog (#433)
+
+`Db.catalog : t -> Catalog.t` is **gone**, replaced by
+`Db.schema : t -> Schema.t` (`lib/db/schema.mli`, module `Granary.Schema`).
+`Catalog.t` is a read-**write** surface — `create_table`, `drop_table`,
+`add_column`, `rename_table`, `set_index_stats`, `set_last_inserted_rowid`,
+`set_fk_enforcement`, and `Catalog.store` (which reaches the raw `Store.t`) all
+take a `t` — so handing it out let a consumer mutate the in-memory schema, or
+write to the store, **out of band from SQL DDL and the WAL**. The constraint
+used to live in the accessor's doc comment; it is now a type.
+
+**The projection is a live VIEW, not a snapshot, and that is the load-bearing
+part.** `Schema.t` *is* the handle's `Catalog.t` behind an abstract type
+(`Schema.of_catalog` is the identity; there is deliberately no inverse), so DDL
+run through SQL is visible through a projection taken before it. A copy would
+have been a second piece of catalog state that goes stale — the shape #589 and
+#633 are about — and this one would have gone stale silently, since nothing
+invalidates a value the caller is holding.
+
+**What it exposes**, and nothing else: `list_tables` / `find_table` (returning
+`Schema.table` = name, `Row.column list`, `fk_constraints`, `without_rowid`,
+`columnar`), `table_exists`, `indexes_for_table` / `find_index` (returning
+`Catalog.index_info`, an immutable record carrying #576's statistics),
+`index_exists`, plus `pp` / `pp_table`.
+
+`Schema.table` is a **projection, not `Catalog.table_meta`**, and the reason is
+not tidiness: `table_meta.storage`'s `Columnar` arm carries a
+`Col_store.t`, which is mutable, so re-exporting `table_meta` would have left a
+real out-of-band write path open under a type that claims to be read-only. Two
+residual sharp edges are accepted and documented rather than deep-copied around
+(a copy would be the snapshot this design rejects): `index_stats.range_histograms`
+and `histogram.boundaries` are `array`s, so their elements are assignable in
+place. They are planner statistics, not schema, and mutating one changes a cost
+estimate rather than what the engine believes the schema is.
+
+**`Db.plan : t -> string -> (Plan.op, error) result Lwt.t` is the other half of
+the change.** Planning a statement against a handle's own schema was the one
+legitimate use of the live catalog that a projection cannot serve — `Sema.bind`
+and `Planner.plan` both take a `Catalog.t` — and the planner's own tests
+(`test_range_histogram_576`) did exactly that. It parses, binds and plans
+without executing, opens no transaction and writes nothing, and routes the way
+`execute` does. **The alternative was worse**: a test could otherwise only reach
+a `Catalog.t` by opening a *second* one over the same store, which is the
+duplicated-catalog anti-pattern the #589/#633 sections exist to prevent.
+
+No deprecated alias was kept. A compatibility shim re-exposing the mutable
+handle under another name would defeat the whole change, and the only known
+consumer outside this repo is camel's hook type environment (`tej/camel#67`),
+which uses `list_tables` and per-table `columns` — both of which the projection
+carries. `test/test_readonly_catalog_433.ml` pins every accessor, the live-view
+property (including a rolled-back `CREATE`), and `Db.plan`; the removal itself
+is not testable — it is a compile-time property, checked by every consumer that
+builds.
+
 ### One `Db.t`, one explicit transaction (#555)
 
 A `Db.t` carries a single explicit-transaction slot and every statement resolves

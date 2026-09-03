@@ -2066,3 +2066,19 @@
  (name test_cmp_eq_738)
  (modules test_cmp_eq_738)
  (libraries granary alcotest lwt.unix))
+
+; #433: [Db.catalog] handed out the live mutable [Catalog.t]; it is replaced by
+; [Db.schema], an opaque read-only projection ([Granary.Schema]). In-memory is
+; enough — this is an API-surface and catalog-visibility property, with no WAL
+; or durability dimension.
+
+(test
+ (name test_readonly_catalog_433)
+ (modules test_readonly_catalog_433)
+ (libraries
+  granary
+  granary.catalog
+  granary.encoding
+  granary.sql
+  alcotest
+  lwt.unix))

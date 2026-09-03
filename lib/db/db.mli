@@ -211,16 +211,33 @@ val set_event_callback : t -> (Event.t -> unit) option -> unit
     monitor to filter page events by table (#385). *)
 val tree_of_table : t -> string -> int option
 
-(** [catalog t] is the active in-memory catalog backing [t], for read-only
-    schema/type projection — column names, types, and NOT NULL constraints via
-    {!Granary_catalog.Catalog.list_tables} / {!Granary_catalog.Catalog.find_table}.
-    The result reflects the schema at call time; the engine may swap its catalog
-    on recovery, so treat the returned handle as a snapshot rather than caching
-    it across a reopen. This is the {e live} handle: [Catalog.t] also exposes
-    mutators ([drop_table], [add_column], …), so "do not mutate it — schema
-    changes go through SQL DDL" is a caller contract, not enforced. See #433 for
-    a possible opaque read-only projection should this grow more consumers. *)
-val catalog : t -> Granary_catalog.Catalog.t
+(** [schema t] is a read-only projection of the active in-memory catalog backing
+    [t] — table names, column names/types/constraints, and index metadata. See
+    {!Schema} for the exposed surface.
+
+    #433: this replaces the former [catalog] accessor, which handed out the
+    {e live} {!Granary_catalog.Catalog.t}. That type is a read-write surface
+    ([create_table], [drop_table], [add_column], [set_last_inserted_rowid],
+    [store], …), so a consumer could mutate the schema — or reach the raw
+    store — out of band from SQL DDL and the WAL. "Do not mutate it" was a doc
+    comment, not a constraint; now it is a type.
+
+    The projection is a {e live view}, not a snapshot: it holds the same
+    catalog the handle executes against, so DDL run through SQL is visible
+    through it immediately. It does {e not} survive the catalog swap {!vacuum}
+    performs, so do not cache one across a VACUUM — every other handle over the
+    store is dead after that anyway (#634). *)
+val schema : t -> Schema.t
+
+(** [plan t sql] parses, binds and plans [sql] against [t]'s active schema
+    {e without executing it}. Read-only: nothing is written and no transaction
+    is opened. It exists because planning a statement against a handle's own
+    catalog was the one legitimate use of the removed [catalog] accessor that a
+    schema projection cannot serve (the binder and planner take a
+    [Catalog.t]) — the planner's tests inspect the chosen access path this way.
+    Routing follows {!execute}: the statement is planned against the handle its
+    active schema selects. *)
+val plan : t -> string -> (Granary_sql.Plan.op, error) result Lwt.t
 
 (** Rebuild the database file in place: copies every tree from the
     current file into a fresh sibling [path ^ ".vacuum-tmp"], then

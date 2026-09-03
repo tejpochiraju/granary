@@ -587,7 +587,10 @@ let tree_of_table t name =
   | _ -> None
 ;;
 
-let catalog t = t.catalog
+(* #433: hand out a read-only projection, never the live [Catalog.t] — see
+   schema.mli.  [Schema.of_catalog] is the identity on the handle, so this is a
+   live view of the catalog the handle executes against, not a snapshot. *)
+let schema t = Schema.of_catalog t.catalog
 
 (* #634: this handle's cohort, to pass to {!of_store} for a second handle over
    the SAME store so a VACUUM on either invalidates the other loudly.
@@ -2980,6 +2983,19 @@ let prepare_impl ?on top sql =
 ;;
 
 let prepare top sql = prepare_impl top sql
+
+(* #433: plan a statement against this handle's schema without executing it.
+   Read-only — no transaction is opened and nothing is written.  It is the
+   replacement for the one use of the removed [catalog] accessor a read-only
+   schema projection cannot serve: [Sema.bind] and [Planner.plan] both take a
+   [Catalog.t].  Staleness is checked for the same reason {!prepare_impl}
+   checks it — a post-VACUUM handle's catalog describes a closed store. *)
+let plan top sql =
+  if is_stale top
+  then Lwt.return (Error (Runtime stale_msg))
+  else fst (compile_routed top sql)
+;;
+
 let param_slot st name = List.assoc_opt name st.param_names
 
 let params_of_named st named =
