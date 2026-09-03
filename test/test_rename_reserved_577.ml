@@ -61,6 +61,7 @@ open Lwt.Syntax
 open Granary_sql
 module Db = Granary.Db
 module Cat = Granary_catalog.Catalog
+module Sql_ident = Granary_encoding.Sql_ident
 
 let run = Lwt_main.run
 
@@ -198,7 +199,7 @@ let rewrite_delimits_reserved_words () =
 let one_rule_across_the_libraries () =
   let names =
     [ "a"; "plain"; ""; "my col"; "1col"; "a\"b"; "order"; "KEY"; "Select"; "log2" ]
-    @ Ast.sql_keywords
+    @ Sql_ident.sql_keywords
   in
   List.iter
     (fun s ->
@@ -206,7 +207,7 @@ let one_rule_across_the_libraries () =
        Alcotest.(check string)
          (Printf.sprintf "Sql_ident.quote_ident %S" s)
          want
-         (Granary_encoding.Sql_ident.quote_ident s);
+         (Sql_ident.quote_ident s);
        Alcotest.(check string)
          (Printf.sprintf "Exec.quote_ident %S" s)
          want
@@ -238,7 +239,7 @@ let check_every_keyword () =
     (fun k ->
        (* the table's own columns are [a] and [b]; nothing in the list collides *)
        check_survives_rename_to (String.lowercase_ascii k))
-    Ast.sql_keywords
+    Sql_ident.sql_keywords
 ;;
 
 let check_survives_reopen () =
@@ -455,7 +456,7 @@ let ordinary_rename_stays_bare () =
 let arb_keyword =
   QCheck.make
     ~print:(Printf.sprintf "%S")
-    QCheck.Gen.(oneof_list (List.map String.lowercase_ascii Ast.sql_keywords))
+    QCheck.Gen.(oneof_list (List.map String.lowercase_ascii Sql_ident.sql_keywords))
 ;;
 
 let prop_check_rename =

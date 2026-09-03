@@ -547,28 +547,19 @@ val binop_to_sql : binop -> string
 (** Render a scalar function as its SQL keyword (e.g. [Fn_length] → ["LENGTH"]). *)
 val func_to_sql : scalar_func -> string
 
-(** #572: every word the lexer turns into a keyword token rather than an
-    identifier, upper-cased. Mirrors the keyword table in [lexer.mll].
-
-    Since #577 the rule and its keyword table live in
-    {!Granary_encoding.Sql_ident}, so that [Granary_catalog] — which sits below
-    the parser and rewrites the same stored SQL text on RENAME COLUMN — shares
-    one implementation with the emitters here. These four values are aliases. *)
-val sql_keywords : string list
-
-(** [is_sql_keyword s] is whether [s] — compared case-insensitively, as the
-    lexer does — is one of {!sql_keywords}. *)
-val is_sql_keyword : string -> bool
-
-(** [ident_needs_quoting s] is whether [s] must be written delimited to be read
-    back as the identifier [s]: it is not a plain [[A-Za-z_][A-Za-z0-9_]*]
-    word, or it is one that the lexer would swallow as a keyword. *)
-val ident_needs_quoting : string -> bool
-
 (** #572: quote a SQL identifier with double quotes when
-    {!ident_needs_quoting} says so (embedded quotes doubled); returned verbatim
-    otherwise. The single rule shared by every SQL-text emitter in the engine —
-    {!expr_to_sql} here and the DDL renderer in [Exec]. *)
+    {!Granary_encoding.Sql_ident.ident_needs_quoting} says so (embedded quotes
+    doubled); returned verbatim otherwise. The single rule shared by every
+    SQL-text emitter in the engine — {!expr_to_sql} here and the DDL renderer
+    in [Exec].
+
+    An alias for {!Granary_encoding.Sql_ident.quote_ident}: since #577 the rule
+    and its keyword table live in [granary.encoding], so that
+    [Granary_catalog] — which sits below the parser and rewrites the same
+    stored SQL text on RENAME COLUMN — shares one implementation with the
+    emitters here. This alias is kept because {!expr_to_sql} calls it and
+    [Exec] re-exports it; the keyword-list side of the rule is reached at
+    {!Granary_encoding.Sql_ident} directly (#619). *)
 val quote_ident : string -> string
 
 (** Serialise an expression back to SQL text, used for CHECK-constraint

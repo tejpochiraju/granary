@@ -1412,6 +1412,7 @@
  (libraries
   granary
   granary.sql
+  granary.encoding
   alcotest
   qcheck-core
   qcheck-alcotest
