@@ -210,6 +210,45 @@ If a gate fails on your box, check `uptime` first: sibling agents running
 suites in parallel are the usual cause, and the gates print their per-trial
 numbers so you can tell noise from a regression.
 
+**`bench_wal_fsync_overlap` sizes its own reader workload, and that calibration
+is where its flakes come from — not the ceiling (#623, 2026-09-03).** The gate's
+arithmetic ceiling is `1 + T_readers / T_writer`, so `read_ops` is chosen at
+startup as `target_seconds / per_op` from paired probe runs rather than
+hard-coded. That divisor is the whole risk surface: a per-op estimate that is
+too LOW oversizes the workload, which is #538's root cause, and the resize
+safety net in `measure` deliberately does not cover the `(1.15, 1.667]` oversize
+band, so a draw in that range is not self-correcting. #590 removed the
+estimator's *bias*; #623 is the residual *spread* it left on the record — the
+chosen `read_ops` spanned ~3.3x run-to-run on a quiet box, wider than #590's
+stated ~2x. The fix is seven paired probe reps folded with a symmetric trimmed
+mean, where it was three folded with a median. **The trimmed mean is the median
+generalised, not a replacement for it** — on three draws the two are the same
+number, which is what makes this a variance change rather than a re-decision of
+#538's fold — and on more draws it uses more of them, so its sampling variance
+is lower without moving the centre, and in particular without moving it *down*
+(the marginal's noise is a difference of two one-sided delays and is therefore
+symmetric; where a loaded box does skew it, the trimmed mean sits *above* the
+median, which is the safe side). Pinned by three deterministic cases in the
+file's own `statistics` suite, which need no quiet box because estimator
+variance is a property of the arithmetic — unlike the false-failure rate the
+issue's alternative remedy would have measured. Cost: calibration is ~2.5 s
+longer, on a run that takes ~10 s and up to ~30 s when it retries.
+
+**It does NOT close #623, and the negative measurement is the reason.** On a
+*loaded* box (12-core, shared, load 2.3-4.6), 10 interleaved old/new pairs of
+the calibration gave max/min 2.46x before and 2.69x after — no narrowing, and
+well inside what 10 draws per arm resolve. The estimator's variance genuinely
+falls; it is simply not the dominant term once load varies between calibration
+and measurement, which is the residual `reader_ratio`'s own comment already
+names. #623's number was taken on a *quiet* box and only a quiet box can
+retire it. The untried next lever is `probe_ops`, not more reps: the marginal
+is a difference of two probes, so raising the probe SIZE improves its
+signal-to-noise linearly where more reps only do so as the square root. Note
+also that the issue's "an oversized `read_ops` fails loudly" framing is only
+half the story — an *undersized* one drives the secondary ceiling
+`1 + T_r/T_w` down to the 1.2 floor and reports INCONCLUSIVE, and a run whose
+every config lands there fails as "measured nothing".
+
 ### Formatting
 
 **Use `scripts/check-fmt.sh` — it is the canonical local equivalent of CI's `dune build @fmt` gate.** It self-wraps podman (no manual `podman run`), runs the pinned ocamlformat over every `.ml`/`.mli` in `lib/ test/ bin/ bench/`, prints a unified diff for each deviation, and exits non-zero. Run it from the repo or worktree root:
