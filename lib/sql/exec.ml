@@ -1677,6 +1677,190 @@ let int_bitop lv rv f =
   | _ -> Row.V_null
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #722: COLLATE is a comparison attribute, not a value transform.      *)
+(* ------------------------------------------------------------------ *)
+
+(* The comparison KEY of [v] under [c].  A key is only ever compared, never
+   emitted, so folding case here cannot change what a projection returns —
+   which is the whole of #722.  [Collate_binary] and [Collate_rtrim] are the
+   identity, exactly as they were before. *)
+let collate_key (c : Ast.collation) (v : Row.value) : Row.value =
+  match c, v with
+  | Ast.Collate_nocase, Row.V_text s -> Row.V_text (String.lowercase_ascii s)
+  | _, v -> v
+;;
+
+(* The collation governing a comparison whose operand is [e].
+
+   SQLite's rule is that an operand has an explicit collating-function
+   assignment if ANY subexpression of it uses the postfix COLLATE operator, and
+   the leftmost such assignment wins.  So
+   [(x COLLATE NOCASE) || '!' = 'HELLO!'] compares under NOCASE even though the
+   COLLATE sits two nodes down — oracle-checked, sqlite3 answers both the
+   'HELLO' and the 'Hello' row where granary answered neither.
+
+   A subquery ([P_subquery] / [P_exists], and the statement half of
+   [P_in_select]) is an opaque leaf here: its result column's collation is a
+   property of the inner SELECT, not of this expression, and none of the four
+   walkers over [Plan.expr] descends into an [Ast.stmt] either. *)
+let rec expr_collation (e : Plan.expr) : Ast.collation =
+  match e with
+  | Plan.P_collate (_, c) -> c
+  | Plan.P_lit _ | Plan.P_col _ | Plan.P_param _ -> Ast.Collate_binary
+  | Plan.P_subquery _ | Plan.P_exists _ -> Ast.Collate_binary
+  | Plan.P_excluded_col _ | Plan.P_window_slot _ -> Ast.Collate_binary
+  | Plan.P_not e | Plan.P_is_null e | Plan.P_is_not_null e -> expr_collation e
+  | Plan.P_neg e | Plan.P_bitnot e | Plan.P_cast (e, _) -> expr_collation e
+  | Plan.P_in_select (x, _) -> expr_collation x
+  | Plan.P_binop (_, l, r) -> collation2 l r
+  | Plan.P_between (x, lo, hi) -> collation3 x lo hi
+  | Plan.P_in (x, vals) -> collation_in x vals
+  | Plan.P_func (_, args) -> collation_of_list args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    (match collation_opt scrutinee with
+     | Ast.Collate_binary ->
+       (match collation_of_branches branches with
+        (* every subexpression *)
+        | Ast.Collate_binary -> collation_opt else_
+        | c -> c)
+     | c -> c)
+
+and collation_opt (e : Plan.expr option) : Ast.collation =
+  match e with
+  | None -> Ast.Collate_binary
+  | Some e -> expr_collation e
+
+(* Every subexpression of a CASE's branches — what {!expr_collation} needs when
+   the whole CASE is an operand of an outer comparison. *)
+and collation_of_branches (bs : (Plan.expr * Plan.expr) list) : Ast.collation =
+  match bs with
+  | [] -> Ast.Collate_binary
+  | (cond, result) :: rest ->
+    (match collation2 cond result with
+     | Ast.Collate_binary -> collation_of_branches rest
+     | c -> c)
+
+(* Only the WHEN conditions — the comparison a [CASE x WHEN w] performs is
+   [x = w], so a THEN result is not an operand of it.  Scanned in place rather
+   than through [List.map fst] because this is reached per ROW. *)
+and collation_of_conds (bs : (Plan.expr * Plan.expr) list) : Ast.collation =
+  match bs with
+  | [] -> Ast.Collate_binary
+  | (cond, _) :: rest ->
+    (match expr_collation cond with
+     | Ast.Collate_binary -> collation_of_conds rest
+     | c -> c)
+
+(* Two operands, leftmost explicit assignment wins.  Spelled out rather than
+   going through {!collation_of_list} because this runs per ROW for every
+   comparison in every WHERE clause: a list and a thunk per evaluation would be
+   a real allocation on the TPC-C path, where the answer is [Collate_binary]
+   after two constructor matches. *)
+and collation2 (a : Plan.expr) (b : Plan.expr) : Ast.collation =
+  match expr_collation a with
+  | Ast.Collate_binary -> expr_collation b
+  | c -> c
+
+and collation3 (a : Plan.expr) (b : Plan.expr) (c : Plan.expr) : Ast.collation =
+  match collation2 a b with
+  | Ast.Collate_binary -> expr_collation c
+  | x -> x
+
+and collation_in (x : Plan.expr) (vals : Plan.expr list) : Ast.collation =
+  match expr_collation x with
+  | Ast.Collate_binary -> collation_of_list vals
+  | c -> c
+
+and collation_of_list (es : Plan.expr list) : Ast.collation =
+  match es with
+  | [] -> Ast.Collate_binary
+  | e :: rest ->
+    (match expr_collation e with
+     | Ast.Collate_binary -> collation_of_list rest
+     | c -> c)
+;;
+
+(* [compare_values] under a collation: both sides are keyed, so the comparison
+   is collation-aware while the values the caller keeps are untouched. *)
+let compare_collated (c : Ast.collation) (a : Row.value) (b : Row.value) : int =
+  compare_values (collate_key c a) (collate_key c b)
+;;
+
+(* An aggregate's comparison collation comes from its argument expression.  The
+   bare-column forms carry [arg_expr = None] and are always BINARY, which is
+   what they were before #722. *)
+let agg_spec_collation (spec : Plan.agg_spec) : Ast.collation =
+  match spec.Plan.arg_expr with
+  | Some e -> expr_collation e
+  | None -> Ast.Collate_binary
+;;
+
+(* Per-output-column collation of a row-producing plan op.
+
+   #722: DISTINCT and the three set operations compare the OUTPUT row and hold
+   no expressions of their own — [Op_distinct] is literally [{ child : op }] —
+   so the collation has to be read back off the projection underneath them.
+   A column this cannot resolve answers [Collate_binary], which is what every
+   column answered before #722 unless the projection happened to lower-case it. *)
+let rec output_collations (op : Plan.op) : Ast.collation list =
+  match op with
+  | Plan.Op_expr_project { exprs; _ } | Plan.Op_const_select { exprs } ->
+    List.map (fun (e, _) -> expr_collation e) exprs
+  | Plan.Op_project { ordinals; child } ->
+    let inner = output_collations child in
+    let at i = Option.value (List.nth_opt inner i) ~default:Ast.Collate_binary in
+    List.map at ordinals
+  | Plan.Op_aggregate { proj; aggs; _ } -> List.map (proj_item_collation aggs) proj
+  | Plan.Op_sort { child; _ }
+  | Plan.Op_limit { child; _ }
+  | Plan.Op_filter { child; _ }
+  | Plan.Op_distinct { child } -> output_collations child
+  | Plan.Op_union { left; _ } | Plan.Op_intersect { left; _ } | Plan.Op_except { left; _ }
+    -> output_collations left
+  | _ -> []
+
+and proj_item_collation (aggs : Plan.agg_spec list) (pi : Plan.proj_item) : Ast.collation =
+  match pi with
+  | Plan.PI_expr e -> expr_collation e
+  | Plan.PI_agg_slot k ->
+    (match List.nth_opt aggs k with
+     | Some spec -> agg_spec_collation spec
+     | None -> Ast.Collate_binary)
+  | Plan.PI_group_col _ | Plan.PI_window_slot _ -> Ast.Collate_binary
+;;
+
+(* The dedup-key function for rows whose columns carry [cols].  When every
+   column is BINARY — the overwhelmingly common case, and every case before
+   #722 — this IS [row_key], so DISTINCT and the set operations pay nothing at
+   all for the feature; the all-binary test is made once per operator rather
+   than once per row. *)
+let collated_row_keyer (cols : Ast.collation list) : Row.t -> string =
+  if List.for_all (fun c -> c = Ast.Collate_binary) cols
+  then row_key
+  else (
+    let arr = Array.of_list cols in
+    let at i = if i < Array.length arr then arr.(i) else Ast.Collate_binary in
+    fun row -> row_key (Array.mapi (fun i v -> collate_key (at i) v) row))
+;;
+
+(* Only a COMPARISON takes a collation from its operands; every other binop is
+   a value computation and must not fold.  Before #722 the fold ran for EVERY
+   operator, so [(x COLLATE NOCASE) || 'B'] answered ['hellob'] where sqlite3
+   answers ['HELLOB'].
+
+   [Like] is excluded because {!like_match} already lower-cases both sides, and
+   [Glob] because sqlite3's GLOB is case-sensitive regardless of collation
+   (oracle-checked: [x COLLATE NOCASE GLOB 'HELL*'] matches only ['HELLO']). *)
+let binop_takes_collation (op : Plan.binop) : bool =
+  match op with
+  | Plan.Eq | Plan.Ne | Plan.Lt | Plan.Le | Plan.Gt | Plan.Ge -> true
+  | Plan.Like | Plan.Glob -> false
+  | Plan.Add | Plan.Sub | Plan.Mul | Plan.Div | Plan.Mod -> false
+  | Plan.And | Plan.Or | Plan.Concat -> false
+  | Plan.Bit_and | Plan.Bit_or | Plan.Lshift | Plan.Rshift -> false
+;;
+
 let rec eval_expr
           (clock : (unit -> float) option)
           (params : Row.value array)
@@ -1705,9 +1889,14 @@ let rec eval_expr
      any cross-type pair, which made both ends true at once and the whole
      predicate true for every row. [x] is still evaluated once. *)
   | Plan.P_between (x, lo, hi) ->
-    let vx = eval_expr clock params row x in
-    let vlo = eval_expr clock params row lo in
-    let vhi = eval_expr clock params row hi in
+    (* #722: BETWEEN reached [eval_binop] directly, bypassing the collation
+       propagation the [P_binop] arm did, so [x COLLATE NOCASE BETWEEN a AND b]
+       folded [x] but neither bound and answered NO rows where sqlite3 answers
+       two.  Both ends are now keyed with the same collation as [x]. *)
+    let c = collation3 x lo hi in
+    let vx = collate_key c (eval_expr clock params row x) in
+    let vlo = collate_key c (eval_expr clock params row lo) in
+    let vhi = collate_key c (eval_expr clock params row hi) in
     eval_binop Plan.And (eval_binop Plan.Ge vx vlo) (eval_binop Plan.Le vx vhi)
   | Plan.P_in (x, vals) -> eval_in clock params row x vals
   | Plan.P_is_null e ->
@@ -1722,26 +1911,19 @@ let rec eval_expr
     (match eval_expr clock params row e with
      | Row.V_null -> Row.V_null
      | v -> if value_truthy v then Row.V_int 0L else Row.V_int 1L)
+  (* #722: the collation is read off the OPERAND EXPRESSIONS and applied to
+     both comparison keys.  Before, it was applied by [P_collate] to its own
+     value and to the other operand, which made a collated value observable
+     wherever it was not compared. *)
   | Plan.P_binop (op, lhs_e, rhs_e) ->
     let lv = eval_expr clock params row lhs_e in
     let rv = eval_expr clock params row rhs_e in
-    let is_nocase = function
-      | Plan.P_collate (_, Ast.Collate_nocase) -> true
-      | _ -> false
-    in
-    let nocase_text v =
-      match v with
-      | Row.V_text s -> Row.V_text (String.lowercase_ascii s)
-      | o -> o
-    in
-    let lv', rv' =
-      if is_nocase lhs_e
-      then lv, nocase_text rv
-      else if is_nocase rhs_e
-      then nocase_text lv, rv
-      else lv, rv
-    in
-    eval_binop op lv' rv'
+    if not (binop_takes_collation op)
+    then eval_binop op lv rv
+    else (
+      match collation2 lhs_e rhs_e with
+      | Ast.Collate_binary -> eval_binop op lv rv
+      | c -> eval_binop op (collate_key c lv) (collate_key c rv))
   | Plan.P_func (func, args) ->
     eval_func clock func (List.map (eval_expr clock params row) args)
   | Plan.P_case { scrutinee; branches; else_ } ->
@@ -1756,19 +1938,20 @@ let rec eval_expr
     failwith
       "Exec: P_window_slot in eval_expr — must be substituted by planner before \
        evaluation"
-  | Plan.P_collate (e, Ast.Collate_nocase) ->
-    let v = eval_expr clock params row e in
-    (match v with
-     | Row.V_text s -> Row.V_text (String.lowercase_ascii s)
-     | o -> o)
-  | Plan.P_collate (e, _) ->
-    eval_expr clock params row e (* Collate_binary and Collate_rtrim are identity *)
+  (* #722: a COLLATE never changes the VALUE.  It is read by the comparison
+     sites through {!expr_collation}; here it is the identity, so a projected
+     or concatenated or CAST-wrapped collated column returns what is stored. *)
+  | Plan.P_collate (e, _) -> eval_expr clock params row e
 
 and eval_in clock params row x vals =
-  let vx = eval_expr clock params row x in
-  if vx = Row.V_null
+  let vx_raw = eval_expr clock params row x in
+  if vx_raw = Row.V_null
   then Row.V_null
   else (
+    (* #722: [IN] is a disjunction of equalities, so it takes a collation from
+       its operands the way [=] does. *)
+    let c = collation_in x vals in
+    let vx = collate_key c vx_raw in
     let result =
       List.fold_left
         (fun acc ve ->
@@ -1776,7 +1959,7 @@ and eval_in clock params row x vals =
            match acc with
            | `Found -> `Found
            | _ when v = Row.V_null -> `Maybe
-           | _ when compare_values vx v = 0 -> `Found
+           | _ when compare_values vx (collate_key c v) = 0 -> `Found
            | acc -> acc)
         `Not_found
         vals
@@ -1787,7 +1970,16 @@ and eval_in clock params row x vals =
     | `Not_found -> Row.V_int 0L)
 
 and eval_case_expr clock params row scrutinee branches else_ =
-  let scr_val = Option.map (eval_expr clock params row) scrutinee in
+  (* #722: [CASE x WHEN v THEN ...] is an equality against [x], so it takes a
+     collation from the scrutinee and the branch conditions. *)
+  let c =
+    match collation_opt scrutinee with
+    | Ast.Collate_binary -> collation_of_conds branches
+    | c -> c
+  in
+  let scr_val =
+    Option.map (fun e -> collate_key c (eval_expr clock params row e)) scrutinee
+  in
   let rec find_match = function
     | [] ->
       (match else_ with
@@ -1798,7 +1990,7 @@ and eval_case_expr clock params row scrutinee branches else_ =
         match scr_val with
         | None -> value_truthy (eval_expr clock params row cond)
         | Some sv ->
-          let cv = eval_expr clock params row cond in
+          let cv = collate_key c (eval_expr clock params row cond) in
           (match sv, cv with
            | Row.V_null, _ | _, Row.V_null -> false
            | _ -> compare_values sv cv = 0)
@@ -1806,6 +1998,14 @@ and eval_case_expr clock params row scrutinee branches else_ =
       if matched then eval_expr clock params row result else find_match rest
   in
   find_match branches
+
+(* #722: a sort / partition / peer-boundary key is a COMPARISON key — it is
+   never emitted — so the key expression's collation is applied to it here.
+   Before #722 the same effect fell out of [P_collate] rewriting the value,
+   which is why ORDER BY ... COLLATE NOCASE worked while a projection of the
+   same expression did not. *)
+and eval_sort_key clock params row (e : Plan.expr) : Row.value =
+  collate_key (expr_collation e) (eval_expr clock params row e)
 
 and eval_func
       (clock : (unit -> float) option)
@@ -6729,8 +6929,8 @@ let apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches =
            let rec cmp = function
              | [] -> 0
              | (e, dir, nulls) :: rest ->
-               let va = eval_expr clock params ra e in
-               let vb = eval_expr clock params rb e in
+               let va = eval_sort_key clock params ra e in
+               let vb = eval_sort_key clock params rb e in
                let c = compare_with_nulls dir nulls va vb in
                if c <> 0 then c else cmp rest
            in
@@ -11005,7 +11205,8 @@ and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
 and eval_partition_key clock params (row : Row.t) (partition_by : Plan.expr list)
   : Row.value list
   =
-  List.map (eval_expr clock params row) partition_by
+  (* #722: a partition key is compared, never emitted — see {!eval_sort_key}. *)
+  List.map (eval_sort_key clock params row) partition_by
 
 and partition_keys_equal (a : Row.value list) (b : Row.value list) : bool =
   List.length a = List.length b && List.for_all2 (fun x y -> compare_values x y = 0) a b
@@ -11045,8 +11246,8 @@ and sort_partition_by
          let rec cmp = function
            | [] -> 0
            | (e, dir, nulls) :: rest ->
-             let va = eval_expr clock params ra e in
-             let vb = eval_expr clock params rb e in
+             let va = eval_sort_key clock params ra e in
+             let vb = eval_sort_key clock params rb e in
              let c = compare_with_nulls dir nulls va vb in
              if c <> 0 then c else cmp rest
          in
@@ -11072,8 +11273,8 @@ and win_rank
              compare_with_nulls
                dir
                nulls
-               (eval_expr clock params sorted_rows.(pos) e)
-               (eval_expr clock params sorted_rows.(pos - 1) e)
+               (eval_sort_key clock params sorted_rows.(pos) e)
+               (eval_sort_key clock params sorted_rows.(pos - 1) e)
              <> 0)
           wplan.Plan.order_by
       in
@@ -11100,8 +11301,8 @@ and win_dense_rank
              compare_with_nulls
                dir
                nulls
-               (eval_expr clock params sorted_rows.(pos) e)
-               (eval_expr clock params sorted_rows.(pos - 1) e)
+               (eval_sort_key clock params sorted_rows.(pos) e)
+               (eval_sort_key clock params sorted_rows.(pos - 1) e)
              <> 0)
           wplan.Plan.order_by
       in
@@ -11247,8 +11448,8 @@ and win_percent_rank
                compare_with_nulls
                  dir
                  nulls
-                 (eval_expr clock params sorted_rows.(pos) e)
-                 (eval_expr clock params sorted_rows.(pos - 1) e)
+                 (eval_sort_key clock params sorted_rows.(pos) e)
+                 (eval_sort_key clock params sorted_rows.(pos - 1) e)
                <> 0)
             wplan.Plan.order_by
         in
@@ -11283,8 +11484,8 @@ and win_cume_dist
                 compare_with_nulls
                   dir
                   nulls
-                  (eval_expr clock params sorted_rows.(!peer_end + 1) e)
-                  (eval_expr clock params sorted_rows.(!peer_end) e)
+                  (eval_sort_key clock params sorted_rows.(!peer_end + 1) e)
+                  (eval_sort_key clock params sorted_rows.(!peer_end) e)
                 = 0)
              wplan.Plan.order_by
       do
@@ -11774,8 +11975,8 @@ and stream_sort clock params store mode cat keys child =
          if acc <> 0
          then acc
          else (
-           let va = eval_expr clock params a key
-           and vb = eval_expr clock params b key in
+           let va = eval_sort_key clock params a key
+           and vb = eval_sort_key clock params b key in
            compare_with_nulls dir nulls va vb))
       0
       keys'
@@ -12328,10 +12529,12 @@ and agg_sum (vals : Row.value list) : Row.value =
    afterwards.  A NULL is "seen" like any other value, so it survives the dedup
    as ONE entry and is then dropped by each aggregate's own NULL handling —
    which is why [COUNT(DISTINCT x)] skips NULLs exactly as [COUNT(x)] does. *)
-and distinct_filter () : Row.value -> bool =
+and distinct_filter ?(collation = Ast.Collate_binary) () : Row.value -> bool =
   let seen = Hashtbl.create 64 in
   fun v ->
-    let k = row_key [| v |] in
+    (* #722: the dedup KEY carries the argument's collation; the value the
+       aggregate then accumulates is the raw one. *)
+    let k = row_key [| collate_key collation v |] in
     if Hashtbl.mem seen k
     then false
     else (
@@ -12339,7 +12542,12 @@ and distinct_filter () : Row.value -> bool =
       true)
 
 (* Evaluate one aggregate [spec] over the argument values of a group. *)
-and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.value =
+and aggregate_over_values
+      ?(collation = Ast.Collate_binary)
+      (func : Ast.agg_func)
+      (vals : Row.value list)
+  : Row.value
+  =
   match func with
   | Ast.Agg_count ->
     let n =
@@ -12366,13 +12574,15 @@ and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.va
         vals
     in
     if n = 0 then Row.V_null else Row.V_real (sum /. float_of_int n)
+  (* #722: MIN/MAX compare under the argument's collation but return the RAW
+     winning value, so [MIN(x COLLATE NOCASE)] answers 'HELLO', not 'hello'. *)
   | Ast.Agg_min ->
     List.fold_left
       (fun acc v ->
          match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
-         | v, cur -> if compare_values v cur < 0 then v else cur)
+         | v, cur -> if compare_collated collation v cur < 0 then v else cur)
       Row.V_null
       vals
   | Ast.Agg_max ->
@@ -12381,7 +12591,7 @@ and aggregate_over_values (func : Ast.agg_func) (vals : Row.value list) : Row.va
          match v, acc with
          | Row.V_null, _ -> acc
          | v, Row.V_null -> v
-         | v, cur -> if compare_values v cur > 0 then v else cur)
+         | v, cur -> if compare_collated collation v cur > 0 then v else cur)
       Row.V_null
       vals
   | Ast.Agg_group_concat sep ->
@@ -12416,11 +12626,14 @@ and aggregate_one clock params (spec : Plan.agg_spec) (group_rows : Row.t list)
      | Ast.Agg_group_concat _ -> failwith "GROUP_CONCAT requires a column argument"
      | _ -> failwith "non-COUNT aggregate must have a column argument")
   | Some get ->
+    let collation = agg_spec_collation spec in
     let vals = List.map get group_rows in
     let vals =
-      if spec.Plan.distinct then List.filter (distinct_filter ()) vals else vals
+      if spec.Plan.distinct
+      then List.filter (distinct_filter ~collation ()) vals
+      else vals
     in
-    aggregate_over_values spec.Plan.func vals
+    aggregate_over_values ~collation spec.Plan.func vals
 
 (* Partition [rows] into (group_key, group_rows) by [group_cols] (stable). *)
 and aggregate_build_groups group_cols rows : (Row.value list * Row.t list) list =
@@ -12506,7 +12719,8 @@ and make_agg_acc clock params (spec : Plan.agg_spec)
        Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
      | _ -> None)
   | Some get ->
-    let update_v, finalize = make_agg_acc_over_values spec.Plan.func in
+    let collation = agg_spec_collation spec in
+    let update_v, finalize = make_agg_acc_over_values ~collation spec.Plan.func in
     (* #491: DISTINCT keeps the #247 fast path rather than falling back to the
        general path — a no-GROUP-BY distinct count is exactly TPC-C
        StockLevel's shape.  The filter wraps the GETTER's result, not the row,
@@ -12516,7 +12730,7 @@ and make_agg_acc clock params (spec : Plan.agg_spec)
     let update =
       if spec.Plan.distinct
       then (
-        let keep = distinct_filter () in
+        let keep = distinct_filter ~collation () in
         fun (row : Row.t) ->
           let v = get row in
           if keep v then update_v v)
@@ -12531,7 +12745,7 @@ and make_agg_acc clock params (spec : Plan.agg_spec)
    what makes "these two MUST stay byte-identical" checkable by reading them
    side by side instead of by trusting a comment.  It is also what lets #491's
    DISTINCT filter sit between the getter and the accumulator. *)
-and make_agg_acc_over_values (func : Ast.agg_func)
+and make_agg_acc_over_values ?(collation = Ast.Collate_binary) (func : Ast.agg_func)
   : (Row.value -> unit) * (unit -> Row.value)
   =
   match func with
@@ -12581,13 +12795,15 @@ and make_agg_acc_over_values (func : Ast.agg_func)
           incr n
         | v -> agg_non_numeric_failure "AVG" v)
     , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
+  (* #722: same collation rule as [aggregate_over_values] — these two MUST
+     stay byte-identical. *)
   | Ast.Agg_min ->
     let best = ref Row.V_null in
     ( (fun v ->
         match v, !best with
         | Row.V_null, _ -> ()
         | v, Row.V_null -> best := v
-        | v, cur -> if compare_values v cur < 0 then best := v)
+        | v, cur -> if compare_collated collation v cur < 0 then best := v)
     , fun () -> !best )
   | Ast.Agg_max ->
     let best = ref Row.V_null in
@@ -12595,7 +12811,7 @@ and make_agg_acc_over_values (func : Ast.agg_func)
         match v, !best with
         | Row.V_null, _ -> ()
         | v, Row.V_null -> best := v
-        | v, cur -> if compare_values v cur > 0 then best := v)
+        | v, cur -> if compare_collated collation v cur > 0 then best := v)
     , fun () -> !best )
   | Ast.Agg_group_concat sep ->
     let separator = Option.value sep ~default:"," in
@@ -14213,10 +14429,13 @@ and stream_union clock params store mode cat all left right =
   else
     let* rows = Lwt_stream.to_list combined in
     let seen = Hashtbl.create 64 in
+    (* #722: as for DISTINCT, the compound's column collations come from the
+       LEFT arm's projection. *)
+    let key_of = collated_row_keyer (output_collations left) in
     let deduped =
       List.filter
         (fun row ->
-           let k = row_key row in
+           let k = key_of row in
            if Hashtbl.mem seen k
            then false
            else (
@@ -14230,14 +14449,15 @@ and stream_intersect clock params store mode cat left right =
   let* ls = to_stream clock params store ~mode ~cat left in
   let* rs = to_stream clock params store ~mode ~cat right in
   let* right_list = Lwt_stream.to_list rs in
+  let key_of = collated_row_keyer (output_collations left) in
   let right_set = Hashtbl.create (max 1 (List.length right_list)) in
-  List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+  List.iter (fun r -> Hashtbl.replace right_set (key_of r) ()) right_list;
   let* left_list = Lwt_stream.to_list ls in
   let seen = Hashtbl.create 64 in
   let result =
     List.filter
       (fun row ->
-         let k = row_key row in
+         let k = key_of row in
          if (not (Hashtbl.mem right_set k)) || Hashtbl.mem seen k
          then false
          else (
@@ -14251,14 +14471,15 @@ and stream_except clock params store mode cat left right =
   let* ls = to_stream clock params store ~mode ~cat left in
   let* rs = to_stream clock params store ~mode ~cat right in
   let* right_list = Lwt_stream.to_list rs in
+  let key_of = collated_row_keyer (output_collations left) in
   let right_set = Hashtbl.create (max 1 (List.length right_list)) in
-  List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+  List.iter (fun r -> Hashtbl.replace right_set (key_of r) ()) right_list;
   let* left_list = Lwt_stream.to_list ls in
   let seen = Hashtbl.create 64 in
   let result =
     List.filter
       (fun row ->
-         let k = row_key row in
+         let k = key_of row in
          if Hashtbl.mem right_set k || Hashtbl.mem seen k
          then false
          else (
@@ -14617,10 +14838,14 @@ and to_stream
   | Plan.Op_distinct { child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let seen = Hashtbl.create 64 in
+    (* #722: dedup under each output column's collation, so
+       [SELECT DISTINCT x COLLATE NOCASE] still folds 'HELLO' and 'Hello' into
+       one row — while emitting the stored value rather than a lower-cased one. *)
+    let key_of = collated_row_keyer (output_collations child) in
     Lwt.return
       (Lwt_stream.filter
          (fun row ->
-            let k = row_key row in
+            let k = key_of row in
             if Hashtbl.mem seen k
             then false
             else (

@@ -1975,3 +1975,15 @@
  (name test_change_feed_error_737)
  (modules test_change_feed_error_737)
  (libraries granary alcotest lwt.unix))
+
+; #722: COLLATE is a comparison attribute, not a value transformation. The
+; P_collate arm of eval_expr used to lower-case the VALUE, so a projected,
+; CAST-wrapped or concatenated collated column returned something the table
+; never stored. Every fixture pairs 'HELLO' with 'Hello' so a BINARY build and
+; a NOCASE one answer differently, and every case carries an uncollated
+; control.
+
+(test
+ (name test_collate_722)
+ (modules test_collate_722)
+ (libraries granary alcotest lwt.unix))

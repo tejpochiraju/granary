@@ -667,6 +667,103 @@ EOF
   whose first two cases assert the projection and HAVING already had the rule —
   that is what makes this consistency rather than a new opinion.
 
+- **`COLLATE` is a comparison attribute and never rewrites a value (#722, fixed
+  2026-09-03).** `Exec.eval_expr`'s `P_collate` arm used to implement
+  `COLLATE NOCASE` as `String.lowercase_ascii` **on the value**. For an equality
+  test the two models are indistinguishable, which is why it stood; in a
+  value-returning position they are not, and
+  `SELECT x COLLATE NOCASE FROM t` returned `'hello'` where sqlite3 returns
+  `'HELLO'`. The same leak reached `CAST`, `||`, a function argument, `MIN`/`MAX`'s
+  result, and the rows `SELECT DISTINCT` emits.
+
+  `P_collate` is now the **identity on the value**. `Exec.expr_collation` reads
+  the collation off an operand *expression* and each comparison site keys both
+  sides through `Exec.collate_key` before comparing. **`collate_key` is
+  byte-identical to the old fold**, so at every site the fix touched, the
+  comparison answer is unchanged and only the emitted value moves — which is
+  what made a change this wide auditable. The corollary is the hazard: a
+  comparison site the fix *missed* would silently drop from NOCASE to BINARY, so
+  the enumeration below is the artifact, not the diff.
+
+  The collation of an operand follows sqlite3's rule — an operand carries an
+  explicit collating-function assignment if **any** subexpression uses postfix
+  `COLLATE`, leftmost wins. Two consequences beyond the headline, both
+  oracle-checked: it now propagates *out* of a subexpression
+  (`(x COLLATE NOCASE) || '!' = 'HELLO!'` matches, where it used to match
+  nothing), and it no longer folds through a **non-comparison** operator
+  (`(x COLLATE NOCASE) || 'B'` is `'HELLOB'`, not `'hellob'`).
+  `Exec.binop_takes_collation` is that boundary: the six comparisons take one,
+  and `Like` (`like_match` already lower-cases both sides) and `Glob` (sqlite3's
+  GLOB is case-sensitive regardless of collation, oracle-checked) deliberately
+  do not.
+
+  **The comparison sites, all of them.** `P_binop`; `P_between` (which reached
+  `eval_binop` *directly*, bypassing the old propagation entirely, so
+  `x COLLATE NOCASE BETWEEN a AND b` folded `x` and neither bound and answered
+  **no rows** — a second bug the model fixes rather than preserves); `eval_in`
+  and `eval_in_select`; `eval_case_expr`'s scrutinee; the four sort-key sites
+  and the window partition/peer sites, all via `Exec.eval_sort_key`;
+  `distinct_filter` and MIN/MAX in both `aggregate_over_values` and
+  `make_agg_acc_over_values` (which stay byte-identical to each other), keyed
+  off `agg_spec_collation`; and `Op_distinct` plus the three set operations.
+
+  **The dedup sites are the awkward ones and the reason `Exec.output_collations`
+  exists.** `Op_distinct` is literally `{ child : op }` — it compares the OUTPUT
+  row and holds no expressions — so before #722 it deduped case-insensitively
+  only as a *side effect* of the projection having lower-cased the value, and it
+  emitted that lower-cased value. Making `P_collate` transparent without giving
+  those nodes the collation would have turned a wrong VALUE into a wrong ROW
+  COUNT, which is worse. `output_collations` reads the per-column collation back
+  off the projection underneath (`Op_expr_project`, `Op_const_select`,
+  `Op_aggregate`'s `proj_item`s, descending through `Op_project`'s ordinals and
+  through sort/limit/filter), and answers `Collate_binary` for anything it
+  cannot resolve. `collated_row_keyer` makes the all-binary test **once per
+  operator**, returning `row_key` itself, so DISTINCT and UNION pay nothing.
+
+  **`GROUP BY x COLLATE NOCASE` is a parse error and stayed one.** It is the one
+  comparison site that could not be made collation-aware, and the reason is a
+  grammar limitation rather than a decision: `Ast.group_by_item` is
+  `string * string option`, a name and an optional qualifier, not an expression,
+  so `Exec.aggregate_build_groups` (over `group_cols : int list`) has nothing to
+  consult. sqlite3 accepts it. **Anything that widens `group_by_item` to an
+  expression owes that comparator the same treatment the sort keys got** —
+  pinned as a live assertion by `group_by_collate_is_still_a_parse_error`, which
+  fails if the grammar is widened without it.
+
+  **A collated comparison cannot reach an index seek, and declining is the
+  chosen answer.** Not by a new rule: every seek decision is made on
+  `Sema.bound_expr` *before* `plan_expr` runs, and both recognisers
+  (`Planner.recognise_eq_col_lit`, `recognise_range_col_lit`, plus
+  `recognise_eq_col_col` for join keys) pattern-match `BE_col` / `BE_lit` /
+  `BE_param` **directly with no wrapper stripping**, so a `BE_collate` falls to
+  their `| _ -> None` arm in either operand position. That has to stay true.
+  `Index_key.encode_value` emits BINARY bytes, so a NOCASE seek over them would
+  skip exactly the rows the collation exists to find — the rows-lost failure
+  mode the NaN section above describes — and it would be **unrecoverable**,
+  because `Planner.plan_base` *drops* the conjunct a seek consumed
+  (`residual_filter ~consumed`), deleting the predicate that would otherwise
+  re-check the collation. Teaching a recogniser to strip `BE_collate` therefore
+  requires forcing the conjunct to stay unconsumed, or a collation-aware
+  encoding, and neither is worth it for a feature with no DDL spelling.
+
+  There is **no DDL collation in this engine** — `COLLATE` appears in the
+  grammar only as a postfix expression operator, never in a column definition or
+  a `CREATE INDEX` — so no column and no index carries an implicit non-binary
+  collation, and a UNIQUE constraint is BINARY by construction. If DDL collation
+  is ever added, the index-seek question above reopens *and* the UNIQUE conflict
+  probe (byte-exact on `Index_key` encodings) becomes a second, independent
+  divergence.
+
+  Two accepted residuals, neither introduced by #722: which duplicate survives a
+  NOCASE-equal group in `UNION`/`INTERSECT` differs from sqlite3 (it sorts the
+  compound and reports a different representative; granary streams the left arm
+  and keeps the first it saw — the row *count* agrees), and an aggregate result
+  projected under DISTINCT gets its collation from `agg_spec_collation`, not
+  from the aggregate's own output column. Pinned by `test/test_collate_722.ml`;
+  the two cases in `test/test_collate_outer_ref_670.ml` that used to pin the
+  folded values were rewritten to the sqlite3 answer, deliberately, as that
+  file's own comment predicted they would have to be.
+
 - **One rule resolves a correlated subquery's outer references (#635/#626/#615, 2026-08-06).**
   An input's **scope identifier** is its FROM item's alias where it has one and
   its table name otherwise — an alias *replaces* the name. A qualified outer

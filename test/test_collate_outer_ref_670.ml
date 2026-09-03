@@ -150,42 +150,52 @@ let a_collate_nested_under_another_node_is_descended_through () =
    VALUES it produces, not merely by the absence of a refusal: three outer rows,
    three different correlated values, each matching its own [i.fk = o.k].
 
-   {b This is also where granary diverges from sqlite3, on the collation and
-   not on the correlation.}  sqlite3 answers
+   {b #722 CHANGED THIS ANSWER DELIBERATELY.}  When this file was written the
+   expected row for [b] was [b|world], because granary evaluated
+   [P_collate (_, NOCASE)] as [String.lowercase_ascii] on the value itself
+   ([Exec.eval_expr]) — so a COLLATE in a PROJECTION rewrote what came back.
+   The comment here said the divergence was "pinned as granary's current answer
+   rather than sqlite3's, so that fixing #722 shows up as a deliberate change to
+   this line".  This is that change.
+
+   Since #722 a COLLATE is a comparison attribute and never rewrites a value:
+   the collation is read off the operand expressions by
+   [Exec.expr_collation] and applied at the comparison sites
+   ([Exec.collate_key]), so a projected collated column returns what is stored.
+   sqlite3 answers
 
      a|hello
      b|WORLD
      c|yyy
 
-   because a collation is a property of a COMPARISON and never rewrites the
-   value.  granary evaluates [P_collate (_, NOCASE)] as
-   [String.lowercase_ascii] on the value itself ([Exec.eval_expr]), so a
-   COLLATE in a PROJECTION changes what comes back: [WORLD] is returned as
-   [world].  That is pre-existing, has nothing to do with #670 — the plain
-   uncorrelated shape below does the same on unmodified code — and is tracked
-   as #722.  Pinned here as granary's current answer rather than sqlite3's, so
-   that fixing #722 shows up as a deliberate change to this line. *)
+   and so does granary now.  The correlation half of this case — that each
+   outer row gets its OWN [i.v], which is what #670 fixed — is unchanged and is
+   still what the three distinct values assert. *)
 let the_substituted_reference_is_the_outer_rows () =
   with_db (fun db ->
     seed db;
     check_rows
-      ~label:"each outer row gets its own correlated value (#722: b is folded)"
-      [ [ "a"; "hello" ]; [ "b"; "world" ]; [ "c"; "yyy" ] ]
+      ~label:"each outer row gets its own correlated value (#722: values are raw)"
+      [ [ "a"; "hello" ]; [ "b"; "WORLD" ]; [ "c"; "yyy" ] ]
       (rows_of db "SELECT k, (SELECT v FROM i WHERE i.fk = o.k) COLLATE NOCASE FROM o"))
 ;;
 
-(* #722, isolated: no subquery, no correlation, nothing #670 touches — so this
-   is what the engine did before this branch and what it still does.  It is
-   here to keep the divergence above from being read as something the fix
-   introduced.
+(* #722, isolated: no subquery, no correlation, nothing #670 touches.
+
+   {b This answer changed deliberately under #722.}  It used to assert
+   [a|hello / b|world / c|zzz] — the folded values — and existed to record that
+   the folding was pre-existing rather than something #670 introduced.  It now
+   asserts the sqlite3 answer, which is the point of #722: a COLLATE in a
+   projection is a comparison attribute with nothing to compare, so it is the
+   identity on the value.
 
    sqlite3: a|HELLO / b|world / c|zzz  (the stored values, unchanged). *)
-let collate_in_a_projection_folds_the_value_pre_existing_722 () =
+let collate_in_a_projection_returns_the_stored_value_722 () =
   with_db (fun db ->
     seed db;
     check_rows
-      ~label:"granary folds; sqlite3 would return HELLO and zzz unchanged"
-      [ [ "a"; "hello" ]; [ "b"; "world" ]; [ "c"; "zzz" ] ]
+      ~label:"#722: the projection returns the stored value, as sqlite3 does"
+      [ [ "a"; "HELLO" ]; [ "b"; "world" ]; [ "c"; "zzz" ] ]
       (rows_of db "SELECT k, x COLLATE NOCASE FROM o"))
 ;;
 
@@ -298,11 +308,11 @@ let () =
             `Quick
             an_uncorrelated_subquery_under_collate_is_unchanged
         ] )
-    ; ( "divergence_722"
+    ; ( "resolved_by_722"
       , [ Alcotest.test_case
-            "collate_in_a_projection_folds_the_value_pre_existing_722"
+            "collate_in_a_projection_returns_the_stored_value_722"
             `Quick
-            collate_in_a_projection_folds_the_value_pre_existing_722
+            collate_in_a_projection_returns_the_stored_value_722
         ] )
     ; ( "resolved_by_721"
       , [ Alcotest.test_case
