@@ -10048,16 +10048,14 @@ let rec substitute_outer_in_expr
   | Ast.E_agg (f, a) -> Ast.E_agg (f, Option.map go a)
   | Ast.E_agg_distinct (f, a) -> Ast.E_agg_distinct (f, go a)
   | Ast.E_window { func; args; window } ->
+    let go_key (k : Ast.order_key) = { k with Ast.expr = go k.Ast.expr } in
     Ast.E_window
       { func
       ; args = List.map go args
       ; window =
           { window with
             Ast.partition_by = List.map go window.Ast.partition_by
-          ; Ast.order_by =
-              List.map
-                (fun (k : Ast.order_key) -> { k with Ast.expr = go k.Ast.expr })
-                window.Ast.order_by
+          ; Ast.order_by = List.map go_key window.Ast.order_by
           }
       }
 

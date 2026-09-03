@@ -78,8 +78,10 @@ let rows_of db sql =
   | Error e -> Alcotest.failf "query %S: %a" sql Db.pp_error e
   | Ok stream ->
     (match run (Lwt_stream.to_list stream) with
-     | rows -> List.sort compare (List.map (fun r -> Array.to_list (Array.map render r)) rows)
-     | exception e -> Alcotest.failf "query %S raised during drain: %s" sql (Printexc.to_string e))
+     | rows ->
+       List.sort compare (List.map (fun r -> Array.to_list (Array.map render r)) rows)
+     | exception e ->
+       Alcotest.failf "query %S raised during drain: %s" sql (Printexc.to_string e))
 ;;
 
 let check_rows ~label expected actual =
