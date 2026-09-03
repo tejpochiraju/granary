@@ -7775,12 +7775,19 @@ let execute_drop_table
       ~(_indexes : Cat.index_info list)
   : unit Lwt.t
   =
-  with_ddl_txn store cat mode (fun tx ->
-    let name = table_meta.Cat.name in
-    (* #283: [Cat.drop_table] self-registers the cache undo for the table and each
-       dependent index (via [Schema_cache.remove_table]/[remove_index]), so no
-       external snapshot+undo is needed here. *)
-    Cat.drop_table cat tx ~name)
+  let name = table_meta.Cat.name in
+  let* () =
+    with_ddl_txn store cat mode (fun tx ->
+      (* #283: [Cat.drop_table] self-registers the cache undo for the table and each
+         dependent index (via [Schema_cache.remove_table]/[remove_index]), so no
+         external snapshot+undo is needed here. *)
+      Cat.drop_table cat tx ~name)
+  in
+  (* #405: the table's rows are gone, so every cached result over [name] is
+     stale.  Marked AFTER the drop succeeds: a raising DROP marks nothing, which
+     matches [Db]'s [Error] arm discarding the accumulator. *)
+  mark_dirty name;
+  Lwt.return_unit
 ;;
 
 (** Run [Op_drop_index]: remove catalog entry for the index.
@@ -8832,6 +8839,29 @@ let alter_rename_table ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) new_nam
     Lwt.return 0
 ;;
 
+(* #405: which user table names an ALTER makes stale for a name-keyed external
+   read cache.  Every ALTER form this engine has changes the table's OBSERVABLE
+   contents, so all four mark:
+
+   - [DROP COLUMN] physically rewrites every stored row (see [alter_drop_column]);
+   - [ADD COLUMN] leaves the row bytes alone, but widens every row a reader sees,
+     so a cached [SELECT] result has the wrong arity - the same failure mode;
+   - [RENAME COLUMN] changes the names a result set is keyed by;
+   - [RENAME TABLE] invalidates the OLD name (queries against it now fail) AND
+     the new one (which now answers with rows it did not have before), so both
+     are marked.
+
+   The marks are deliberately over-approximate, like the rest of this
+   accumulator (#666): a superfluous invalidation costs one re-read, a missing
+   one serves a wrong answer from cache. *)
+let mark_alter_dirty ~(table_meta : Cat.table_meta) = function
+  | Ast.AA_rename_table new_name ->
+    mark_dirty table_meta.Cat.name;
+    mark_dirty new_name
+  | Ast.AA_add_column _ | Ast.AA_rename_column _ | Ast.AA_drop_column _ ->
+    mark_dirty table_meta.Cat.name
+;;
+
 (* Op_alter_table: dispatch on the ALTER action.
 
    #282: the ALTER mutators run through [with_ddl_txn], which supplies a single
@@ -8843,24 +8873,29 @@ let alter_rename_table ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) new_nam
 let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta) action
   : int Lwt.t
   =
-  with_ddl_txn store cat mode (fun tx ->
-    match action with
-    | Ast.AA_add_column col_def -> alter_add_column ~txn:tx cat ~table_meta col_def
-    | Ast.AA_rename_table new_name -> alter_rename_table ~txn:tx cat ~table_meta new_name
-    | Ast.AA_rename_column (old_col, new_col) ->
-      let* result =
-        Cat.rename_column ~txn:tx cat ~table_name:table_meta.Cat.name ~old_col ~new_col
-      in
-      (match result with
-       | Error msg -> Lwt.fail_with msg
-       | Ok () ->
-         (* #553: the rename rewrites the CHECK / GENERATED expression SQL of
-            this table, and those caches are keyed by that SQL text — a stale
-            entry would keep a compiled expression resolved against the old
-            column list.  Same reasoning as [alter_drop_column]. *)
-         clear_table_expr_caches table_meta.Cat.name;
-         Lwt.return 0)
-    | Ast.AA_drop_column col_name -> alter_drop_column tx cat ~table_meta col_name)
+  let* n =
+    with_ddl_txn store cat mode (fun tx ->
+      match action with
+      | Ast.AA_add_column col_def -> alter_add_column ~txn:tx cat ~table_meta col_def
+      | Ast.AA_rename_table new_name ->
+        alter_rename_table ~txn:tx cat ~table_meta new_name
+      | Ast.AA_rename_column (old_col, new_col) ->
+        let* result =
+          Cat.rename_column ~txn:tx cat ~table_name:table_meta.Cat.name ~old_col ~new_col
+        in
+        (match result with
+         | Error msg -> Lwt.fail_with msg
+         | Ok () ->
+           (* #553: the rename rewrites the CHECK / GENERATED expression SQL of
+              this table, and those caches are keyed by that SQL text — a stale
+              entry would keep a compiled expression resolved against the old
+              column list.  Same reasoning as [alter_drop_column]. *)
+           clear_table_expr_caches table_meta.Cat.name;
+           Lwt.return 0)
+      | Ast.AA_drop_column col_name -> alter_drop_column tx cat ~table_meta col_name)
+  in
+  mark_alter_dirty ~table_meta action;
+  Lwt.return n
 ;;
 
 (* Op_create_index: create the index unless IF NOT EXISTS finds it present. *)

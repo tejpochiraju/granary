@@ -588,22 +588,33 @@ val history_release : ?schema:string -> t -> unit
     @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
 val history_log : ?schema:string -> t -> Granary_store.History.record list Lwt.t
 
-(** #240: the set of user tables whose {e rows} a write statement actually
-    mutated, including tables touched indirectly by triggers and FK cascades.
-    Sorted and deduplicated; internal/system tables are excluded.  Enables an
-    external read cache to invalidate the tables whose row data changed.
+(** #240: the set of user tables whose {e observable contents} a statement
+    changed — including tables touched indirectly by triggers and FK cascades,
+    and (since #405) by row-rewriting or destructive DDL.  Sorted and
+    deduplicated; internal/system tables are excluded.  Enables an external read
+    cache to invalidate exactly the tables whose answers moved.
 
-    {b Scope: row-level DML only.}  This signal reports {!Db.execute}-style row
-    mutations (INSERT / UPDATE / DELETE, upserts, cascades, trigger bodies,
-    columnar and FTS writes).  It does {b not} report schema-changing or
-    destructive DDL — [DROP TABLE], and [ALTER TABLE] in all its forms
-    ([ADD]/[DROP]/[RENAME COLUMN], [RENAME TABLE]) — {e even when the DDL
-    physically rewrites every row} (e.g. [ALTER TABLE … DROP COLUMN], which
-    reshapes the stored rows).  Such a statement yields an {b empty} list here.
-    A consumer that caches query results MUST invalidate on schema changes
-    through a separate schema-version / fingerprint signal (cf. #174); an empty
-    result from a DDL statement therefore does {b not} imply the table's
-    observable contents are unchanged. *)
+    {b Reported.}
+
+    - Row-level DML: INSERT / UPDATE / DELETE, upserts, FK cascades, trigger
+      bodies, columnar and FTS writes, and [PRAGMA not_null_repair].
+    - [DROP TABLE] — marks the dropped table.
+    - [ALTER TABLE], in all four forms — [DROP COLUMN] (which physically
+      rewrites every stored row), [ADD COLUMN] (which leaves the bytes alone but
+      widens every row a reader sees, so a cached result has the wrong arity),
+      [RENAME COLUMN], and [RENAME TABLE] (which marks {e both} the old name and
+      the new one).
+
+    {b Not reported}, because no existing table's contents change: [CREATE
+    TABLE] and [CREATE VIRTUAL TABLE] (the new table is empty); [CREATE INDEX]
+    and [DROP INDEX] (query answers are identical — only plans differ); view
+    and trigger DDL; [VACUUM] (a physical rebuild that preserves every row);
+    [ATTACH] / [DETACH].
+
+    {b Over-approximate, deliberately.}  Like the rest of this accumulator the
+    marks are {e not} undone by a [ROLLBACK] (#666), so a rolled-back statement
+    may still report what it touched.  A superfluous invalidation costs one
+    re-read; a missing one serves a wrong answer from cache. *)
 type dirty_tables = string list
 
 (** #417 Phase 0: one row-level mutation in the delta feed.  [rowid] is the row's
@@ -626,15 +637,18 @@ type row_change = Granary_sql.Exec.row_change =
 
 (** #417: the per-table row-level deltas a write statement produced — [(table,
     changes)] pairs sorted by table name, each table's changes in application
-    order.  Same name/scope rules as {!dirty_tables}: user tables only, internal
-    [sqlite_…] objects excluded, DDL out of band. *)
+    order.  Same name/scope rules as {!dirty_tables} for user tables and internal
+    [sqlite_…] objects, but this feed carries {e row} deltas only: DDL is
+    reported by {e name} through {!dirty_tables} (#405) and contributes no
+    entries here. *)
 type table_changes = (string * row_change list) list
 
 (** Like {!execute}, but also returns the {!dirty_tables} the statement mutated.
     The list is empty for a no-op write (e.g. [INSERT OR IGNORE] that inserts
-    nothing) and for {e all} DDL (including row-rewriting DDL such as [ALTER
-    TABLE … DROP COLUMN] and [DROP TABLE]) — see the {!dirty_tables} scope note;
-    DDL invalidation is out of band. *)
+    nothing) and for DDL that leaves every existing table's contents alone
+    ([CREATE TABLE], [CREATE INDEX] / [DROP INDEX], view and trigger DDL); it is
+    {e non}-empty for [DROP TABLE] and every [ALTER TABLE] form.  See the
+    {!dirty_tables} scope note for the exact split. *)
 val execute_with_dirty : t -> string -> (dirty_tables, error) result Lwt.t
 
 (** Like {!execute_change_count}, but also returns the {!dirty_tables} the
@@ -646,8 +660,9 @@ val execute_change_count_with_dirty
 
 (** #417: like {!execute_with_dirty}, but returns the row-level {!table_changes}
     delta feed (rowid + old/new rows) instead of just the table names — the input
-    an incremental view-maintenance layer consumes.  Empty for no-op writes and
-    DDL, same as {!execute_with_dirty}.
+    an incremental view-maintenance layer consumes.  Empty for no-op writes, and
+    empty for DDL — which {!execute_with_dirty} reports by name (#405) but which
+    produces no row-level deltas.
 
     {b Phase 0 coverage.}  The feed covers ordinary rowid-table DML: INSERT,
     UPDATE, DELETE, REPLACE (delete-old + insert-new), UPSERT [DO UPDATE], and

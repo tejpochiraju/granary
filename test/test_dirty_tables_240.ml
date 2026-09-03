@@ -1,7 +1,11 @@
-(** #240: the set of user tables a write statement actually mutated, exposed via
+(** #240: the set of user tables a statement actually mutated, exposed via
     {!Db.execute_with_dirty}.  The load-bearing property for an external read
     cache is completeness under FK cascades and triggers: a write to one table
-    that silently mutates another (inside the engine) reports BOTH. *)
+    that silently mutates another (inside the engine) reports BOTH.
+
+    #405 extends that to DDL that changes a table's observable contents -
+    [DROP TABLE] and every [ALTER TABLE] form - and pins the DDL that does not
+    (index, view and trigger DDL) as still reporting nothing. *)
 
 module Db = Granary.Db
 
@@ -56,24 +60,121 @@ let test_ddl_is_empty () =
     check_dirty "create table dirties nothing" [] (dirty db "CREATE TABLE t (x INTEGER)"))
 ;;
 
-(* #240 / PR #404 review: the signal is row-level DML only.  Schema-changing and
-   destructive DDL reports an EMPTY set — even [ALTER TABLE … DROP COLUMN], which
-   physically rewrites every stored row.  camel invalidates schema changes out of
-   band (a schema-version / fingerprint signal, cf. #174).  These tests pin that
-   boundary so the [] contract can't silently regress into "row-neutral". *)
-let test_alter_drop_column_is_empty () =
+(* #405: index DDL changes no table's observable contents - the same rows come
+   back, only the plan differs - so it stays out of the signal even though
+   CREATE INDEX writes a whole B-tree. *)
+let test_index_ddl_is_empty () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    check_dirty "create index dirties nothing" [] (dirty db "CREATE INDEX ix ON t (b)");
+    check_dirty "drop index dirties nothing" [] (dirty db "DROP INDEX ix"))
+;;
+
+(* #405: a DROP that drops nothing marks nothing. *)
+let test_drop_table_if_exists_missing_is_empty () =
+  with_db (fun db ->
+    check_dirty "drop if exists no-op" [] (dirty db "DROP TABLE IF EXISTS nope"))
+;;
+
+(* #405: view and trigger DDL touch no table's rows. *)
+let test_view_and_trigger_ddl_is_empty () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY)";
+    exec db "CREATE TABLE u (a INTEGER PRIMARY KEY)";
+    check_dirty "create view" [] (dirty db "CREATE VIEW v AS SELECT a FROM t");
+    check_dirty "drop view" [] (dirty db "DROP VIEW v");
+    check_dirty
+      "create trigger"
+      []
+      (dirty
+         db
+         "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO u VALUES (NEW.a); END");
+    check_dirty "drop trigger" [] (dirty db "DROP TRIGGER t_ai"))
+;;
+
+(* #405: DDL that changes a table's OBSERVABLE contents is in scope.  It used to
+   report [] - the #240 signal was row-level DML only - so a name-keyed external
+   cache kept serving rows of the wrong shape after [ALTER TABLE ... DROP
+   COLUMN], and kept serving a dropped table's rows entirely.  These tests pin
+   the four ALTER forms plus DROP TABLE; the [] cases above pin the DDL that
+   really does leave every table's answers alone. *)
+let test_alter_drop_column_marks () =
   with_db (fun db ->
     exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c TEXT)";
     exec db "INSERT INTO t VALUES (1, 'x', 'y')";
-    (* DROP COLUMN drains + re-puts every row (reshaped), yet is out of scope. *)
-    check_dirty "drop column reports nothing" [] (dirty db "ALTER TABLE t DROP COLUMN c"))
+    (* DROP COLUMN drains + re-puts every row, reshaped: the stored bytes move. *)
+    check_dirty "drop column marks" [ "t" ] (dirty db "ALTER TABLE t DROP COLUMN c"))
 ;;
 
-let test_drop_table_is_empty () =
+(* ADD COLUMN writes no row, but every row a reader sees gains a cell, so a
+   cached result has the wrong arity - the same failure mode as DROP COLUMN. *)
+let test_alter_add_column_marks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    check_dirty "add column marks" [ "t" ] (dirty db "ALTER TABLE t ADD COLUMN c TEXT"))
+;;
+
+let test_alter_rename_column_marks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    check_dirty
+      "rename column marks"
+      [ "t" ]
+      (dirty db "ALTER TABLE t RENAME COLUMN b TO b2"))
+;;
+
+(* RENAME TABLE marks BOTH names: the old one stops answering, the new one
+   starts answering with rows it did not have before. *)
+let test_alter_rename_table_marks_both () =
   with_db (fun db ->
     exec db "CREATE TABLE t (a INTEGER PRIMARY KEY)";
     exec db "INSERT INTO t VALUES (1)";
-    check_dirty "drop table reports nothing" [] (dirty db "DROP TABLE t"))
+    check_dirty
+      "rename table marks old and new"
+      [ "t"; "t2" ]
+      (dirty db "ALTER TABLE t RENAME TO t2"))
+;;
+
+let test_drop_table_marks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO t VALUES (1)";
+    check_dirty "drop table marks" [ "t" ] (dirty db "DROP TABLE t"))
+;;
+
+(* #405: [DROP REACTIVE VIEW] runs an internal [DROP TABLE _rv_<name>] inside the
+   caller's accumulator, so the materialisation's own name now appears.  That is
+   the pre-existing shape, not new noise: [CREATE REACTIVE VIEW] populates the
+   same table through the ordinary insert path and has always reported it.  The
+   two spellings agreeing is the property worth pinning - a cache holding rows
+   of [_rv_rv] is told when the view is created and when it is dropped. *)
+let test_reactive_view_ddl_marks_materialisation () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO t VALUES (1)";
+    check_dirty
+      "create reactive view marks its materialisation"
+      [ "_rv_rv" ]
+      (dirty db "CREATE REACTIVE VIEW rv AS SELECT a FROM t");
+    check_dirty
+      "drop reactive view marks the same name"
+      [ "_rv_rv" ]
+      (dirty db "DROP REACTIVE VIEW rv"))
+;;
+
+(* #405 x #417: the DDL marks are NAMES only.  The row-level delta feed carries
+   no entry for a DDL statement - it describes rowid-keyed row mutations, and a
+   dropped or reshaped table is not one - so a consumer of both must invalidate
+   from the name set, not conclude "no deltas, nothing changed". *)
+let test_ddl_marks_name_but_emits_no_row_changes () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    let changes = unwrap (run (Db.execute_with_changes db "DROP TABLE t")) in
+    Alcotest.(check int) "no row-level deltas for DDL" 0 (List.length changes))
 ;;
 
 let test_update_hit_and_miss () =
@@ -322,12 +423,37 @@ let () =
         ; Alcotest.test_case "run_with_dirty" `Quick test_run_with_dirty
         ; Alcotest.test_case "error propagates" `Quick test_error_propagates
         ] )
-    ; ( "ddl boundary (out of scope)"
-      , [ Alcotest.test_case
-            "alter drop column empty"
+    ; ( "ddl out of scope (#405)"
+      , [ Alcotest.test_case "index ddl empty" `Quick test_index_ddl_is_empty
+        ; Alcotest.test_case
+            "drop-if-exists no-op empty"
             `Quick
-            test_alter_drop_column_is_empty
-        ; Alcotest.test_case "drop table empty" `Quick test_drop_table_is_empty
+            test_drop_table_if_exists_missing_is_empty
+        ; Alcotest.test_case
+            "view/trigger ddl empty"
+            `Quick
+            test_view_and_trigger_ddl_is_empty
+        ] )
+    ; ( "ddl in scope (#405)"
+      , [ Alcotest.test_case "alter drop column marks" `Quick test_alter_drop_column_marks
+        ; Alcotest.test_case "alter add column marks" `Quick test_alter_add_column_marks
+        ; Alcotest.test_case
+            "alter rename column marks"
+            `Quick
+            test_alter_rename_column_marks
+        ; Alcotest.test_case
+            "alter rename table marks both"
+            `Quick
+            test_alter_rename_table_marks_both
+        ; Alcotest.test_case "drop table marks" `Quick test_drop_table_marks
+        ; Alcotest.test_case
+            "reactive-view ddl marks materialisation"
+            `Quick
+            test_reactive_view_ddl_marks_materialisation
+        ; Alcotest.test_case
+            "ddl emits no row-level deltas"
+            `Quick
+            test_ddl_marks_name_but_emits_no_row_changes
         ] )
     ; ( "cascades"
       , [ Alcotest.test_case "on delete cascade" `Quick test_on_delete_cascade

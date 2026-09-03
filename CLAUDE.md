@@ -1899,6 +1899,51 @@ EOF
   of resyncing fails 4 — including the raising-AFTER-trigger case, which is the
   one that decides between the two fixes.
 
+- **The #240 name set covers DDL that changes a table's observable contents
+  (#405, decided 2026-09-03).** It used to be row-level DML only, so
+  `execute_with_dirty` answered `[]` for `DROP TABLE` and for every `ALTER
+  TABLE` form — including `DROP COLUMN`, which physically re-`put`s every row.
+  A name-keyed external cache went on serving a dropped table's rows, and rows
+  of the wrong arity after a column was added or dropped. The `db.mli` wording
+  ("pure-DDL … the list is empty") was the second half of the defect: it
+  implied `DROP COLUMN` was row-neutral, which it is not.
+
+  Marked: `DROP TABLE` (the table's name), and all four `ALTER TABLE` forms —
+  `DROP COLUMN`, `ADD COLUMN`, `RENAME COLUMN`, and `RENAME TABLE`, which marks
+  **both** the old name (it stops answering) and the new one (it starts
+  answering with rows it did not have before). `ADD COLUMN` writes no row byte
+  and is marked anyway: every row a reader sees gains a cell, so a cached
+  result has the wrong arity — the same failure mode as `DROP COLUMN`, reached
+  through the catalog instead of the tree.
+
+  **Not** marked, because no existing table's answers move: `CREATE TABLE` /
+  `CREATE VIRTUAL TABLE` (the new table is empty); `CREATE INDEX` / `DROP
+  INDEX` (a whole B-tree is written or discarded, but every query returns the
+  same rows — only the plan differs); view and trigger DDL; `VACUUM` (a
+  physical rebuild that preserves every row, and which anyway kills every
+  sibling handle, #634); `ATTACH` / `DETACH` (the signal carries bare names
+  with no schema qualification, so it could not express the change).
+
+  Two properties this rests on. The marks are taken **after** the DDL succeeds,
+  so a raising `ALTER` marks nothing — which agrees with `Db`'s `Error` arm
+  discarding the accumulator. And they are **names only**: `mark_dirty` does
+  not touch the #417 delta log, so `execute_with_changes` still reports no
+  row-level deltas for DDL, and a reactive view's `rv_absorb_changes` (which
+  reads `dirty_changes`, not `dirty_elements`) cannot pick up a phantom row
+  from a `DROP TABLE`. A consumer of both must invalidate from the name set;
+  "no deltas" does not mean "nothing changed". Pinned by the two new
+  `ddl in scope (#405)` / `ddl out of scope (#405)` groups in
+  `test/test_dirty_tables_240.ml`, which replace the two tests that asserted
+  the opposite.
+
+  One knock-on worth knowing: `DROP REACTIVE VIEW v` runs an internal
+  `DROP TABLE _rv_v` inside the caller's accumulator, so the materialisation's
+  own name now appears in the dirty list. That is not new noise — `CREATE
+  REACTIVE VIEW` populates `_rv_v` through the ordinary insert path and has
+  always reported it — and the two spellings now agreeing is pinned by
+  `reactive-view ddl marks materialisation`. The `rv_flush` path is unaffected:
+  it installs its own accumulator (`Db.rv_flush`), which shields the caller's.
+
 - A column's `not_null` no longer records *why* it is set — declared or implied by a primary key — because #530 folded both into the one stored bit. Anything that removes a key therefore cannot restore the column's original nullability: `ALTER TABLE ... DROP COLUMN` on a composite-PK member clears `primary_key` on the survivors but deliberately leaves `not_null`, since the engine is still enforcing it. Two bits (or an origin tag) is the fix if this ever needs to be exact — not cleverness at the ALTER sites.
 
 ### A failing autocheckpoint is surfaced, never raised (#638)
