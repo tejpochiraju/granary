@@ -2215,6 +2215,18 @@
  (modules test_negative_zero_754)
  (libraries granary alcotest lwt.unix))
 
+; #755: a cross-numeric FOREIGN KEY reference is missed when the child column
+; is indexed, so RESTRICT (and, per the cascade-path audit, SET NULL / SET
+; DEFAULT / CASCADE) orphans or skips a row that [=] says is still referenced.
+; Same defect family as #743/#738, fixed the same way: the indexed seek routes
+; through [Exec.index_lookup_values] with the child column's declared type.
+; In-memory: pure comparator/planner behaviour.
+
+(test
+ (name test_fk_cross_numeric_755)
+ (modules test_fk_cross_numeric_755)
+ (libraries granary alcotest qcheck-core qcheck-alcotest lwt.unix))
+
 ; #416: the RO tree-root memo must never serve a root from a different
 ; committed generation (commits, DDL, rollback, as-of/live alternation), and
 ; the Op_project fusion into a rowid point lookup must project exactly what

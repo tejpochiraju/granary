@@ -3808,49 +3808,61 @@ let fk_child_has_ref_multi_in_tx
       ~col_idxs:child_col_idxs
   with
   | Some idx when not (List.exists (fun v -> v = Row.V_null) parent_vals) ->
-    let ivs = List.map row_value_to_index_value parent_vals in
-    let prefix, plen = encode_index_key_prefix ivs in
-    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    (* O(log n) native seek; stop at the first non-matching prefix (#228/#229). *)
-    let* cur = S.seek_ge tx idx.Cat.idx_tree_id seek_key in
-    let found = ref false in
-    let exhausted = ref false in
-    let rec walk () =
-      if !found || !exhausted
-      then Lwt.return_unit
-      else (
-        match%lwt S.seek_next cur with
-        | None ->
-          exhausted := true;
-          Lwt.return_unit
-        | Some (ikey, _ival) ->
-          if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-          then (
-            let rowid = decode_index_key_rowid ikey in
-            let child_tree_id, _, _, _ = Cat.row_storage child_meta in
-            let* row_opt = S.get tx child_tree_id (Rowid.encode rowid) in
-            match row_opt with
-            | None -> walk ()
-            | Some vbytes ->
-              let row = decode_with_virtual None [||] child_meta vbytes in
-              let ok =
-                List.for_all2
-                  (fun ci pv -> compare_values row.(ci) pv = 0)
-                  child_col_idxs
-                  parent_vals
-              in
-              if ok
-              then (
-                found := true;
-                Lwt.return_unit)
-              else walk ())
-          else (
-            exhausted := true;
-            Lwt.return_unit))
+    (* #755: seek the index through {!index_lookup_values}'s exact
+       cross-numeric translation, keyed by the CHILD column's declared type
+       — the same rule {!nlj_probe_values} uses for a join probe (#743).
+       [None] means no key of the child column's type can equal [parent_vals],
+       which is the honest "no child row can reference this" answer, not a
+       reason to widen into the full scan below. *)
+    let child_tys =
+      List.map (fun ci -> (List.nth child_meta.Cat.columns ci).Row.ty) child_col_idxs
     in
-    let* () = walk () in
-    S.seek_close cur;
-    Lwt.return !found
+    (match index_lookup_values (List.combine parent_vals child_tys) with
+     | None -> Lwt.return false
+     | Some iks ->
+       let prefix, plen = encode_index_key_prefix iks in
+       let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+       (* O(log n) native seek; stop at the first non-matching prefix (#228/#229). *)
+       let* cur = S.seek_ge tx idx.Cat.idx_tree_id seek_key in
+       let found = ref false in
+       let exhausted = ref false in
+       let rec walk () =
+         if !found || !exhausted
+         then Lwt.return_unit
+         else (
+           match%lwt S.seek_next cur with
+           | None ->
+             exhausted := true;
+             Lwt.return_unit
+           | Some (ikey, _ival) ->
+             if
+               Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+             then (
+               let rowid = decode_index_key_rowid ikey in
+               let child_tree_id, _, _, _ = Cat.row_storage child_meta in
+               let* row_opt = S.get tx child_tree_id (Rowid.encode rowid) in
+               match row_opt with
+               | None -> walk ()
+               | Some vbytes ->
+                 let row = decode_with_virtual None [||] child_meta vbytes in
+                 let ok =
+                   List.for_all2
+                     (fun ci pv -> compare_values row.(ci) pv = 0)
+                     child_col_idxs
+                     parent_vals
+                 in
+                 if ok
+                 then (
+                   found := true;
+                   Lwt.return_unit)
+                 else walk ())
+             else (
+               exhausted := true;
+               Lwt.return_unit))
+       in
+       let* () = walk () in
+       S.seek_close cur;
+       Lwt.return !found)
   | _ ->
     full_scan_exists tx child_meta (fun row ->
       List.for_all2
@@ -5836,46 +5848,56 @@ let scan_child_rows_multi_tx
       ~col_idxs:child_col_idxs
   with
   | Some idx when not (List.exists (fun v -> v = Row.V_null) parent_vals) ->
-    let ivs = List.map row_value_to_index_value parent_vals in
-    let prefix, plen = encode_index_key_prefix ivs in
-    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    (* O(log n) native seek; scan only the matching prefix range (#228/#229). *)
-    let* cur = S.seek_ge tx idx.Cat.idx_tree_id seek_key in
-    let buf = ref [] in
-    let exhausted = ref false in
-    let rec walk () =
-      if !exhausted
-      then Lwt.return_unit
-      else (
-        match%lwt S.seek_next cur with
-        | None ->
-          exhausted := true;
-          Lwt.return_unit
-        | Some (ikey, _ival) ->
-          if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-          then (
-            let rowid = decode_index_key_rowid ikey in
-            let child_tree_id_fk, _, _, _ = Cat.row_storage child_meta in
-            let* row_opt = S.get tx child_tree_id_fk (Rowid.encode rowid) in
-            match row_opt with
-            | None -> walk ()
-            | Some vbytes ->
-              let row = decode_with_virtual None [||] child_meta vbytes in
-              let all_match =
-                List.for_all2
-                  (fun ci pv -> compare_values row.(ci) pv = 0)
-                  child_col_idxs
-                  parent_vals
-              in
-              if all_match then buf := (rowid, row) :: !buf;
-              walk ())
-          else (
-            exhausted := true;
-            Lwt.return_unit))
+    (* #755: same fix as {!fk_child_has_ref_multi_in_tx} — this scan backs
+       the immediate RESTRICT check AND the CASCADE / SET NULL / SET DEFAULT
+       actions, so a byte-exact seek here silently skipped cascading a
+       cross-numeric-equal child row, not just RESTRICT's existence check. *)
+    let child_tys =
+      List.map (fun ci -> (List.nth child_meta.Cat.columns ci).Row.ty) child_col_idxs
     in
-    let* () = walk () in
-    S.seek_close cur;
-    Lwt.return (List.rev !buf)
+    (match index_lookup_values (List.combine parent_vals child_tys) with
+     | None -> Lwt.return []
+     | Some iks ->
+       let prefix, plen = encode_index_key_prefix iks in
+       let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+       (* O(log n) native seek; scan only the matching prefix range (#228/#229). *)
+       let* cur = S.seek_ge tx idx.Cat.idx_tree_id seek_key in
+       let buf = ref [] in
+       let exhausted = ref false in
+       let rec walk () =
+         if !exhausted
+         then Lwt.return_unit
+         else (
+           match%lwt S.seek_next cur with
+           | None ->
+             exhausted := true;
+             Lwt.return_unit
+           | Some (ikey, _ival) ->
+             if
+               Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+             then (
+               let rowid = decode_index_key_rowid ikey in
+               let child_tree_id_fk, _, _, _ = Cat.row_storage child_meta in
+               let* row_opt = S.get tx child_tree_id_fk (Rowid.encode rowid) in
+               match row_opt with
+               | None -> walk ()
+               | Some vbytes ->
+                 let row = decode_with_virtual None [||] child_meta vbytes in
+                 let all_match =
+                   List.for_all2
+                     (fun ci pv -> compare_values row.(ci) pv = 0)
+                     child_col_idxs
+                     parent_vals
+                 in
+                 if all_match then buf := (rowid, row) :: !buf;
+                 walk ())
+             else (
+               exhausted := true;
+               Lwt.return_unit))
+       in
+       let* () = walk () in
+       S.seek_close cur;
+       Lwt.return (List.rev !buf))
   | _ ->
     full_scan_collect tx child_meta (fun row ->
       List.for_all2
