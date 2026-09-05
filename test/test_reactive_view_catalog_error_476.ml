@@ -16,7 +16,16 @@
     pages to the main file at COMMIT, so arming [write_page] fails the
     autocommit that [borrow_or_autocommit] opens for the catalog write. The
     non-WAL commit path releases the writer lock from an [Lwt.finalize] handler,
-    so an armed failure leaves the store usable rather than deadlocked. *)
+    so an armed failure leaves the store usable rather than deadlocked.
+
+    #757 review finding, reusing this file's fault-injection harness: a failed
+    [CREATE REACTIVE VIEW] used to leave a GHOST registry entry —
+    [rv_create]'s [register] closure inserted into [top.reactive_views] before
+    [Cat.persist_reactive_view] ran, so [Db.is_reactive_view] /
+    [Db.reactive_view_generation] / [Db.register_view_callback] all answered
+    as though a durably-nonexistent view existed, and a retry hit a bogus
+    "already exists". [a_failed_create_leaves_no_ghost_entry] pins the fix:
+    the registry gains an entry only after the persist succeeds. *)
 
 open Lwt.Syntax
 module S = Granary_store.Store
@@ -180,6 +189,58 @@ let drop_reactive_view_reports_a_store_fault_as_error () =
      Lwt.return_unit)
 ;;
 
+(* #757 review finding: [rv_create]'s [register] closure used to insert the
+   new [rv_entry] into [top.reactive_views] BEFORE
+   [Cat.persist_reactive_view] ran, so a faulted persist left a GHOST entry —
+   [Db.execute] reports [Error] as though the CREATE never happened, but
+   [Db.is_reactive_view] / [Db.reactive_view_generation] /
+   [Db.register_view_callback] all read [top.reactive_views] directly and
+   would have gone on answering as though the view durably existed, and a
+   retried CREATE would then fail with "already exists" over nothing
+   durable. The fix reorders [register] to persist first and only touch the
+   registry on [Ok]. *)
+let a_failed_create_leaves_no_ghost_entry () =
+  Lwt_main.run
+    (let fail = ref false in
+     let* store = open_or_fail ~fail () in
+     let* db = Db.of_store store in
+     let* () = exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT)" in
+     fail := true;
+     let* r =
+       Db.execute
+         db
+         "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp"
+     in
+     (match r with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "CREATE REACTIVE VIEW reported success on a dead device");
+     Alcotest.(check bool)
+       "the view is NOT live after the failed create"
+       false
+       (Db.is_reactive_view db "cnt");
+     Alcotest.(check (option int))
+       "no ghost generation for the never-durably-created view"
+       None
+       (Db.reactive_view_generation db "cnt");
+     (match Db.register_view_callback db ~view_name:"cnt" (fun _ -> Lwt.return_unit) with
+      | Error (`Unknown_view _) -> ()
+      | Ok _ ->
+        Alcotest.fail "register_view_callback attached to a view that isn't durable");
+     (* The device recovers; a retry must succeed rather than hit a bogus
+        "already exists" over a ghost in-memory entry. *)
+     fail := false;
+     let* r2 =
+       Db.execute
+         db
+         "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp"
+     in
+     (match r2 with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "the retried CREATE should succeed: %a" Db.pp_error e);
+     Alcotest.(check bool) "and now it is live" true (Db.is_reactive_view db "cnt");
+     Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "reactive view catalog error contract (#476)"
@@ -193,6 +254,10 @@ let () =
             "DROP REACTIVE VIEW reports a store fault as Error"
             `Quick
             drop_reactive_view_reports_a_store_fault_as_error
+        ; Alcotest.test_case
+            "#757: a failed CREATE leaves no ghost registry entry"
+            `Quick
+            a_failed_create_leaves_no_ghost_entry
         ] )
     ]
 ;;

@@ -51,6 +51,32 @@ type rowid_counters = (tree_id, int64) Hashtbl.t
     to forget (#633). *)
 val rowid_counters : t -> rowid_counters
 
+(** #757: per-reactive-view-name generation identity, shared by every
+    [Db.t]/catalog handle opened over this store — the same rationale as
+    {!rowid_counters}: a reactive view's registry entry is reconstructed
+    independently by each handle (a fresh top-level open, or a worker handle
+    from {!Store} sharing this store via [Db.create_worker_handle]), and two
+    independent reconstructions of the SAME live incarnation of a view must
+    agree on its identity, or a sibling handle would see a view it never
+    dropped or recreated as a fresh incarnation.  Keyed by view name; the
+    value is the generation most recently minted for that name's current live
+    incarnation.  Not persisted — like {!rowid_counters}, this is process-local
+    bookkeeping a fresh handle either finds already populated (a sibling got
+    there first) or populates itself (the first handle over this store to see
+    this name). *)
+type rv_generations = (string, int) Hashtbl.t
+
+(** This store's reactive-view generation map.  Every [Db.t] opened over the
+    same store gets this same table — mirrors {!rowid_counters} above. *)
+val rv_generations : t -> rv_generations
+
+(** #757: mint a fresh generation, unique for the lifetime of this store and
+    never reused, even across drops and recreates of any reactive view name.
+    Shared by every handle over this store the same way {!rowid_counters} is,
+    so two sibling handles can never mint colliding values — whether for the
+    same name or different ones. *)
+val rv_next_generation : t -> int
+
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
 type error =

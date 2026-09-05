@@ -391,9 +391,18 @@ type backend =
    construction instead of by remembering to pass an argument. *)
 type rowid_counters = (tree_id, int64) Hashtbl.t
 
+(* #757: see the [.mli] doc comment on [rv_generations] — mirrors
+   [rowid_counters]'s rationale one level up, for reactive-view identity
+   instead of rowid allocation. *)
+type rv_generations = (string, int) Hashtbl.t
+
 type t =
   { backend : backend
   ; rowid_counters : rowid_counters
+  ; rv_generations : rv_generations
+  ; mutable rv_gen_next : int
+    (** #757: the next value {!rv_next_generation} will hand out.  Never
+        reset, never decremented — see the [.mli] doc comment. *)
   ; lock : Rwlock.t
   ; (* #718: wait/hold accounting for [lock], attributed by acquisition site.
        Lives on [t] rather than on [bt_state] because [lock] does: the Mem
@@ -501,6 +510,14 @@ let geometry t =
 (* #633: the one accessor.  Handing the table out rather than wrapping it keeps
    the catalog's [patch]/[publish] hot path a plain [Hashtbl] lookup. *)
 let rowid_counters t = t.rowid_counters
+
+(* #757: same shape as [rowid_counters] above, for reactive-view identity. *)
+let rv_generations t = t.rv_generations
+
+let rv_next_generation t =
+  t.rv_gen_next <- t.rv_gen_next + 1;
+  t.rv_gen_next
+;;
 
 type ro_snapshot =
   { rs_store : t
@@ -829,6 +846,8 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 let create () : t =
   { backend = Mem (Hashtbl.create 16)
   ; rowid_counters = Hashtbl.create 16
+  ; rv_generations = Hashtbl.create 4
+  ; rv_gen_next = 0
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -913,6 +932,8 @@ let make_btree_store
   in
   { backend = Btree st
   ; rowid_counters = Hashtbl.create 16
+  ; rv_generations = Hashtbl.create 4
+  ; rv_gen_next = 0
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None

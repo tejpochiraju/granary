@@ -41,26 +41,36 @@ type rv_entry =
         placeholder schema; on the first non-empty refresh the [_rv_…] table is
         re-created with column types inferred from the data. *)
   ; rv_generation : int
-    (** #757: minted fresh — from the process-global {!rv_gen_seq} counter,
-        never reset — every time a name gets a new registry entry, whether
-        that is a first-ever [CREATE REACTIVE VIEW] or a recreate after
-        [DROP REACTIVE VIEW] freed the name.  A caller that captured the
-        generation at registration time (see {!register_view_callback}) can
-        later compare it against {!reactive_view_generation} to tell "this is
-        still the view I attached to" from "this name got dropped and
-        recreated out from under me" — the liveness accessors
-        ({!reactive_view_names}, {!is_reactive_view}) answer only the former
-        question and say "alive" for the new incarnation too.
+    (** #757: identifies which incarnation of [rv_name] this registry entry
+        is.  A caller that captured the generation at registration time (see
+        {!register_view_callback}) can later compare it against
+        {!reactive_view_generation} to tell "this is still the view I attached
+        to" from "this name got dropped and recreated out from under me" —
+        the liveness accessors ({!reactive_view_names}, {!is_reactive_view})
+        answer only the former question and say "alive" for the new
+        incarnation too.
 
-        Drawing from one never-reset process-global counter, rather than e.g.
-        resetting to 0/1 on every fresh entry, is what makes distinctness hold
-        for THIS name across its whole lifetime regardless of how many OTHER
-        views are created and dropped in between: a per-name counter reset on
-        every create could coincide for two different incarnations of the same
-        name if other views' churn wasn't tracked precisely, and a shared
-        counter that resets makes no such promise at all.  A single
-        never-decreasing global sequence sidesteps both failure modes for
-        free — the same trick {!rv_cb_seq} already uses for callback ids. *)
+        Minted from {!Store.rv_next_generation} / recorded into
+        {!Store.rv_generations} — the STORE, not a counter local to this
+        module — because [top.reactive_views] itself is reconstructed
+        independently by every {!t} sharing one store (a fresh top-level
+        open, or a worker handle from {!create_worker_handle}).  A
+        module-local counter would mint a different value per handle for the
+        very same live incarnation, which defeats the guarantee: see
+        {!rv_mint_generation} / {!rv_generation_for_load} for the two ways an
+        entry acquires this field, and their doc comment for why one always
+        advances the counter and the other reuses whatever the store already
+        recorded.  One never-decreasing, store-wide sequence — rather than
+        e.g. resetting to 0/1 on every fresh entry — is what makes
+        distinctness hold for THIS name across its whole lifetime regardless
+        of how many OTHER views are created and dropped in between, and
+        regardless of how many handles are doing the creating and dropping:
+        a per-name counter reset on every create could coincide for two
+        different incarnations of the same name if other views' churn wasn't
+        tracked precisely, and a shared counter that resets makes no such
+        promise at all.  The same trick {!rv_cb_seq} already uses for
+        callback ids, one level up from a single module to the store every
+        [Db.t] over it shares. *)
   ; mutable rv_callbacks : (int * (Sql.Exec.row_change list -> unit Lwt.t)) list
     (** #746: held NEWEST-FIRST so {!register_view_callback} is O(1) — it used
         to be [rv_callbacks <- rv_callbacks @ [ cb ]], which copies the whole
@@ -4166,16 +4176,39 @@ let rv_group_col_ty top base group_ord =
   | None -> "TEXT"
 ;;
 
-(* #757: one process-global, never-reset counter minting [rv_generation]
-   values — the same pattern as [rv_cb_seq] below, for the same reason: a
-   single shared sequence guarantees every fresh registry entry for a given
-   name gets a value strictly greater than any this name has ever had before,
-   without needing to track that name's own history separately. *)
-let rv_gen_seq = ref 0
+(* #757: [rv_generation] values are minted from the STORE, not from a
+   [Db.ml]-local counter — [Store.rv_next_generation] / [Store.rv_generations]
+   — because the registry that [rv_generation] lives in ([top.reactive_views])
+   is reconstructed independently by every [Db.t] handle over one store (a
+   fresh top-level open, or a worker handle from [Db.create_worker_handle]).
+   A per-process, per-[Db.ml]-module counter would mint a DIFFERENT value for
+   the same live incarnation of a view in each handle's independent
+   reconstruction, which defeats the whole guarantee: a worker handle spawned
+   after a sibling already created view [v] would report a fresh generation
+   for [v] even though neither handle ever dropped or recreated it. Owning
+   the counter AND the name -> current-generation map on the store is what
+   makes every handle over that store agree, exactly the same reasoning
+   [Store.rowid_counters] already established for the rowid allocator
+   (#589/#633).
 
-let rv_next_generation () =
-  incr rv_gen_seq;
-  !rv_gen_seq
+   [rv_mint_generation] is for a genuine (re)create: it always advances the
+   counter and overwrites the store's record for [name], because a CREATE
+   really is a brand new incarnation regardless of what the map currently
+   says. [rv_generation_for_load] is for reconstructing an ALREADY-KNOWN
+   incarnation from persisted catalog state (this handle's own [rv_load] at
+   open, or a sibling's) — it reuses whatever generation the store already
+   has recorded for [name], and only mints a fresh one the first time any
+   handle over this store has ever loaded [name]. *)
+let rv_mint_generation store name =
+  let g = S.rv_next_generation store in
+  Hashtbl.replace (S.rv_generations store) name g;
+  g
+;;
+
+let rv_generation_for_load store name =
+  match Hashtbl.find_opt (S.rv_generations store) name with
+  | Some g -> g
+  | None -> rv_mint_generation store name
 ;;
 
 let rv_create top ~sql ~name query refresh =
@@ -4209,24 +4242,35 @@ let rv_create top ~sql ~name query refresh =
     | Ok choice ->
       rv_guard top (fun () ->
         let register ~provisional mode out_cols =
-          let entry =
-            { rv_name = name
-            ; rv_query = query
-            ; rv_base_tables = base_tables
-            ; rv_out_cols = out_cols
-            ; rv_mode = mode
-            ; rv_provisional = provisional
-            ; rv_generation = rv_next_generation ()
-            ; rv_callbacks = []
-            }
-          in
-          Hashtbl.replace top.reactive_views name entry;
+          (* #757: persist BEFORE the registry gains an entry, not after.
+             Before this, [Hashtbl.replace top.reactive_views name entry] ran
+             first and a subsequent [Cat.persist_reactive_view] failure left a
+             ghost entry behind: [Db.execute] reports [Error] as if the
+             CREATE never happened, but [reactive_view_generation] and
+             [register_view_callback] both read [top.reactive_views] and would
+             have gone on answering as though the view durably existed — and a
+             retried CREATE would then fail with "already exists" over
+             nothing durable.  Ordering it the other way means a faulted
+             persist leaves NOTHING in the registry to be stale. *)
           (* #476: the catalog write reports a store fault as [Error msg]; lift
              it into [Db]'s own error type rather than letting it raise. *)
           let* pr = Cat.persist_reactive_view top.store ~name ~sql in
           match pr with
           | Error msg -> Lwt.return (Error (Runtime msg))
-          | Ok () -> Lwt.return (Ok ())
+          | Ok () ->
+            let entry =
+              { rv_name = name
+              ; rv_query = query
+              ; rv_base_tables = base_tables
+              ; rv_out_cols = out_cols
+              ; rv_mode = mode
+              ; rv_provisional = provisional
+              ; rv_generation = rv_mint_generation top.store name
+              ; rv_callbacks = []
+              }
+            in
+            Hashtbl.replace top.reactive_views name entry;
+            Lwt.return (Ok ())
         in
         match choice with
         | `Delta (group_ord, measure) ->
@@ -4446,6 +4490,14 @@ let rv_drop top ~name ~if_exists =
     | Ok () when not live -> Lwt.return (Ok ())
     | Ok () ->
       Hashtbl.remove top.reactive_views name;
+      (* #757: also forget the store-wide generation record for [name].  Not
+         load-bearing for correctness — a subsequent CREATE always mints a
+         fresh generation via [rv_mint_generation] regardless of what this map
+         says — but it keeps the map from answering for a name no handle
+         should currently find live, and it means a hypothetical future load
+         path can never resurrect a dropped view's old identity by consulting
+         this table. *)
+      Hashtbl.remove (S.rv_generations top.store) name;
       (* Forget pending base-table deltas no remaining view depends on.
          Currently dead code: in autocommit [rv_flush_inner]'s finalizer empties
          [rv_pending] after every statement, so it can only ever accumulate
@@ -4505,7 +4557,7 @@ let rv_load top =
                  ; rv_out_cols = out_cols
                  ; rv_mode = mode
                  ; rv_provisional = false
-                 ; rv_generation = rv_next_generation ()
+                 ; rv_generation = rv_generation_for_load top.store name
                  ; rv_callbacks = []
                  };
                Lwt.return_unit

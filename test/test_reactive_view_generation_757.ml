@@ -13,8 +13,8 @@
     handle registered against the old [v] has no signal that it should
     re-register.
 
-    [Db.reactive_view_generation] closes that gap: it is minted fresh from a
-    process-global, never-reset counter every time a name gets a new registry
+    [Db.reactive_view_generation] closes that gap: it is minted from a
+    store-wide, never-reset counter every time a name gets a new registry
     entry, so two different incarnations of the same name never compare equal
     even though every liveness query says "alive" throughout.
 
@@ -32,7 +32,27 @@
       [reactive_view_generation] reports immediately after;
     - a QCheck property: for any sequence of create/drop operations on one
       view name interspersed with creates/drops of OTHER names, the sequence
-      of generations observed for the target name is strictly increasing. *)
+      of generations observed for the target name is strictly increasing;
+    - {b review finding, fixed}: a worker handle produced by
+      [Db.create_worker_handle] over the SAME store reconstructs its own copy
+      of a view's registry entry independently ([Db.of_store]'s [rv_load]
+      runs again), which used to mint a BRAND NEW generation for a view the
+      worker never dropped or recreated — falsely signalling churn that never
+      happened. The generation is now minted from a counter and a
+      name→generation map that live on the underlying store
+      ([Granary_store.Store.rv_next_generation] /
+      [Granary_store.Store.rv_generations]), not on [Db.t], so a worker
+      handle created after the parent already has a view live reuses the
+      SAME generation the parent recorded. Pinned below by creating the view
+      on a parent handle, then deriving a worker and checking both
+      [reactive_view_generation] and [register_view_callback]'s returned
+      generation agree with the parent's.
+
+    A companion fault-injection test for the OTHER review finding — a failed
+    [CREATE REACTIVE VIEW] used to leave a ghost registry entry with a live
+    generation when the durable [persist_reactive_view] write failed — lives
+    in [test_reactive_view_catalog_error_476.ml], which already has the
+    store-fault-injection harness this needs. *)
 
 module Db = Granary.Db
 
@@ -178,6 +198,47 @@ let register_returns_the_generation_the_accessor_reports () =
     | None -> Alcotest.fail "v must still be live immediately after registering")
 ;;
 
+(* Review finding on PR #761: [Db.create_worker_handle] derives a second
+   [Db.t] over the SAME underlying store, and that derivation reconstructs
+   the reactive-view registry independently ([Db.of_store]'s [rv_load] runs
+   again for the worker). Before the fix, [rv_load] always minted a NEW
+   generation via a [Db.ml]-local counter, so a worker handle created after
+   the parent already had view [v] live would report a DIFFERENT generation
+   for [v] than the parent — a false "dropped and recreated" signal for a
+   view that was never touched. The fix moved the counter (and a
+   name -> current-generation map) onto the underlying store, shared by
+   construction between every handle over it, so a worker's independently
+   rebuilt registry entry for an unchanged view agrees with every sibling's. *)
+let worker_handle_over_the_same_store_reuses_the_parents_generation () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT)";
+    create_view db "v";
+    let g_parent =
+      match Db.reactive_view_generation db "v" with
+      | Some g -> g
+      | None -> Alcotest.fail "v should be live on the parent handle"
+    in
+    let worker = run (Db.create_worker_handle db) in
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close worker) with
+        | _ -> ())
+      (fun () ->
+         (match Db.reactive_view_generation worker "v" with
+          | Some g_worker ->
+            Alcotest.(check int)
+              "a worker handle spawned after v's CREATE reuses the parent's generation \
+               rather than minting a fresh one from its own independent rv_load"
+              g_parent
+              g_worker
+          | None -> Alcotest.fail "v should be visible to the worker handle too");
+         let _h, g_registered = attach worker ~view_name:"v" (fun _ -> Lwt.return_unit) in
+         Alcotest.(check int)
+           "register_view_callback on the worker reports that same shared generation"
+           g_parent
+           g_registered))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* QCheck property: interleaved churn on the target name and on OTHER names
    must never let two incarnations of the target collide, and the target's own
@@ -289,6 +350,12 @@ let () =
             `Quick
             repeated_cycles_never_repeat_a_generation
         ; QCheck_alcotest.to_alcotest target_generation_sequence_is_strictly_increasing
+        ] )
+    ; ( "shared across sibling handles over one store"
+      , [ Alcotest.test_case
+            "a worker handle reuses the parent's generation"
+            `Quick
+            worker_handle_over_the_same_store_reuses_the_parents_generation
         ] )
     ]
 ;;
