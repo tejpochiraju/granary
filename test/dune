@@ -2172,7 +2172,13 @@
 (test
  (name test_row_hooks_752)
  (modules test_row_hooks_752)
- (libraries granary alcotest qcheck-core qcheck-alcotest lwt.unix))
+ (libraries
+  granary
+  granary.store
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix))
 
 ; #750: a compound-root CREATE REACTIVE VIEW is refused. base_tables_of
 ; answered [] for an S_compound root, so the view registered with no base

@@ -44,10 +44,14 @@ type row_mutation = S.row_mutation =
   }
 
 (* #752: the opaque handle {!register_row_hook} returns and
-   {!unregister_row_hook} consumes.  Carries the (table, timing, event) key
-   it was registered under, so removal never needs — and can never get wrong —
-   a second copy of that key from the caller, plus the {!Store.row_hook_id}
-   {!Store.row_hook_register} minted for it. *)
+   {!unregister_row_hook} consumes.  Carries the {!Store.row_hook_id}
+   {!Store.row_hook_register} minted for it, which is what
+   {!unregister_row_hook} actually resolves by (#752 review round 4: through
+   the registry's own reverse index, not by re-deriving the (table, timing,
+   event) key). [rh_table]/[rh_timing]/[rh_event] are kept only as the
+   registration-time key {!pp_row_hook} displays for logging — after a
+   RENAME they no longer necessarily describe where the hook currently fires,
+   since removal does not depend on them being current. *)
 type row_hook =
   { rh_table : string
   ; rh_timing : [ `Before | `After ]
@@ -159,19 +163,15 @@ type t =
         {!create_worker_handle} is what an application that wants concurrent
         explicit transactions should use today. *)
   ; views : (string, Sql.Ast.stmt) Hashtbl.t
-  ; triggers : (string, Sql.Ast.stmt) Hashtbl.t (* trigger_name -> S_create_trigger AST *)
-  ; mutable row_hook_depth : int
-    (** #752 (review round 3): recursion depth for a row hook's own nested DML
-        re-entering {!execute}/{!execute_change_count} on this same [t] —
-        mirrors {!trigger_depth} / {!max_trigger_depth} below, so a hook that
-        (directly or via a chain of other hooks/triggers) re-triggers itself
-        fails cleanly instead of exhausting the OCaml call stack.  Deliberately
-        NOT shared with [trigger_depth]: the two guards are independent, so a
-        row hook and a SQL trigger can each nest up to their own limit in the
-        same call chain without one starving the other's budget. The actual
-        row-hook registry lives on {!Store.row_hooks} — shared by every
-        [Db.t] over this store (#589/#633) — not here; nothing table-keyed
-        remains on [t] itself. *)
+  ; triggers : (string, Sql.Ast.stmt) Hashtbl.t
+    (* trigger_name -> S_create_trigger AST *)
+    (* #752 (review round 4): the row-hook registry AND its recursion-depth
+     counter both live on {!Store.row_hooks} — shared by every [Db.t] over
+     this store (#589/#633) — rather than here.  The depth counter moved off
+     [t] in round 4: a per-handle counter let recursion alternating between
+     [create_worker_handle] siblings nest well past the intended cap before
+     either handle's own copy noticed. Nothing table-keyed or hook-related
+     remains on [t] itself. *)
   ; mutable savepoint_names : string list (* active savepoints, newest first *)
   ; mutable auto_began : bool (* txn started implicitly by SAVEPOINT *)
   ; mutable last_changes : int (** rows affected by the last DML statement *)
@@ -478,7 +478,6 @@ let open_in_memory ?clock () =
     ; txn_poisoned = false
     ; views = Hashtbl.create 4
     ; triggers = Hashtbl.create 4
-    ; row_hook_depth = 0
     ; savepoint_names = []
     ; auto_began = false
     ; last_changes = 0
@@ -572,7 +571,6 @@ let of_store ?clock ?durability ?file_path ?cohort store =
     ; txn_poisoned = false
     ; views
     ; triggers
-    ; row_hook_depth = 0
     ; savepoint_names = []
     ; auto_began = false
     ; last_changes = 0
@@ -1601,8 +1599,10 @@ let max_trigger_depth = 32
 
 (** #752 (review round 3, item 4): maximum OCaml row-hook recursion depth —
     same bound as {!max_trigger_depth}, tracked on an independent counter
-    ({!t.row_hook_depth}) so a row hook and a SQL trigger nesting into each
-    other in one call chain each get their own full budget. *)
+    ({!Store.row_hook_depth}, shared store-wide since round 4 so a chain
+    alternating between {!create_worker_handle} siblings is still bounded)
+    so a row hook and a SQL trigger nesting into each other in one call
+    chain each get their own full budget. *)
 let max_row_hook_depth = 32
 
 (** Compile and execute one pre-substituted trigger body statement within the
@@ -1791,15 +1791,22 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
     | `Before -> "before"
     | `After -> "after"
   in
-  (* #752 review (round 3, item 4): mirrors {!fire_trigger_stmt}'s
-     [max_trigger_depth] guard, on its own independent counter — a row hook
-     whose own nested DML (directly, or via a chain of other hooks/triggers)
-     re-enters this same hook fails cleanly with a bounded message instead of
-     exhausting the OCaml call stack.  Deliberately a SEPARATE counter from
-     [trigger_depth]: a row hook and a SQL trigger nesting into each other in
-     one call chain each get their own full budget rather than sharing one,
-     so neither kind's legitimate recursion is starved by the other's. *)
-  if t.row_hook_depth >= max_row_hook_depth
+  (* #752 review (round 3, item 4; round 4: moved to the STORE): mirrors
+     {!fire_trigger_stmt}'s [max_trigger_depth] guard, on its own independent
+     counter — a row hook whose own nested DML (directly, or via a chain of
+     other hooks/triggers) re-enters this same hook fails cleanly with a
+     bounded message instead of exhausting the OCaml call stack.
+     Deliberately a SEPARATE counter from [trigger_depth]: a row hook and a
+     SQL trigger nesting into each other in one call chain each get their own
+     full budget rather than sharing one, so neither kind's legitimate
+     recursion is starved by the other's. The counter itself lives on
+     {!Store.row_hooks} rather than on [t] (round 4): the nested DML re-firing
+     this hook may run through a DIFFERENT [Db.t] sharing this store
+     ({!create_worker_handle}), and it is still the SAME logical recursion, so
+     a per-handle counter would let a chain alternating handles nest well past
+     the cap before either handle's own copy noticed. *)
+  let reg = S.row_hooks t.store in
+  if S.row_hook_depth reg >= max_row_hook_depth
   then
     Lwt.fail_with
       (Printf.sprintf
@@ -1808,7 +1815,7 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
          table_name
          max_row_hook_depth)
   else (
-    t.row_hook_depth <- t.row_hook_depth + 1;
+    S.row_hook_depth_incr reg;
     Lwt.finalize
       (fun () ->
          Lwt.catch
@@ -1829,7 +1836,7 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
                     table_name
                     (Printexc.to_string exn))))
       (fun () ->
-         t.row_hook_depth <- t.row_hook_depth - 1;
+         S.row_hook_depth_decr reg;
          Lwt.return_unit))
 
 and make_combined_hook t table_meta ~timing ~event =
@@ -4980,10 +4987,13 @@ let register_row_hook t ~table ~timing ~event fn =
        SQL statement stream, so it does not automatically share in a
        rolled-back transaction's undo the way DDL does.  Registering through
        the SAME #269 schema-undo stack the DROP/RENAME paths use is what
-       makes a same-transaction [RENAME] compose correctly with this: undo
-       closures run most-recent-first, so a rename registered AFTER this call
-       unwinds BEFORE this one, restoring the (table, timing, event) key
-       before this closure's lookup runs (#752 review round 2). *)
+       makes a same-transaction [RENAME] compose correctly with this.
+       [S.row_hook_unregister] resolves by [id] alone (#752 review round 4),
+       through the registry's own reverse index, so it finds and removes [id]
+       regardless of which (table, timing, event) key a RENAME registered
+       either before or after this call has since moved it to — no LIFO
+       ordering between this undo and a rename's is needed for correctness
+       any more. *)
     (match t.explicit_txn with
      | None -> ()
      | Some _ ->
@@ -4991,21 +5001,12 @@ let register_row_hook t ~table ~timing ~event fn =
          (* Discards the returned re-undo closure: once this fires the
             enclosing transaction is already being rolled back, so there is
             nothing further to protect this removal against. *)
-         ignore
-           (S.row_hook_unregister (S.row_hooks t.store) ~table ~timing ~event id
-            : unit -> unit)));
+         ignore (S.row_hook_unregister (S.row_hooks t.store) id : unit -> unit)));
     Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id }
 ;;
 
 let unregister_row_hook t h =
-  let undo =
-    S.row_hook_unregister
-      (S.row_hooks t.store)
-      ~table:h.rh_table
-      ~timing:h.rh_timing
-      ~event:h.rh_event
-      h.rh_id
-  in
+  let undo = S.row_hook_unregister (S.row_hooks t.store) h.rh_id in
   (* #752 review (round 3, item 3): mirrors {!register_row_hook}'s own
      transactional undo — an unregister issued mid-transaction must be
      reversible by that transaction's ROLLBACK, or [BEGIN;

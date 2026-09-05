@@ -33,6 +33,7 @@
 
 module Db = Granary.Db
 module Row = Granary_encoding.Row
+module Store = Granary_store.Store
 
 let run = Lwt_main.run
 
@@ -404,6 +405,32 @@ let test_rename_table_migrates_its_hooks () =
       Alcotest.fail "expected exactly one Insert mutation reported under the new name")
 ;;
 
+(* Round-4 review #1: unregister_row_hook must still detach the hook after a
+   RENAME has ALREADY COMMITTED -- not just survive a rolled-back one. The
+   handle's rh_table was captured as "t" at registration time; the registry
+   entry now lives under "t2". Resolving removal by identity (not by
+   re-deriving the captured table name) is what makes this work: a stale
+   rh_table must not leave the hook permanently undetachable, which for a
+   `Before hook is an undetachable veto. *)
+let test_unregister_after_a_committed_rename_still_detaches_the_hook () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let fired = ref 0 in
+    let h =
+      attach db ~table:"t" ~timing:`After ~event:`Insert (ok_hook (fun _ -> incr fired))
+    in
+    (* Autocommit: this RENAME is durable before the next statement runs. *)
+    exec db "ALTER TABLE t RENAME TO t2";
+    exec db "INSERT INTO t2 VALUES (1, 10)";
+    Alcotest.(check int) "fires under the new name before unregister" 1 !fired;
+    Db.unregister_row_hook db h;
+    exec db "INSERT INTO t2 VALUES (2, 20)";
+    Alcotest.(check int)
+      "unregister (by identity) detaches it even after a committed rename"
+      1
+      !fired)
+;;
+
 (* #1c: a hook registered while a CREATE TABLE is in flight must not survive
    that transaction's ROLLBACK -- otherwise a LATER, unrelated CREATE TABLE
    of the same name silently reattaches it. *)
@@ -633,6 +660,54 @@ let test_row_hook_self_recursion_is_bounded () =
     exec db "ROLLBACK")
 ;;
 
+(* Round-4 review: the recursion-depth counter must be SHARED across every
+   Db.t handle over one store, not per-handle -- otherwise a chain that
+   alternates handles (create_worker_handle siblings) could nest well past
+   the intended cap before either handle's own copy noticed.
+   Db.of_store, called twice over the SAME manually-created Store.t, gives
+   two sibling handles the same way create_worker_handle does, but also
+   hands back the raw Store.t so the test can pre-load
+   Store.row_hook_depth directly -- simulating recursion already attributed
+   to "the other handle" -- without needing genuine nested DML across two
+   handles, which cannot be constructed without deadlocking: a second
+   handle's autocommit INSERT would try to begin a fresh write transaction
+   while the first handle's is still open on the very same store. *)
+let test_row_hook_recursion_limit_is_shared_across_sibling_handles () =
+  let store = Store.create () in
+  let a = run (Db.of_store store) in
+  let b = run (Db.of_store store) in
+  Fun.protect
+    ~finally:(fun () ->
+      (try run (Db.close a) with
+       | _ -> ());
+      try run (Db.close b) with
+      | _ -> ())
+    (fun () ->
+       exec a "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+       let reg = Store.row_hooks store in
+       let fired = ref 0 in
+       let _h =
+         attach
+           a
+           ~table:"t"
+           ~timing:`Before
+           ~event:`Insert
+           (ok_hook (fun _ -> incr fired))
+       in
+       (* Simulate max_row_hook_depth levels of recursion already attributed
+          to a DIFFERENT handle (b) sharing this store. If the guard were
+          per-handle, a's own fresh counter would read 0 here and this
+          INSERT would succeed instead of hitting the limit. *)
+       for _ = 1 to 32 do
+         Store.row_hook_depth_incr reg
+       done;
+       exec_error a ~needle:"recursion limit" "INSERT INTO t VALUES (1)";
+       Alcotest.(check int) "the hook never got to run" 0 !fired;
+       for _ = 1 to 32 do
+         Store.row_hook_depth_decr reg
+       done)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Transactional unregister (review round 3, item 3)                     *)
 (* ------------------------------------------------------------------ *)
@@ -838,6 +913,10 @@ let () =
             "a sibling worker handle's RENAME migrates the other handle's hook"
             `Quick
             test_worker_handle_sibling_rename_migrates_the_others_hook
+        ; Alcotest.test_case
+            "unregister after a committed rename still detaches the hook"
+            `Quick
+            test_unregister_after_a_committed_rename_still_detaches_the_hook
         ] )
     ; ( "exception normalisation"
       , [ Alcotest.test_case
@@ -850,6 +929,10 @@ let () =
             "self-recursion is bounded"
             `Quick
             test_row_hook_self_recursion_is_bounded
+        ; Alcotest.test_case
+            "the recursion limit is shared across sibling handles"
+            `Quick
+            test_row_hook_recursion_limit_is_shared_across_sibling_handles
         ] )
     ; ( "transactional unregister"
       , [ Alcotest.test_case

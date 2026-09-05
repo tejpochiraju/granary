@@ -424,7 +424,28 @@ type row_hook_fn = row_mutation -> (unit, string) result Lwt.t
 
 type row_hooks =
   { row_hook_tbl : (row_hook_key, (row_hook_id * row_hook_fn) list) Hashtbl.t
+  ; row_hook_index : (row_hook_id, row_hook_key) Hashtbl.t
+    (** #752 (review round 4): the CURRENT (table, timing, event) key for
+        every live id, maintained alongside [row_hook_tbl] by every function
+        that inserts, removes, or moves an entry.  Without this,
+        [Db.unregister_row_hook] would have to trust a [row_hook] handle's
+        table name as captured AT REGISTRATION TIME — which
+        [row_hooks_migrate_table] can silently invalidate by moving the entry
+        to a new key, leaving the handle's captured name stale and the
+        unregister call finding nothing to remove under it (a [`Before] hook
+        with veto power that a caller can no longer detach). Resolving by
+        [row_hook_id] alone through this index instead means a rename can
+        never desynchronise a handle from the registry entry it names. *)
   ; mutable row_hook_next_id : int
+  ; mutable row_hook_depth : int
+    (** #752 (review round 4): nested row-hook-firing depth, shared by every
+        [Db.t] over this store — same rationale as everything else on
+        [row_hooks]. It must live here rather than on [Db.t]: a hook's nested
+        DML re-entering the hook path through a DIFFERENT handle sharing this
+        store ({!Db.create_worker_handle}, #589/#633) still nests the SAME
+        logical recursion, and a per-handle counter would let a chain that
+        alternates handles nest past the cap before either handle's own
+        counter noticed. *)
   }
 
 type t =
@@ -565,27 +586,45 @@ let rv_carry_over_generations ~from ~to_ =
    a raw [Hashtbl] — the "hardened primitive" the round-3 review asked for. *)
 let row_hooks t = t.row_hooks
 
+(* Record [id]'s current key in the reverse index for every entry in [lst]. *)
+let index_entries (reg : row_hooks) key lst =
+  List.iter (fun (id, _) -> Hashtbl.replace reg.row_hook_index id key) lst
+;;
+
 let row_hook_register (reg : row_hooks) ~table ~timing ~event fn =
   reg.row_hook_next_id <- reg.row_hook_next_id + 1;
   let id = reg.row_hook_next_id in
   let key = table, timing, event in
   let existing = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
   Hashtbl.replace reg.row_hook_tbl key ((id, fn) :: existing);
+  Hashtbl.replace reg.row_hook_index id key;
   id
 ;;
 
-let row_hook_unregister (reg : row_hooks) ~table ~timing ~event id =
-  let key = table, timing, event in
-  match Hashtbl.find_opt reg.row_hook_tbl key with
+(* #752 (review round 4): resolves by [id] alone through {!row_hook_index}
+   rather than trusting a caller-supplied (table, timing, event) — the round-3
+   design took the key as an argument, which a [Db.row_hook] handle captured
+   at registration time and {!row_hooks_migrate_table} could silently
+   invalidate by moving the entry to a new key, leaving
+   [Db.unregister_row_hook] unable to find (and therefore detach) a hook it
+   still holds a handle for. *)
+let row_hook_unregister (reg : row_hooks) id =
+  match Hashtbl.find_opt reg.row_hook_index id with
   | None -> fun () -> ()
-  | Some snapshot ->
+  | Some key ->
+    Hashtbl.remove reg.row_hook_index id;
+    let snapshot = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
     (match List.filter (fun (i, _) -> i <> id) snapshot with
      | [] -> Hashtbl.remove reg.row_hook_tbl key
      | kept -> Hashtbl.replace reg.row_hook_tbl key kept);
     (* Exact snapshot-and-restore, mirroring {!row_hooks_purge_table} at a
        single-key granularity: idempotent because replaying it re-sets the
-       SAME fixed value rather than re-deriving one from current state. *)
-    fun () -> Hashtbl.replace reg.row_hook_tbl key snapshot
+       SAME fixed value rather than re-deriving one from current state — the
+       index entry is restored alongside the list entry so a SECOND undo
+       replay (or a later lookup) still resolves [id] correctly. *)
+    fun () ->
+      Hashtbl.replace reg.row_hook_tbl key snapshot;
+      Hashtbl.replace reg.row_hook_index id key
 ;;
 
 let row_hook_fire_list (reg : row_hooks) ~table ~timing ~event =
@@ -614,10 +653,16 @@ let row_hooks_purge_table (reg : row_hooks) name =
          Option.map (fun entries -> key, entries) (Hashtbl.find_opt reg.row_hook_tbl key))
       all_row_hook_timings_events
   in
-  List.iter (fun (key, _) -> Hashtbl.remove reg.row_hook_tbl key) snapshot;
+  List.iter
+    (fun (key, entries) ->
+       Hashtbl.remove reg.row_hook_tbl key;
+       List.iter (fun (id, _) -> Hashtbl.remove reg.row_hook_index id) entries)
+    snapshot;
   fun () ->
     List.iter
-      (fun (key, entries) -> Hashtbl.replace reg.row_hook_tbl key entries)
+      (fun (key, entries) ->
+         Hashtbl.replace reg.row_hook_tbl key entries;
+         index_entries reg key entries)
       snapshot
 ;;
 
@@ -627,7 +672,9 @@ let move_row_hook_key (reg : row_hooks) ~old_name ~new_name (timing, event) =
   | None -> ()
   | Some entries ->
     Hashtbl.remove reg.row_hook_tbl old_key;
-    Hashtbl.replace reg.row_hook_tbl (new_name, timing, event) entries
+    let new_key = new_name, timing, event in
+    Hashtbl.replace reg.row_hook_tbl new_key entries;
+    index_entries reg new_key entries
 ;;
 
 let row_hooks_migrate_table (reg : row_hooks) ~old_name ~new_name =
@@ -645,9 +692,18 @@ let row_hooks_carry_over ~from ~to_ =
   Hashtbl.iter
     (fun key entries -> Hashtbl.replace to_.row_hooks.row_hook_tbl key entries)
     from.row_hooks.row_hook_tbl;
+  Hashtbl.iter
+    (fun id key -> Hashtbl.replace to_.row_hooks.row_hook_index id key)
+    from.row_hooks.row_hook_index;
   if from.row_hooks.row_hook_next_id > to_.row_hooks.row_hook_next_id
   then to_.row_hooks.row_hook_next_id <- from.row_hooks.row_hook_next_id
 ;;
+
+(* #752 (review round 4): see the [.mli] doc comment on [row_hooks]'s
+   [row_hook_depth] field for the rationale (store-wide, not per-[Db.t]). *)
+let row_hook_depth (reg : row_hooks) = reg.row_hook_depth
+let row_hook_depth_incr (reg : row_hooks) = reg.row_hook_depth <- reg.row_hook_depth + 1
+let row_hook_depth_decr (reg : row_hooks) = reg.row_hook_depth <- reg.row_hook_depth - 1
 
 type ro_snapshot =
   { rs_store : t
@@ -978,7 +1034,12 @@ let create () : t =
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
-  ; row_hooks = { row_hook_tbl = Hashtbl.create 4; row_hook_next_id = 0 }
+  ; row_hooks =
+      { row_hook_tbl = Hashtbl.create 4
+      ; row_hook_index = Hashtbl.create 4
+      ; row_hook_next_id = 0
+      ; row_hook_depth = 0
+      }
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -1065,7 +1126,12 @@ let make_btree_store
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
-  ; row_hooks = { row_hook_tbl = Hashtbl.create 4; row_hook_next_id = 0 }
+  ; row_hooks =
+      { row_hook_tbl = Hashtbl.create 4
+      ; row_hook_index = Hashtbl.create 4
+      ; row_hook_next_id = 0
+      ; row_hook_depth = 0
+      }
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None

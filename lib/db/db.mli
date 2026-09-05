@@ -1004,18 +1004,28 @@ type row_mutation =
 
 (** #752: an opaque handle for one registered OCaml row-mutation hook,
     returned by {!register_row_hook} and consumed by {!unregister_row_hook}.
-    Mirrors {!view_callback} (#746/#437): it carries the (table, timing,
-    event) key it was registered under, so there is no way to present it
-    together with a mismatched key at removal time, and its id is minted from
-    a counter shared by every {!t} over the same store
-    ({!Granary_store.Store.row_hooks}, #752 review round 3 — see
-    {!register_row_hook}'s doc comment), so a handle presented to a {!t} over
-    a DIFFERENT store matches nothing rather than removing an unrelated hook. *)
+    Its id is minted from a counter shared by every {!t} over the same store
+    ({!Granary_store.Store.row_hooks}, #752 review round 3), so a handle
+    presented to a {!t} over a DIFFERENT store matches nothing rather than
+    removing an unrelated hook.
+
+    {b Removal resolves by id alone, not by the (table, timing, event) key
+    (#752 review round 4).} An earlier revision of this feature had
+    {!unregister_row_hook} re-derive that key from the handle's fields to
+    look the hook up — which a RENAME could silently invalidate: the
+    handle's captured table name would no longer match where the entry
+    actually lives, and the unregister call would find nothing to remove
+    (an undetachable hook, which for a [`Before] hook is an undetachable
+    veto). The handle's [table]/[timing]/[event] are kept only for
+    {!pp_row_hook}'s display; after a RENAME they describe where the hook
+    was {e registered}, not necessarily where it fires now. *)
 type row_hook
 
-(** Render a handle as [table:timing:event#id] (e.g. [orders:before:insert#3]).
-    For logging and test failure messages; the id is an opaque serial number
-    with no meaning beyond identity. *)
+(** Render a handle as [table:timing:event#id] (e.g. [orders:before:insert#3]),
+    using the fields captured at registration time. For logging and test
+    failure messages; the id is an opaque serial number with no meaning
+    beyond identity, and — per {!row_hook}'s doc comment — is what removal
+    actually uses, not the displayed table/timing/event. *)
 val pp_row_hook : Format.formatter -> row_hook -> unit
 
 (** #752: register [fn] to run on every [event] mutation of [table] at
@@ -1172,13 +1182,18 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
 
     {b A row hook's own nested DML re-entering this same hook is bounded,
     like SQL trigger recursion (#752 review round 3, item 4).} If [fn] itself
-    performs DML (via {!execute}/{!execute_change_count} on this same [t])
-    that re-triggers the same or another row hook, the nesting is capped at
-    the same depth {!Db}'s SQL-trigger recursion guard uses, on an
-    independent counter — so a self-recursing hook fails cleanly with a
-    bounded "recursion limit exceeded" message instead of exhausting the
-    OCaml call stack. A row hook and a SQL trigger nesting into each other in
-    one call chain each get their own full budget rather than sharing one.
+    performs DML (via {!execute}/{!execute_change_count} on this same [t], OR
+    on a {!create_worker_handle} sibling sharing this store — see below) that
+    re-triggers the same or another row hook, the nesting is capped at the
+    same depth {!Db}'s SQL-trigger recursion guard uses, on an independent
+    counter — so a self-recursing hook fails cleanly with a bounded
+    "recursion limit exceeded" message instead of exhausting the OCaml call
+    stack. A row hook and a SQL trigger nesting into each other in one call
+    chain each get their own full budget rather than sharing one. {b The
+    counter is store-wide, not per-handle (#752 review round 4)}: nested DML
+    that re-enters the hook path through a DIFFERENT handle over the same
+    store is still counted as the same recursion, so a chain that alternates
+    handles cannot nest past the cap by splitting its frames across them.
 
     {b A hook that raises is treated exactly like one that returns [Error]
     (#752 review).} [fn]'s documented failure path is [Error msg], but a hook
@@ -1208,12 +1223,16 @@ val register_row_hook
 (** #752: detach the row hook [h] names — for every handle sharing [h]'s
     store (#752 review round 3): the removal acts on
     {!Granary_store.Store.row_hooks}, so a sibling handle stops seeing [h]
-    fire too. Idempotent and never raises: calling it a second time, on a
-    hook whose table no longer has any hooks registered, or on a handle
-    minted over a DIFFERENT store, is simply a no-op — unlike
-    {!unregister_view_callback} this reports no [bool], since a row hook has
-    no analogous "mid-flush" caller who needs to know whether its own
-    removal request was the one that mattered.
+    fire too, {b and stays correct across a RENAME of the table [h] was
+    registered on} (#752 review round 4) — resolved by [h]'s id through the
+    registry's own reverse index rather than by re-deriving the table name
+    [h] captured at registration, which a RENAME can move the entry away
+    from. Idempotent and never raises: calling it a second time, on a hook
+    that is no longer registered anywhere, or on a handle minted over a
+    DIFFERENT store, is simply a no-op — unlike {!unregister_view_callback}
+    this reports no [bool], since a row hook has no analogous "mid-flush"
+    caller who needs to know whether its own removal request was the one
+    that mattered.
 
     {b Undone by an enclosing transaction's ROLLBACK, symmetrically with
     {!register_row_hook} (#752 review round 3, item 3).} Calling this inside

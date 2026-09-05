@@ -171,26 +171,30 @@ val row_hook_register
   -> (row_mutation -> (unit, string) result Lwt.t)
   -> row_hook_id
 
-(** Detach the hook [id] registered on (table, timing, event), and return a
-    closure that reverses exactly that detachment — the same "perform, return
-    the undo" shape as {!row_hooks_purge_table}/{!row_hooks_migrate_table},
-    for the same reason (#752 review round 3, item 3): [Db.unregister_row_hook]
-    needs it so [BEGIN; unregister_row_hook h; ROLLBACK] does not leave [h]
-    permanently detached, and a caller with no transaction to protect against
-    (an unregister that is itself undoing a registration, say) simply
-    discards it. Idempotent: a second call to either the outer function or
-    its returned closure, or an [id] not currently registered under this
-    exact key, is a no-op. Drops the (table, timing, event) key from the
-    registry entirely once its last hook is removed (rather than leaving it
-    mapped to [[]]), so {!row_hooks_is_empty} correctly returns to [true]. *)
-val row_hook_unregister
-  :  row_hooks
-  -> table:string
-  -> timing:row_hook_timing
-  -> event:row_hook_event
-  -> row_hook_id
-  -> unit
-  -> unit
+(** Detach the hook [id], and return a closure that reverses exactly that
+    detachment — the same "perform, return the undo" shape as
+    {!row_hooks_purge_table}/{!row_hooks_migrate_table}, for the same reason
+    (#752 review round 3, item 3): [Db.unregister_row_hook] needs it so
+    [BEGIN; unregister_row_hook h; ROLLBACK] does not leave [h] permanently
+    detached, and a caller with no transaction to protect against (an
+    unregister that is itself undoing a registration, say) simply discards
+    it.
+
+    {b Resolved by [id] alone (#752 review round 4), not by a caller-supplied
+    (table, timing, event).} A [Db.row_hook] handle's table name is captured
+    at registration time; {!row_hooks_migrate_table} can silently move the
+    entry to a new key afterwards (a RENAME), and a caller unregistering by
+    the handle's now-stale name would find nothing to remove — an
+    undetachable hook, which for a [`Before] hook is an undetachable veto.
+    Looking [id] up through the registry's own reverse index instead means a
+    rename can never desynchronise a handle from the entry it names.
+
+    Idempotent: a second call to either the outer function or its returned
+    closure, or an [id] not currently registered anywhere, is a no-op. Drops
+    the (table, timing, event) key from the registry entirely once its last
+    hook is removed (rather than leaving it mapped to [[]]), so
+    {!row_hooks_is_empty} correctly returns to [true]. *)
+val row_hook_unregister : row_hooks -> row_hook_id -> unit -> unit
 
 (** The hooks registered on (table, timing, event), in registration order.
     [[]] if none are registered. *)
@@ -241,6 +245,23 @@ val row_hooks_migrate_table
     {!Db.vacuum}'s one call site, before the handle swaps onto the new store —
     the same point {!rv_carry_over_generations} is called from. *)
 val row_hooks_carry_over : from:t -> to_:t -> unit
+
+(** #752 (review round 4): current nested row-hook-firing depth, shared by
+    every [Db.t] over this store. [Db]'s recursion guard (mirroring its SQL
+    trigger recursion guard) reads this — not a per-handle counter — so that
+    a hook whose nested DML re-enters the hook path through a DIFFERENT
+    handle sharing this store ({!Db.create_worker_handle}) still counts
+    against the SAME budget: the recursion is one logical chain regardless of
+    which handle each frame happens to run through. *)
+val row_hook_depth : row_hooks -> int
+
+(** Increment {!row_hook_depth} by one — call before entering a row hook's
+    body. *)
+val row_hook_depth_incr : row_hooks -> unit
+
+(** Decrement {!row_hook_depth} by one — call (under [Lwt.finalize], so it
+    runs even if the body raised) after a row hook's body returns. *)
+val row_hook_depth_decr : row_hooks -> unit
 
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
