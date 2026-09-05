@@ -3406,3 +3406,93 @@ the fixed behaviour through the same `check_all_three` harness every other
 case in that file uses, rather than leaving a "known limitation" test
 standing once the limitation is gone.
 
+**Two gaps surfaced in PR review before merge, both on paths the original
+diff did not reach, and both are now closed.**
+
+1. **No format-version bump.** The original PR described this as "the same
+   call #578 made" but never actually MADE that call: `#578` bumped
+   `Header.current_format_version`/`min_supported_format_version` to v3
+   specifically so a pre-#578 file is refused at open time rather than
+   silently misdecoded, and this PR left the constant at `3l` with no
+   detection at all. Concretely: a database written pre-#754 with an indexed
+   `-0.0` has that row's key sitting under the OLD bytes; opening it with a
+   post-#754 binary and seeking `WHERE b = 0.0` builds the NEW bytes and
+   silently fails to find it — the very bug this issue exists to fix,
+   reintroduced for pre-existing data via the one channel (opening an old
+   file) the in-memory test suite never exercises. Fixed by bumping both
+   constants to `4l` in `lib/storage/header.ml`, with a new `v4` entry in the
+   file's own version-history comment explaining precisely why this
+   incompatibility is narrower than v3's (a v3 file's bytes still DECODE
+   correctly under v4 — only a `-0.0` row's SEEK reachability is affected —
+   but there is no way to tell without a full index scan whether a given file
+   has one, so the whole file is refused). Pinned by
+   `test_v3_format_rejected_by_v4` in `test/test_header.ml`, added alongside
+   the existing generic `test_obsolete_format_rejected` (which also now
+   covers this automatically, since it computes its bad version as
+   `min_supported_format_version - 1` rather than a literal) — the new test
+   pins the exact historical version number `3l` by name so the assertion
+   keeps meaning "a pre-#754 file" even through a future version bump.
+
+2. **The covering-index MIN/MAX fast path returned the wrong SIGN.**
+   `Exec.run_index_cover_walk` (#674's covering-index aggregate optimisation)
+   decodes MIN/MAX's value straight off the index key — that is the whole
+   point of the optimisation, to never fetch a table row — but #754's
+   encoder now makes a stored `-0.0` decode back as `+0.0` unconditionally
+   (the sign is genuinely gone from the key, the same loss #578 already
+   accepted for NaN's payload). So `CREATE INDEX i ON t(b); INSERT INTO t
+   VALUES (-0.0), (1.5); SELECT MIN(b) FROM t` returned `+0.0` through the
+   covering fast path while the identical query without a usable index — or
+   with the fast path forced off — correctly returned `-0.0`. This is
+   exactly the value-corruption failure mode this document's "why option 1
+   over option 2" section warned about ("a stored `-0.0` would become `0.0`
+   the moment it was written... observable through a covering read"); it
+   recurred anyway because that warning was about VALUE-ingress rewriting,
+   and this bug is a READ-path decode, a channel the original analysis did
+   not enumerate.
+
+   **Fixed by excluding REAL-typed columns from MIN/MAX's covering-index
+   eligibility gate** (`Exec.index_cover_minmax_ok`, in `lib/sql/exec.ml`),
+   rather than by fetching the winning row (which would restore correctness
+   but silently give up the `rows_examined = 0` guarantee `test_covering_
+   index_674.ml`'s `rows_examined_bound` suite pins for every eligible
+   shape) or by trying to recover the lost sign bit from the key (there is
+   nothing left to recover — the whole point of #754 is that the two bit
+   patterns are no longer distinguishable once encoded). A REAL MIN/MAX now
+   falls back to the general aggregate path, which fetches the actual row and
+   therefore the actual sign (`Row.encode`/`decode` still preserve it
+   bit-for-bit; only the INDEX KEY projection of a REAL loses it). INTEGER
+   and TEXT MIN/MAX, and every type's COUNT, are unaffected — COUNT never
+   reads the value, and no other type has a #754-shaped collapse. Pinned by
+   `agrees_with_negative_zero` (the exact repro, fast-path vs. forced-off
+   agreement, plus an explicit "`MIN(b)` is `-0.0`, not `+0.0`" assertion) and
+   `real_minmax_column_falls_back` (`rows_examined > 0` for a REAL MIN/MAX,
+   confirming the new gate is a real exclusion and not vacuously always-true)
+   in `test/test_covering_index_674.ml`.
+
+3. **QCheck property-suite gap (non-blocking, addressed anyway).** Both #578
+   and #754 are instances of the same class — an index-key encoding
+   disagreeing with `compare_values`'s coarser equivalence — and neither was
+   ever findable by `test/test_index_key.ml`'s existing QCheck properties,
+   which draw from `QCheck.float`'s uniformly-random bit patterns and so have
+   effectively zero probability of ever drawing an exact corner value like
+   `-0.0`, `Float.nan`, or an infinity. Both bugs were found only by manual,
+   issue-driven inspection. Added `prop_encode_equality_matches_compare_
+   exactly`: an explicit corpus of corner floats (`0.0`, `-0.0`, `Float.nan`,
+   two DIFFERENT NaN bit patterns, both infinities, `min_float`/`max_float`/
+   `epsilon`) unioned with ordinary random floats via `QCheck.Gen.oneof`,
+   checked against the full BICONDITIONAL `Float.compare a b = 0 ⟺
+   Bytes.equal (encode_value (IK_real a)) (encode_value (IK_real b))` — not
+   only the one-directional implication #754's shape needs, because the
+   converse direction is #578's shape generalised (a coarser key than
+   `compare_values` gives UNIQUE a false conflict between values the engine
+   considers distinct). It passes today, confirming the biconditional holds
+   exactly for `IK_real` after #754; it exists so a THIRD instance of this
+   class fails a property test before it ever needs a human to notice the
+   symptom.
+
+4. **Stale doc line (non-blocking, fixed anyway).** `docs/plans/2026-05-15-
+   phase-1-disk-storage.md`'s original implementation-plan checklist named
+   the ordering unit test as `-1.0 < -0.0 < 0.0 < 1.0` — the exact ordering
+   #754 removes. Annotated in place rather than silently rewritten, since the
+   surrounding document is a historical plan, not living reference material.
+

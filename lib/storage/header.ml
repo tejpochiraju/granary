@@ -45,19 +45,36 @@ type t =
      the 8 payload bytes the old encoding actually wrote there, desyncing every
      later field in that key.  There is no migration path, so v3 refuses to
      open anything older (see [min_supported_format_version]) rather than risk
-     silently misdecoding an index. *)
-let current_format_version = 3l
-let max_supported_format_version = 3l
+     silently misdecoding an index.
+   - v4: #754 — [Index_key.encode_value]'s [IK_real] arm now normalizes
+     [-0.0]'s bit pattern to [+0.0]'s before the order-preserving transform, so
+     the two encode IDENTICALLY rather than [-0.0] sorting strictly below
+     [+0.0].  Unlike v3, this is not a tag-byte desync: the field WIDTH and
+     every OTHER float's bytes are unchanged, so a v3 index over a REAL column
+     that never stored a [-0.0] decodes perfectly well under a v4 reader.  The
+     one row that decodes wrong is a stored [-0.0] itself: its v3 index key
+     sits under the OLD bytes ([0x7FFF...], sign-flip-then-lognot), and a
+     v4-built seek for [0.0] constructs the NEW bytes ([0x8000...],
+     sign-flip-only) — the key simply is not found, silently, exactly the
+     seek-misses-a-row bug #754 fixes for FRESH data reintroduced for a v3
+     FILE opened by a v4 binary.  There is no per-row way to tell, on open,
+     whether a v3 file's indexes hold a [-0.0] without a full index scan, and
+     no migration/reindex-on-open mechanism exists to fall back to, so v4
+     refuses to open a v3-or-older file outright rather than risk it — the
+     same call v3 made for its own encoding change. *)
+let current_format_version = 4l
+let max_supported_format_version = 4l
 
 (* Lowest on-disk format version this build can open.  Set equal to
-   [current_format_version]: v3's index-key tag renumbering (see above) is a
-   silent, garbage-producing incompatibility for any pre-existing index over
-   an INTEGER/REAL/TEXT/BLOB column, and there is no reindex-on-open mechanism
-   in this codebase to fall back to (verified: nothing between v1 and v2 ever
-   migrated in place either — a v1 file just kept being read/written as v1).
-   Refusing outright is the "loud, not silent" pattern this project already
-   uses for #634 (VACUUM staleness) and #598 (ATTACH routing). *)
-let min_supported_format_version = 3l
+   [current_format_version]: both v3's index-key tag renumbering and v4's
+   [-0.0] key normalization (see above) are silent, garbage-producing-or-row-
+   losing incompatibilities for a pre-existing index, and there is no
+   reindex-on-open mechanism in this codebase to fall back to (verified:
+   nothing between v1 and v2 ever migrated in place either — a v1 file just
+   kept being read/written as v1).  Refusing outright is the "loud, not
+   silent" pattern this project already uses for #634 (VACUUM staleness) and
+   #598 (ATTACH routing). *)
+let min_supported_format_version = 4l
 
 type error =
   | Io of string

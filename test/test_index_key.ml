@@ -490,6 +490,79 @@ let prop_real_order_preserving =
        cmp_float = cmp_bytes)
 ;;
 
+(* #754 review finding: [prop_real_order_preserving] above explicitly
+   [assume]s away NaN and infinity, and plain [QCheck.float] draws its bits
+   uniformly at random — which makes the probability of ever drawing an EXACT
+   corner value like [-0.0] or [Float.nan] indistinguishable from zero. Both
+   #578 (NaN colliding with NULL's key) and #754 ([-0.0] sorting apart from
+   [+0.0]) were real encoding bugs that this property suite, as written,
+   could not have found; they were only caught by manual, issue-driven
+   inspection. This is the fix: an explicit corpus of the corner values that
+   matter, unioned with ordinary random floats via [QCheck.Gen.oneof], driving
+   ONE property general enough to describe what #578 and #754 are both
+   instances of.
+
+   The property is the exact converse pairing [Bytes.equal] with
+   [Float.compare = 0] rather than a one-directional implication, because
+   within [IK_real] alone the encoding is meant to be EXACTLY as coarse as
+   [compare_values] and no coarser:
+   - [Float.compare a b = 0] must imply same key ({b this is #754's shape} —
+     a finer key than [compare_values] loses rows to a seek, as an
+     indexed [-0.0] did against a `[WHERE b = 0.0]` seek);
+   - [Float.compare a b <> 0] must imply a DIFFERENT key ({b this is #578's
+     shape, generalised} — a coarser key than [compare_values] gives
+     UNIQUE a false conflict between two values the engine considers
+     distinct; #578 itself was cross-TYPE (NaN vs NULL) rather than two
+     REALs, but the within-REAL direction is the same failure mode and this
+     is the property that would catch a future instance of it).
+
+   [Float.compare] (not raw [=]) is the oracle because it is what
+   [compare_values]'s numeric-class comparator ultimately delegates to for
+   two REALs (#579/#733), and it is the one comparator that already agrees
+   with [encode_value] on both NaN-below-every-number (#536) and
+   NaN-equals-NaN (confirmed: [Float.compare nan1 nan2 = 0] for two
+   DIFFERENT NaN bit patterns, matching every NaN sharing the single [0x01]
+   tag byte). *)
+let corner_floats =
+  [ 0.0
+  ; -0.0
+  ; 1.0
+  ; -1.0
+  ; Float.nan
+  ; Float.infinity
+  ; Float.neg_infinity
+  ; (* an alternate NaN bit pattern: same "is NaN", different payload *)
+    Int64.float_of_bits 0x7FF8_0000_0000_0001L
+  ; (* a signed alternate NaN bit pattern *)
+    Int64.float_of_bits 0xFFF8_0000_0000_0002L
+  ; Float.min_float
+  ; Float.max_float
+  ; Float.epsilon
+  ]
+;;
+
+let gen_corner_or_random_float =
+  let open QCheck.Gen in
+  oneof [ oneof_list corner_floats; float ]
+;;
+
+let arb_corner_or_random_float = QCheck.make gen_corner_or_random_float
+
+let prop_encode_equality_matches_compare_exactly =
+  QCheck.Test.make
+    ~count:5000
+    ~name:
+      "encode_value equality matches Float.compare = 0 exactly (#536/#578/#754 \
+       generalized)"
+    (QCheck.pair arb_corner_or_random_float arb_corner_or_random_float)
+    (fun (a, b) ->
+       let compare_equal = Float.compare a b = 0 in
+       let keys_equal =
+         Bytes.equal (encode_value (IK_real a)) (encode_value (IK_real b))
+       in
+       compare_equal = keys_equal)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Alcotest suite                                                       *)
 (* ------------------------------------------------------------------ *)
@@ -582,6 +655,7 @@ let () =
       ; prop_text_order_preserving
       ; prop_encode_decode_roundtrip
       ; prop_real_order_preserving
+      ; prop_encode_equality_matches_compare_exactly
       ]
   in
   Alcotest.run "Index_key" (unit_tests @ [ "qcheck", qcheck_tests ])

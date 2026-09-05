@@ -251,6 +251,44 @@ let agrees_with_nan () =
     qs
 ;;
 
+(* #754: MIN/MAX over a REAL column must report the STORED VALUE's actual
+   sign, not the index key's normalized-to-[+0.0] bit pattern.
+
+   [Index_key.encode_value] (#754) makes [-0.0] and [+0.0] encode to the SAME
+   key bytes so an equality seek can find a stored [-0.0] again — but that
+   means [Index_key.decode] can no longer tell the two apart: it only ever
+   returns [+0.0]. The covering-index fast path used to decode the MIN/MAX
+   value straight off the index key (never touching the row, which is the
+   whole point of #674), so before excluding REAL columns from
+   [index_cover_minmax_ok] this returned [+0.0] here even though the true
+   minimum row, stored via [Row.encode]/[decode] which preserve the sign
+   bit-for-bit, is [-0.0] — the exact repro from the #754 PR review. *)
+let agrees_with_negative_zero () =
+  with_db
+  @@ fun db ->
+  exec db "CREATE TABLE tz (w INTEGER NOT NULL, b REAL NOT NULL)";
+  exec db "CREATE INDEX idx_tz ON tz (w, b)";
+  exec db "BEGIN";
+  exec_params db "INSERT INTO tz VALUES (1, ?)" [ Db.V_real (-0.0) ];
+  exec db "INSERT INTO tz VALUES (1, 1.5)";
+  exec db "COMMIT";
+  let qs = [ "SELECT MIN(b) FROM tz WHERE w = 1"; "SELECT MAX(b) FROM tz WHERE w = 1" ] in
+  List.iter
+    (fun sql ->
+       set_fastpath true;
+       let fast = rows_of db sql in
+       set_fastpath false;
+       let slow = rows_of db sql in
+       set_fastpath true;
+       Alcotest.(check (list string)) sql slow fast)
+    qs;
+  set_fastpath true;
+  Alcotest.(check (list string))
+    "MIN(b) is -0.0, not +0.0"
+    [ "r:-0" ]
+    (rows_of db "SELECT MIN(b) FROM tz WHERE w = 1")
+;;
+
 (* #517 range alongside MIN/MAX: design says fall back, must stay correct. *)
 let agrees_with_range () =
   with_db
@@ -521,6 +559,36 @@ let range_falls_back () =
     (stats.Db.rows_examined > 0)
 ;;
 
+(* #754: MIN/MAX over a REAL indexed column must fall back to the general
+   path (table rows examined), because the index key can no longer
+   distinguish [-0.0] from [+0.0] and the covering walk has no row to consult
+   otherwise — see [index_cover_minmax_ok]. COUNT is unaffected, since it
+   never reads the value itself; only checked here for MIN/MAX. *)
+let real_minmax_column_falls_back () =
+  with_db
+  @@ fun db ->
+  exec db "CREATE TABLE tz2 (w INTEGER NOT NULL, b REAL NOT NULL)";
+  exec db "CREATE INDEX idx_tz2 ON tz2 (w, b)";
+  exec db "BEGIN";
+  for i = 1 to 10 do
+    exec db (Printf.sprintf "INSERT INTO tz2 VALUES (1, %d.5)" i)
+  done;
+  exec db "COMMIT";
+  set_fastpath true;
+  let n_min, stats_min = stats_of db "SELECT MIN(b) FROM tz2 WHERE w = 1" in
+  Alcotest.(check int) "one row out" 1 n_min;
+  Alcotest.(check bool)
+    "REAL MIN: falls back, table rows ARE examined"
+    true
+    (stats_min.Db.rows_examined > 0);
+  let n_max, stats_max = stats_of db "SELECT MAX(b) FROM tz2 WHERE w = 1" in
+  Alcotest.(check int) "one row out" 1 n_max;
+  Alcotest.(check bool)
+    "REAL MAX: falls back, table rows ARE examined"
+    true
+    (stats_max.Db.rows_examined > 0)
+;;
+
 let group_by_falls_back () =
   with_db
   @@ fun db ->
@@ -577,6 +645,10 @@ let () =
             agrees_fastpath_vs_general
         ; Alcotest.test_case "nullable column agrees" `Quick agrees_nullable_column
         ; Alcotest.test_case "NaN handled the same both ways" `Quick agrees_with_nan
+        ; Alcotest.test_case
+            "negative zero MIN/MAX matches the stored sign (#754)"
+            `Quick
+            agrees_with_negative_zero
         ; Alcotest.test_case "range alongside MIN/MAX agrees" `Quick agrees_with_range
         ; Alcotest.test_case
             "GROUP BY agrees (not fast-pathed)"
@@ -623,6 +695,10 @@ let () =
             `Quick
             non_index_predicate_falls_back
         ; Alcotest.test_case "range falls back" `Quick range_falls_back
+        ; Alcotest.test_case
+            "REAL MIN/MAX column falls back (#754)"
+            `Quick
+            real_minmax_column_falls_back
         ; Alcotest.test_case "GROUP BY falls back" `Quick group_by_falls_back
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest qcheck_min_count_matches_reference ]

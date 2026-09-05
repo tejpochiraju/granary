@@ -396,6 +396,62 @@ let test_obsolete_format_rejected () =
   | Error e -> Alcotest.failf "wrong error: %a" Header.pp_error e
 ;;
 
+(* #754: a v3 file — one that already carries #578's NaN tag-byte fix, but
+   predates #754's [-0.0]-normalizes-to-[+0.0] index-key change — is rejected
+   by a v4 reader, rather than opened and silently misread.  Pinned with the
+   literal historical version [3l] rather than [min_supported_format_version
+   - 1] (which {!test_obsolete_format_rejected} already covers generically),
+   so this test keeps naming the EXACT version #754 obsoletes even if a future
+   bump moves [min_supported_format_version] again.
+
+   Unlike v3's rejection of v2 (a decode-desyncing tag-byte renumbering), a v3
+   file's index bytes decode perfectly well under v4's tag layout — the risk
+   is narrower: a v4 reader's SEEK for [0.0]/[-0.0] builds different bytes than
+   a v3 writer's stored key for [-0.0] did, so an indexed [-0.0] row would
+   silently stop being found by that seek.  There is no way to tell without a
+   full index scan whether a given v3 file's indexes actually hold a [-0.0],
+   so v4 refuses the whole file rather than gamble. *)
+let test_v3_format_rejected_by_v4 () =
+  let _pager, mb = make_pager () in
+  let v3 = 3l in
+  Alcotest.(check bool)
+    "v3 is indeed below this build's floor"
+    true
+    (Int32.compare v3 Header.min_supported_format_version < 0);
+  let build_v3 () =
+    let buf = Cstruct.create Page.page_size in
+    Page.write_common
+      buf
+      { Page.kind = Page.Header; flags = 0; n_keys = 0; right_page = 0l; crc32 = 0l };
+    Page.write_header_fields
+      buf
+      { Page.txn_id = 1L
+      ; root_page = 0L
+      ; freelist_page = 0L
+      ; n_pages_total = 0L
+      ; schema_version = 0L
+      ; page_size = Int32.of_int Page.page_size
+      ; format_version = v3
+      ; reserved_bytes_per_page = 0l
+      ; enc_magic = 0l
+      ; canary_nonce = String.make 16 '\000'
+      ; canary_tag = String.make 16 '\000'
+      };
+    Page.seal buf;
+    let bytes = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes buf 0 bytes 0 Page.page_size;
+    bytes
+  in
+  Hashtbl.replace mb.store 0L (build_v3 ());
+  Hashtbl.replace mb.store 1L (build_v3 ());
+  let pager2 = fresh_pager_over mb () in
+  match run (Header.read_live pager2) with
+  | Error (Header.Unsupported_format v) ->
+    Alcotest.(check int32) "reports v3 as the offending version" v3 v
+  | Ok _ -> Alcotest.fail "expected Unsupported_format: v3 must not be opened by v4"
+  | Error e -> Alcotest.failf "wrong error: %a" Header.pp_error e
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Error-path coverage                                                 *)
 (* ------------------------------------------------------------------ *)
@@ -666,6 +722,10 @@ let () =
             "obsolete format_version rejected"
             `Quick
             test_obsolete_format_rejected
+        ; Alcotest.test_case
+            "v3 (pre-#754) format_version rejected by v4"
+            `Quick
+            test_v3_format_rejected_by_v4
         ] )
     ; ( "encryption"
       , [ Alcotest.test_case
