@@ -2200,3 +2200,15 @@
  (name test_ro_root_memo_416)
  (modules test_ro_root_memo_416)
  (libraries granary granary.unix granary.store alcotest lwt lwt.unix unix))
+
+; #757: a reactive view has no identity across a DROP/CREATE of the same
+; name -- liveness queries (reactive_view_names/is_reactive_view) keep saying
+; "alive" throughout, so a callback holder has no signal to re-register.
+; reactive_view_generation gives each incarnation of a name a fresh,
+; never-repeating value. In-memory is enough: this is registry/process state,
+; not durable state.
+
+(test
+ (name test_reactive_view_generation_757)
+ (modules test_reactive_view_generation_757)
+ (libraries granary alcotest lwt.unix qcheck-core qcheck-alcotest))

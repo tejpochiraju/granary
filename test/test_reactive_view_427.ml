@@ -201,7 +201,7 @@ let test_callbacks () =
          fired := changes :: !fired;
          Lwt.return_unit)
      with
-     | Ok (_ : Db.view_callback) -> ()
+     | Ok ((_ : Db.view_callback), (_ : int)) -> ()
      | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "one commit fired one batch" 1 (List.length !fired);
@@ -244,10 +244,12 @@ let tmp_path () =
 (* #746: [register_view_callback] returns an opaque handle now, and a handle has
    no useful equality, so these assertions compare the result with the handle
    discarded.  [unregister_view_callback] has its own file,
-   test_view_callback_746.ml. *)
+   test_view_callback_746.ml.  #757: the [Ok] case is now a
+   [view_callback * int] pair (handle, generation); the generation is
+   likewise discarded here since these assertions only care about liveness. *)
 let attach db ~view_name cb =
   Result.map
-    (fun (_ : Db.view_callback) -> ())
+    (fun ((_ : Db.view_callback), (_ : int)) -> ())
     (Db.register_view_callback db ~view_name cb)
 ;;
 
@@ -361,7 +363,7 @@ let test_drop_stops_callbacks () =
          incr fired;
          Lwt.return_unit)
      with
-     | Ok (_ : Db.view_callback) -> ()
+     | Ok ((_ : Db.view_callback), (_ : int)) -> ()
      | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "callback fires while live" 1 !fired;

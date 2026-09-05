@@ -40,6 +40,27 @@ type rv_entry =
     (** #427: a full-refresh view materialised while empty gets an all-TEXT
         placeholder schema; on the first non-empty refresh the [_rv_…] table is
         re-created with column types inferred from the data. *)
+  ; rv_generation : int
+    (** #757: minted fresh — from the process-global {!rv_gen_seq} counter,
+        never reset — every time a name gets a new registry entry, whether
+        that is a first-ever [CREATE REACTIVE VIEW] or a recreate after
+        [DROP REACTIVE VIEW] freed the name.  A caller that captured the
+        generation at registration time (see {!register_view_callback}) can
+        later compare it against {!reactive_view_generation} to tell "this is
+        still the view I attached to" from "this name got dropped and
+        recreated out from under me" — the liveness accessors
+        ({!reactive_view_names}, {!is_reactive_view}) answer only the former
+        question and say "alive" for the new incarnation too.
+
+        Drawing from one never-reset process-global counter, rather than e.g.
+        resetting to 0/1 on every fresh entry, is what makes distinctness hold
+        for THIS name across its whole lifetime regardless of how many OTHER
+        views are created and dropped in between: a per-name counter reset on
+        every create could coincide for two different incarnations of the same
+        name if other views' churn wasn't tracked precisely, and a shared
+        counter that resets makes no such promise at all.  A single
+        never-decreasing global sequence sidesteps both failure modes for
+        free — the same trick {!rv_cb_seq} already uses for callback ids. *)
   ; mutable rv_callbacks : (int * (Sql.Exec.row_change list -> unit Lwt.t)) list
     (** #746: held NEWEST-FIRST so {!register_view_callback} is O(1) — it used
         to be [rv_callbacks <- rv_callbacks @ [ cb ]], which copies the whole
@@ -4145,6 +4166,18 @@ let rv_group_col_ty top base group_ord =
   | None -> "TEXT"
 ;;
 
+(* #757: one process-global, never-reset counter minting [rv_generation]
+   values — the same pattern as [rv_cb_seq] below, for the same reason: a
+   single shared sequence guarantees every fresh registry entry for a given
+   name gets a value strictly greater than any this name has ever had before,
+   without needing to track that name's own history separately. *)
+let rv_gen_seq = ref 0
+
+let rv_next_generation () =
+  incr rv_gen_seq;
+  !rv_gen_seq
+;;
+
 let rv_create top ~sql ~name query refresh =
   if Hashtbl.mem top.reactive_views name
   then
@@ -4183,6 +4216,7 @@ let rv_create top ~sql ~name query refresh =
             ; rv_out_cols = out_cols
             ; rv_mode = mode
             ; rv_provisional = provisional
+            ; rv_generation = rv_next_generation ()
             ; rv_callbacks = []
             }
           in
@@ -4471,6 +4505,7 @@ let rv_load top =
                  ; rv_out_cols = out_cols
                  ; rv_mode = mode
                  ; rv_provisional = false
+                 ; rv_generation = rv_next_generation ()
                  ; rv_callbacks = []
                  };
                Lwt.return_unit
@@ -4526,6 +4561,12 @@ let reactive_view_names top =
 
 let is_reactive_view top name = Hashtbl.mem top.reactive_views name
 
+let reactive_view_generation top name =
+  Option.map
+    (fun (e : rv_entry) -> e.rv_generation)
+    (Hashtbl.find_opt top.reactive_views name)
+;;
+
 (* #746: one process-global counter, so no two live handles ever share an id —
    not across views, and not across [Db.t] handles over one store.  A handle
    presented to the wrong handle's registry therefore simply finds nothing
@@ -4540,7 +4581,7 @@ let register_view_callback top ~view_name cb =
     (* O(1): prepend.  The firing site reverses, so registration order is
        preserved — see {!rv_apply_and_notify}. *)
     e.rv_callbacks <- (id, cb) :: e.rv_callbacks;
-    Ok { vcb_view = view_name; vcb_id = id }
+    Ok ({ vcb_view = view_name; vcb_id = id }, e.rv_generation)
   | None -> Error (`Unknown_view view_name)
 ;;
 

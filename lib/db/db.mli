@@ -757,12 +757,25 @@ val pp_view_callback : Format.formatter -> view_callback -> unit
     nothing removed a single callback: [DROP REACTIVE VIEW] was the only
     removal path (#469), so a caller re-wiring callbacks from data — a hook
     table, a config reload — leaked a dead closure per re-wire that was still
-    invoked on every change and had to decide for itself that it was stale. *)
+    invoked on every change and had to decide for itself that it was stale.
+
+    {b #757: the [Ok] case also returns the view's generation at the instant
+    of registration.} [view_name] answers {e liveness} ("is there a reactive
+    view of this name right now?"), not {e identity} ("is this the same view I
+    registered against?") — a [DROP REACTIVE VIEW v; CREATE REACTIVE VIEW v
+    AS ...] leaves [v] live throughout, but the new incarnation starts with no
+    callbacks of its own, so a caller holding a handle from before the drop is
+    stuck on a dead entry with nothing to tell it to re-register. Comparing the
+    generation returned here against a later {!reactive_view_generation} call
+    is that signal: equal means still the same incarnation, different means
+    the name was recreated and the handle should be dropped and re-registered.
+    See {!reactive_view_generation} for the monotonicity guarantee this
+    depends on. *)
 val register_view_callback
   :  t
   -> view_name:string
   -> (row_change list -> unit Lwt.t)
-  -> (view_callback, [ `Unknown_view of string ]) result
+  -> (view_callback * int, [ `Unknown_view of string ]) result
 
 (** #746: detach the callback [h] names.  Returns [true] if it was still
     registered and has now been removed, [false] if it was not — because it was
@@ -822,6 +835,40 @@ val reactive_view_names : t -> string list
 (** #437: whether [name] is a live reactive view, i.e. is in
     {!reactive_view_names}. *)
 val is_reactive_view : t -> string -> bool
+
+(** #757: [None] when [name] is not currently a live reactive view (the same
+    condition {!is_reactive_view} reports as [false]); [Some g] when it is
+    live, where [g] identifies {e which incarnation} of [name] is live right
+    now.
+
+    {b Identity, not liveness.} {!reactive_view_names} and {!is_reactive_view}
+    both answer "is there a reactive view named [name] right now?" — and both
+    keep answering "yes" across a [DROP REACTIVE VIEW name; CREATE REACTIVE
+    VIEW name AS ...], because the name never stops being live. They cannot
+    tell a caller that the view underneath the name changed out from under
+    it. [g] can: it is minted fresh — from a process-global, never-reset
+    counter — every time [name] gets a new registry entry, whether that is the
+    first-ever [CREATE REACTIVE VIEW name ...] or a recreate after a drop, so
+    two calls to this function returning different [Some] values for the same
+    [name] means the view was dropped and recreated in between, even if
+    nothing else observable distinguishes the two calls.
+
+    {b Guarantee.} For one fixed [name], every generation it is ever assigned
+    across its whole lifetime (in this process) is strictly greater than every
+    generation assigned to it before, {e regardless of how many other views
+    are created or dropped in between} — the counter is shared and
+    never reset, so unrelated churn on other names can never make two
+    different incarnations of [name] collide on the same value or make a
+    later incarnation's value go backwards.
+
+    {b Composes with {!register_view_callback}.} A caller registers a callback
+    and records the generation returned alongside its handle; later, comparing
+    that recorded generation against a fresh call to this function tells it
+    whether to keep using the handle (equal) or to treat it as stale and
+    re-register (different, or [None] if the name isn't even live any more).
+    This is the identity signal #746's handle-and-liveness pair could not
+    provide on its own. *)
+val reactive_view_generation : t -> string -> int option
 
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
