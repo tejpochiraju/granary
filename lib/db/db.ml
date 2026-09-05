@@ -527,6 +527,7 @@ let of_store ?clock ?durability ?file_path ?cohort store =
 ;;
 
 let open_block
+      ?(init_if_corrupt = false)
       ?geom
       ?clock
       ?durability
@@ -542,7 +543,7 @@ let open_block
   let* result =
     S.open_block
       ?geom
-      ~init_if_corrupt:true
+      ~init_if_corrupt
       ~read_page
       ~write_page
       ~sync
@@ -552,7 +553,26 @@ let open_block
       ()
   in
   match result with
-  | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
+  | Error e ->
+    (* #753/#763: on any open error, [Store.open_block] never wires [close]
+       into a store record for [Db.close] to reach later -- there is no
+       store.  Close here instead, matching [Granary_unix.Store.open_file]'s
+       identical workaround, so a caller that (correctly, per the new
+       [~init_if_corrupt:false] default) treats a corrupt-header device as a
+       routine, expected outcome doesn't leak the underlying fd/handle on
+       every such open.
+
+       #763 (review): guard the call.  A caller's [~close] is not required
+       to swallow its own errors the way this repo's [Unix_file] /
+       [Fault_inject] callbacks do -- if it raises or returns a rejected
+       promise, that must not clobber the [Header_error] we are in the
+       middle of returning, which is exactly the graceful-refusal outcome
+       [~init_if_corrupt:false] exists to produce.  Best-effort cleanup:
+       any exception here is swallowed, not surfaced or logged, since [Db]
+       has no logging channel and the original store error is the one the
+       caller asked for. *)
+    let* () = Lwt.catch (fun () -> close ()) (fun _exn -> Lwt.return_unit) in
+    Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
   | Ok store ->
     let* db = of_store ?clock ?durability store in
     Lwt.return (Ok db)

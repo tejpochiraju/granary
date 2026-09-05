@@ -33,7 +33,18 @@ let open_with_fi ~path ~config =
     FI.open_with_faults ~path ~size_bytes:(4 * 1024 * 1024) ~config
   in
   let* r =
-    Db.open_block ~read_page:read ~write_page:write ~sync ~resize ~n_pages ~close ()
+    (* #753: [path] is created fresh (ftruncate'd, zeroed) by
+       [FI.open_with_faults] on every call, never a pre-existing store, so
+       this is the legitimate provisioning case. *)
+    Db.open_block
+      ~init_if_corrupt:true
+      ~read_page:read
+      ~write_page:write
+      ~sync
+      ~resize
+      ~n_pages
+      ~close
+      ()
   in
   match r with
   | Ok db -> Lwt.return (Some (db, handle))
