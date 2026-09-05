@@ -50,9 +50,11 @@ let exec db sql =
   | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e
 ;;
 
+(* #757: [register_view_callback]'s [Ok] case is now [handle * generation];
+   this file only ever needs the handle. *)
 let attach db ~view_name cb =
   match Db.register_view_callback db ~view_name cb with
-  | Ok h -> h
+  | Ok (h, (_ : int)) -> h
   | Error (`Unknown_view v) -> Alcotest.failf "expected %S to be a live view" v
 ;;
 

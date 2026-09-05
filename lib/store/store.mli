@@ -51,6 +51,55 @@ type rowid_counters = (tree_id, int64) Hashtbl.t
     to forget (#633). *)
 val rowid_counters : t -> rowid_counters
 
+(** #757: per-reactive-view-name generation identity, shared by every
+    [Db.t]/catalog handle opened over this store — the same rationale as
+    {!rowid_counters}: a reactive view's registry entry is reconstructed
+    independently by each handle (a fresh top-level open, or a worker handle
+    from {!Store} sharing this store via [Db.create_worker_handle]), and two
+    independent reconstructions of the SAME live incarnation of a view must
+    agree on its identity, or a sibling handle would see a view it never
+    dropped or recreated as a fresh incarnation.  Keyed by view name; the
+    value is the generation most recently minted for that name's current live
+    incarnation.  Not persisted — like {!rowid_counters}, this is process-local
+    bookkeeping a fresh handle either finds already populated (a sibling got
+    there first) or populates itself (the first handle over this store to see
+    this name). *)
+type rv_generations = (string, int) Hashtbl.t
+
+(** This store's reactive-view generation map.  Every [Db.t] opened over the
+    same store gets this same table — mirrors {!rowid_counters} above. *)
+val rv_generations : t -> rv_generations
+
+(** #757: mint a fresh generation, unique for the lifetime of this store and
+    never reused, even across drops and recreates of any reactive view name.
+    Shared by every handle over this store the same way {!rowid_counters} is,
+    so two sibling handles can never mint colliding values — whether for the
+    same name or different ones. *)
+val rv_next_generation : t -> int
+
+(** #757: carry [from]'s reactive-view generation bookkeeping forward into
+    [to_] — every recorded name/generation pair, and the counter raised to at
+    least [from]'s.  For {!Db.vacuum} to call right after it rebuilds a
+    store's data into a fresh backing file and BEFORE any [Db.t] starts
+    minting generations against the new [t]: a freshly-opened store (this
+    function's own [create]/[open_block]) always starts with an EMPTY
+    {!rv_generations} and its counter at 0, because unlike {!rowid_counters}
+    — whose correct value is always recoverable by rescanning the copied data
+    tree or reading a persisted AUTOINCREMENT high-water mark — a generation
+    is pure process-local bookkeeping with nothing durable to reconstruct it
+    from; {!rv_next_generation}'s copied tree data for [sys_reactive_views]
+    carries the view SQL forward but not this counter. Without this call, a
+    rebuilt store's counter restarting at 0 lets a generation minted before
+    the VACUUM and one minted after collide on the same integer, which
+    directly breaks the "strictly greater than every generation ever assigned
+    to this name before" guarantee {!Db.reactive_view_generation} documents.
+    Idempotent and safe to call on a [to_] that already has entries — an
+    existing entry for a name also in [from] is overwritten with [from]'s
+    value (the two would already agree if [to_] had never independently
+    minted for that name, since nothing mints against [to_] until this
+    returns). *)
+val rv_carry_over_generations : from:t -> to_:t -> unit
+
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
 type error =

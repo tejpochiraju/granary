@@ -215,8 +215,25 @@ val close : t -> unit Lwt.t
     - DDL executed on one handle is {b invisible} to the other's schema cache.
       That one really is inherent to the per-handle catalog: create a table on
       the parent and the worker cannot see it until it is reopened.
-    - Reactive views, ATTACHed schemas and the active-schema setting are
-      per-handle; a worker handle starts with none of the parent's.
+    - ATTACHed schemas and the active-schema setting are per-handle; a worker
+      handle starts with none of the parent's.
+    - Reactive views ARE reconstructed for a worker handle — from the same
+      persisted catalog definitions the parent's came from — but each
+      handle's copy is independently rebuilt rather than shared: its delta-
+      engine state is recomputed from the current base-table contents rather
+      than copied, and it starts with {b none} of the parent's registered
+      callbacks ({!register_view_callback} callbacks are never persisted or
+      inherited). #757: what IS shared across every handle over one store,
+      including a worker handle's independently-rebuilt copy, is a view
+      name's {!reactive_view_generation} identity — a worker handle created
+      after the parent already has view [v] live reuses the SAME generation
+      the parent recorded, rather than minting a fresh one and falsely
+      signalling a drop-and-recreate that never happened. What generation
+      identity does {b not} give a worker handle is live visibility into a
+      sibling's LATER drop-and-recreate of [v] — that is the same
+      DDL-invisibility this bullet already describes, and a handle only
+      picks up a sibling's recreate by re-deriving its view of the store (a
+      fresh {!create_worker_handle}, or reopening).
     - Write transactions {b serialize} on the shared [Rwlock] rather than
       overlapping, and read-only transactions do not overlap a writer either.
       Genuine concurrency needs #555 option 1.
@@ -300,7 +317,23 @@ val plan : t -> string -> (Granary_sql.Plan.op, error) result Lwt.t
     {!stale_after_vacuum} answers [true], and {!close} on one is a safe no-op
     (the store is already closed).  There is no ROLLBACK recovery, unlike #555's
     poison — the caller must take a fresh worker handle off {e this} one.  Called
-    on a handle that is itself stale, VACUUM raises [Failure]. *)
+    on a handle that is itself stale, VACUUM raises [Failure].
+
+    {b #757: reactive-view generations survive VACUUM without colliding.}
+    VACUUM swaps in a brand-new underlying store, and a fresh store's
+    generation counter would otherwise restart at 0 — unlike the rowid
+    allocator, which reseeds itself correctly from the copied tree data, a
+    generation has nothing durable to recover it from. Before the swap
+    becomes visible on [t], the old store's generation bookkeeping is carried
+    into the new one ([Granary_store.Store.rv_carry_over_generations]), so a
+    generation minted before this VACUUM and one minted after it can never
+    collide, and {!reactive_view_generation} keeps its "strictly increasing
+    for this name, forever" guarantee across a VACUUM. This handle's own
+    {!reactive_view_generation} answers for a view unaffected by the VACUUM
+    do not change (nothing about {e this} handle's registry entries is
+    touched, only the counter that mints FUTURE ones) — the DDL-visibility
+    caveat above is what governs whether a SIBLING handle's later
+    drop-and-recreate is visible here, exactly as it does outside a VACUUM. *)
 val vacuum : t -> unit Lwt.t
 
 (** #634: whether this handle — or any ATTACHed schema on it — has been
@@ -795,12 +828,34 @@ val pp_view_callback : Format.formatter -> view_callback -> unit
     nothing removed a single callback: [DROP REACTIVE VIEW] was the only
     removal path (#469), so a caller re-wiring callbacks from data — a hook
     table, a config reload — leaked a dead closure per re-wire that was still
-    invoked on every change and had to decide for itself that it was stale. *)
+    invoked on every change and had to decide for itself that it was stale.
+
+    {b #757: the [Ok] case also returns the view's generation at the instant
+    of registration.} [view_name] answers {e liveness} ("is there a reactive
+    view of this name right now?"), not {e identity} ("is this the same view I
+    registered against?") — a [DROP REACTIVE VIEW v; CREATE REACTIVE VIEW v
+    AS ...] leaves [v] live throughout, but the new incarnation starts with no
+    callbacks of its own, so a caller holding a handle from before the drop is
+    stuck on a dead entry with nothing to tell it to re-register. Comparing the
+    generation returned here against a later {!reactive_view_generation} call
+    is that signal: equal means still the same incarnation, different means
+    the name was recreated and the handle should be dropped and re-registered.
+    See {!reactive_view_generation} for the monotonicity guarantee this
+    depends on.
+
+    {b #766 (open, deliberately not closed here): a TOCTOU gap in that
+    re-registration pattern.} Nothing stops a SECOND drop-and-recreate landing
+    between a caller's generation comparison and its re-registration call, so
+    the re-registration can itself land against an incarnation that is
+    already stale by the time this function returns. Closing it needs an
+    atomic check-and-register (an optional expected-generation argument that
+    fails on mismatch rather than silently registering), which is a further
+    signature change beyond this one; tracked rather than rushed. *)
 val register_view_callback
   :  t
   -> view_name:string
   -> (row_change list -> unit Lwt.t)
-  -> (view_callback, [ `Unknown_view of string ]) result
+  -> (view_callback * int, [ `Unknown_view of string ]) result
 
 (** #746: detach the callback [h] names.  Returns [true] if it was still
     registered and has now been removed, [false] if it was not — because it was
@@ -823,7 +878,17 @@ val register_view_callback
     That is a snapshot, not a tombstone and not a refusal: removal is always
     accepted and never raises, and the visible effect is simply deferred to the
     next batch.  A registration made from inside a callback behaves the same
-    way — it starts firing from the next batch. *)
+    way — it starts firing from the next batch.
+
+    {b #766 (open, deliberately not closed here): [false] is also returned
+    when [h]'s view was dropped and a DIFFERENT incarnation recreated under
+    the same name} — the lookup is by view name, so a stale [h] finds the
+    new incarnation's (unrelated) callback list, fails to find [h]'s id in
+    it, and this reports [false] exactly as it would for "already
+    unregistered". A caller that needs to tell the two apart can compare
+    {!reactive_view_generation} itself; making this function do so natively
+    would need a 3-way result and is tracked, not rushed, in the same
+    follow-up as the TOCTOU note on {!register_view_callback}. *)
 val unregister_view_callback : t -> view_callback -> bool
 
 (** #437: the names of the live reactive views, sorted.  Read from the in-memory
@@ -860,6 +925,65 @@ val reactive_view_names : t -> string list
 (** #437: whether [name] is a live reactive view, i.e. is in
     {!reactive_view_names}. *)
 val is_reactive_view : t -> string -> bool
+
+(** #757: [None] when [name] is not currently a live reactive view {e in this
+    handle's registry} (the same condition {!is_reactive_view} reports as
+    [false]); [Some g] when it is live, where [g] identifies {e which
+    incarnation} of [name] this handle knows as live right now.
+
+    {b Identity, not liveness.} {!reactive_view_names} and {!is_reactive_view}
+    both answer "is there a reactive view named [name] right now?" — and both
+    keep answering "yes" across a [DROP REACTIVE VIEW name; CREATE REACTIVE
+    VIEW name AS ...], because the name never stops being live. They cannot
+    tell a caller that the view underneath the name changed out from under
+    it. [g] can: it is minted fresh every time [name] gets a new registry
+    entry, whether that is the first-ever [CREATE REACTIVE VIEW name ...] or a
+    recreate after a drop, so two calls to this function returning different
+    [Some] values for the same [name] means the view was dropped and
+    recreated in between, even if nothing else observable distinguishes the
+    two calls.
+
+    {b Scope of the guarantee: per store, not per process, and current as of
+    each handle's own last sync.} The generation is minted from a counter that
+    lives on the underlying store ([Granary_store.Store.rv_next_generation]),
+    not on this module, and the store also records which generation is
+    current for each name ([Store.rv_generations]) — {e not} a counter or map
+    private to one {!t}. Every {!t} sharing one store, including one produced
+    by {!create_worker_handle}, therefore mints and reuses generations from
+    the SAME source: a worker handle created after a sibling already has view
+    [v] live reconstructs its own registry entry for [v] from the persisted
+    definition ({!create_worker_handle} always does; see its doc) and picks
+    up the SAME generation the sibling already recorded, rather than minting
+    a fresh one and falsely signalling a drop-and-recreate that never
+    happened. Within one store, for one fixed [name], every generation it is
+    ever assigned across its whole lifetime is strictly greater than every
+    generation assigned to it before, {e regardless of how many other views
+    are created or dropped in between and regardless of how many handles are
+    doing the creating and dropping} — the counter is store-wide and never
+    reset, so unrelated churn can never make two different incarnations of
+    [name] collide on the same value or make a later incarnation's value go
+    backwards.
+
+    What this does {e not} give you is live cross-handle DDL propagation: a
+    handle's own copy of the generation for [name] is only as fresh as that
+    handle's own registry, which is populated at that handle's creation (or
+    its own [CREATE]/[DROP]) and is not automatically refreshed when a
+    {e sibling} handle drops and recreates [name] afterwards — the same
+    per-handle DDL-visibility caveat {!create_worker_handle} already documents
+    for tables, views and triggers (#589/#633/#634). A handle that needs to
+    observe a sibling's recreate has to re-derive its view of the store (a
+    fresh {!create_worker_handle}, or reopening), exactly as it would to see
+    the sibling's other DDL.
+
+    {b Composes with {!register_view_callback}.} A caller registers a callback
+    and records the generation returned alongside its handle; later, comparing
+    that recorded generation against a fresh call to this function (on the
+    SAME {!t} the callback was registered on) tells it whether to keep using
+    the handle (equal) or to treat it as stale and re-register (different, or
+    [None] if the name isn't even live any more on this handle). This is the
+    identity signal #746's handle-and-liveness pair could not provide on its
+    own. *)
+val reactive_view_generation : t -> string -> int option
 
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns

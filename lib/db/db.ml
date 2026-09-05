@@ -40,6 +40,37 @@ type rv_entry =
     (** #427: a full-refresh view materialised while empty gets an all-TEXT
         placeholder schema; on the first non-empty refresh the [_rv_…] table is
         re-created with column types inferred from the data. *)
+  ; rv_generation : int
+    (** #757: identifies which incarnation of [rv_name] this registry entry
+        is.  A caller that captured the generation at registration time (see
+        {!register_view_callback}) can later compare it against
+        {!reactive_view_generation} to tell "this is still the view I attached
+        to" from "this name got dropped and recreated out from under me" —
+        the liveness accessors ({!reactive_view_names}, {!is_reactive_view})
+        answer only the former question and say "alive" for the new
+        incarnation too.
+
+        Minted from {!Store.rv_next_generation} / recorded into
+        {!Store.rv_generations} — the STORE, not a counter local to this
+        module — because [top.reactive_views] itself is reconstructed
+        independently by every {!t} sharing one store (a fresh top-level
+        open, or a worker handle from {!create_worker_handle}).  A
+        module-local counter would mint a different value per handle for the
+        very same live incarnation, which defeats the guarantee: see
+        {!rv_mint_generation} / {!rv_generation_for_load} for the two ways an
+        entry acquires this field, and their doc comment for why one always
+        advances the counter and the other reuses whatever the store already
+        recorded.  One never-decreasing, store-wide sequence — rather than
+        e.g. resetting to 0/1 on every fresh entry — is what makes
+        distinctness hold for THIS name across its whole lifetime regardless
+        of how many OTHER views are created and dropped in between, and
+        regardless of how many handles are doing the creating and dropping:
+        a per-name counter reset on every create could coincide for two
+        different incarnations of the same name if other views' churn wasn't
+        tracked precisely, and a shared counter that resets makes no such
+        promise at all.  The same trick {!rv_cb_seq} already uses for
+        callback ids, one level up from a single module to the store every
+        [Db.t] over it shares. *)
   ; mutable rv_callbacks : (int * (Sql.Exec.row_change list -> unit Lwt.t)) list
     (** #746: held NEWEST-FIRST so {!register_view_callback} is O(1) — it used
         to be [rv_callbacks <- rv_callbacks @ [ cb ]], which copies the whole
@@ -743,6 +774,17 @@ let vacuum t : unit Lwt.t =
                 let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
                 Lwt.fail_with msg
               | Ok new_store ->
+                (* #757: carry the OLD store's reactive-view generation
+                   bookkeeping into the new one BEFORE anything can mint
+                   against it.  [t.store] still names the pre-VACUUM store
+                   here — the swap below hasn't run yet — so this is the last
+                   point at which both stores are reachable.  Without it, the
+                   new store's counter would restart at 0 (see
+                   [S.rv_carry_over_generations]'s doc comment for why a
+                   generation, unlike a rowid counter, has nothing durable to
+                   reseed itself from), and a generation minted before this
+                   VACUUM could collide with one minted after it. *)
+                S.rv_carry_over_generations ~from:t.store ~to_:new_store;
                 (* #634: the fresh catalog deliberately gets FRESH rowid counters
                  (no [?rowid_counters]).  It must: the counters the old catalog
                  held describe the pre-VACUUM file, and this one is re-seeded
@@ -4165,6 +4207,41 @@ let rv_group_col_ty top base group_ord =
   | None -> "TEXT"
 ;;
 
+(* #757: [rv_generation] values are minted from the STORE, not from a
+   [Db.ml]-local counter — [Store.rv_next_generation] / [Store.rv_generations]
+   — because the registry that [rv_generation] lives in ([top.reactive_views])
+   is reconstructed independently by every [Db.t] handle over one store (a
+   fresh top-level open, or a worker handle from [Db.create_worker_handle]).
+   A per-process, per-[Db.ml]-module counter would mint a DIFFERENT value for
+   the same live incarnation of a view in each handle's independent
+   reconstruction, which defeats the whole guarantee: a worker handle spawned
+   after a sibling already created view [v] would report a fresh generation
+   for [v] even though neither handle ever dropped or recreated it. Owning
+   the counter AND the name -> current-generation map on the store is what
+   makes every handle over that store agree, exactly the same reasoning
+   [Store.rowid_counters] already established for the rowid allocator
+   (#589/#633).
+
+   [rv_mint_generation] is for a genuine (re)create: it always advances the
+   counter and overwrites the store's record for [name], because a CREATE
+   really is a brand new incarnation regardless of what the map currently
+   says. [rv_generation_for_load] is for reconstructing an ALREADY-KNOWN
+   incarnation from persisted catalog state (this handle's own [rv_load] at
+   open, or a sibling's) — it reuses whatever generation the store already
+   has recorded for [name], and only mints a fresh one the first time any
+   handle over this store has ever loaded [name]. *)
+let rv_mint_generation store name =
+  let g = S.rv_next_generation store in
+  Hashtbl.replace (S.rv_generations store) name g;
+  g
+;;
+
+let rv_generation_for_load store name =
+  match Hashtbl.find_opt (S.rv_generations store) name with
+  | Some g -> g
+  | None -> rv_mint_generation store name
+;;
+
 let rv_create top ~sql ~name query refresh =
   if Hashtbl.mem top.reactive_views name
   then
@@ -4196,23 +4273,35 @@ let rv_create top ~sql ~name query refresh =
     | Ok choice ->
       rv_guard top (fun () ->
         let register ~provisional mode out_cols =
-          let entry =
-            { rv_name = name
-            ; rv_query = query
-            ; rv_base_tables = base_tables
-            ; rv_out_cols = out_cols
-            ; rv_mode = mode
-            ; rv_provisional = provisional
-            ; rv_callbacks = []
-            }
-          in
-          Hashtbl.replace top.reactive_views name entry;
+          (* #757: persist BEFORE the registry gains an entry, not after.
+             Before this, [Hashtbl.replace top.reactive_views name entry] ran
+             first and a subsequent [Cat.persist_reactive_view] failure left a
+             ghost entry behind: [Db.execute] reports [Error] as if the
+             CREATE never happened, but [reactive_view_generation] and
+             [register_view_callback] both read [top.reactive_views] and would
+             have gone on answering as though the view durably existed — and a
+             retried CREATE would then fail with "already exists" over
+             nothing durable.  Ordering it the other way means a faulted
+             persist leaves NOTHING in the registry to be stale. *)
           (* #476: the catalog write reports a store fault as [Error msg]; lift
              it into [Db]'s own error type rather than letting it raise. *)
           let* pr = Cat.persist_reactive_view top.store ~name ~sql in
           match pr with
           | Error msg -> Lwt.return (Error (Runtime msg))
-          | Ok () -> Lwt.return (Ok ())
+          | Ok () ->
+            let entry =
+              { rv_name = name
+              ; rv_query = query
+              ; rv_base_tables = base_tables
+              ; rv_out_cols = out_cols
+              ; rv_mode = mode
+              ; rv_provisional = provisional
+              ; rv_generation = rv_mint_generation top.store name
+              ; rv_callbacks = []
+              }
+            in
+            Hashtbl.replace top.reactive_views name entry;
+            Lwt.return (Ok ())
         in
         match choice with
         | `Delta (group_ord, measure) ->
@@ -4421,6 +4510,19 @@ let rv_drop top ~name ~if_exists =
     (* Live in the registry?  Decided once, up front: it selects the erase
        strategy and, below, whether there is any in-memory state to drop. *)
     let live = Hashtbl.mem top.reactive_views name in
+    (* #757: capture the generation THIS drop is retiring before [rv_guard]'s
+       body runs — it awaits across the catalog write, during which a
+       DIFFERENT handle's CREATE of this SAME name can complete and mint a
+       fresh generation into the store-wide map.  See the compare-and-remove
+       below for why this is captured now rather than re-read after. *)
+    let dropped_generation =
+      if live
+      then
+        Option.map
+          (fun (e : rv_entry) -> e.rv_generation)
+          (Hashtbl.find_opt top.reactive_views name)
+      else None
+    in
     let* r =
       rv_guard top (fun () ->
         if live
@@ -4432,6 +4534,25 @@ let rv_drop top ~name ~if_exists =
     | Ok () when not live -> Lwt.return (Ok ())
     | Ok () ->
       Hashtbl.remove top.reactive_views name;
+      (* #757: compare-and-remove, not an unconditional remove.  An
+         unconditional [Hashtbl.remove] here would be racy: if a sibling
+         handle's CREATE REACTIVE VIEW of this SAME name completed during
+         [rv_guard]'s await above (see [dropped_generation]'s comment) and
+         minted its own fresh generation into this map, an unconditional
+         remove would delete THAT live, unrelated incarnation's entry rather
+         than the stale one this drop is actually cleaning up — and a later
+         load (e.g. another [create_worker_handle]) would then mint yet
+         another generation disagreeing with the concurrent creator's own
+         in-memory copy. Only remove the map entry if it still holds the
+         exact generation this drop is retiring; if it holds something else,
+         a newer CREATE already claimed the name and this drop has nothing
+         of its own left to clean up here. *)
+      (match dropped_generation with
+       | Some g ->
+         (match Hashtbl.find_opt (S.rv_generations top.store) name with
+          | Some g' when g' = g -> Hashtbl.remove (S.rv_generations top.store) name
+          | _ -> ())
+       | None -> ());
       (* Forget pending base-table deltas no remaining view depends on.
          Currently dead code: in autocommit [rv_flush_inner]'s finalizer empties
          [rv_pending] after every statement, so it can only ever accumulate
@@ -4491,6 +4612,7 @@ let rv_load top =
                  ; rv_out_cols = out_cols
                  ; rv_mode = mode
                  ; rv_provisional = false
+                 ; rv_generation = rv_generation_for_load top.store name
                  ; rv_callbacks = []
                  };
                Lwt.return_unit
@@ -4546,6 +4668,12 @@ let reactive_view_names top =
 
 let is_reactive_view top name = Hashtbl.mem top.reactive_views name
 
+let reactive_view_generation top name =
+  Option.map
+    (fun (e : rv_entry) -> e.rv_generation)
+    (Hashtbl.find_opt top.reactive_views name)
+;;
+
 (* #746: one process-global counter, so no two live handles ever share an id —
    not across views, and not across [Db.t] handles over one store.  A handle
    presented to the wrong handle's registry therefore simply finds nothing
@@ -4560,7 +4688,7 @@ let register_view_callback top ~view_name cb =
     (* O(1): prepend.  The firing site reverses, so registration order is
        preserved — see {!rv_apply_and_notify}. *)
     e.rv_callbacks <- (id, cb) :: e.rv_callbacks;
-    Ok { vcb_view = view_name; vcb_id = id }
+    Ok ({ vcb_view = view_name; vcb_id = id }, e.rv_generation)
   | None -> Error (`Unknown_view view_name)
 ;;
 

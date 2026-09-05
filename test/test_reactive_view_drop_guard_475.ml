@@ -98,7 +98,7 @@ let user_drop_inside_a_refresh_window_is_refused () =
          seen := Some r;
          Lwt.return_unit)
      with
-     | Ok (_ : Db.view_callback) -> ()
+     | Ok ((_ : Db.view_callback), (_ : int)) -> ()
      | Error (`Unknown_view v) -> Alcotest.failf "register_view_callback: unknown %s" v);
     exec db "INSERT INTO t VALUES (1, 'a')";
     (match !seen with
