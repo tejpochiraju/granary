@@ -568,6 +568,13 @@ things that were tried and rejected) is usually the point.
   same symptom as #589, reproducible under multi-terminal TPC-C — do not trust
   a multi-terminal run's output without checking its own consistency oracle
   until it's fixed.
+- **`-0.0` and `+0.0` encode to the same index key, closing the #743 residual
+  (#754).** `Index_key.encode_value` used to order `-0.0` strictly below
+  `+0.0`, disagreeing with `compare_values`'s `-0.0 = 0.0`; a genuine on-disk
+  format change with no migration path, deliberately not the same mechanism
+  as #578's NaN tag byte despite the surface similarity. Also closes a real
+  UNIQUE-index constraint hole (a REAL column could hold both `0.0` and
+  `-0.0`).
 
 ## Repository structure
 

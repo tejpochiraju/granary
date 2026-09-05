@@ -255,15 +255,15 @@ useful reading order — search for the issue number instead.
   row. Filed as **#755**, deliberately not fixed in #743 (different site, and
   the cascade paths want auditing with it).
 
-  **The one residual #743 could not close is `-0.0`, and it is not #743's
-  (#754).** `Float.compare (-0.) 0.` is `0`, so `compare_values` and `=` call
-  `0`, `0.0` and `-0.0` all equal; `Index_key.encode_value` deliberately orders
-  `-0.0` below `+0.0`. That split already existed between an indexed and an
-  unindexed `WHERE b = 0.0` over a REAL column holding `-0.0` (measured on
-  `main`: 0 rows with the index, the row without it), and the join arms inherit
-  exactly it and nothing wider — the canonical hash key matches, the index
-  probe does not. Closing it means changing the index encoding or
-  `compare_values`, which moves index ordering; see #754.
+  **The one residual #743 could not close was `-0.0`, and it was not #743's —
+  fixed by #754, see below.** `Float.compare (-0.) 0.` is `0`, so
+  `compare_values` and `=` call `0`, `0.0` and `-0.0` all equal;
+  `Index_key.encode_value` used to deliberately order `-0.0` below `+0.0`.
+  That split already existed between an indexed and an unindexed
+  `WHERE b = 0.0` over a REAL column holding `-0.0` (measured on `main`
+  pre-#754: 0 rows with the index, the row without it), and the join arms
+  inherited exactly it and nothing wider — the canonical hash key matched, the
+  index probe did not.
 
   Pinned by `test/test_join_key_743.ml`, whose `check_all_three` runs the same
   data as a hash join, as a nested-loop probe and as a WHERE filter and asserts
@@ -3272,4 +3272,137 @@ future optimisation cannot quietly trade it away: an AUTOINCREMENT high-water
 survives losing its `_sys_tables` row and being reconstructed from the mirror.
 That case must be **file-backed** — the Mem backend never exercises mirror
 reconstruction meaningfully.
+
+
+### `-0.0` and `+0.0` encode to the same index key (#754, decided 2026-09-05)
+
+Split out of #743 as the one residual its cross-numeric JOIN KEY fix could
+not close. `Float.compare (-0.) 0.` is `0`, so `Exec.compare_values` — and
+therefore `=`, since #738 — has always said `0`, `0.0` and `-0.0` are all
+equal. `Index_key.encode_value`'s `IK_real` arm disagreed: it deliberately
+encoded `-0.0` strictly BELOW `+0.0`, so the index's byte order was IEEE's
+total order applied literally to the bit pattern, rather than the coarser
+equivalence `compare_values` uses.
+
+An equality conjunct on an indexed column is CONSUMED by the access path —
+`Planner.residual_filter` drops it once the seek is built, so the seek IS the
+answer and nothing re-checks the rows it yields. `WHERE b = 0.0` against an
+indexed REAL column therefore returned zero rows whenever the only matching
+stored value was `-0.0`, while the identical unindexed query correctly
+returned it (verified on `main`, 2026-09-03, before this fix). #743's
+nested-loop join probe inherits the same seek and so inherited the same gap;
+its hash-join arm keys on `Exec.join_key_value`, which already canonicalises
+an integral REAL — `-0.0` included — to `IK_int`, so the hash arm already
+agreed with `compare_values` and was not the side that needed fixing.
+
+**Three options were on the table, and the issue asked that all three be
+argued through rather than picked by default:**
+
+1. **Make `Index_key.encode_value` encode `-0.0` as `+0.0`** — chosen.
+2. Normalize `-0.0` to `+0.0` at value-ingress points (the parser's unary
+   minus on a float literal, and `row_value_to_index_value`) — rejected.
+3. Leave the encoding alone and make every equality-seek site probe both
+   possible keys for a literal `0.0`/`-0.0`, unioning the results — rejected.
+
+**Option 1 was chosen, and it is deliberately NOT the same move #578 made,
+even though the issue text and #743's own note both describe it as "as #578
+did for NaN."** #578 gave NaN a brand-new tag byte (`0x01`) that no other
+value had ever used — a value gaining its own key, disagreeing with nothing
+that existed before. This fix is a different shape: `-0.0` and `+0.0` already
+had distinct keys, and the fix makes them collide on purpose, because at the
+value level (`compare_values`) they were always the same value. That
+distinction matters for what kind of change this is: #578 could not corrupt
+any existing on-disk index, because no pre-#578 row had ever been encoded
+with tag `0x01`. This fix CAN — a database written before it, holding a
+`-0.0` in an indexed REAL column, has that row's index entry under the OLD
+bytes (`-0.0`'s bit pattern sign-flipped to `0x7FFF...`), and a POST-fix seek
+for `0.0` builds the NEW bytes (`0x8000...`) and will not find it. That is a
+genuine on-disk index-format change, not merely an additive one.
+
+**The mechanism is a bit-pattern normalization inside `encode_value`'s
+`IK_real` arm** (`lib/encoding/index_key.ml`), not a value-ingress rewrite:
+before the existing sign-magnitude transform runs, `Int64.bits_of_float f`
+is compared against `Int64.min_int` — the exact IEEE bit pattern for `-0.0`
+(sign bit set, every other bit zero, and nothing else has this pattern) — and
+replaced with `0L` (`+0.0`'s bits) when it matches. The transform that
+follows is otherwise untouched, so `-0.0` now takes the same path `+0.0`
+always did and the two produce byte-identical keys. `decode` is unchanged:
+it only ever needs to invert bytes this encoder now produces, and a stored
+`+0.0` key decodes to `+0.0` — the sign bit a caller supplied for `-0.0` is
+lost once it passes through an index key, exactly as NaN's specific bit
+pattern was already lost through the single-byte `0x01` tag (#578). The row
+STORE (`Row.encode`/`decode`) is untouched and still preserves `-0.0` bit-for
+-bit; only the index-key projection of a REAL value collapses the sign of
+zero, which is the same asymmetry #578 accepted for NaN's payload.
+
+**Why option 1 over option 2 (value-ingress normalization).** Option 2 would
+silently rewrite a value the caller supplied — a stored `-0.0` would become
+`0.0` the moment it was written, not only when read back through an index.
+That is observable through `SELECT` on an UNINDEXED column, a covering read,
+or a re-`SELECT` of the literal row, none of which #754 is about — the bug is
+specific to a *seek* silently missing a row, not to the row's stored value
+being wrong. Option 2 would also have to hit every ingress point (the
+parser's unary-minus-on-float-literal production, AND
+`row_value_to_index_value`, AND any bound-parameter path), and miss one and
+the collapse is inconsistent depending on how the value arrived — a worse
+failure mode than the bug it fixes. Option 1 fixes the actual site of
+disagreement (the index-key projection) and touches no value the engine ever
+hands back to a caller unindexed.
+
+**Why option 1 over option 3 (seek both keys).** Probing both `+0.0` and
+`-0.0` keys for a literal `0.0` avoids any format change, but it has to be
+threaded through every equality-seek site that can name a REAL literal
+matching zero — `Exec.index_lookup_values`'s direct REAL arm, its two
+cross-numeric arms (an INTEGER `0` probing a REAL column, and vice versa),
+`check_insert_unique`'s conflict probe, `unique_violation_on_update`, and the
+`CREATE UNIQUE INDEX` build-time duplicate scan — each returning a UNION of
+two lookups instead of one. That is strictly more code, at more sites, for a
+one-value special case, and it does not even close the gap fully: it fixes
+equality but leaves a RANGE seek's boundary handling to reason about two
+keys at one point on the number line, which `range_bound_key` does not do
+today and would have to. Option 1 fixes the single root cause once and every
+consumer of `Index_key.encode_value` inherits the fix for free — the WHERE
+seek, both #743 join-probe arms, the UNIQUE build probe, and
+`unique_violation_on_update` — with no site-by-site change and no risk of
+missing one.
+
+**No migration path exists and none is being added, matching the project's
+young-project stance and #578's own precedent.** Granary has no shipped
+databases with a compatibility contract to preserve; #578 changed the
+on-disk meaning of a stored NaN's index key with no rebuild tooling, and
+this follows the same call. A database that already holds an indexed `-0.0`
+built before this change needs its index rebuilt (`DROP INDEX` /
+`CREATE INDEX`, or a table rewrite) to have that row's key take the new
+bytes; nothing detects or forces this automatically. If granary starts
+shipping databases with an on-disk compatibility promise, this is one of the
+changes an index-versioning or migration story would need to account for
+retroactively.
+
+**As a consequence, the UNIQUE-index probe gained a real correctness fix,
+not just a symmetric one.** Before this change, a UNIQUE index over a REAL
+column could hold BOTH `0.0` and `-0.0` — two different encoded keys — even
+though `compare_values` (and every other type's UNIQUE enforcement, which
+routes through the same encoding) has always treated them as one value. That
+was a genuine constraint hole, not merely an omission; #754 closes it as a
+side effect of fixing the seek, because `check_insert_unique`,
+`unique_violation_on_update` and the `CREATE UNIQUE INDEX` build probe all
+read `Index_key.encode_value` bytes as an equality test, exactly like the
+WHERE seek does.
+
+`test/test_negative_zero_754.ml` pins the issue's exact repro (indexed vs.
+unindexed `WHERE b = 0.0` and `WHERE b = 0`, the "unoptimizable foil"
+`WHERE b + 0 = 0.0` as a regression control, and an explicit
+indexed-vs-unindexed agreement check), the #743 join-probe residual (hash
+arm already correct, nested-loop arm now fixed), and the UNIQUE-index
+constraint hole in both insert orders. `test/test_index_key.ml`'s
+`-0.0 < +0.0` unit test is now `-0.0 encodes same as +0.0`, and its
+`encode/decode roundtrip` QCheck property is widened the same way #578
+widened it for NaN: a generated `-0.0` is allowed to decode back as `+0.0`,
+rather than requiring identical bits. `test/test_join_key_743.ml`'s
+`negative_zero_is_a_known_residual_of_the_index_encoding` — which pinned the
+gap as an accepted limitation — is replaced by
+`negative_zero_now_matches_across_all_three_execution_paths`, which asserts
+the fixed behaviour through the same `check_all_three` harness every other
+case in that file uses, rather than leaving a "known limitation" test
+standing once the limitation is gone.
 

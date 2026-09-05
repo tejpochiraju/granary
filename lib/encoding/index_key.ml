@@ -128,7 +128,36 @@ let encode_value v =
     else (
       let buf = Bytes.create 9 in
       Bytes.set_uint8 buf 0 0x03;
-      let bits = Int64.bits_of_float f in
+      let raw_bits = Int64.bits_of_float f in
+      (* #754: normalize -0.0's bit pattern to +0.0's BEFORE the
+         order-preserving transform below.  [Float.compare (-0.) 0. = 0], so
+         [Exec.compare_values] and therefore [=] have always treated [-0.0],
+         [0.0] and [0] as equal — but this encoding used to give [-0.0] its
+         own key strictly below [+0.0]'s (see the derivation that used to sit
+         here: [-0.0] flipped to [0x7FFF...], [+0.0] to [0x8000...]).  An
+         equality conjunct on an indexed column is CONSUMED by the access path
+         ([Planner.residual_filter] drops it once the seek is built), so
+         nothing re-checks the rows a seek yields — the seek IS the answer,
+         exactly the invariant #536/#578 established for NaN. A [-0.0] row
+         therefore went missing from `WHERE b = 0.0` whenever the column was
+         indexed, while the identical unindexed query found it.
+
+         The fix collapses the two bit patterns to one key, the same GOAL as
+         #578's fix (make the index level agree with the value level exactly,
+         not just "both below every number") but a different MECHANISM: #578
+         gave a value its OWN new key; this makes two PREVIOUSLY DISTINCT keys
+         the SAME key, because at the value level they always were.  That is a
+         genuine on-disk index-format change — an index built before this fix
+         holds a [-0.0] under the old, now-unreachable-by-seek bytes — and
+         there is deliberately no rebuild/migration path, the same call #578
+         made for its own tag-byte change and the standing project stance
+         (see docs/DECISIONS.md, #754): granary has no shipped databases to
+         preserve on-disk compatibility with yet.
+
+         [Int64.min_int] ([0x8000_0000_0000_0000]) is exactly the IEEE bit
+         pattern for [-0.0] (sign bit set, all other bits zero) and nothing
+         else, so this touches no other float. *)
+      let bits = if Int64.equal raw_bits Int64.min_int then 0L else raw_bits in
       (* Order-preserving encoding for IEEE 754 doubles:
          - Negative float (sign bit = 1): flip ALL bits.
            Result has MSB=0, range [0x0010..., 0x7FFF...].
@@ -136,9 +165,9 @@ let encode_value v =
            Result has MSB=1, range [0x8000..., 0xFFEF...].
          All encoded negatives are less than all encoded positives.
          Within each group, the original IEEE ordering is preserved.
-         -0.0 (0x8000_0000_0000_0000) → lognot → 0x7FFF_FFFF_FFFF_FFFF
          +0.0 (0x0000_0000_0000_0000) → flip sign → 0x8000_0000_0000_0000
-         So -0.0 < +0.0 ✓ *)
+         #754: [-0.0] is normalized to [+0.0]'s bits above, so it now encodes
+         identically to [+0.0] rather than sorting strictly below it. *)
       let stored =
         if Int64.shift_right_logical bits 63 = 1L
         then

@@ -409,9 +409,12 @@ let exact_real_of_int64 (n : int64) : float option =
      (matching [Float.compare nan nan = 0]) and none can collide with a number
      or with NULL's [0x00];
    - [-0.0] canonicalises to [IK_int 0], which is what makes it join [0.0] and
-     [0] alike — [Float.compare (-0.) 0. = 0], so [compare_values] agrees.  The
-     raw index encoding deliberately separates them ([-0.0 < +0.0], see
-     [Index_key.encode_value]), which is why the raw bytes could not be used;
+     [0] alike — [Float.compare (-0.) 0. = 0], so [compare_values] agrees.
+     Before #754 the raw index encoding separated [-0.0] from [+0.0]
+     ([-0.0 < +0.0]), which was why the raw bytes alone could not be used for
+     this canonical key; [Index_key.encode_value] now normalizes [-0.0] to
+     [+0.0]'s bits too, so the raw encoding and this canonical key agree on
+     every REAL value, not just the ones this function special-cases;
    - a cross-CLASS pair keeps distinct tag bytes and never joins, which is
      [compare_values]' answer too.
 

@@ -59,11 +59,19 @@ let test_real_ordering_neg_zero_pos () =
   then Alcotest.fail "IK_real 0.0 should sort before IK_real 1.0"
 ;;
 
-let test_neg_zero_less_than_pos_zero () =
+(* #754: [-0.0] used to encode strictly BELOW [+0.0] (IEEE total order applied
+   literally to the bit pattern), while [Exec.compare_values] has always
+   treated [-0.0], [0.0] and [0] as equal ([Float.compare (-0.) 0. = 0]). An
+   equality conjunct on an indexed column is consumed by the access path, so
+   that disagreement was a silent rows-lost bug: `WHERE b = 0.0` missed a
+   stored `-0.0` whenever the column was indexed. The fix collapses the two
+   bit patterns to one key, so they now encode IDENTICALLY rather than
+   [-0.0] sorting first. *)
+let test_neg_zero_encodes_same_as_pos_zero () =
   let enc_neg_zero = encode_value (IK_real (-0.0)) in
   let enc_pos_zero = encode_value (IK_real 0.0) in
-  if not (cmp_bytes enc_neg_zero enc_pos_zero < 0)
-  then Alcotest.fail "-0.0 should sort before +0.0 in encoding"
+  if not (Bytes.equal enc_neg_zero enc_pos_zero)
+  then Alcotest.fail "-0.0 and +0.0 should encode identically (#754)"
 ;;
 
 (* #578: NaN used to encode identically to IK_null (both the single [0x00]
@@ -452,6 +460,11 @@ let prop_encode_decode_roundtrip =
                  | IK_int x, IK_int y -> Int64.equal x y
                  | IK_real x, IK_real y ->
                    (Float.is_nan x && Float.is_nan y)
+                   (* #754: [-0.0] and [+0.0] share one key, so a generated
+                         [-0.0] round-trips through [decode] as [+0.0] — both
+                         are "zero" under float equality even though their bit
+                         patterns differ. *)
+                   || (Float.equal x 0.0 && Float.equal y 0.0)
                    || Int64.equal (Int64.bits_of_float x) (Int64.bits_of_float y)
                  | IK_text x, IK_text y -> String.equal x y
                  | IK_blob x, IK_blob y -> Bytes.equal x y
@@ -499,7 +512,10 @@ let () =
         ] )
     ; ( "real"
       , [ Alcotest.test_case "-1.0 < 0.0 < 1.0" `Quick test_real_ordering_neg_zero_pos
-        ; Alcotest.test_case "-0.0 < +0.0" `Quick test_neg_zero_less_than_pos_zero
+        ; Alcotest.test_case
+            "-0.0 encodes same as +0.0 (#754)"
+            `Quick
+            test_neg_zero_encodes_same_as_pos_zero
         ; Alcotest.test_case
             "NaN encodes distinctly from NULL (#578)"
             `Quick
