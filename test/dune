@@ -2173,3 +2173,30 @@
   granary.encoding
   alcotest
   lwt.unix))
+
+; #316: measurement of the per-row AUTOINCREMENT catalog-mirror write.
+
+(test
+ (name test_autoinc_mirror_316)
+ (modules test_autoinc_mirror_316)
+ (libraries granary granary.store granary.unix alcotest lwt.unix))
+
+; #743: a cross-numeric JOIN KEY equality matches the rows [=] says are equal,
+; in BOTH join executors — the hash arm's canonical key and the nested-loop
+; arm's typed index probe. Split out of #738, which fixed the same defect for a
+; [col = literal] equality. In-memory: pure comparator/planner behaviour.
+
+(test
+ (name test_join_key_743)
+ (modules test_join_key_743)
+ (libraries granary alcotest lwt.unix))
+
+; #416: the RO tree-root memo must never serve a root from a different
+; committed generation (commits, DDL, rollback, as-of/live alternation), and
+; the Op_project fusion into a rowid point lookup must project exactly what
+; the Lwt_stream.map wrapper it replaced would have.
+
+(test
+ (name test_ro_root_memo_416)
+ (modules test_ro_root_memo_416)
+ (libraries granary granary.unix granary.store alcotest lwt lwt.unix unix))

@@ -87,10 +87,11 @@ type seek =
       }
 
 (* #516: one component of a nested-loop join's index probe key.  See plan.mli
-   for why the constant parts are a pure narrowing. *)
+   for why the constant parts are a pure narrowing, and #743 for why each part
+   carries the declared type of the index column it pins. *)
 type probe_part =
-  | Probe_from_left of int
-  | Probe_const of expr
+  | Probe_from_left of int * Granary_encoding.Row.ty
+  | Probe_const of expr * Granary_encoding.Row.ty
 
 type op =
   | Op_create_table of

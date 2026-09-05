@@ -196,23 +196,88 @@ useful reading order — search for the issue number instead.
   cross-numeric catch-all, i.e. the same incoherence as `1 <> 1.0`, fixed by
   the same change rather than by a NaN rule. #536's decided order is unchanged.
 
-  **What #738 does NOT close, and the reason for the split (#743).** A JOIN KEY
-  equality is consumed too, by a different mechanism and in two different
-  executors, and neither learned the cross-numeric case: the keyed
-  `Exec.stream_hash_join` arm hashes both sides on
-  `Index_key.encode_value (row_value_to_index_value v)`, and
-  `Exec.nlj_probe_left` encodes its probe the same way. So
-  `FROM l JOIN r ON l.a = r.b` (INTEGER vs REAL) answers no rows while
-  `ON 1 = 1 WHERE l.a = r.b` answers the row; sqlite3 answers the row for
+  **A JOIN KEY equality is consumed too, and #738 left both of its executors
+  behind — #743, fixed 2026-09-03.** `Planner.recognise_eq_col_col` picks the
+  key and nothing re-applies the ON predicate, so the key *is* the match test,
+  exactly as a seek is. The keyed `Exec.stream_hash_join` arm hashed both sides
+  on `Index_key.encode_value (row_value_to_index_value v)` and
+  `Exec.nlj_probe_left` encoded its probe the same way, so
+  `FROM l JOIN r ON l.a = r.b` (INTEGER vs REAL) answered no rows while
+  `ON 1 = 1 WHERE l.a = r.b` answered the row; sqlite3 answers the row for
   **both** (oracle-checked). Both spellings answered *no rows* before #738, so
-  no answer regressed — what is new is that they disagree with each other.
-  Fixing the hash arm alone is easy (a canonical key: an integral real keys as
-  the int it names) and was deliberately **not** done, because the nested-loop
-  arm seeks a *typed* index and needs `Plan.probe_part` to carry the index
-  column types the way `Op_index_lookup`'s `keys` does — so a partial fix would
-  make the answer depend on whether a `CREATE INDEX` exists. Strict column
-  typing keeps this to cross-type joins only: one column can never hold both
-  `1` and `1.0`, which is also why the UNIQUE byte probe is unaffected.
+  no answer regressed — what was new is that they disagreed with each other.
+
+  **The two executors had to move in one change**, because which one runs
+  depends on whether the right table has an index the probe can use: fixing one
+  alone would have made the answer depend on whether a `CREATE INDEX` exists,
+  the #639/#589 failure mode. They moved by two *different* mechanisms, and the
+  asymmetry is the thing to understand before editing either:
+
+  - **The hash arm has no index and no column type to translate towards** —
+    both sides are just row values — so it keys on `Exec.join_key_value`, a
+    CANONICAL key: an integral REAL keys as the INTEGER it names, via the same
+    `Exec.int64_of_exact_real` the index sites use. That makes canonical-key
+    equality **exactly** `compare_values … = 0` on non-NULL values, which is
+    provable rather than approximate: a non-integral REAL keeps REAL's tag
+    `0x03` and can never collide with an INTEGER's `0x02`; above 2^53 the
+    directions stay apart because the helper is exact and not an
+    `Int64.to_float` promotion (that would be #733 inside a join key); NaN is
+    declined by that helper *first*, so it stays `IK_real nan` whose encoding
+    is the single byte `0x01` (#578) — all NaNs share one bucket, matching
+    `Float.compare nan nan = 0`, and none collides with a number or with NULL's
+    `0x00`. **No residual re-check is needed and none was added**, precisely
+    because the key is exact; if a future change makes the key an
+    over-approximation it owes a `compare_values` re-check on each candidate
+    pair.
+  - **The nested-loop arm seeks a typed index**, so `Plan.probe_part` now
+    carries the declared type of the index column each part pins — the way
+    `Op_index_lookup`'s `keys : (int * Row.ty * expr) list` always did — and
+    `Exec.nlj_probe_values` translates through `Exec.index_lookup_values`, the
+    very function the `WHERE col = lit` seek uses. So a join key and a filter
+    cannot disagree about which stored keys an equality covers. The type is
+    supplied by `Planner.probe_key_for_index` from the RIGHT table's column
+    list; note `Probe_from_left (ord, ty)` pairs a LEFT-row ordinal with the
+    RIGHT index column's type, which is the whole point.
+
+  NULL is unchanged and must stay so: both hash sides drop a NULL key before
+  keying and `index_lookup_values` answers `None` for one, so a NULL join key
+  matches nothing and a LEFT JOIN null-extends it.
+
+  **Strict column typing bounds the blast radius, and that claim was verified
+  rather than assumed.** One column can never hold both `1` and `1.0`
+  (`INSERT 1.0` into an INTEGER column is a sema error), so the UNIQUE
+  conflict probe and the index put/del encodings are genuinely unaffected. The
+  **FK child-reference probe is not** — a child column and its parent column
+  may be declared with different numeric types — and it is broken today:
+  `Exec.fk_child_has_ref` seeks the child index with raw bytes when one exists
+  and falls back to a `compare_values` scan when one does not, so an indexed
+  cross-numeric child reference is MISSED and `ON DELETE RESTRICT` orphans the
+  row. Filed as **#755**, deliberately not fixed in #743 (different site, and
+  the cascade paths want auditing with it).
+
+  **The one residual #743 could not close is `-0.0`, and it is not #743's
+  (#754).** `Float.compare (-0.) 0.` is `0`, so `compare_values` and `=` call
+  `0`, `0.0` and `-0.0` all equal; `Index_key.encode_value` deliberately orders
+  `-0.0` below `+0.0`. That split already existed between an indexed and an
+  unindexed `WHERE b = 0.0` over a REAL column holding `-0.0` (measured on
+  `main`: 0 rows with the index, the row without it), and the join arms inherit
+  exactly it and nothing wider — the canonical hash key matches, the index
+  probe does not. Closing it means changing the index encoding or
+  `compare_values`, which moves index ordering; see #754.
+
+  Pinned by `test/test_join_key_743.ml`, whose `check_all_three` runs the same
+  data as a hash join, as a nested-loop probe and as a WHERE filter and asserts
+  `used_index` for each, so a planner change cannot make the agreement vacuous
+  by choosing one arm for all three. Verified by mutation: reverting either arm
+  alone fails 6 of its 10 cases.
+
+  **TEXT vs numeric is a deliberate divergence and must stay one.** sqlite3
+  applies column affinity to a comparison operand, so `ON tl.a = tr.b` across a
+  TEXT and an INTEGER column joins the row (oracle-checked 2026-09-03). Granary
+  applies no affinity anywhere — the same divergence recorded below for
+  `o BETWEEN 100 AND '119'` — so a cross-CLASS pair is never equal, in the join
+  key and in the filter alike. What #743 owes is that the three spellings agree
+  with each other, and they do.
 
   Pinned by `test/test_cmp_eq_738.ml`. Its `*_seeks_*` cases are the point of
   the file: each runs the seeking spelling **and** an unoptimizable foil
@@ -223,9 +288,9 @@ useful reading order — search for the issue number instead.
   seek/residual disagreements. `test_cmp_result_733`'s
   `cross_numeric_equality_is_unchanged_pending_738` — which pinned the hole so
   #738 would have a test to invert — is now
-  `cross_numeric_equality_is_exact_738` and asserts the opposite, and
-  `a_cross_numeric_join_key_still_matches_nothing_743` pins #743's residual as
-  known behaviour rather than endorsed — change it as a decision.
+  `cross_numeric_equality_is_exact_738` and asserts the opposite.
+  `a_cross_numeric_join_key_still_matches_nothing_743`, which pinned #743's
+  hole the same way, is now `a_cross_numeric_join_key_matches_now_743`.
 
   **Why the index path survived #733, which is the thing to check before
   touching this again.** `range_bound_key`'s `pred`/`succ` widening was written
@@ -2614,6 +2679,77 @@ written. And `fts_execute_query`'s `FQ_and` intersection is still
 ~4x per doubling). That is the same defect class in a different function and is
 tracked separately.
 
+### A tree's root is a function of the committed state, not of the snapshot (#416)
+
+`Store.bt_state` memoizes `tree_id -> data-tree root page` **across** RO
+snapshots, tagged with the committed generation it describes — the pair
+`(header txn_id, meta root page)`. A generation mismatch resets the whole memo
+before anything is served from it, so at most one committed state is ever
+described, and the publish after the meta descent re-checks the generation
+because that descent awaited.
+
+**The soundness argument is the one `rs_snap_trees` already rested on, not a
+new one.** A snapshot resolves each tree once and reuses that root for its
+whole life however many commits happen meanwhile, so a tree's root is already
+treated as a function of the committed state the snapshot reads. Two snapshots
+at the *same* committed state therefore observe the same roots by definition;
+all this change does is identify that state by `(txn_id, meta root)` rather
+than by snapshot identity. `commit` advances `txn_id` monotonically and never
+reuses a value, and `rollback` leaves both the id and the root page alone while
+reverting the meta tree to that root (#382), so an aborted txn cannot strand an
+entry. `ro_begin_as_of` resolves its snapshot from a *history record*, which is
+why the meta root is checked alongside the txn id and why the memo has to reset
+**backwards** as well as forwards — alternating an as-of read with a live one is
+the case a single-generation memo has to keep re-deriving, and it is pinned.
+
+Three consequences worth knowing:
+
+- **A memo hit skips the meta descent, so the meta pages are no longer pinned
+  into `rs_pinned` on that path.** That is fine and is not what pins are for
+  here: the checkpoint's RO gate is `active_reader_frames` (registered at
+  `ro_begin`), not the pin set, and a page nobody reads needs no pin. Anything
+  that makes a pin load-bearing for *correctness* rather than for cache
+  retention owes this path a second look.
+- **Interleaving snapshots at different generations degrades to the old cost,
+  never to a wrong answer** — each transition resets the memo. That is the
+  accepted trade for a bounded, single-generation table.
+- **The memo hangs off `Store.t`, so every catalog and worker handle over one
+  store shares it** — deliberately, and for the same reason as #633's rowid
+  counters: a tree id is an identity within one store. It is unsynchronised,
+  which is sound under Lwt's cooperative single-domain scheduling because the
+  generation check, the reset and the lookup that follows it sit in ONE
+  synchronous block with no await between them, and the publish after the
+  meta descent re-checks. Nothing in `lib/` spawns a domain (`Parallel` has no
+  call sites there), and the per-store `active_readers` / `trees` / `tree_tags`
+  hashtables already rest on the same assumption. **Anything that runs reads on
+  a second domain owes this table a lock**, along with those three.
+
+The measured effect, and the other half of #416's re-measurement, are recorded
+in `test/test_point_lookup_alloc_416.ml`'s header: a warm
+`SELECT payload FROM t WHERE id = ?` went 1419.9 -> 950.9 words/lookup, of which
+~214 is this memo and ~231 is fusing `Op_project` into `Op_rowid_lookup`
+(`Lwt_stream.map` builds a whole second stream over a one-row one, and its
+source is the *async* `Lwt_stream.from`; `project_row` is a pure ordinal
+selection, so applying it to the at-most-one row is observationally identical).
+**#416's own 2026-06-19 attribution is stale on both points** — it priced the
+meta descent as "≈0, the meta tree is tiny/hot" and never costed the
+`Lwt_stream.map` layer at all. The terms it *did* identify as dominant are
+still dominant and still unaddressed: ~420 words in the data-tree descent
+(async multi-level Lwt bind chains, needing the synchronous cache-resident fast
+path) and ~160 in `ro_begin`/`ro_end`. The issue's "well under 500
+words/lookup" target is open.
+
+One stale thing in #416 itself, so nobody hunts for it: its acceptance criteria
+ask to re-run `test/bench_multicore_read_headroom.ml`. **That file does not
+exist in the tree** (nor does any other `Domain.spawn` site outside
+`lib/parallel`, which has no callers), so that criterion cannot be met as
+written.
+
+`test/test_ro_root_memo_416.ml` pins the invalidation (commit, DDL, rollback,
+as-of/live alternation) and the fused projection; both halves were
+mutation-checked — disabling the generation test fails five of its six cases,
+dropping the ordinals fails five as well.
+
 ### One `Db.t`, one explicit transaction (#555)
 
 A `Db.t` carries a single explicit-transaction slot and every statement resolves
@@ -3067,4 +3203,73 @@ but see the #706 bullet above: a multi-terminal run currently trips its own
 consistency oracle, because #703 is the first thing in the tree to drive real
 concurrent worker-handle writers through a workload that rolls back a bumped
 rowid table under load.
+
+
+### The AUTOINCREMENT mirror write is measured, and it stays (#316, decided 2026-09-03)
+
+#314 made an AUTOINCREMENT table's sticky rowid high-water survive mirror
+reconstruction by having every counter bump rewrite that table's **mirror**
+entry (`Catalog.put_table_counter_tx` -> `put_mirror_tx`) alongside the primary
+`_sys_tables` row. The mirror entry re-encodes the FULL schema — name, tree id,
+fingerprint, every column, the FK block — so #316 recorded the worry that a
+write-heavy AUTOINCREMENT workload pays a serialize-and-`S.put` of the whole
+schema blob per allocated rowid, growing with the table's width. It was filed
+`deferred`, with "no action needed unless an AUTOINCREMENT-heavy write benchmark
+regresses".
+
+**Measured rather than optimised**, per that condition.
+`test/test_autoinc_mirror_316.ml` reports three quantities per inserted row —
+minor words, WAL bytes, and the mirror blob's own size — for a 3-column and a
+30-column table, plain rowid vs AUTOINCREMENT, in autocommit and inside an
+explicit transaction. Every figure is a count or an allocation, never a clock,
+so a loaded box does not move it; the numbers below were byte-identical across
+repeated runs (400 rows per point, WAL mode, on disk, autocheckpoint disabled
+for the measured window so the WAL only grows).
+
+| autocommit | minor words/row | WAL bytes/row | mirror blob |
+|---|---|---|---|
+| width 3, plain | 11 679.4 | 43 157.0 | 69 B |
+| width 3, AUTOINC | 13 988.0 | 51 397.0 | 71 B |
+| width 30, plain | 16 920.4 | 44 506.3 | 386 B |
+| width 30, AUTOINC | 21 401.6 | 52 746.3 | 388 B |
+| **explicit txn** (400 rows in one BEGIN/COMMIT) | | | |
+| width 30, plain | 7 311.9 | 164.8 | 386 B |
+| width 30, AUTOINC | 7 318.0 | 175.1 | 388 B |
+
+Three findings, and the decision rests on all three:
+
+- **The WAL delta is +8 240 bytes/row — exactly two 4 120-byte frames — and it
+  is IDENTICAL at 3 and at 30 columns.** The durable half of the cost is the two
+  pages the mirror `S.put` dirties, not the size of the blob it serialises. So
+  the issue's optimisation 1 (encode the counter as a small standalone record
+  keyed separately) would leave it **untouched**: a put of 8 bytes dirties the
+  same pages as a put of 388. That is the finding that matters most, because
+  option 1 was the "least semantically loaded" candidate and it turns out to
+  attack the minority half.
+- The allocation delta does grow with the width, 2 308.6 -> 4 481.2 words/row,
+  but only **1.94x for a 10x wider schema and a 5.5x bigger blob**. The
+  re-encode is a minority of it; the 4 KB page and WAL-frame machinery around
+  the put is the rest.
+- **Inside an explicit transaction the whole thing costs +6.1 words/row and
+  +10.3 bytes/row** — one extra WAL frame for the entire 400-row transaction —
+  because #347's `~defer_counter` already coalesces the counter write (primary
+  row AND #314 mirror) to COMMIT. That is the issue's optimisation 2, **already
+  in place wherever it can mean anything**; in autocommit "commit time" IS per
+  row, so there is nothing left for it to coalesce.
+
+Net: 19-27% over a plain rowid insert, confined to the autocommit single-row
+path, which already spends ~43 KB of WAL per row on per-statement transaction
+machinery before AUTOINCREMENT is mentioned. Only optimisation 3 (refresh the
+mirror counter every N bumps) would remove the 8 240 bytes, and it buys ~16% of
+an un-batched insert in exchange for a durability semantics change. **Closed as
+measured-and-acceptable; batch the inserts.** Anyone reopening this owes a
+workload where the cost is NOT dominated by autocommit's own per-statement
+transaction, and should note that the width-scaling premise the issue was filed
+on is the half that did not survive measurement.
+
+The same test pins the invariant the per-row write exists to guarantee, so a
+future optimisation cannot quietly trade it away: an AUTOINCREMENT high-water
+survives losing its `_sys_tables` row and being reconstructed from the mirror.
+That case must be **file-backed** — the Mem backend never exercises mirror
+reconstruction meaningfully.
 

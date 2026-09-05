@@ -147,10 +147,24 @@ type seek =
     only from the top-level [AND] spine of the WHERE clause, which the planner
     still applies in full to the joined row, so a constant can never change
     which joined rows survive — only how many right rows are read to find
-    them. *)
+    them.
+
+    {b #743: every part carries the declared type of the INDEX COLUMN it pins},
+    exactly as {!Op_index_lookup}'s [keys] do and for the same reason. The probe
+    is a typed seek into a typed index, so a probe value of the {i other}
+    numeric type needs [Exec.index_lookup_values]' exact translation — an
+    integral REAL addresses the INTEGER key it names, and vice versa only when
+    the round-trip is exact. Without the type the probe encoded the raw value
+    and a cross-numeric join key matched nothing, while the same equality
+    written as a WHERE filter matched (#738 made [=] exact at the value level).
+    See {!Exec.index_lookup_values}. *)
 type probe_part =
-  | Probe_from_left of int (** take the value from this column ordinal of the LEFT row *)
-  | Probe_const of expr (** a constant pinned by a WHERE equality on the right table *)
+  | Probe_from_left of int * Granary_encoding.Row.ty
+  (** take the value from this column ordinal of the LEFT row, and seek it as a
+      key of the given index-column type *)
+  | Probe_const of expr * Granary_encoding.Row.ty
+  (** a constant pinned by a WHERE equality on the right table, with the index
+      column's type *)
 
 type op =
   | Op_create_table of
