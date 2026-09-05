@@ -247,13 +247,14 @@ useful reading order — search for the issue number instead.
   rather than assumed.** One column can never hold both `1` and `1.0`
   (`INSERT 1.0` into an INTEGER column is a sema error), so the UNIQUE
   conflict probe and the index put/del encodings are genuinely unaffected. The
-  **FK child-reference probe is not** — a child column and its parent column
-  may be declared with different numeric types — and it is broken today:
-  `Exec.fk_child_has_ref` seeks the child index with raw bytes when one exists
-  and falls back to a `compare_values` scan when one does not, so an indexed
-  cross-numeric child reference is MISSED and `ON DELETE RESTRICT` orphans the
-  row. Filed as **#755**, deliberately not fixed in #743 (different site, and
-  the cascade paths want auditing with it).
+  **FK child-reference probe was not** — a child column and its parent column
+  may be declared with different numeric types — and was broken as of #743:
+  `Exec.fk_child_has_ref` seeked the child index with raw bytes when one
+  existed and fell back to a `compare_values` scan when one did not, so an
+  indexed cross-numeric child reference was MISSED and `ON DELETE RESTRICT`
+  orphaned the row. Deliberately not fixed in #743 itself (different site, and
+  the cascade paths wanted auditing with it); fixed separately by **#755**,
+  below.
 
   **The one residual #743 could not close was `-0.0`, and it was not #743's —
   fixed by #754, see below.** `Float.compare (-0.) 0.` is `0`, so
@@ -356,6 +357,92 @@ useful reading order — search for the issue number instead.
   Verified by mutation: with promotion restored, four cases in that file fail,
   including both properties. An assertion on a single fixed input order catches
   none of it.
+
+- **A cross-numeric FK child reference is found by RESTRICT and every
+  cascade action, indexed or not (#755, decided 2026-09-05).** The gap #743
+  left open (above): `Exec.fk_child_has_ref_multi_in_tx` (the deferred-recheck
+  path) and `Exec.scan_child_rows_multi_tx` (the shared "locate the child
+  rows" primitive — used not only by the immediate RESTRICT check but by
+  `FA_set_null`, `FA_set_default` and `FA_cascade` on both DELETE and UPDATE)
+  each seeked the child FK index with raw `row_value_to_index_value` bytes, so
+  a parent value of one numeric class and a child column of the other missed
+  each other in the index even though `=` (via `compare_values`, exact since
+  #579/#738) says they are equal. So a cross-numeric-indexed child row was
+  silently skipped by SET NULL/SET DEFAULT/CASCADE too, not just RESTRICT —
+  arguably worse, since nothing raises and a stale FK value is left behind.
+
+  Both functions now resolve the child index's declared column types from
+  `child_meta.Cat.columns` and route the seek through
+  `Exec.index_lookup_values`, keyed by the CHILD column's declared type — the
+  same rule #743 gave the nested-loop join probe. `None` from that translation
+  means "no key of the child column's type can equal this parent value",
+  which for the FK case is the honest "no child row can reference this, so
+  the action is safe" answer, not a reason to fall back to the scan.
+  `Cat.find_index_covering_cols` has exactly two callers in `lib/sql/exec.ml`
+  and both are fixed; `update_col_in_tx` needed no change (it updates an
+  already-located row by rowid, never seeks by value).
+
+  **Two follow-on defects surfaced in PR #765's review, both fixed in the
+  same change rather than filed separately:**
+
+  - **A deferred recheck must not reuse a column ordinal a mid-transaction
+    schema change has invalidated.** `enforce_insert_fk`'s deferred-recheck
+    closure used to capture `child_col_idxs` (an ordinal) at INSERT time and
+    reuse it unchanged when the recheck ran at COMMIT; an `ALTER TABLE ...
+    DROP COLUMN` on the same table before COMMIT, in the same explicit
+    transaction, can shift or invalidate that ordinal by the time the recheck
+    actually runs — reachable as an uncaught `Invalid_argument`/`Failure
+    "nth"`, or a silently wrong column comparison that lets a live reference
+    through as "no match". `Exec.make_fk_recheck` already existed with the
+    correct pattern (used by the UPDATE-side RESTRICT and the general cascade
+    recheck): it re-resolves both column lists **by NAME**
+    (`find_col_idx_by_name_opt`) against the schema fetched fresh AT RECHECK
+    TIME, and if a name no longer resolves (dropped), reports "not violated"
+    — the same "nothing left to enforce" answer a table drop already gives an
+    FK. `enforce_insert_fk` now calls it instead of hand-rolling its own
+    closure with the stale-ordinal bug, which also deleted the duplicate
+    logic.
+  - **A VIRTUAL generated FK-child column's declared type is not a reliable
+    key for the seek.** `Row.encode_col_value` enforces that a column's
+    runtime value tag matches its declared type for every ordinary and
+    STORED-generated column — a mismatch raises there, so it can never reach
+    storage — but a VIRTUAL generated column is always encoded as NULL and
+    recomputed on read (`compute_virtual_generated_cols`) with **no** such
+    check, so its expression's result can be a different storage class than
+    the column declares (e.g. `x REAL GENERATED ALWAYS AS (y) VIRTUAL` where
+    `y` is INTEGER — the index physically holds `IK_int`, never `IK_real`).
+    Seeking by the declared type would then walk a prefix the index never
+    holds, silently treating a real reference as absent — reopening the same
+    failure class for a different reason. `Exec.child_index_key_types`
+    excludes a VIRTUAL generated column from the indexed fast path entirely
+    (returns `None`, meaning "do not trust the index for this seek"), falling
+    back to the scan, which recomputes the row and compares by VALUE
+    regardless of what storage class the index physically holds. No
+    equivalent problem exists for a STORED generated FK-child column, by the
+    `encode_col_value` argument above. This is a narrower instance of a wider,
+    pre-existing and NOT fixed here gap — nothing anywhere casts a GENERATED
+    column's evaluated value to its declared type, so an ordinary indexed
+    `WHERE`/`JOIN` seek against a VIRTUAL generated column with a
+    declared-vs-actual type mismatch has the analogous exposure. Not
+    addressed in #755's scope; worth its own issue if it proves reachable in
+    practice.
+
+  `Exec.seek_index_matches` also factors the seek-and-prefix-walk mechanics
+  the two fixed functions shared near-verbatim into one helper, parameterised
+  by an `on_match` callback that returns whether to stop early (an existence
+  check) or keep collecting (a locate-all scan) — a review cleanliness item,
+  not a correctness one.
+
+  Pinned by `test/test_fk_cross_numeric_755.ml`: the issue's own repro, the
+  un-indexed regression guard, the reversed type order, a same-type
+  no-false-refusal case, both cascade actions found in the audit (SET NULL,
+  CASCADE), the DROP COLUMN schema-drift repro from both review findings, the
+  VIRTUAL generated FK-child column repro, and a 200-case QCheck property
+  tying RESTRICT's refusal to genuine cross-numeric reference existence,
+  indexed or not. Verified by reverting to the pre-#765-review code: the
+  DROP COLUMN test fails with the predicted `Invalid_argument("index out of
+  bounds")` and the VIRTUAL generated-column test fails by wrongly allowing
+  the DELETE.
 
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does

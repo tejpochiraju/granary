@@ -429,8 +429,23 @@ things that were tried and rejected) is usually the point.
 - **A cross-numeric JOIN KEY equality matches, in both join executors
   (#743).** #738 fixed this for `col = literal`; the hash join's canonical key
   and the nested-loop probe's typed index seek closed the same gap for `ON
-  l.a = r.b`. The FK child-reference probe has the analogous bug, filed as
-  #755 and deliberately not fixed here.
+  l.a = r.b`. The FK child-reference probe had the analogous bug; fixed
+  separately in #755 (below).
+- **A cross-numeric FK child reference is found by RESTRICT and every
+  cascade action, indexed or not (#755).** `Exec.fk_child_has_ref_multi{,_in_tx}`
+  and `Exec.scan_child_rows_multi_tx` (the latter backs the immediate RESTRICT
+  check AND SET NULL/SET DEFAULT/CASCADE) now seek the child index through
+  `Exec.index_lookup_values`, keyed by the child column's declared type — the
+  same rule #743 gave the nested-loop join probe. Two follow-on findings from
+  PR #765's review, fixed in the same change: a deferred recheck now
+  re-resolves its column ordinals by NAME against the schema AT RECHECK TIME
+  (`Exec.make_fk_recheck`) rather than reusing ones captured at statement
+  time, which a mid-transaction `DROP COLUMN` can shift or invalidate; and a
+  VIRTUAL generated FK-child column is excluded from the indexed fast path
+  (`Exec.child_index_key_types`) because its expression's actual runtime
+  storage class can differ from its declared column type, unlike an ordinary
+  or STORED column (`Row.encode_col_value` enforces that agreement only for
+  those).
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.

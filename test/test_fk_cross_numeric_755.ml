@@ -87,6 +87,22 @@ let expect_fk_refused db sql =
       (contains ~needle:"FOREIGN KEY" msg)
 ;;
 
+(* Like [Db.execute], but a non-[Failure] exception escaping the call (the
+   review's item 1 failure mode: an [Invalid_argument]/[Failure "nth"] from a
+   stale ordinal) is caught and reported as an [Error] string too, rather than
+   aborting the whole test binary — so a regression here shows up as an
+   Alcotest failure with the exception's message, not a crash. See
+   [Db.commit_txn]: it converts [Failure] to [Error (Runtime _)] itself but
+   re-raises everything else. *)
+let exec_result db sql : (unit, string) result =
+  try
+    match run (Db.execute db sql) with
+    | Ok () -> Ok ()
+    | Error e -> Error (Format.asprintf "%a" Db.pp_error e)
+  with
+  | exn -> Error (Printf.sprintf "uncaught exception: %s" (Printexc.to_string exn))
+;;
+
 let query_texts db sql =
   match run (Db.query db sql) with
   | Error e -> Alcotest.failf "query %S: %a" sql Db.pp_error e
@@ -230,6 +246,121 @@ let indexed_cross_numeric_delete_cascade_fires () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* PR #765 review item 1: a deferred recheck must not reuse a column     *)
+(* ordinal that a mid-transaction DROP COLUMN has shifted or removed.    *)
+(* ------------------------------------------------------------------ *)
+
+(* [enforce_insert_fk]'s deferred recheck used to capture [child_col_idxs]
+   (the FK column's ordinal) at INSERT time and reuse it unchanged when the
+   recheck ran at COMMIT. [junk] sits before [pid] in the child's column
+   list, so dropping it shifts [pid] from ordinal 1 to ordinal 0 -- and the
+   fix ([Exec.make_fk_recheck], reused here instead of a hand-rolled
+   closure) re-resolves the FK's column NAMES against the schema at recheck
+   time instead of trusting a captured ordinal. The parent row is never
+   inserted, so the violation is genuine and COMMIT must still refuse it --
+   without crashing on the stale ordinal in between. *)
+let deferred_recheck_survives_drop_column_and_still_refuses () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p1 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c1 (junk INTEGER, pid INTEGER REFERENCES p1(id) DEFERRABLE INITIALLY \
+       DEFERRED)";
+    exec db "BEGIN";
+    exec db "INSERT INTO c1 VALUES (0, 999)";
+    (* Shifts pid from ordinal 1 to ordinal 0 in c1's column list. *)
+    exec db "ALTER TABLE c1 DROP COLUMN junk";
+    match exec_result db "COMMIT" with
+    | Ok () -> Alcotest.fail "COMMIT should refuse: parent 999 was never inserted"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "COMMIT failed with a FOREIGN KEY error, not a crash (got %S)"
+           msg)
+        true
+        (contains ~needle:"FOREIGN KEY" msg))
+;;
+
+(* Same schema drift, but the parent row DOES arrive before COMMIT: the
+   recheck must resolve [pid]'s new ordinal (0) correctly and let the
+   transaction through, not misread a stale ordinal into a false violation
+   (or into comparing the wrong column entirely). *)
+let deferred_recheck_survives_drop_column_and_still_allows () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p2 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c2 (junk INTEGER, pid INTEGER REFERENCES p2(id) DEFERRABLE INITIALLY \
+       DEFERRED)";
+    exec db "BEGIN";
+    exec db "INSERT INTO c2 VALUES (0, 999)";
+    exec db "ALTER TABLE c2 DROP COLUMN junk";
+    exec db "INSERT INTO p2 VALUES (999)";
+    (match exec_result db "COMMIT" with
+     | Ok () -> ()
+     | Error msg -> Alcotest.failf "COMMIT should have succeeded, got %S" msg);
+    Alcotest.(check (list string))
+      "the child row is intact"
+      [ "999" ]
+      (query_texts db "SELECT pid FROM c2"))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* PR #765 review item 2: a VIRTUAL generated FK-child column's DECLARED *)
+(* type may not match its expression's ACTUAL runtime storage class.     *)
+(* ------------------------------------------------------------------ *)
+
+(* [x] is declared REAL but its generator [(y)] simply forwards an INTEGER
+   column, so the value the index physically stores is [Index_key.IK_int],
+   never [IK_real] -- [Row.encode_col_value] enforces that agreement for an
+   ordinary or STORED column (a mismatch there raises), but a VIRTUAL column
+   is always encoded as NULL and recomputed on read with no such check.
+   Before the fix, translating the seek through [x]'s DECLARED type (REAL)
+   produced an [IK_real] key that could never match the stored [IK_int]
+   entry, so RESTRICT silently missed a real reference. The fix treats a
+   VIRTUAL generated FK-child column as ineligible for the indexed fast path
+   ([Exec.child_index_key_types] returns [None]), falling back to the scan,
+   which recomputes the row and compares by VALUE regardless of the index's
+   physical key encoding. *)
+let generated_virtual_fk_child_column_restrict_refuses () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p3 (z INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO p3 VALUES (1)";
+    exec
+      db
+      "CREATE TABLE c3 (y INTEGER, x REAL GENERATED ALWAYS AS (y) VIRTUAL, FOREIGN KEY \
+       (x) REFERENCES p3(z))";
+    exec db "CREATE INDEX c3_x ON c3(x)";
+    expect_ok db "INSERT INTO c3(y) VALUES (1)";
+    expect_fk_refused db "DELETE FROM p3 WHERE z = 1")
+;;
+
+(* Same generated-column shape, but the child's virtual value does NOT equal
+   the parent row being deleted: no false refusal from treating the index as
+   unusable (the scan must still discriminate correctly by value). *)
+let generated_virtual_fk_child_column_restrict_allows_when_unreferenced () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p4 (z INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO p4 VALUES (1)";
+    exec db "INSERT INTO p4 VALUES (2)";
+    exec
+      db
+      "CREATE TABLE c4 (y INTEGER, x REAL GENERATED ALWAYS AS (y) VIRTUAL, FOREIGN KEY \
+       (x) REFERENCES p4(z))";
+    exec db "CREATE INDEX c4_x ON c4(x)";
+    expect_ok db "INSERT INTO c4(y) VALUES (2)";
+    expect_ok db "DELETE FROM p4 WHERE z = 1";
+    Alcotest.(check (list string))
+      "row 2 (referenced) survives"
+      [ "2" ]
+      (query_texts db "SELECT z FROM p4"))
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Property: RESTRICT agrees with [=] regardless of indexing            *)
 (* ------------------------------------------------------------------ *)
 
@@ -303,6 +434,26 @@ let () =
             "indexed cross-numeric ON DELETE CASCADE fires"
             `Quick
             indexed_cross_numeric_delete_cascade_fires
+        ] )
+    ; ( "review_item_1_deferred_recheck_schema_drift"
+      , [ Alcotest.test_case
+            "DROP COLUMN before COMMIT: deferred recheck still refuses"
+            `Quick
+            deferred_recheck_survives_drop_column_and_still_refuses
+        ; Alcotest.test_case
+            "DROP COLUMN before COMMIT: deferred recheck still allows"
+            `Quick
+            deferred_recheck_survives_drop_column_and_still_allows
+        ] )
+    ; ( "review_item_2_generated_virtual_fk_child"
+      , [ Alcotest.test_case
+            "VIRTUAL generated FK-child column: RESTRICT refuses"
+            `Quick
+            generated_virtual_fk_child_column_restrict_refuses
+        ; Alcotest.test_case
+            "VIRTUAL generated FK-child column: RESTRICT allows when unreferenced"
+            `Quick
+            generated_virtual_fk_child_column_restrict_allows_when_unreferenced
         ] )
     ; "property", List.map QCheck_alcotest.to_alcotest [ prop_restrict_matches_equality ]
     ]
