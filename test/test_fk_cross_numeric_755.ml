@@ -560,6 +560,158 @@ let precheck_delete_fk_fails_loudly_not_with_bare_column_not_found () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* PR #765 review round 4, item 1: four cascade-dispatch functions still  *)
+(* resolved FK columns with the raw find_col_idx_by_name{,_opt} instead   *)
+(* of resolve_fk_col_idxs, and disagreed with each other and with the     *)
+(* RESTRICT paths on failure mode for the identical corrupted-column      *)
+(* condition (#767's standalone Cat.drop_column corruption, reached here  *)
+(* the same way as round 3's item 2 tests -- an autocommit DROP COLUMN    *)
+(* with no pending check, so nothing refuses the drop itself):            *)
+(*   - cascade_delete_fk: find_col_idx_by_name_opt, SILENT Lwt.return_unit *)
+(*     (the cascade action never runs, nothing raised -- worse than       *)
+(*     RESTRICT's own loud refusal for the identical condition)           *)
+(*   - apply_update_cascade_fk / apply_delete_cascade_fk: raw              *)
+(*     find_col_idx_by_name, bare Failure "column not found: <name>"      *)
+(*   - cascade_update_fk (and its set_null/set_default siblings): same    *)
+(*     raw-crash gap, a separate call path                                *)
+(* All four now route through resolve_fk_col_idxs, agreeing with          *)
+(* enforce_insert_fk's deferred path and precheck_update_fk/               *)
+(* precheck_delete_fk's immediate path.                                   *)
+(* ------------------------------------------------------------------ *)
+
+(* apply_delete_cascade_fk: top-level DELETE cascade dispatch (direct
+   child of the row being deleted). *)
+let apply_delete_cascade_fk_fails_loudly () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p14 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c14 (pid INTEGER REFERENCES p14(id) ON DELETE SET NULL, junk INTEGER)";
+    exec db "INSERT INTO p14 VALUES (1)";
+    exec db "INSERT INTO c14 VALUES (1, 0)";
+    expect_ok db "ALTER TABLE c14 DROP COLUMN pid";
+    match exec_result db "DELETE FROM p14 WHERE id = 1" with
+    | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf "a loud, FK-specific message (got %S)" msg)
+        true
+        (contains ~needle:"FOREIGN KEY" msg))
+;;
+
+(* apply_update_cascade_fk: top-level UPDATE cascade dispatch (direct
+   child of the row being updated). *)
+let apply_update_cascade_fk_fails_loudly () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p15 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c15 (pid INTEGER REFERENCES p15(id) ON UPDATE CASCADE, junk INTEGER)";
+    exec db "INSERT INTO p15 VALUES (1)";
+    exec db "INSERT INTO c15 VALUES (1, 0)";
+    expect_ok db "ALTER TABLE c15 DROP COLUMN pid";
+    match exec_result db "UPDATE p15 SET id = 2 WHERE id = 1" with
+    | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf "a loud, FK-specific message (got %S)" msg)
+        true
+        (contains ~needle:"FOREIGN KEY" msg))
+;;
+
+(* cascade_delete_fk: the NESTED DELETE cascade dispatch, reached only when
+   a cascade recursively deletes a further child's own children. p16's
+   delete cascades into m16 (ON DELETE CASCADE), and m16's row deletion
+   then dispatches ITS OWN children (c16) through cascade_delete_fk --
+   the function that used to silently no-op on a corrupted column instead
+   of raising. Before the fix, m16's row would be silently deleted with no
+   error even though c16's FK could not be evaluated; after the fix, the
+   whole DELETE fails and m16's row survives (transaction rolled back). *)
+let cascade_delete_fk_fails_loudly_not_silently () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p16 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE m16 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p16(id) ON \
+       DELETE CASCADE)";
+    exec
+      db
+      "CREATE TABLE c16 (mid INTEGER REFERENCES m16(id) ON DELETE SET NULL, junk INTEGER)";
+    exec db "INSERT INTO p16 VALUES (1)";
+    exec db "INSERT INTO m16 VALUES (10, 1)";
+    exec db "INSERT INTO c16 VALUES (10, 0)";
+    expect_ok db "ALTER TABLE c16 DROP COLUMN mid";
+    (match exec_result db "DELETE FROM p16 WHERE id = 1" with
+     | Ok () -> Alcotest.fail "expected an error: c16's FK constraint is unresolvable"
+     | Error msg ->
+       Alcotest.(check bool)
+         (Printf.sprintf "a loud, FK-specific message (got %S)" msg)
+         true
+         (contains ~needle:"FOREIGN KEY" msg));
+    Alcotest.(check (list string))
+      "m16's row survives: the whole statement failed, nothing was silently deleted"
+      [ "10" ]
+      (query_texts db "SELECT id FROM m16"))
+;;
+
+(* cascade_update_fk: the NESTED UPDATE cascade dispatch, reached only when
+   a cascade recursively updates a further child's own children. p17's key
+   change cascades into m17.pid (ON UPDATE CASCADE), and that column
+   change then dispatches m17's OWN children (c17, which reference
+   m17.pid) through cascade_update_fk -- the function that used to raise a
+   bare "column not found" instead of a loud FK-specific message. *)
+let cascade_update_fk_fails_loudly () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p17 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE m17 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p17(id) ON \
+       UPDATE CASCADE, UNIQUE (pid))";
+    exec
+      db
+      "CREATE TABLE c17 (mid INTEGER REFERENCES m17(pid) ON UPDATE CASCADE, junk INTEGER)";
+    exec db "INSERT INTO p17 VALUES (1)";
+    exec db "INSERT INTO m17 VALUES (10, 1)";
+    exec db "INSERT INTO c17 VALUES (1, 0)";
+    expect_ok db "ALTER TABLE c17 DROP COLUMN mid";
+    match exec_result db "UPDATE p17 SET id = 2 WHERE id = 1" with
+    | Ok () -> Alcotest.fail "expected an error: c17's FK constraint is unresolvable"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf "a loud, FK-specific message (got %S)" msg)
+        true
+        (contains ~needle:"FOREIGN KEY" msg))
+;;
+
+(* PR #765 review round 4, item 2: fk_obligation_conflict's negative-
+   ordinal crash trap -- the same bug class round 3 fixed in
+   make_fk_recheck, reopened in the new function round 3 itself added.
+
+   Every [pfk_fk_ordinal] can be the [-1] sentinel if [Exec.fk_ordinal]
+   somehow failed to find the constraint at enqueue time (should never
+   happen -- every caller passes an [fk] literally drawn from the list
+   [fk_ordinal] searches, per its own docs), and [List.nth_opt] RAISES
+   [Invalid_argument] on a negative index rather than answering [None].
+   Guarded explicitly in [fk_obligation_conflict], the same shape as
+   [make_fk_recheck]'s own round-3 guard for the identical trap.
+
+   NOT given a dedicated SQL-level test, deliberately, matching
+   [make_fk_recheck]'s own guard (round 3, also untested at the SQL
+   level): [Exec.fk_obligation_conflict] and [Exec.fk_ordinal] are
+   private to [lib/sql/exec.ml] (no [val] in [exec.mli]), so forcing the
+   [-1] sentinel from outside the module would require either exposing an
+   internal-only seam purely for this test, or a schema-corruption bug
+   this PR's own fixes ([Exec.fk_ordinal] finding a constraint by
+   PHYSICAL EQUALITY against a list every caller draws it from) rule out
+   by construction. A test that cannot fail without a change nobody would
+   make is not a regression guard; the code comment on the guard itself
+   is what carries the invariant here. *)
+
+(* ------------------------------------------------------------------ *)
 (* PR #765 review item 5: the new seek path over a WITHOUT ROWID child   *)
 (* table, which addresses rows by their PK value rather than a rowid.   *)
 (* ------------------------------------------------------------------ *)
@@ -700,6 +852,24 @@ let () =
             "precheck_delete_fk fails loudly, not with bare \"column not found\""
             `Quick
             precheck_delete_fk_fails_loudly_not_with_bare_column_not_found
+        ] )
+    ; ( "review_round_4_cascade_dispatch_loud_failure"
+      , [ Alcotest.test_case
+            "apply_delete_cascade_fk fails loudly"
+            `Quick
+            apply_delete_cascade_fk_fails_loudly
+        ; Alcotest.test_case
+            "apply_update_cascade_fk fails loudly"
+            `Quick
+            apply_update_cascade_fk_fails_loudly
+        ; Alcotest.test_case
+            "cascade_delete_fk fails loudly, not silently"
+            `Quick
+            cascade_delete_fk_fails_loudly_not_silently
+        ; Alcotest.test_case
+            "cascade_update_fk fails loudly"
+            `Quick
+            cascade_update_fk_fails_loudly
         ] )
     ; ( "review_item_5_without_rowid_child"
       , [ Alcotest.test_case

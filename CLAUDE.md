@@ -459,9 +459,17 @@ things that were tried and rejected) is usually the point.
   defence in depth. `precheck_update_fk`/`precheck_delete_fk` (the immediate
   RESTRICT path) also now fail with the same loud, FK-specific message the
   deferred path already gave, instead of a bare internal `Failure "column
-  not found"`. Full write-up — including the residual this does NOT close
-  (`RENAME TABLE`/`DROP TABLE` can still desync a pending check by table
-  name) — in `docs/DECISIONS.md`.
+  not found"`. Round 4 found the same disagreement one layer further down —
+  four CASCADE-dispatch functions (`cascade_delete_fk`, `apply_update_cascade_fk`,
+  `apply_delete_cascade_fk`, `cascade_update_fk`) resolved FK columns with
+  the raw `find_col_idx_by_name{,_opt}` and disagreed with each other and
+  with RESTRICT (a silent no-op, or a bare crash, for the identical
+  corrupted-column condition) — plus a reopened `List.nth_opt` negative-index
+  crash trap in round 3's own new `Exec.fk_obligation_conflict`. All now
+  route through `Exec.resolve_fk_col_idxs` / guard the sentinel explicitly.
+  Full write-up — including the residual this does NOT close (`RENAME
+  TABLE`/`DROP TABLE` can still desync a pending check by table name,
+  tracked as #768) — in `docs/DECISIONS.md`.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.

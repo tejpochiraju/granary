@@ -595,6 +595,81 @@ useful reading order — search for the issue number instead.
   refused, and the immediate path's bare "column not found" instead of a
   loud FK message).
 
+  **Round 4 found the same disagreement one layer further down — the
+  CASCADE-application functions, not just the RESTRICT paths — and a
+  reopened crash trap in round 3's own new function, 2026-09-05.** Every
+  fix through round 3 converged the RESTRICT surface — `make_fk_recheck`
+  (deferred), `precheck_update_fk`/`precheck_delete_fk` (immediate) — on
+  one behaviour for a corrupted column: fail loudly with an FK-specific
+  message. Round 4's review found four CASCADE-dispatch functions never
+  got the same treatment, and disagreed with each other as well as with
+  RESTRICT:
+  - `cascade_delete_fk` (the NESTED cascade dispatch, reached when a
+    CASCADE recursively deletes a further child's own children) used
+    `find_col_idx_by_name_opt` and, on a miss, **silently `Lwt.return_unit`**
+    — the cascade action (SET NULL/SET DEFAULT/CASCADE/RESTRICT) never
+    runs, nothing raised. Worse than RESTRICT's own loud refusal for the
+    identical condition, and the literal "nothing errors" failure mode
+    this issue's own cascade-path audit (#755's original diff) called out
+    for the cross-numeric bug — reopened here for the corrupted-column
+    case instead.
+  - `apply_update_cascade_fk` / `apply_delete_cascade_fk` (the TOP-LEVEL
+    cascade dispatch for a direct child of the row being updated/deleted)
+    and `cascade_update_fk` (the nested UPDATE-side sibling of
+    `cascade_delete_fk`, plus its `cascade_update_set_null`/
+    `cascade_update_set_default` call chain) all used the raw, crashing
+    `find_col_idx_by_name` — a bare `Failure "column not found: <name>"`
+    with no FK context, a third behaviour for the same condition.
+
+  All four (and, as a non-blocking cleanup folded in the same round since
+  it was cheap, `enforce_insert_fk`'s own inline resolution, which
+  predated `resolve_fk_col_idxs` and duplicated its logic with a
+  slightly different message) now go through `Exec.resolve_fk_col_idxs`
+  — one behaviour for "an FK column can no longer be resolved," everywhere
+  in the FK surface, deferred or immediate, RESTRICT or CASCADE.
+
+  **A second, independent finding in the same round: `fk_obligation_conflict`
+  (round 3's own new function) reopened round 3's `make_fk_recheck`
+  crash trap in the function that was supposed to prevent needing it.**
+  `List.nth_opt child_now.Cat.fk_constraints chk.Cat.pfk_fk_ordinal` raises
+  `Invalid_argument` for a NEGATIVE index rather than answering `None` —
+  the identical gap `make_fk_recheck` guards against explicitly — and
+  every `pfk_fk_ordinal` can be the `-1` sentinel if `Exec.fk_ordinal`
+  ever fails to resolve at enqueue time. Reachable (in principle) from
+  ANY `RENAME COLUMN`/`DROP COLUMN` in a transaction that shares the
+  queue with one corrupted pending check, crashing an otherwise-unrelated
+  ALTER instead of refusing it. Guarded the same way: check
+  `pfk_fk_ordinal < 0` first and treat it as "no conflict from this
+  entry" (this pending check can never be resolved either way, so it
+  cannot be the reason to refuse someone else's ALTER).
+
+  Neither finding needed a structural-vs-targeted reassessment — both are
+  "make an existing loud-failure convention apply somewhere it was missed"
+  and "add the same defensive guard a sibling function already has,"
+  not a new mutation shape past the round-3 refusal.
+
+  Pinned by four new `test/test_fk_cross_numeric_755.ml` cases, one per
+  CASCADE-dispatch function, each reached via #767's same standalone
+  autocommit `DROP COLUMN` (no pending check, so round 3's refusal does
+  not intervene): `apply_delete_cascade_fk_fails_loudly` and
+  `apply_update_cascade_fk_fails_loudly` hit the two top-level dispatch
+  functions directly; `cascade_delete_fk_fails_loudly_not_silently` and
+  `cascade_update_fk_fails_loudly` reach the two NESTED dispatch functions
+  by building a two-level cascade chain (`p -> m -> c`, corrupting `c`'s
+  column) so the recursive call actually exercises them rather than the
+  top-level pair. `fk_obligation_conflict`'s negative-ordinal guard is
+  deliberately NOT given a dedicated SQL-level test, for the same reason
+  `make_fk_recheck`'s round-3 sibling guard was not: both `fk_ordinal` and
+  `fk_obligation_conflict` are private to `exec.ml` (no `val` in
+  `exec.mli`), and forcing the `-1` sentinel from outside the module would
+  need either a test-only seam into private state or a schema-corruption
+  bug this PR's own `fk_ordinal` (physical-equality lookup against a list
+  every caller draws its argument from) rules out by construction. All
+  four new cases verified to fail against the pre-round-4 code exactly as
+  predicted (a WIP commit, checked out and restored — not `git stash`):
+  the silent-no-op case for `cascade_delete_fk` and the bare
+  `Failure "column not found: <name>"` for the other three.
+
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does
   for UNIQUE. `OR IGNORE` skips the offending row — consistent with the UNIQUE
