@@ -74,6 +74,15 @@ let expect_ok db sql params ~msg =
   | Error e -> Alcotest.failf "%s : expected success, got: %a" msg Db.pp_error e
 ;;
 
+(* Like [expect_ok] but against an already-{!prepare}d statement, for seeding
+   several rows through one reusable statement rather than re-preparing the
+   same SQL per row. *)
+let expect_ok_stmt st params ~msg =
+  match run (Db.run st ~params) with
+  | Ok _ -> ()
+  | Error e -> Alcotest.failf "%s : expected success, got: %a" msg Db.pp_error e
+;;
+
 let contains ~needle hay =
   let nl = String.length needle
   and hl = String.length hay in
@@ -91,6 +100,21 @@ let expect_unique_violation db sql params ~table ~col ~msg =
       (Printf.sprintf "%s : UNIQUE violation (got %S)" msg got)
       true
       (contains ~needle:want got)
+;;
+
+(* Like [expect_unique_violation] but for a DDL statement (e.g. [CREATE
+   UNIQUE INDEX]) rather than a DML statement with parameters — no [params]
+   or [table]/[col], since [execute_create_index]'s build-time duplicate
+   probe reports the offending index/column pair however the DDL names it. *)
+let expect_ddl_unique_violation db sql ~msg =
+  match run (Db.execute db sql) with
+  | Ok () -> Alcotest.failf "%s : expected UNIQUE violation, but %S succeeded" msg sql
+  | Error e ->
+    let got = Format.asprintf "%a" Db.pp_error e in
+    Alcotest.(check bool)
+      (Printf.sprintf "%s : UNIQUE violation (got %S)" msg got)
+      true
+      (contains ~needle:"UNIQUE constraint failed" got)
 ;;
 
 let render = function
@@ -265,10 +289,57 @@ let unique_index_rejects_positive_zero_after_negative_zero () =
       ~msg:"+0.0 now conflicts with the stored -0.0")
 ;;
 
-(* Control: an ordinary integer 0 is a DIFFERENT storage class from a REAL
-   column and must not be reachable through this path at all (strict column
-   typing refuses the insert before it ever reaches the index). Not affected
-   by #754 — kept here so the suite documents the boundary of the fix. *)
+(* ------------------------------------------------------------------ *)
+(* CREATE UNIQUE INDEX's own build-time duplicate scan (retroactive build   *)
+(* over pre-existing rows), as opposed to the INSERT-time probe above.      *)
+(* ------------------------------------------------------------------ *)
+
+(* docs/DECISIONS.md claims #754 closes this "for free" because
+   [execute_create_index]'s build-time duplicate scan reads
+   [Index_key.encode_value] bytes exactly like [check_insert_unique] does —
+   but that claim had no direct test through the RETROACTIVE-build path
+   specifically (as opposed to building the index first and then inserting,
+   which every other case in this file already covers). This is the
+   PR-review-requested repro: seed both signs of zero BEFORE the index
+   exists, then attempt to build a UNIQUE index over them. *)
+let create_unique_index_build_rejects_existing_negative_zero_pair () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (r REAL)";
+    let st = prepare db "INSERT INTO t (r) VALUES (?)" in
+    expect_ok_stmt st [ Db.V_real 0.0 ] ~msg:"seed +0.0";
+    expect_ok_stmt st [ Db.V_real (-0.0) ] ~msg:"seed -0.0";
+    expect_ddl_unique_violation
+      db
+      "CREATE UNIQUE INDEX ui ON t (r)"
+      ~msg:"retroactive build over an existing +0.0/-0.0 pair conflicts (#754)")
+;;
+
+(* Control, same shape as [unique_index_is_still_per_column_typed] but for
+   the BUILD path rather than INSERT: seeding two ordinary distinct REAL
+   values before the index exists must still let the build succeed, so the
+   test above is pinning a real exclusion rather than "every retroactive
+   REAL UNIQUE build fails". *)
+let create_unique_index_build_accepts_distinct_reals () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (r REAL)";
+    let st = prepare db "INSERT INTO t (r) VALUES (?)" in
+    expect_ok_stmt st [ Db.V_real 0.0 ] ~msg:"seed 0.0";
+    expect_ok_stmt st [ Db.V_real 1.5 ] ~msg:"seed 1.5";
+    exec db "CREATE UNIQUE INDEX ui ON t (r)")
+;;
+
+(* Control: there is no INTEGER-to-REAL coercion anywhere in this engine to
+   exercise here — strict column typing refuses an INTEGER LITERAL into a
+   REAL column outright at sema (`INSERT INTO u (k, r) VALUES (2, 1)` fails
+   with "type mismatch: expected REAL, got INTEGER", verified directly
+   against this table shape), and binding a `V_int` PARAMETER to a REAL
+   column reaches an unrelated, unhandled `Row.encode` invariant failure
+   further down (a real gap, but not this issue's — out of scope for #754).
+   So the only thing this test can and does confirm is the boundary of the
+   fix itself: two ORDINARY, distinct REAL values (`0.0` and `1.0`, neither
+   of them the `+0.0`/`-0.0` pair #754 is about) still insert into the same
+   UNIQUE REAL column without a false conflict, i.e. #754's key-collapsing
+   change is scoped to signed zero and does not make every REAL collide. *)
 let unique_index_is_still_per_column_typed () =
   with_db (fun db ->
     exec db "CREATE TABLE u (k INTEGER PRIMARY KEY, r REAL)";
@@ -279,9 +350,6 @@ let unique_index_is_still_per_column_typed () =
          "INSERT INTO u (k, r) VALUES (1, ?)"
          [ Db.V_real 0.0 ]
          ~msg:"seed 0.0");
-    (* r is REAL-typed; an INTEGER literal is coerced/stored under the
-       column's declared type by the same path every other insert takes, so
-       this exercises no new behaviour — just confirms the fixture is sane. *)
     ignore
       (expect_ok
          db
@@ -338,6 +406,16 @@ let () =
             "sanity: distinct reals still insert"
             `Quick
             unique_index_is_still_per_column_typed
+        ] )
+    ; ( "unique_index_build"
+      , [ Alcotest.test_case
+            "retroactive build over an existing +0.0/-0.0 pair conflicts"
+            `Quick
+            create_unique_index_build_rejects_existing_negative_zero_pair
+        ; Alcotest.test_case
+            "retroactive build over distinct reals still succeeds"
+            `Quick
+            create_unique_index_build_accepts_distinct_reals
         ] )
     ]
 ;;
