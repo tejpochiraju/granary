@@ -1747,17 +1747,80 @@ and make_trigger_hook t table_meta ~timing ~event =
     ordering decision above: it runs before any matching SQL [BEFORE] trigger,
     so a veto pre-empts that trigger's body — including its nested DML —
     from running at all. *)
+(* #752 review (items 3/4): run one registered OCaml row hook and normalise
+   every way it can fail into [Failure], the one exception class every caller
+   up the stack (starting with {!run_dml}'s own [Lwt.catch]) already turns
+   into [Error (Runtime _)]:
+
+   - an [Error msg] return, the documented veto/failure path;
+   - a raw OCaml exception a careless hook raises instead (a [Not_found], a
+     failed pattern match, ...) — without this, that would propagate as
+     whatever exception it happened to be, breaking the [(_, error) result]
+     contract every other failure in this module upholds.
+
+   The message is prefixed with the timing and table rather than given its
+   own {!error} variant.  A closed polymorphic-variant case (as
+   {!register_row_hook} uses for [`Unknown_table]) does not fit here — this
+   fires from deep inside the write path, not at a single call boundary, and
+   every existing consumer of [execute]/[execute_change_count] already
+   matches on the small, closed {!error} type; adding a case there is exactly
+   the widening {!register_view_callback}'s own doc comment argues against
+   (#437/#746) — it would force every exhaustive match on {!error} in this
+   codebase to grow an arm only this one feature can produce.  The prefix is
+   the cheap alternative: a caller who wants to tell a hook veto from an
+   unrelated internal error can still do so by matching the [Runtime]
+   message text. *)
+and fire_ocaml_row_hook ~timing ~table_name (_id, fn) mutation =
+  let label =
+    match timing with
+    | `Before -> "before"
+    | `After -> "after"
+    | `Instead_of -> "instead-of"
+  in
+  Lwt.catch
+    (fun () ->
+       let* r = fn mutation in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error msg ->
+         Lwt.fail_with (Printf.sprintf "%s row hook on '%s': %s" label table_name msg))
+    (function
+      | Failure _ as exn -> Lwt.fail exn
+      | exn ->
+        Lwt.fail_with
+          (Printf.sprintf
+             "%s row hook on '%s' raised: %s"
+             label
+             table_name
+             (Printexc.to_string exn)))
+
 and make_combined_hook t table_meta ~timing ~event =
   let sql_hook = make_trigger_hook t table_meta ~timing ~event in
   let ocaml_hooks =
-    match timing with
-    | (`Before | `After) as narrow_timing ->
-      (match Hashtbl.find_opt t.row_hooks (table_meta.Cat.name, narrow_timing, event) with
-       | None -> []
-       (* held newest-first (O(1) registration, #746's pattern); reverse here
-          to fire in registration order. *)
-       | Some lst -> List.rev lst)
-    | `Instead_of -> []
+    (* #752 review (item 5): mirror {!make_trigger_hook}'s own
+       [Hashtbl.length t.triggers = 0] fast path — a table with no row hooks
+       registered ANYWHERE pays for one length check, not a per-(table,
+       timing, event) [Hashtbl.find_opt]. *)
+    if Hashtbl.length t.row_hooks = 0
+    then []
+    else (
+      match timing with
+      | (`Before | `After) as narrow_timing ->
+        (match
+           Hashtbl.find_opt t.row_hooks (table_meta.Cat.name, narrow_timing, event)
+         with
+         | None -> []
+         (* held newest-first (O(1) registration, #746's pattern); reverse here
+            to fire in registration order. *)
+         | Some lst -> List.rev lst)
+      | `Instead_of ->
+        (* Unreachable: every call site below builds this hook only for
+           [`Before]/[`After] — [`Instead_of] is [make_trigger_hook]'s own
+           concern for INSTEAD OF triggers on a VIEW, which never appear as
+           [table_meta] here.  Kept exhaustive rather than [assert false] so
+           a future [`Instead_of] call site fails closed (no row hooks) rather
+           than raising. *)
+        [])
   in
   match sql_hook, ocaml_hooks with
   | None, [] -> None
@@ -1765,12 +1828,10 @@ and make_combined_hook t table_meta ~timing ~event =
     Some
       (fun ~tx ~new_row ~old_row ->
         let run_ocaml_hooks () =
+          let mutation = { table = table_meta.Cat.name; new_row; old_row } in
           Lwt_list.iter_s
-            (fun (_id, fn) ->
-               let* r = fn { table = table_meta.Cat.name; new_row; old_row } in
-               match r with
-               | Ok () -> Lwt.return_unit
-               | Error msg -> Lwt.fail_with msg)
+            (fun entry ->
+               fire_ocaml_row_hook ~timing ~table_name:table_meta.Cat.name entry mutation)
             ocaml_hooks
         in
         let run_sql_hook () =
@@ -2544,6 +2605,76 @@ let execute_control_op top t sql op =
   | _ -> None
 ;;
 
+(* #752 review: [row_hooks] is keyed by table NAME, and — unlike the SQL
+   trigger/view caches — is not itself a stored, versioned catalog object, so
+   nothing purges or re-keys it when the table it names is dropped or
+   renamed.  Two concrete breakages that closes:
+
+   - [DROP TABLE t; CREATE TABLE t (different columns)]: without a purge, a
+     hook registered against the old [t] silently reattaches to the new,
+     differently-shaped table the moment it is created, and — since a
+     [`Before] hook can veto — a stale hook is a correctness/security gap,
+     not just a leak.
+   - [ALTER TABLE t RENAME TO t2]: without a migration, the hook is filed
+     under a name [make_combined_hook] never looks up again (it always keys
+     on the table's CURRENT name), so it silently stops firing forever, with
+     no error — the caller has no way to know.
+
+   Both run only after the op has actually SUCCEEDED (called from the success
+   arm of {!run_dml} / {!run_core}), so a failed or rolled-back DROP/RENAME
+   leaves the registry untouched. *)
+(* Every (timing, event) pair a row hook can be registered under.  Shared by
+   {!purge_row_hooks_for_table} and {!migrate_row_hooks_for_table} so neither
+   nests two [List.iter]s to cover the cartesian product by hand. *)
+let all_row_hook_timings_events =
+  List.concat_map
+    (fun timing -> List.map (fun event -> timing, event) [ `Insert; `Update; `Delete ])
+    [ `Before; `After ]
+;;
+
+let purge_row_hooks_for_table t name =
+  List.iter
+    (fun (timing, event) -> Hashtbl.remove t.row_hooks (name, timing, event))
+    all_row_hook_timings_events
+;;
+
+(* #752 review: RENAME migrates row-hook registrations to the new name rather
+   than refusing the rename outright, unlike #609's view/trigger dependency
+   check.  #609 refuses because a view/trigger is stored as raw, unparsed SQL
+   text with no name to rewrite in place — refusal is a technical necessity,
+   not a chosen philosophy.  [row_hooks] is a structured in-memory [Hashtbl]
+   keyed by name, so re-keying it is exact and lossless; refusing here would
+   only strand a caller's hook (and camel's [reject!] veto with it) for no
+   correctness reason.  A [row_mutation] fired after the rename reports
+   [table = new_name] — the same as every other observation of the table
+   post-rename. *)
+let migrate_row_hook_key t ~old_name ~new_name (timing, event) =
+  let old_key = old_name, timing, event in
+  match Hashtbl.find_opt t.row_hooks old_key with
+  | None -> ()
+  | Some entries ->
+    Hashtbl.remove t.row_hooks old_key;
+    Hashtbl.replace t.row_hooks (new_name, timing, event) entries
+;;
+
+let migrate_row_hooks_for_table t ~old_name ~new_name =
+  if not (String.equal old_name new_name)
+  then List.iter (migrate_row_hook_key t ~old_name ~new_name) all_row_hook_timings_events
+;;
+
+(* #752 review: dispatch the above for whichever DDL op just succeeded.  Called
+   from both DML entry points ({!run_dml} and {!run_core}) so a prepared
+   [DROP TABLE] / [ALTER TABLE ... RENAME] gets the same bookkeeping a
+   one-shot [Db.execute] does. *)
+let sync_row_hooks_after_op t op =
+  match op with
+  | Sql.Plan.Op_drop_table { table_meta; _ } ->
+    purge_row_hooks_for_table t table_meta.Cat.name
+  | Sql.Plan.Op_alter_table { table_meta; action = Sql.Ast.AA_rename_table new_name } ->
+    migrate_row_hooks_for_table t ~old_name:table_meta.Cat.name ~new_name
+  | _ -> ()
+;;
+
 (* Build the trigger BEFORE/AFTER hooks, the REPLACE/UPSERT secondary hooks,
    and the INSERT target table name for a DML op. *)
 let dml_hooks t op =
@@ -2615,6 +2746,7 @@ let run_dml t op ~on_ok =
          let* n = lwt_op in
          t.last_changes <- n;
          t.total_changes <- t.total_changes + n;
+         sync_row_hooks_after_op t op;
          (match insert_table_name with
           | Some tbl when n > 0 ->
             (match Cat.find_table_cached t.catalog ~name:tbl with
@@ -3290,6 +3422,7 @@ let run_core st ~params =
          in
          t.last_changes <- n;
          t.total_changes <- t.total_changes + n;
+         sync_row_hooks_after_op t st.plan;
          (match insert_table_name with
           | Some tbl when n > 0 ->
             (match Cat.find_table_cached t.catalog ~name:tbl with
@@ -4839,9 +4972,17 @@ let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
 let row_hook_seq = ref 0
 
 let register_row_hook t ~table ~timing ~event fn =
-  if not (Cat.table_exists t.catalog ~name:table)
-  then Error (`Unknown_table table)
-  else (
+  match Cat.find_table_cached t.catalog ~name:table with
+  | None -> Error (`Unknown_table table)
+  (* #752 review: a COLUMNSTORE table's INSERT calls [Col_store.insert_rows]
+     directly, bypassing [before_hook]/[after_hook] entirely, and its
+     UPDATE/DELETE are refused outright — so a hook registered here could
+     NEVER fire, for any (timing, event).  Refusing at registration matches
+     the #660 precedent (a GENERATED column on a COLUMNSTORE table is refused
+     at DDL rather than half-wired); wiring the columnar write path to fire
+     hooks is a larger, separate change than #752 or this fixup owes. *)
+  | Some tm when Cat.is_columnar tm -> Error (`Columnstore_unsupported table)
+  | Some _ ->
     incr row_hook_seq;
     let id = !row_hook_seq in
     let key = table, timing, event in
@@ -4849,7 +4990,27 @@ let register_row_hook t ~table ~timing ~event fn =
     (* O(1): prepend, like {!register_view_callback}; {!make_combined_hook}
        reverses at the firing site to restore registration order. *)
     Hashtbl.replace t.row_hooks key ((id, fn) :: existing);
-    Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id })
+    (* #752 review: without this, [BEGIN; CREATE TABLE t(...); register_row_hook
+       ~table:"t" ...; ROLLBACK] leaves the hook attached in [t.row_hooks] even
+       though the table it was registered against never really existed — a
+       LATER, unrelated [CREATE TABLE t] then silently reattaches it.
+       [register_row_hook] is a plain OCaml call, not itself part of the SQL
+       statement stream, so it does not automatically share in a rolled-back
+       transaction's undo the way DDL does; wiring it through the SAME #269
+       schema-undo log [staged_schema_change] uses for the view/trigger caches
+       closes that gap with the same mechanism, instead of a bespoke one. Only
+       needed when a transaction is actually open — outside one there is no
+       rollback to protect against. Idempotent by construction (removes by
+       [id]), matching {!Cat.register_schema_undo}'s contract. *)
+    (match t.explicit_txn with
+     | None -> ()
+     | Some _ ->
+       Cat.register_schema_undo t.catalog (fun () ->
+         match Hashtbl.find_opt t.row_hooks key with
+         | None -> ()
+         | Some lst ->
+           Hashtbl.replace t.row_hooks key (List.filter (fun (i, _) -> i <> id) lst)));
+    Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id }
 ;;
 
 let unregister_row_hook t h =

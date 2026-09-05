@@ -1026,9 +1026,52 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
     {!register_view_callback}'s [`Unknown_view] (#437): a caller wiring hooks
     from config can tell a typo from a successful registration. The error is a
     closed polymorphic variant rather than the module-wide {!error} for the
-    same reason #437 gives — this is {!register_row_hook}'s only failure, and
-    widening {!error} would add a case no other function returning
+    same reason #437 gives — this is {!register_row_hook}'s only failure
+    class, and widening {!error} would add a case no other function returning
     [(_, error) result] can produce.
+
+    {b Returns [Error (`Columnstore_unsupported table)] for a [USING
+    COLUMNSTORE] table (#752 review).} The columnar write path calls
+    [Col_store.insert_rows] directly for INSERT, bypassing [before_hook]/
+    [after_hook] entirely, and refuses UPDATE/DELETE outright — so a hook
+    registered on a columnstore table could never fire, for any [timing] or
+    [event]. Refusing at registration matches the precedent set by a
+    GENERATED column on a [USING COLUMNSTORE] table being refused at DDL
+    (#660) rather than silently accepted and then never honoured.
+
+    {b A hook is tied to the table it was registered against, not to the
+    name — DROP TABLE purges it; RENAME migrates it (#752 review).} Both are
+    applied once the DDL statement that names [table] actually {e succeeds}
+    (a failed or rolled-back DROP/RENAME leaves the registry untouched):
+    - [DROP TABLE table] removes every hook registered on it, for every
+      [timing]/[event]. Without this, [DROP TABLE t; CREATE TABLE t (...)]
+      with a different shape would silently reattach a stale hook to the new
+      table — and since a [`Before] hook can veto, a misattached one is a
+      correctness/security gap, not just a leak.
+    - [ALTER TABLE table RENAME TO new_name] re-keys every hook registered
+      on it to fire under [new_name] instead — {e not} a refusal, unlike
+      #609's view/trigger dependency check. #609 refuses because a view or
+      trigger is stored as raw, unparsed SQL text with no name to rewrite in
+      place; that is a technical necessity, not a chosen policy. A row hook
+      is a structured in-memory registration keyed by name, so re-keying it
+      is exact and lossless, and a [row_mutation] fired after the rename
+      reports [table = new_name] — refusing here would only strand a
+      caller's hook (and camel's [reject!] veto with it) for no correctness
+      reason.
+
+    {b Registering inside an explicit transaction is undone by its ROLLBACK
+    (#752 review).} [register_row_hook] is an OCaml call, not a SQL statement,
+    so it does not automatically share in a transaction's rollback the way
+    DDL run through {!execute} does. Without special handling,
+    [BEGIN; CREATE TABLE t(...); (* register_row_hook here *); ROLLBACK]
+    would leave the hook attached even though [t] never really existed — and
+    a {e later, unrelated} [CREATE TABLE t] would silently reattach it. When
+    a transaction is open at the moment of registration, the registration is
+    therefore undone if that transaction rolls back (including a
+    [ROLLBACK TO] that unwinds past the point of registration), via the same
+    #269 schema-undo mechanism the view/trigger caches use. Registering
+    outside an explicit transaction is unaffected — there is no rollback to
+    protect against.
 
     {b Veto ([`Before] only).}  [fn] returns [(unit, string) result Lwt.t].
     [Ok ()] lets the write proceed (or, for [`After], simply completes).
@@ -1095,14 +1138,32 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
     a row hook is an in-memory OCaml closure: it does not survive closing and
     reopening the database, and a sibling handle from
     {!create_worker_handle} starts with none registered, exactly as it does
-    for {!register_view_callback}. *)
+    for {!register_view_callback}.
+
+    {b A hook that raises is treated exactly like one that returns [Error]
+    (#752 review).} [fn]'s documented failure path is [Error msg], but a hook
+    that raises an OCaml exception instead ([Not_found], a failed pattern
+    match, ...) gets the identical treatment rather than escaping the
+    [(_, error) result] contract every other failure in this library upholds:
+    the exception is caught and re-raised as [Failure], the one exception
+    class {!execute}/{!execute_change_count} already turn into
+    [Error (Runtime _)]. The resulting message is prefixed with the timing,
+    event and table (e.g. ["before row hook on 't': <msg>"], or
+    ["... raised: <exn>"] for a genuine exception) rather than given its own
+    {!error} variant — deliberately: this fires from deep inside the write
+    path rather than at a single call boundary, and adding a case to the
+    small, closed {!error} type would force every existing exhaustive match
+    on it to grow an arm only this one feature can produce, which is exactly
+    what #437/#746 chose closed polymorphic variants over for
+    {!register_view_callback}. A caller that needs to tell a hook's veto from
+    an unrelated internal error can match the [Runtime] message text. *)
 val register_row_hook
   :  t
   -> table:string
   -> timing:[ `Before | `After ]
   -> event:[ `Insert | `Update | `Delete ]
   -> (row_mutation -> (unit, string) result Lwt.t)
-  -> (row_hook, [ `Unknown_table of string ]) result
+  -> (row_hook, [ `Unknown_table of string | `Columnstore_unsupported of string ]) result
 
 (** #752: detach the row hook [h] names. Idempotent and never raises: calling
     it a second time, on a hook whose table no longer has any hooks

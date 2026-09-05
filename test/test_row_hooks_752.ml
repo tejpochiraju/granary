@@ -98,6 +98,8 @@ let attach db ~table ~timing ~event fn =
   match Db.register_row_hook db ~table ~timing ~event fn with
   | Ok h -> h
   | Error (`Unknown_table t) -> Alcotest.failf "expected %S to be a known table" t
+  | Error (`Columnstore_unsupported t) ->
+    Alcotest.failf "expected %S to be a non-columnstore table" t
 ;;
 
 let ok_hook fn m =
@@ -116,6 +118,8 @@ let test_unknown_table_reports_and_registers_nothing () =
         Lwt.return (Ok ()))
     with
     | Error (`Unknown_table t) -> Alcotest.(check string) "names the table" "nope" t
+    | Error (`Columnstore_unsupported t) ->
+      Alcotest.failf "expected `Unknown_table, got `Columnstore_unsupported %S" t
     | Ok _ -> Alcotest.fail "expected `Unknown_table")
 ;;
 
@@ -350,6 +354,123 @@ let test_unregister_is_idempotent_and_ignores_foreign_handles () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* DDL invalidation (review findings #1/#2)                             *)
+(* ------------------------------------------------------------------ *)
+
+(* #1a: DROP TABLE must purge every hook registered on it, or a later,
+   unrelated CREATE TABLE of the same name silently reattaches a stale one. *)
+let test_drop_table_purges_its_hooks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let fired = ref 0 in
+    let _h =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        incr fired;
+        Lwt.return (Error "stale hook must never run again"))
+    in
+    exec db "DROP TABLE t";
+    (* A differently-shaped table under the same name. *)
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'ok')";
+    Alcotest.(check int) "the stale hook never fires" 0 !fired;
+    Alcotest.(check (list string))
+      "the new table has its row"
+      [ "1|ok" ]
+      (texts db "SELECT * FROM t"))
+;;
+
+(* #1b: RENAME migrates the hook to the new name rather than stranding it. *)
+let test_rename_table_migrates_its_hooks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let seen = ref [] in
+    let _h =
+      attach
+        db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (ok_hook (fun m -> seen := m :: !seen))
+    in
+    exec db "ALTER TABLE t RENAME TO t2";
+    exec db "INSERT INTO t2 VALUES (1, 10)";
+    match !seen with
+    | [ ({ Db.table = "t2"; new_row = Some row; old_row = None } : Db.row_mutation) ] ->
+      Alcotest.(check string)
+        "fires under the new name with the right row"
+        "1|10"
+        (show_row row)
+    | _ ->
+      Alcotest.fail "expected exactly one Insert mutation reported under the new name")
+;;
+
+(* #1c: a hook registered while a CREATE TABLE is in flight must not survive
+   that transaction's ROLLBACK -- otherwise a LATER, unrelated CREATE TABLE
+   of the same name silently reattaches it. *)
+let test_rolled_back_create_table_leaves_no_hook () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let fired = ref 0 in
+    let _h =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        incr fired;
+        Lwt.return (Error "must never run: its table was rolled back"))
+    in
+    exec db "ROLLBACK";
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    exec db "INSERT INTO t VALUES (1, 10)";
+    Alcotest.(check int) "the rolled-back registration never fires" 0 !fired;
+    Alcotest.(check (list string))
+      "the real row landed"
+      [ "1|10" ]
+      (texts db "SELECT * FROM t"))
+;;
+
+(* #2: a row hook on a COLUMNSTORE table can never fire (INSERT bypasses the
+   hook pair entirely; UPDATE/DELETE are refused outright on such a table),
+   so registration itself is refused. *)
+let test_columnstore_table_refuses_registration () =
+  with_db (fun db ->
+    exec db "CREATE TABLE c (id INTEGER, v INTEGER) USING COLUMNSTORE";
+    match
+      Db.register_row_hook db ~table:"c" ~timing:`After ~event:`Insert (fun _ ->
+        Lwt.return (Ok ()))
+    with
+    | Error (`Columnstore_unsupported t) ->
+      Alcotest.(check string) "names the table" "c" t
+    | Error (`Unknown_table t) ->
+      Alcotest.failf "expected `Columnstore_unsupported, got `Unknown_table %S" t
+    | Ok _ -> Alcotest.fail "expected `Columnstore_unsupported")
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Exception normalisation (review finding #3)                          *)
+(* ------------------------------------------------------------------ *)
+
+exception Boom
+
+(* A hook that raises rather than returning [Error] must still surface as an
+   ordinary [Error (Runtime _)] from [Db.execute] -- never as an unhandled
+   exception escaping [Lwt_main.run], which would break the [(_, error)
+   result] contract every other failure in this library upholds. *)
+let test_hook_raising_is_normalised_to_a_result () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let _h = attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ -> raise Boom) in
+    match run (Db.execute db "INSERT INTO t VALUES (1, 10)") with
+    | Ok () -> Alcotest.fail "expected the raised exception to abort the statement"
+    | Error e ->
+      let msg = Format.asprintf "%a" Db.pp_error e in
+      Alcotest.(check bool)
+        (Printf.sprintf "reports Runtime mentioning the exception (got %S)" msg)
+        true
+        (String.length msg > 0)
+    | exception _ ->
+      Alcotest.fail "the raised exception escaped Db.execute's result contract")
+;;
+
+(* ------------------------------------------------------------------ *)
 (* QCheck: registered/unregistered set matches what fires               *)
 (* ------------------------------------------------------------------ *)
 
@@ -498,6 +619,30 @@ let () =
             "idempotent and ignores foreign handles"
             `Quick
             test_unregister_is_idempotent_and_ignores_foreign_handles
+        ] )
+    ; ( "ddl invalidation"
+      , [ Alcotest.test_case
+            "DROP TABLE purges its hooks"
+            `Quick
+            test_drop_table_purges_its_hooks
+        ; Alcotest.test_case
+            "RENAME migrates its hooks"
+            `Quick
+            test_rename_table_migrates_its_hooks
+        ; Alcotest.test_case
+            "a rolled-back CREATE TABLE leaves no hook behind"
+            `Quick
+            test_rolled_back_create_table_leaves_no_hook
+        ; Alcotest.test_case
+            "a COLUMNSTORE table refuses registration"
+            `Quick
+            test_columnstore_table_refuses_registration
+        ] )
+    ; ( "exception normalisation"
+      , [ Alcotest.test_case
+            "a raising hook is normalised to a result"
+            `Quick
+            test_hook_raising_is_normalised_to_a_result
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest prop_fired_matches_registered ]
     ]
