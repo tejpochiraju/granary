@@ -427,6 +427,57 @@ let test_rolled_back_create_table_leaves_no_hook () =
       (texts db "SELECT * FROM t"))
 ;;
 
+(* Round-2 review #1: a rolled-back DROP TABLE must restore the hooks it
+   purged, exactly as it restores the catalog row -- the purge is not itself
+   allowed to survive a ROLLBACK that undoes the DROP it was reacting to. *)
+let test_rolled_back_drop_table_restores_its_hooks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let fired = ref 0 in
+    let _h =
+      attach db ~table:"t" ~timing:`After ~event:`Insert (ok_hook (fun _ -> incr fired))
+    in
+    exec db "BEGIN";
+    exec db "DROP TABLE t";
+    exec db "ROLLBACK";
+    exec db "INSERT INTO t VALUES (1, 10)";
+    Alcotest.(check int) "the hook survives the rolled-back DROP" 1 !fired)
+;;
+
+(* Round-2 review #2: a hook registered mid-transaction, then relocated by a
+   RENAME in the SAME transaction, must be fully undone when that whole
+   transaction rolls back -- the registration itself happened inside the
+   rolled-back transaction, so the CORRECT end state is no hook at all, not
+   one left dangling under whatever name the (also rolled-back) rename moved
+   it to. This is the LIFO-ordering case: the rename's own undo must run
+   BEFORE register_row_hook's undo (which was registered earlier and looks
+   for the ORIGINAL name), or the latter finds nothing under that name and
+   removes nothing -- leaving the hook permanently misfiled under the
+   rename's target name. Proven here the way the review frames the danger: a
+   LATER, wholly unrelated table created under that target name must not
+   silently inherit the stale hook (and, since it's a [`Before] hook, gain an
+   unexpected veto). *)
+let test_rolled_back_rename_does_not_leave_a_hook_misfiled_under_the_target_name () =
+  with_db (fun db ->
+    exec db "CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)";
+    exec db "BEGIN";
+    let fired = ref 0 in
+    let _h =
+      attach db ~table:"a" ~timing:`After ~event:`Insert (ok_hook (fun _ -> incr fired))
+    in
+    exec db "ALTER TABLE a RENAME TO b";
+    exec db "ROLLBACK";
+    (* The registration happened inside the now-rolled-back transaction, so
+       it is gone entirely -- not restored under "a". *)
+    exec db "INSERT INTO a VALUES (1, 10)";
+    Alcotest.(check int) "not restored under the original name either" 0 !fired;
+    (* The real regression: a later, unrelated table named "b" must not
+       silently inherit a hook stranded there by the aborted rename. *)
+    exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)";
+    exec db "INSERT INTO b VALUES (1, 10)";
+    Alcotest.(check int) "an unrelated later table 'b' does not inherit it" 0 !fired)
+;;
+
 (* #2: a row hook on a COLUMNSTORE table can never fire (INSERT bypasses the
    hook pair entirely; UPDATE/DELETE are refused outright on such a table),
    so registration itself is refused. *)
@@ -633,6 +684,14 @@ let () =
             "a rolled-back CREATE TABLE leaves no hook behind"
             `Quick
             test_rolled_back_create_table_leaves_no_hook
+        ; Alcotest.test_case
+            "a rolled-back DROP TABLE restores its hooks"
+            `Quick
+            test_rolled_back_drop_table_restores_its_hooks
+        ; Alcotest.test_case
+            "a rolled-back RENAME does not misfile a hook under the target name"
+            `Quick
+            test_rolled_back_rename_does_not_leave_a_hook_misfiled_under_the_target_name
         ; Alcotest.test_case
             "a COLUMNSTORE table refuses registration"
             `Quick
