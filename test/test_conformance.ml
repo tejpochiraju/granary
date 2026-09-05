@@ -834,6 +834,7 @@ let open_mirage path () =
   let* adapter = MB.connect dev in
   let* r =
     Db.open_block
+      ~init_if_corrupt:true (* fresh, zeroed 4MB temp file: #753 *)
       ~read_page:(MB.read_page adapter)
       ~write_page:(MB.write_page adapter)
       ~sync:(MB.sync adapter)

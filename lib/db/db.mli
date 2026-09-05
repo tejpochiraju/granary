@@ -76,11 +76,40 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
     [durability] sets the database-wide durability knob (full/batched/off)
     before the catalog is loaded.
 
+    {b #753: [init_if_corrupt] defaults to [false].}  It is forwarded
+    verbatim to {!Granary_store.Store.open_block}, whose header check cannot
+    distinguish "a zeroed, never-before-used device" from "an existing
+    device whose header failed to parse" — both look like a missing header
+    and are the same code path.  So the choice is really "may this open
+    format the device if its header is unreadable," not "is this device
+    known to be corrupt":
+
+    - [false] (the default): an unreadable header — corrupt {e or} freshly
+      zeroed — is refused rather than silently reformatted.  [Db]'s
+      {!error} type has no dedicated variant for this (every
+      {!Granary_store.Store.error} is wrapped as [Runtime]), so the failure
+      surfaces as [Error (Runtime msg)] where [msg] names
+      [Header_error(both header pages corrupt)] — check the message text,
+      not the variant, to distinguish this from other [Runtime] failures.
+      For a persisted, already-provisioned database this is the safe
+      choice: a media fault, a partial write, a wrong device path, or a
+      device belonging to a different application must not be mistaken for
+      "nothing here yet" and quietly wiped into an empty store that looks
+      healthy to the caller.
+    - [true]: {b provisioning only — destroys whatever is on the device.}
+      An unreadable header is treated as fresh and the device is
+      initialised.  Reach for this only at a deliberate one-time
+      provisioning step (first boot of a new device), never as a
+      steady-state open path, since it cannot tell "new" from "corrupt"
+      any better than [false] can — it just resolves the ambiguity the
+      other way.
+
     This is the platform-agnostic entry point.  Unix file convenience
     constructors ([open_file] / [open_file_wal]) live in the [granary.unix]
     driver library so this core carries no [unix] dependency (#170). *)
 val open_block
-  :  ?geom:Granary_storage.Geometry.t
+  :  ?init_if_corrupt:bool
+  -> ?geom:Granary_storage.Geometry.t
   -> ?clock:(unit -> float)
   -> ?durability:Granary_store.Store.durability
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)

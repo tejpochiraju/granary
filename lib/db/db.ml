@@ -527,6 +527,7 @@ let of_store ?clock ?durability ?file_path ?cohort store =
 ;;
 
 let open_block
+      ?(init_if_corrupt = false)
       ?geom
       ?clock
       ?durability
@@ -542,7 +543,7 @@ let open_block
   let* result =
     S.open_block
       ?geom
-      ~init_if_corrupt:true
+      ~init_if_corrupt
       ~read_page
       ~write_page
       ~sync

@@ -431,6 +431,19 @@
  (libraries granary granary.block granary.unix alcotest lwt.unix unix))
 
 (test
+ (name test_open_block_init_753)
+ (modules test_open_block_init_753)
+ (libraries
+  granary
+  granary.block
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+(test
  (name test_wal)
  (modules test_wal)
  (libraries granary.storage alcotest lwt.unix))
