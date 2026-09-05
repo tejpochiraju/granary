@@ -7873,7 +7873,20 @@ let execute_drop_table
       (* #283: [Cat.drop_table] self-registers the cache undo for the table and each
          dependent index (via [Schema_cache.remove_table]/[remove_index]), so no
          external snapshot+undo is needed here. *)
-      Cat.drop_table cat tx ~name)
+      let* () = Cat.drop_table cat tx ~name in
+      (* #752 (review round 3): this is the ONE place a table is ever dropped
+         — every caller of [execute]/[execute_with_count] (top-level DML,
+         prepared statements, and trigger-body nested DML via
+         [Db.run_trigger_op], which all funnel through here) gets the
+         row-hook purge by construction, not by each remembering to call it.
+         [Store.row_hooks] is shared by every [Db.t] over this store
+         (#589/#633), so a sibling handle's registered hook is purged too —
+         self-registers the cache undo exactly like [Cat.drop_table] does
+         just above, so [with_ddl_txn] discards it on commit and replays it
+         on rollback with no special-casing here. *)
+      let undo = S.row_hooks_purge_table (S.row_hooks store) name in
+      Cat.register_schema_undo cat undo;
+      Lwt.return_unit)
   in
   (* #405: the table's rows are gone, so every cached result over [name] is
      stale.  Marked AFTER the drop succeeds: a raising DROP marks nothing, which
@@ -8970,7 +8983,23 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
       match action with
       | Ast.AA_add_column col_def -> alter_add_column ~txn:tx cat ~table_meta col_def
       | Ast.AA_rename_table new_name ->
-        alter_rename_table ~txn:tx cat ~table_meta new_name
+        let* n = alter_rename_table ~txn:tx cat ~table_meta new_name in
+        (* #752 (review round 3): this is the ONE place a table is ever
+           renamed — see the matching comment on the DROP TABLE path above
+           for why routing the row-hook migration through here (rather than
+           each caller of [execute]/[execute_with_count] remembering to call
+           it) closes the trigger-body and cross-handle gaps by construction.
+           Registers its own undo the same way [Cat.rename_table] already
+           does for the catalog row, so [with_ddl_txn] discards or replays it
+           in lockstep with the rest of this statement's schema-cache undo. *)
+        let undo =
+          S.row_hooks_migrate_table
+            (S.row_hooks store)
+            ~old_name:table_meta.Cat.name
+            ~new_name
+        in
+        Cat.register_schema_undo cat undo;
+        Lwt.return n
       | Ast.AA_rename_column (old_col, new_col) ->
         let* result =
           Cat.rename_column ~txn:tx cat ~table_name:table_meta.Cat.name ~old_col ~new_col

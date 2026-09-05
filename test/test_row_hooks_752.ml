@@ -495,6 +495,93 @@ let test_columnstore_table_refuses_registration () =
     | Ok _ -> Alcotest.fail "expected `Columnstore_unsupported")
 ;;
 
+(* Round-3 review #1: a DROP TABLE run from INSIDE a trigger body (nested DML,
+   via Db.run_trigger_op) must purge that table's row hooks exactly like a
+   top-level DROP TABLE does. This was the gap in the round-2 design: the
+   purge lived in Db.ml's run_dml/run_core only, and trigger-body DML never
+   goes through either. *)
+let test_drop_table_purges_hooks_even_from_inside_a_trigger_body () =
+  with_db (fun db ->
+    exec db "CREATE TABLE a (id INTEGER PRIMARY KEY)";
+    exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)";
+    exec db "CREATE TRIGGER trg AFTER INSERT ON a BEGIN DROP TABLE b; END";
+    let fired = ref 0 in
+    let _h =
+      attach db ~table:"b" ~timing:`Before ~event:`Insert (fun _ ->
+        incr fired;
+        Lwt.return (Error "stale hook must never run again"))
+    in
+    (* Fires the trigger, whose body drops b via nested DML. *)
+    exec db "INSERT INTO a VALUES (1)";
+    (* A differently-shaped table under the same name. *)
+    exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, name TEXT)";
+    exec db "INSERT INTO b VALUES (1, 'ok')";
+    Alcotest.(check int) "the stale hook never fires" 0 !fired;
+    Alcotest.(check (list string))
+      "the new table has its row"
+      [ "1|ok" ]
+      (texts db "SELECT * FROM b"))
+;;
+
+(* Round-3 review #2: a hook registered through one Db.t handle must be
+   purged/migrated when a SIBLING handle over the SAME store runs the
+   DROP/RENAME -- not just when the registering handle itself does. This is
+   the more severe round-3 finding: without the registry living on Store.t,
+   this defeats create_worker_handle's whole multi-handle guarantee
+   (#589/#633). *)
+let test_worker_handle_sibling_drop_purges_the_others_hook () =
+  with_db (fun a ->
+    exec a "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let fired = ref 0 in
+    let _h =
+      attach a ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        incr fired;
+        Lwt.return (Error "stale hook must never run again"))
+    in
+    let b = run (Db.create_worker_handle a) in
+    (* Sibling handle drops and recreates the table with a different shape. *)
+    exec b "DROP TABLE t";
+    exec b "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+    (* Through b, whose own catalog is current -- a's is stale relative to a
+       sibling's DDL, the pre-existing per-handle caveat create_worker_handle
+       already documents (#589/#633/#634) and unrelated to what this test is
+       checking: whether the STORE-LEVEL row-hook registry was purged. *)
+    exec b "INSERT INTO t VALUES (1, 'ok')";
+    Alcotest.(check int) "the stale hook, registered on a, never fires" 0 !fired;
+    Alcotest.(check (list string))
+      "the new table has its row"
+      [ "1|ok" ]
+      (texts b "SELECT * FROM t"))
+;;
+
+(* Round-3 review #2, the RENAME half: a hook registered on one handle must
+   follow a RENAME run from a SIBLING handle, and fire under the new name
+   observed through either handle. *)
+let test_worker_handle_sibling_rename_migrates_the_others_hook () =
+  with_db (fun a ->
+    exec a "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let seen = ref [] in
+    let _h =
+      attach
+        a
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (ok_hook (fun m -> seen := m :: !seen))
+    in
+    let b = run (Db.create_worker_handle a) in
+    exec b "ALTER TABLE t RENAME TO t2";
+    exec b "INSERT INTO t2 VALUES (1, 10)";
+    match !seen with
+    | [ ({ Db.table = "t2"; new_row = Some row; old_row = None } : Db.row_mutation) ] ->
+      Alcotest.(check string)
+        "fires under the new name for a write from the sibling handle"
+        "1|10"
+        (show_row row)
+    | _ ->
+      Alcotest.fail "expected exactly one Insert mutation reported under the new name")
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Exception normalisation (review finding #3)                          *)
 (* ------------------------------------------------------------------ *)
@@ -519,6 +606,49 @@ let test_hook_raising_is_normalised_to_a_result () =
         (String.length msg > 0)
     | exception _ ->
       Alcotest.fail "the raised exception escaped Db.execute's result contract")
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Recursion guard (review round 3, item 4)                              *)
+(* ------------------------------------------------------------------ *)
+
+(* A Before/Insert hook that always does its own nested INSERT on the same
+   table re-fires itself indefinitely; without a depth cap this would
+   exhaust the OCaml call stack instead of failing cleanly. Runs inside an
+   explicit transaction so the nested Db.execute reuses t.explicit_txn
+   instead of trying (and deadlocking on) a fresh autocommit transaction
+   while the outer one is still open. *)
+let test_row_hook_self_recursion_is_bounded () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    exec db "BEGIN";
+    let next_id = ref 2 in
+    let _h =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        let id = !next_id in
+        incr next_id;
+        exec_ok_lwt db (Printf.sprintf "INSERT INTO t VALUES (%d)" id))
+    in
+    exec_error db ~needle:"recursion limit" "INSERT INTO t VALUES (1)";
+    exec db "ROLLBACK")
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Transactional unregister (review round 3, item 3)                     *)
+(* ------------------------------------------------------------------ *)
+
+let test_rolled_back_unregister_restores_the_hook () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let fired = ref 0 in
+    let h =
+      attach db ~table:"t" ~timing:`After ~event:`Insert (ok_hook (fun _ -> incr fired))
+    in
+    exec db "BEGIN";
+    Db.unregister_row_hook db h;
+    exec db "ROLLBACK";
+    exec db "INSERT INTO t VALUES (1, 10)";
+    Alcotest.(check int) "the rolled-back unregister leaves the hook attached" 1 !fired)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -696,12 +826,36 @@ let () =
             "a COLUMNSTORE table refuses registration"
             `Quick
             test_columnstore_table_refuses_registration
+        ; Alcotest.test_case
+            "DROP TABLE from inside a trigger body purges its hooks"
+            `Quick
+            test_drop_table_purges_hooks_even_from_inside_a_trigger_body
+        ; Alcotest.test_case
+            "a sibling worker handle's DROP purges the other handle's hook"
+            `Quick
+            test_worker_handle_sibling_drop_purges_the_others_hook
+        ; Alcotest.test_case
+            "a sibling worker handle's RENAME migrates the other handle's hook"
+            `Quick
+            test_worker_handle_sibling_rename_migrates_the_others_hook
         ] )
     ; ( "exception normalisation"
       , [ Alcotest.test_case
             "a raising hook is normalised to a result"
             `Quick
             test_hook_raising_is_normalised_to_a_result
+        ] )
+    ; ( "recursion guard"
+      , [ Alcotest.test_case
+            "self-recursion is bounded"
+            `Quick
+            test_row_hook_self_recursion_is_bounded
+        ] )
+    ; ( "transactional unregister"
+      , [ Alcotest.test_case
+            "a rolled-back unregister restores the hook"
+            `Quick
+            test_rolled_back_unregister_restores_the_hook
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest prop_fired_matches_registered ]
     ]

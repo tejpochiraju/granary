@@ -396,6 +396,37 @@ type rowid_counters = (tree_id, int64) Hashtbl.t
    instead of rowid allocation. *)
 type rv_generations = (string, int) Hashtbl.t
 
+(* #752 (review round 3): see the [.mli] doc comment on [row_hooks] for the
+   full rationale. [key] is (table, timing, event); entries are held
+   newest-first per key (O(1) registration), reversed at the firing site by
+   [row_hook_fire_list] to restore registration order — the same shape [Db]'s
+   #746 view-callback registry uses. *)
+type row_hook_timing =
+  [ `Before
+  | `After
+  ]
+
+type row_hook_event =
+  [ `Insert
+  | `Update
+  | `Delete
+  ]
+
+type row_mutation =
+  { table : string
+  ; new_row : Granary_encoding.Row.t option
+  ; old_row : Granary_encoding.Row.t option
+  }
+
+type row_hook_id = int
+type row_hook_key = string * row_hook_timing * row_hook_event
+type row_hook_fn = row_mutation -> (unit, string) result Lwt.t
+
+type row_hooks =
+  { row_hook_tbl : (row_hook_key, (row_hook_id * row_hook_fn) list) Hashtbl.t
+  ; mutable row_hook_next_id : int
+  }
+
 type t =
   { backend : backend
   ; rowid_counters : rowid_counters
@@ -403,6 +434,7 @@ type t =
   ; mutable rv_gen_next : int
     (** #757: the next value {!rv_next_generation} will hand out.  Never
         reset, never decremented — see the [.mli] doc comment. *)
+  ; row_hooks : row_hooks (** #752 (review round 3): see the [.mli] doc comment. *)
   ; lock : Rwlock.t
   ; (* #718: wait/hold accounting for [lock], attributed by acquisition site.
        Lives on [t] rather than on [bt_state] because [lock] does: the Mem
@@ -525,6 +557,96 @@ let rv_carry_over_generations ~from ~to_ =
     (fun name g -> Hashtbl.replace to_.rv_generations name g)
     from.rv_generations;
   if from.rv_gen_next > to_.rv_gen_next then to_.rv_gen_next <- from.rv_gen_next
+;;
+
+(* #752 (review round 3): see the [.mli] doc comments for the rationale.
+   [row_hooks] is opaque, so every mutation goes through the functions below
+   rather than a caller re-deriving composite-key/insert-order logic against
+   a raw [Hashtbl] — the "hardened primitive" the round-3 review asked for. *)
+let row_hooks t = t.row_hooks
+
+let row_hook_register (reg : row_hooks) ~table ~timing ~event fn =
+  reg.row_hook_next_id <- reg.row_hook_next_id + 1;
+  let id = reg.row_hook_next_id in
+  let key = table, timing, event in
+  let existing = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+  Hashtbl.replace reg.row_hook_tbl key ((id, fn) :: existing);
+  id
+;;
+
+let row_hook_unregister (reg : row_hooks) ~table ~timing ~event id =
+  let key = table, timing, event in
+  match Hashtbl.find_opt reg.row_hook_tbl key with
+  | None -> fun () -> ()
+  | Some snapshot ->
+    (match List.filter (fun (i, _) -> i <> id) snapshot with
+     | [] -> Hashtbl.remove reg.row_hook_tbl key
+     | kept -> Hashtbl.replace reg.row_hook_tbl key kept);
+    (* Exact snapshot-and-restore, mirroring {!row_hooks_purge_table} at a
+       single-key granularity: idempotent because replaying it re-sets the
+       SAME fixed value rather than re-deriving one from current state. *)
+    fun () -> Hashtbl.replace reg.row_hook_tbl key snapshot
+;;
+
+let row_hook_fire_list (reg : row_hooks) ~table ~timing ~event =
+  match Hashtbl.find_opt reg.row_hook_tbl (table, timing, event) with
+  | None -> []
+  | Some lst -> List.rev lst
+;;
+
+let row_hooks_is_empty (reg : row_hooks) = Hashtbl.length reg.row_hook_tbl = 0
+
+(* Every (timing, event) pair a row hook can be registered under -- the
+   cartesian product {!row_hooks_purge_table}/{!row_hooks_migrate_table} sweep
+   for one table name, factored out so neither nests two [List.iter]s to
+   cover it by hand. *)
+let all_row_hook_timings_events : (row_hook_timing * row_hook_event) list =
+  List.concat_map
+    (fun timing -> List.map (fun event -> timing, event) [ `Insert; `Update; `Delete ])
+    [ `Before; `After ]
+;;
+
+let row_hooks_purge_table (reg : row_hooks) name =
+  let snapshot =
+    List.filter_map
+      (fun (timing, event) ->
+         let key = name, timing, event in
+         Option.map (fun entries -> key, entries) (Hashtbl.find_opt reg.row_hook_tbl key))
+      all_row_hook_timings_events
+  in
+  List.iter (fun (key, _) -> Hashtbl.remove reg.row_hook_tbl key) snapshot;
+  fun () ->
+    List.iter
+      (fun (key, entries) -> Hashtbl.replace reg.row_hook_tbl key entries)
+      snapshot
+;;
+
+let move_row_hook_key (reg : row_hooks) ~old_name ~new_name (timing, event) =
+  let old_key = old_name, timing, event in
+  match Hashtbl.find_opt reg.row_hook_tbl old_key with
+  | None -> ()
+  | Some entries ->
+    Hashtbl.remove reg.row_hook_tbl old_key;
+    Hashtbl.replace reg.row_hook_tbl (new_name, timing, event) entries
+;;
+
+let row_hooks_migrate_table (reg : row_hooks) ~old_name ~new_name =
+  if String.equal old_name new_name
+  then fun () -> ()
+  else (
+    List.iter (move_row_hook_key reg ~old_name ~new_name) all_row_hook_timings_events;
+    fun () ->
+      List.iter
+        (move_row_hook_key reg ~old_name:new_name ~new_name:old_name)
+        all_row_hook_timings_events)
+;;
+
+let row_hooks_carry_over ~from ~to_ =
+  Hashtbl.iter
+    (fun key entries -> Hashtbl.replace to_.row_hooks.row_hook_tbl key entries)
+    from.row_hooks.row_hook_tbl;
+  if from.row_hooks.row_hook_next_id > to_.row_hooks.row_hook_next_id
+  then to_.row_hooks.row_hook_next_id <- from.row_hooks.row_hook_next_id
 ;;
 
 type ro_snapshot =
@@ -856,6 +978,7 @@ let create () : t =
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
+  ; row_hooks = { row_hook_tbl = Hashtbl.create 4; row_hook_next_id = 0 }
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -942,6 +1065,7 @@ let make_btree_store
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
+  ; row_hooks = { row_hook_tbl = Hashtbl.create 4; row_hook_next_id = 0 }
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None

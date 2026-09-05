@@ -100,6 +100,148 @@ val rv_next_generation : t -> int
     returns). *)
 val rv_carry_over_generations : from:t -> to_:t -> unit
 
+(** #752: whether an OCaml row hook fires before the row write it observes
+    (able to veto — see [Db.register_row_hook]) or only after (observe-only). *)
+type row_hook_timing =
+  [ `Before
+  | `After
+  ]
+
+(** #752: the DML event an OCaml row hook fires for. *)
+type row_hook_event =
+  [ `Insert
+  | `Update
+  | `Delete
+  ]
+
+(** #752: one row-mutation delivered to a registered row-hook callback,
+    modeled on the [NEW]/[OLD] pair a SQL trigger body sees. INSERT:
+    [old_row = None], [new_row = Some _]. DELETE: the reverse. UPDATE: both
+    [Some _]. *)
+type row_mutation =
+  { table : string
+  ; new_row : Granary_encoding.Row.t option
+  ; old_row : Granary_encoding.Row.t option
+  }
+
+(** #752: id for one registered row hook, minted from a counter shared by
+    every handle over this store (mirrors {!rv_next_generation}), so a handle
+    presented an id minted by a sibling matches nothing rather than removing
+    an unrelated hook. Transparent (like {!tree_id}) rather than abstract —
+    nothing about its representation is meant to be hidden, only its
+    provenance (this counter, not any other) is what gives it meaning. *)
+type row_hook_id = int
+
+(** #752 (review round 3): the table-keyed registry every [Db.t] handle's
+    [register_row_hook] / [unregister_row_hook] and every DROP-TABLE /
+    RENAME-TABLE execution path reads and writes — the ONE hardened
+    primitive this module gives every caller for "a table-keyed registry
+    entry that survives/migrates/purges correctly across RENAME, DROP and
+    ROLLBACK, from any execution path, visible across every sibling handle
+    sharing this store."
+
+    It lives on {!t} rather than on a catalog or a [Db.t] for the same reason
+    {!rowid_counters} and {!rv_generations} do: a hook registered through one
+    handle must be visible to, and fire from, every SIBLING handle's write
+    path over the same store ({!Db.create_worker_handle}, #589/#633), and a
+    DROP/RENAME executed by ANY handle must purge/migrate it for all of them
+    — a per-[Db.t] copy could only give that by remembering to synchronise
+    copies, which is exactly the design {!row_hooks} replaces. It is opaque
+    (unlike {!rowid_counters}/{!rv_generations}'s transparent [Hashtbl]
+    aliases) because its correct manipulation is more than a bare table
+    lookup — composite keys, insert-order-preserving retrieval, and
+    snapshot-based undo — so every caller goes through the functions below
+    instead of each re-deriving that logic against a raw [Hashtbl]. *)
+type row_hooks
+
+(** This store's row-hook registry. Every [Db.t] opened over the same store
+    gets this same table — mirrors {!rowid_counters}/{!rv_generations}. *)
+val row_hooks : t -> row_hooks
+
+(** Register [fn] to fire on every [event] mutation of [table] at [timing].
+    Returns the fresh id. O(1): entries are held newest-first per
+    (table, timing, event) key; {!row_hook_fire_list} reverses at the firing
+    site to restore registration order — the same shape [Db]'s #746 view-
+    callback registry uses for the same reason. *)
+val row_hook_register
+  :  row_hooks
+  -> table:string
+  -> timing:row_hook_timing
+  -> event:row_hook_event
+  -> (row_mutation -> (unit, string) result Lwt.t)
+  -> row_hook_id
+
+(** Detach the hook [id] registered on (table, timing, event), and return a
+    closure that reverses exactly that detachment — the same "perform, return
+    the undo" shape as {!row_hooks_purge_table}/{!row_hooks_migrate_table},
+    for the same reason (#752 review round 3, item 3): [Db.unregister_row_hook]
+    needs it so [BEGIN; unregister_row_hook h; ROLLBACK] does not leave [h]
+    permanently detached, and a caller with no transaction to protect against
+    (an unregister that is itself undoing a registration, say) simply
+    discards it. Idempotent: a second call to either the outer function or
+    its returned closure, or an [id] not currently registered under this
+    exact key, is a no-op. Drops the (table, timing, event) key from the
+    registry entirely once its last hook is removed (rather than leaving it
+    mapped to [[]]), so {!row_hooks_is_empty} correctly returns to [true]. *)
+val row_hook_unregister
+  :  row_hooks
+  -> table:string
+  -> timing:row_hook_timing
+  -> event:row_hook_event
+  -> row_hook_id
+  -> unit
+  -> unit
+
+(** The hooks registered on (table, timing, event), in registration order.
+    [[]] if none are registered. *)
+val row_hook_fire_list
+  :  row_hooks
+  -> table:string
+  -> timing:row_hook_timing
+  -> event:row_hook_event
+  -> (row_hook_id * (row_mutation -> (unit, string) result Lwt.t)) list
+
+(** [true] iff no row hook is registered anywhere in this store, for any
+    (table, timing, event) — the fast path a write-path caller checks before
+    ever computing a lookup key, so a store nobody has registered a hook on
+    pays for one length check. *)
+val row_hooks_is_empty : row_hooks -> bool
+
+(** Remove every hook registered on [name], for every (timing, event), and
+    return a closure that reverses exactly that removal. Calling the closure
+    twice is a no-op the second time (it replays a fixed snapshot taken
+    before the removal), so it is safe to hand to a schema-undo log that may
+    replay it more than once (e.g. a [ROLLBACK TO] nested inside a wider
+    [ROLLBACK]'s replay). Used by every DROP-TABLE execution path — see
+    [Sql.Exec.execute_drop_table] — to keep the registry consistent with
+    [table_exists] across both directions of that statement's outcome. *)
+val row_hooks_purge_table : row_hooks -> string -> unit -> unit
+
+(** Move every hook registered on [old_name] to [new_name], for every
+    (timing, event), and return a closure that reverses exactly that move.
+    A no-op (returning a no-op closure) if the two names are equal.
+    [ALTER TABLE ... RENAME] refuses a target name that already names a
+    table, so nothing can already be registered at [new_name] when this
+    runs — the reverse move's own idempotence follows from the same fact
+    {!row_hook_unregister} relies on: the second run finds its source key
+    already empty. Used by every RENAME-TABLE execution path — see
+    [Sql.Exec.execute_alter_table]. *)
+val row_hooks_migrate_table
+  :  row_hooks
+  -> old_name:string
+  -> new_name:string
+  -> unit
+  -> unit
+
+(** #752: carry every registered hook from [from] into [to_] — the VACUUM
+    case, mirroring {!rv_carry_over_generations} exactly: VACUUM builds a
+    wholly new {!t}, so without this call every row hook registered before it
+    would silently vanish across the rebuild, which for a [`Before] hook with
+    veto power is a correctness change, not a cosmetic loss. Call from
+    {!Db.vacuum}'s one call site, before the handle swaps onto the new store —
+    the same point {!rv_carry_over_generations} is called from. *)
+val row_hooks_carry_over : from:t -> to_:t -> unit
+
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
 type error =

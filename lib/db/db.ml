@@ -30,13 +30,14 @@ type view_callback =
   ; vcb_id : int
   }
 
-(* #752: one row-mutation delivered to an OCaml [register_row_hook] callback.
-   INSERT: [old_row = None], [new_row = Some _].  DELETE: the reverse.
-   UPDATE: both [Some _].  Mirrors the [~new_row ~old_row] option pair
-   {!make_trigger_hook} already threads through the write path for SQL
-   triggers — a row hook receives exactly what a trigger body would see via
-   [NEW]/[OLD]. *)
-type row_mutation =
+(* #752 (review round 3): re-exported from {!Store}, which now owns the whole
+   registry — see the [.mli] doc comment on [row_mutation] for why (shared
+   across sibling handles, #589/#633).  INSERT: [old_row = None],
+   [new_row = Some _].  DELETE: the reverse.  UPDATE: both [Some _].  Mirrors
+   the [~new_row ~old_row] option pair {!make_trigger_hook} already threads
+   through the write path for SQL triggers — a row hook receives exactly what
+   a trigger body would see via [NEW]/[OLD]. *)
+type row_mutation = S.row_mutation =
   { table : string
   ; new_row : Row.t option
   ; old_row : Row.t option
@@ -45,12 +46,13 @@ type row_mutation =
 (* #752: the opaque handle {!register_row_hook} returns and
    {!unregister_row_hook} consumes.  Carries the (table, timing, event) key
    it was registered under, so removal never needs — and can never get wrong —
-   a second copy of that key from the caller. *)
+   a second copy of that key from the caller, plus the {!Store.row_hook_id}
+   {!Store.row_hook_register} minted for it. *)
 type row_hook =
   { rh_table : string
   ; rh_timing : [ `Before | `After ]
   ; rh_event : [ `Insert | `Update | `Delete ]
-  ; rh_id : int
+  ; rh_id : S.row_hook_id
   }
 
 type rv_entry =
@@ -158,18 +160,18 @@ type t =
         explicit transactions should use today. *)
   ; views : (string, Sql.Ast.stmt) Hashtbl.t
   ; triggers : (string, Sql.Ast.stmt) Hashtbl.t (* trigger_name -> S_create_trigger AST *)
-  ; row_hooks :
-      ( string * [ `Before | `After ] * [ `Insert | `Update | `Delete ]
-        , (int * (row_mutation -> (unit, string) result Lwt.t)) list )
-        Hashtbl.t
-    (** #752: OCaml-side row-mutation hooks registered via
-        {!register_row_hook}, keyed by (table, timing, event).  Held
-        NEWEST-FIRST per key, like {!rv_callbacks} (#746) — registration is
-        O(1) and the firing site ({!make_combined_hook}) reverses to restore
-        registration order.  Not persisted and not shared across [Db.t]
-        handles over the same store: a {!create_worker_handle} sibling starts
-        with an empty registry, exactly as it does for reactive-view
-        callbacks. *)
+  ; mutable row_hook_depth : int
+    (** #752 (review round 3): recursion depth for a row hook's own nested DML
+        re-entering {!execute}/{!execute_change_count} on this same [t] —
+        mirrors {!trigger_depth} / {!max_trigger_depth} below, so a hook that
+        (directly or via a chain of other hooks/triggers) re-triggers itself
+        fails cleanly instead of exhausting the OCaml call stack.  Deliberately
+        NOT shared with [trigger_depth]: the two guards are independent, so a
+        row hook and a SQL trigger can each nest up to their own limit in the
+        same call chain without one starving the other's budget. The actual
+        row-hook registry lives on {!Store.row_hooks} — shared by every
+        [Db.t] over this store (#589/#633) — not here; nothing table-keyed
+        remains on [t] itself. *)
   ; mutable savepoint_names : string list (* active savepoints, newest first *)
   ; mutable auto_began : bool (* txn started implicitly by SAVEPOINT *)
   ; mutable last_changes : int (** rows affected by the last DML statement *)
@@ -476,7 +478,7 @@ let open_in_memory ?clock () =
     ; txn_poisoned = false
     ; views = Hashtbl.create 4
     ; triggers = Hashtbl.create 4
-    ; row_hooks = Hashtbl.create 4
+    ; row_hook_depth = 0
     ; savepoint_names = []
     ; auto_began = false
     ; last_changes = 0
@@ -570,7 +572,7 @@ let of_store ?clock ?durability ?file_path ?cohort store =
     ; txn_poisoned = false
     ; views
     ; triggers
-    ; row_hooks = Hashtbl.create 4
+    ; row_hook_depth = 0
     ; savepoint_names = []
     ; auto_began = false
     ; last_changes = 0
@@ -822,6 +824,13 @@ let vacuum t : unit Lwt.t =
                    reseed itself from), and a generation minted before this
                    VACUUM could collide with one minted after it. *)
                 S.rv_carry_over_generations ~from:t.store ~to_:new_store;
+                (* #752 (review round 3): same rationale as the generations
+                   carry-over just above, for the row-hook registry: without
+                   this, every hook registered before this VACUUM would
+                   silently vanish across the rebuild (the new store's
+                   registry starts empty), which for a [`Before] hook with
+                   veto power is a correctness change, not a cosmetic loss. *)
+                S.row_hooks_carry_over ~from:t.store ~to_:new_store;
                 (* #634: the fresh catalog deliberately gets FRESH rowid counters
                  (no [?rowid_counters]).  It must: the counters the old catalog
                  held describe the pre-VACUUM file, and this one is re-seeded
@@ -1590,6 +1599,12 @@ let subst_new_old ~schema ~new_row ~old_row stmt =
     SQLITE_MAX_TRIGGER_DEPTH default. *)
 let max_trigger_depth = 32
 
+(** #752 (review round 3, item 4): maximum OCaml row-hook recursion depth —
+    same bound as {!max_trigger_depth}, tracked on an independent counter
+    ({!t.row_hook_depth}) so a row hook and a SQL trigger nesting into each
+    other in one call chain each get their own full budget. *)
+let max_row_hook_depth = 32
+
 (** Compile and execute one pre-substituted trigger body statement within the
     db context.  This installs hooks for the nested DML so triggers fired from
     within a trigger body can themselves fire further triggers, up to
@@ -1770,31 +1785,56 @@ and make_trigger_hook t table_meta ~timing ~event =
    the cheap alternative: a caller who wants to tell a hook veto from an
    unrelated internal error can still do so by matching the [Runtime]
    message text. *)
-and fire_ocaml_row_hook ~(timing : [ `Before | `After ]) ~table_name (_id, fn) mutation =
+and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn) mutation =
   let label =
     match timing with
     | `Before -> "before"
     | `After -> "after"
   in
-  Lwt.catch
-    (fun () ->
-       let* r = fn mutation in
-       match r with
-       | Ok () -> Lwt.return_unit
-       | Error msg ->
-         Lwt.fail_with (Printf.sprintf "%s row hook on '%s': %s" label table_name msg))
-    (function
-      | Failure _ as exn -> Lwt.fail exn
-      | exn ->
-        Lwt.fail_with
-          (Printf.sprintf
-             "%s row hook on '%s' raised: %s"
-             label
-             table_name
-             (Printexc.to_string exn)))
+  (* #752 review (round 3, item 4): mirrors {!fire_trigger_stmt}'s
+     [max_trigger_depth] guard, on its own independent counter — a row hook
+     whose own nested DML (directly, or via a chain of other hooks/triggers)
+     re-enters this same hook fails cleanly with a bounded message instead of
+     exhausting the OCaml call stack.  Deliberately a SEPARATE counter from
+     [trigger_depth]: a row hook and a SQL trigger nesting into each other in
+     one call chain each get their own full budget rather than sharing one,
+     so neither kind's legitimate recursion is starved by the other's. *)
+  if t.row_hook_depth >= max_row_hook_depth
+  then
+    Lwt.fail_with
+      (Printf.sprintf
+         "%s row hook on '%s': recursion limit (%d) exceeded"
+         label
+         table_name
+         max_row_hook_depth)
+  else (
+    t.row_hook_depth <- t.row_hook_depth + 1;
+    Lwt.finalize
+      (fun () ->
+         Lwt.catch
+           (fun () ->
+              let* r = fn mutation in
+              match r with
+              | Ok () -> Lwt.return_unit
+              | Error msg ->
+                Lwt.fail_with
+                  (Printf.sprintf "%s row hook on '%s': %s" label table_name msg))
+           (function
+             | Failure _ as exn -> Lwt.fail exn
+             | exn ->
+               Lwt.fail_with
+                 (Printf.sprintf
+                    "%s row hook on '%s' raised: %s"
+                    label
+                    table_name
+                    (Printexc.to_string exn))))
+      (fun () ->
+         t.row_hook_depth <- t.row_hook_depth - 1;
+         Lwt.return_unit))
 
 and make_combined_hook t table_meta ~timing ~event =
   let sql_hook = make_trigger_hook t table_meta ~timing ~event in
+  let reg = S.row_hooks t.store in
   (* #752 review (round 2, item 4): paired with [ocaml_hooks] rather than
      re-deriving from [timing] at the firing site, so {!fire_ocaml_row_hook}'s
      [~timing] argument is always this NARROWED [[ `Before | `After ]] value —
@@ -1803,20 +1843,15 @@ and make_combined_hook t table_meta ~timing ~event =
      [run_ocaml_hooks] below never actually needs it for [`Instead_of]. *)
   let narrow_timing, ocaml_hooks =
     (* #752 review (item 5): mirror {!make_trigger_hook}'s own
-       [Hashtbl.length t.triggers = 0] fast path — a table with no row hooks
+       [Hashtbl.length t.triggers = 0] fast path — a store with no row hooks
        registered ANYWHERE pays for one length check, not a per-(table,
-       timing, event) [Hashtbl.find_opt]. *)
-    if Hashtbl.length t.row_hooks = 0
+       timing, event) lookup. *)
+    if S.row_hooks_is_empty reg
     then None, []
     else (
       match timing with
       | (`Before | `After) as nt ->
-        ( Some nt
-        , (match Hashtbl.find_opt t.row_hooks (table_meta.Cat.name, nt, event) with
-           | None -> []
-           (* held newest-first (O(1) registration, #746's pattern); reverse
-             here to fire in registration order. *)
-           | Some lst -> List.rev lst) )
+        Some nt, S.row_hook_fire_list reg ~table:table_meta.Cat.name ~timing:nt ~event
       | `Instead_of ->
         (* Unreachable: every call site below builds this hook only for
            [`Before]/[`After] — [`Instead_of] is [make_trigger_hook]'s own
@@ -1839,6 +1874,7 @@ and make_combined_hook t table_meta ~timing ~event =
             Lwt_list.iter_s
               (fun entry ->
                  fire_ocaml_row_hook
+                   t
                    ~timing
                    ~table_name:table_meta.Cat.name
                    entry
@@ -2616,127 +2652,17 @@ let execute_control_op top t sql op =
   | _ -> None
 ;;
 
-(* #752 review: [row_hooks] is keyed by table NAME, and — unlike the SQL
-   trigger/view caches — is not itself a stored, versioned catalog object, so
-   nothing purges or re-keys it when the table it names is dropped or
-   renamed.  Two concrete breakages that closes:
-
-   - [DROP TABLE t; CREATE TABLE t (different columns)]: without a purge, a
-     hook registered against the old [t] silently reattaches to the new,
-     differently-shaped table the moment it is created, and — since a
-     [`Before] hook can veto — a stale hook is a correctness/security gap,
-     not just a leak.
-   - [ALTER TABLE t RENAME TO t2]: without a migration, the hook is filed
-     under a name [make_combined_hook] never looks up again (it always keys
-     on the table's CURRENT name), so it silently stops firing forever, with
-     no error — the caller has no way to know.
-
-   Both run only after the op has actually SUCCEEDED (called from the success
-   arm of {!run_dml} / {!run_core}), so a failed or rolled-back DROP/RENAME
-   leaves the registry untouched. *)
-(* Every (timing, event) pair a row hook can be registered under.  Shared by
-   {!purge_row_hooks_for_table} and {!migrate_row_hooks_for_table} so neither
-   nests two [List.iter]s to cover the cartesian product by hand. *)
-let all_row_hook_timings_events =
-  List.concat_map
-    (fun timing -> List.map (fun event -> timing, event) [ `Insert; `Update; `Delete ])
-    [ `Before; `After ]
-;;
-
-(* #752 review (round 2): every row-hook mutation this module makes —
-   {!register_row_hook}'s own registration as well as the DROP/RENAME
-   bookkeeping below — goes through this ONE door when a transaction is open,
-   so all of it shares the SAME #269 schema-undo stack {!Cat.register_schema_undo}
-   already gives view/trigger caches.  That is what makes the composition
-   correct regardless of interleaving: undo closures run most-recent-first
-   (LIFO), so e.g. [register_row_hook "a"; RENAME a TO b; ROLLBACK] undoes the
-   rename FIRST — moving the entry back to "a" — before the OLDER
-   registration-time undo (which looks up "a") ever runs, so it still finds
-   what it is looking for. Outside an explicit transaction [apply] just runs;
-   there is no rollback to protect against. *)
-let with_row_hook_undo t ~apply ~undo =
-  apply ();
-  match t.explicit_txn with
-  | None -> ()
-  | Some _ -> Cat.register_schema_undo t.catalog undo
-;;
-
-(* #752 review (round 2): DROP TABLE's purge must itself be undone by a
-   ROLLBACK, exactly like the catalog row {!Cat.drop_table} restores —
-   otherwise [BEGIN; DROP TABLE t; ROLLBACK] brings [t] back with none of its
-   hooks. Snapshots every (key, entries) pair that actually exists before
-   removing it, so the undo is an exact replay rather than a guess; replaying
-   it twice is a no-op (the second run [Hashtbl.replace]s the identical
-   value), satisfying {!Cat.register_schema_undo}'s idempotence requirement. *)
-let purge_row_hooks_for_table t name =
-  let snapshot =
-    List.filter_map
-      (fun (timing, event) ->
-         let key = name, timing, event in
-         Option.map (fun entries -> key, entries) (Hashtbl.find_opt t.row_hooks key))
-      all_row_hook_timings_events
-  in
-  with_row_hook_undo
-    t
-    ~apply:(fun () -> List.iter (fun (key, _) -> Hashtbl.remove t.row_hooks key) snapshot)
-    ~undo:(fun () ->
-      List.iter (fun (key, entries) -> Hashtbl.replace t.row_hooks key entries) snapshot)
-;;
-
-(* #752 review: RENAME migrates row-hook registrations to the new name rather
-   than refusing the rename outright, unlike #609's view/trigger dependency
-   check.  #609 refuses because a view/trigger is stored as raw, unparsed SQL
-   text with no name to rewrite in place — refusal is a technical necessity,
-   not a chosen philosophy.  [row_hooks] is a structured in-memory [Hashtbl]
-   keyed by name, so re-keying it is exact and lossless; refusing here would
-   only strand a caller's hook (and camel's [reject!] veto with it) for no
-   correctness reason.  A [row_mutation] fired after the rename reports
-   [table = new_name] — the same as every other observation of the table
-   post-rename. *)
-let migrate_row_hook_key t ~old_name ~new_name (timing, event) =
-  let old_key = old_name, timing, event in
-  match Hashtbl.find_opt t.row_hooks old_key with
-  | None -> ()
-  | Some entries ->
-    Hashtbl.remove t.row_hooks old_key;
-    Hashtbl.replace t.row_hooks (new_name, timing, event) entries
-;;
-
-(* #752 review (round 2): the migration's own undo is just the SAME move run
-   backwards ([new_name] -> [old_name]).  [ALTER TABLE ... RENAME] refuses a
-   target name that already names a table (a real table, or a table pending
-   in this same transaction), so nothing can already be registered at
-   [new_name] when the forward move runs — whatever sits there when the undo
-   runs is exactly this move's own output, or (composed with an intervening,
-   already-unwound registration/removal under the LIFO ordering
-   {!with_row_hook_undo} documents) still nothing more than that. Running it
-   twice is idempotent for the same reason [migrate_row_hook_key] itself is:
-   the second run finds the source key already empty and does nothing. *)
-let migrate_row_hooks_for_table t ~old_name ~new_name =
-  if not (String.equal old_name new_name)
-  then
-    with_row_hook_undo
-      t
-      ~apply:(fun () ->
-        List.iter (migrate_row_hook_key t ~old_name ~new_name) all_row_hook_timings_events)
-      ~undo:(fun () ->
-        List.iter
-          (migrate_row_hook_key t ~old_name:new_name ~new_name:old_name)
-          all_row_hook_timings_events)
-;;
-
-(* #752 review: dispatch the above for whichever DDL op just succeeded.  Called
-   from both DML entry points ({!run_dml} and {!run_core}) so a prepared
-   [DROP TABLE] / [ALTER TABLE ... RENAME] gets the same bookkeeping a
-   one-shot [Db.execute] does. *)
-let sync_row_hooks_after_op t op =
-  match op with
-  | Sql.Plan.Op_drop_table { table_meta; _ } ->
-    purge_row_hooks_for_table t table_meta.Cat.name
-  | Sql.Plan.Op_alter_table { table_meta; action = Sql.Ast.AA_rename_table new_name } ->
-    migrate_row_hooks_for_table t ~old_name:table_meta.Cat.name ~new_name
-  | _ -> ()
-;;
+(* #752 (review round 3): DROP-TABLE/RENAME-TABLE row-hook bookkeeping used to
+   live here, as a Db.ml-only mechanism called from {!run_dml}/{!run_core}'s
+   success arms. That missed trigger-body DML (which runs through
+   {!run_trigger_op}, not those two) and was invisible to sibling handles
+   over the same store ({!create_worker_handle}). Both gaps close by
+   construction now that the registry itself lives on
+   {!Granary_store.Store.row_hooks} and the purge/migrate calls live inside
+   [Sql.Exec.execute_drop_table] / [Sql.Exec.execute_alter_table] — the ONE
+   place a table is ever dropped or renamed, reached by every caller of
+   [Sql.Exec.execute]/[execute_with_count] alike. See those functions' doc
+   comments for the exhaustiveness argument. *)
 
 (* Build the trigger BEFORE/AFTER hooks, the REPLACE/UPSERT secondary hooks,
    and the INSERT target table name for a DML op. *)
@@ -2809,7 +2735,6 @@ let run_dml t op ~on_ok =
          let* n = lwt_op in
          t.last_changes <- n;
          t.total_changes <- t.total_changes + n;
-         sync_row_hooks_after_op t op;
          (match insert_table_name with
           | Some tbl when n > 0 ->
             (match Cat.find_table_cached t.catalog ~name:tbl with
@@ -3485,7 +3410,6 @@ let run_core st ~params =
          in
          t.last_changes <- n;
          t.total_changes <- t.total_changes + n;
-         sync_row_hooks_after_op t st.plan;
          (match insert_table_name with
           | Some tbl when n > 0 ->
             (match Cat.find_table_cached t.catalog ~name:tbl with
@@ -5029,11 +4953,6 @@ let unregister_view_callback top h =
 
 let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
 
-(* #752: one process-global counter for row-hook ids, on the same rationale as
-   {!rv_cb_seq} — no two [row_hook] handles ever collide, including across
-   [Db.t] handles over one store. *)
-let row_hook_seq = ref 0
-
 let register_row_hook t ~table ~timing ~event fn =
   match Cat.find_table_cached t.catalog ~name:table with
   | None -> Error (`Unknown_table table)
@@ -5046,57 +4965,55 @@ let register_row_hook t ~table ~timing ~event fn =
      hooks is a larger, separate change than #752 or this fixup owes. *)
   | Some tm when Cat.is_columnar tm -> Error (`Columnstore_unsupported table)
   | Some _ ->
-    incr row_hook_seq;
-    let id = !row_hook_seq in
-    let key = table, timing, event in
+    (* #752 (review round 3): the registration itself lives on
+       {!Store.row_hooks} — shared by every [Db.t] over this store
+       (#589/#633) — rather than on [t], so a hook registered through one
+       handle fires from every sibling's write path too, and a DROP/RENAME
+       executed by ANY handle purges/migrates it for all of them (see
+       [Sql.Exec.execute_drop_table] / [execute_alter_table]). *)
+    let id = S.row_hook_register (S.row_hooks t.store) ~table ~timing ~event fn in
     (* #752 review: without the undo below, [BEGIN; CREATE TABLE t(...);
        register_row_hook ~table:"t" ...; ROLLBACK] would leave the hook
-       attached in [t.row_hooks] even though the table it was registered
-       against never really existed — a LATER, unrelated [CREATE TABLE t]
-       then silently reattaches it.  [register_row_hook] is a plain OCaml
-       call, not itself part of the SQL statement stream, so it does not
-       automatically share in a rolled-back transaction's undo the way DDL
-       does.  Going through {!with_row_hook_undo} — the SAME door
-       {!purge_row_hooks_for_table}/{!migrate_row_hooks_for_table} use — is
-       what makes a same-transaction [RENAME] compose correctly with this:
-       undo closures run most-recent-first, so a rename registered AFTER this
-       call unwinds BEFORE this one, restoring [key] before this closure's
-       lookup runs (#752 review round 2). *)
-    with_row_hook_undo
-      t
-      ~apply:(fun () ->
-        let existing = Option.value (Hashtbl.find_opt t.row_hooks key) ~default:[] in
-        (* O(1): prepend, like {!register_view_callback}; {!make_combined_hook}
-           reverses at the firing site to restore registration order. *)
-        Hashtbl.replace t.row_hooks key ((id, fn) :: existing))
-      ~undo:(fun () ->
-        match Hashtbl.find_opt t.row_hooks key with
-        | None -> ()
-        | Some lst ->
-          (match List.filter (fun (i, _) -> i <> id) lst with
-           | [] -> Hashtbl.remove t.row_hooks key
-           | kept -> Hashtbl.replace t.row_hooks key kept));
+       attached even though the table it was registered against never really
+       existed — a LATER, unrelated [CREATE TABLE t] then silently reattaches
+       it.  [register_row_hook] is a plain OCaml call, not itself part of the
+       SQL statement stream, so it does not automatically share in a
+       rolled-back transaction's undo the way DDL does.  Registering through
+       the SAME #269 schema-undo stack the DROP/RENAME paths use is what
+       makes a same-transaction [RENAME] compose correctly with this: undo
+       closures run most-recent-first, so a rename registered AFTER this call
+       unwinds BEFORE this one, restoring the (table, timing, event) key
+       before this closure's lookup runs (#752 review round 2). *)
+    (match t.explicit_txn with
+     | None -> ()
+     | Some _ ->
+       Cat.register_schema_undo t.catalog (fun () ->
+         (* Discards the returned re-undo closure: once this fires the
+            enclosing transaction is already being rolled back, so there is
+            nothing further to protect this removal against. *)
+         ignore
+           (S.row_hook_unregister (S.row_hooks t.store) ~table ~timing ~event id
+            : unit -> unit)));
     Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id }
 ;;
 
 let unregister_row_hook t h =
-  let key = h.rh_table, h.rh_timing, h.rh_event in
-  match Hashtbl.find_opt t.row_hooks key with
+  let undo =
+    S.row_hook_unregister
+      (S.row_hooks t.store)
+      ~table:h.rh_table
+      ~timing:h.rh_timing
+      ~event:h.rh_event
+      h.rh_id
+  in
+  (* #752 review (round 3, item 3): mirrors {!register_row_hook}'s own
+     transactional undo — an unregister issued mid-transaction must be
+     reversible by that transaction's ROLLBACK, or [BEGIN;
+     unregister_row_hook h; ROLLBACK] leaves [h] permanently detached even
+     though nothing else about the transaction survived. *)
+  match t.explicit_txn with
   | None -> ()
-  | Some lst ->
-    (* [List.filter] builds a new list, so an unregister from inside a
-       currently-firing hook cannot perturb the batch {!make_combined_hook}
-       already snapshotted via [List.rev] — same reasoning as
-       {!unregister_view_callback} (#746). *)
-    (match List.filter (fun (id, _) -> id <> h.rh_id) lst with
-     | [] ->
-       (* #752 review (round 2): drop the key entirely rather than leaving
-          [key -> []] behind — otherwise [Hashtbl.length t.row_hooks] never
-          returns to 0 once anything has ever been registered, permanently
-          defeating {!make_combined_hook}'s zero-cost fast path.  Matches
-          {!purge_row_hooks_for_table}, which already uses [Hashtbl.remove]. *)
-       Hashtbl.remove t.row_hooks key
-     | kept -> Hashtbl.replace t.row_hooks key kept)
+  | Some _ -> Cat.register_schema_undo t.catalog undo
 ;;
 
 let pp_row_hook fmt h =
