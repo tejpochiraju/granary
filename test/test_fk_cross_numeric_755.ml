@@ -364,18 +364,25 @@ let generated_virtual_fk_child_column_restrict_allows_when_unreferenced () =
 (* PR #765 review, round 2: the by-NAME re-resolution round 1 added to    *)
 (* make_fk_recheck has the same failure class one level up (RENAME), and *)
 (* a genuinely broken composite FK must fail loudly, not silently.       *)
+(*                                                                        *)
+(* Superseded by round 3's structural fix below: renaming or dropping a  *)
+(* column a pending deferred FK check still needs is now REFUSED         *)
+(* outright at the ALTER TABLE statement itself, so these two mutations  *)
+(* never reach COMMIT to exercise make_fk_recheck's by-ordinal/loud-      *)
+(* failure logic at all. That logic stays (defence in depth, and the     *)
+(* home of #765's own reasoning about WHY ordinal beats name), but the   *)
+(* observable behaviour these tests pin moved earlier -- to the ALTER    *)
+(* itself -- so they're rewritten to match rather than deleted.          *)
 (* ------------------------------------------------------------------ *)
 
-(* Round 1's fix re-resolved [pid] by NAME against the schema at recheck
-   time -- correct for a DROP of an unrelated column, but a RENAME of the
-   FK's OWN column moves the very name it was resolving. [Cat.rename_column]
-   rewrites the catalog's [fk_local_cols] to "pid2" immediately, so a
-   name-based lookup for "pid" finds nothing, its length check fails, and
-   (round 1's code) reported "not violated" -- COMMIT silently succeeded
-   despite parent 999 never existing. The fix identifies the constraint by
-   ORDINAL instead ([Exec.fk_ordinal]), which survives the rename, so
-   [fk_now.Cat.fk_local_cols] is already "pid2" when the recheck reads it. *)
-let deferred_recheck_survives_rename_column_and_still_refuses () =
+(* Renaming the FK's own local column while its deferred check is still
+   pending must be REFUSED outright (round 3's structural fix), not
+   attempted-and-chased on the recheck side: round 1 chased [DROP COLUMN]
+   by ordinal, round 2 chased [RENAME COLUMN] by name-at-recheck-time, and
+   round 3 found a THIRD shape (DROP+ADD of the identical name) that fools
+   both. Refusing the mutation while the obligation is live closes the
+   whole class instead of predicting its next shape. *)
+let alter_table_refuses_rename_of_pending_fk_column () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
     exec db "CREATE TABLE p8 (id INTEGER PRIMARY KEY)";
@@ -384,52 +391,64 @@ let deferred_recheck_survives_rename_column_and_still_refuses () =
       "CREATE TABLE c8 (pid INTEGER REFERENCES p8(id) DEFERRABLE INITIALLY DEFERRED)";
     exec db "BEGIN";
     exec db "INSERT INTO c8 VALUES (999)";
-    exec db "ALTER TABLE c8 RENAME COLUMN pid TO pid2";
-    match exec_result db "COMMIT" with
-    | Ok () -> Alcotest.fail "COMMIT should refuse: parent 999 was never inserted"
-    | Error msg ->
-      Alcotest.(check bool)
-        (Printf.sprintf
-           "COMMIT failed with a FOREIGN KEY error, not a silent success (got %S)"
-           msg)
-        true
-        (contains ~needle:"FOREIGN KEY" msg))
+    (match exec_result db "ALTER TABLE c8 RENAME COLUMN pid TO pid2" with
+     | Ok () ->
+       Alcotest.fail
+         "RENAME COLUMN should be refused: pid has a deferred FK check pending"
+     | Error msg ->
+       Alcotest.(check bool)
+         (Printf.sprintf "refused with a clear conflict message (got %S)" msg)
+         true
+         (contains ~needle:"deferred check still pending" msg));
+    exec db "ROLLBACK";
+    let col_names =
+      match run (Db.query db "PRAGMA table_info(c8)") with
+      | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+      | Ok stream ->
+        List.map
+          (fun (r : Db.row) ->
+             match r.(1) with
+             | Db.V_text s -> s
+             | _ -> Alcotest.fail "unexpected PRAGMA table_info shape")
+          (run (Lwt_stream.to_list stream))
+    in
+    Alcotest.(check (list string)) "the column was never renamed" [ "pid" ] col_names)
 ;;
 
-(* Same rename, but the parent row DOES arrive before COMMIT: the recheck
-   must resolve the renamed column correctly and let the transaction
-   through, not turn a spurious "column not found" into a false violation. *)
-let deferred_recheck_survives_rename_column_and_still_allows () =
+(* No over-refusal: renaming an UNRELATED column on the SAME table, while a
+   deferred FK check is genuinely pending against a DIFFERENT column of
+   that table, must succeed normally -- the conflict check is keyed on the
+   specific column the pending obligation needs, not on "any ALTER touching
+   a table with any pending check". *)
+let alter_table_allows_rename_of_unrelated_column_with_pending_fk () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
     exec db "CREATE TABLE p9 (id INTEGER PRIMARY KEY)";
     exec
       db
-      "CREATE TABLE c9 (pid INTEGER REFERENCES p9(id) DEFERRABLE INITIALLY DEFERRED)";
+      "CREATE TABLE c9 (pid INTEGER REFERENCES p9(id) DEFERRABLE INITIALLY DEFERRED, \
+       junk INTEGER)";
     exec db "BEGIN";
-    exec db "INSERT INTO c9 VALUES (999)";
-    exec db "ALTER TABLE c9 RENAME COLUMN pid TO pid2";
+    exec db "INSERT INTO c9 VALUES (999, 0)";
+    (* junk is unrelated to the pending FK check on pid -- must succeed. *)
+    expect_ok db "ALTER TABLE c9 RENAME COLUMN junk TO junk2";
     exec db "INSERT INTO p9 VALUES (999)";
     (match exec_result db "COMMIT" with
      | Ok () -> ()
      | Error msg -> Alcotest.failf "COMMIT should have succeeded, got %S" msg);
     Alcotest.(check (list string))
-      "the child row is intact under its new column name"
+      "the child row is intact"
       [ "999" ]
-      (query_texts db "SELECT pid2 FROM c9"))
+      (query_texts db "SELECT pid FROM c9"))
 ;;
 
-(* A composite FK, DEFERRABLE, with one of its two local columns dropped
-   before COMMIT: [Cat.drop_column] does not touch [fk_constraints] at all,
-   so the catalog is left with a genuinely DANGLING column name in this
-   constraint -- not a "the constraint moved" case ordinal identification can
-   paper over, but a "this constraint can no longer be evaluated" one.
-   [make_fk_recheck] must fail LOUDLY here, the same way the immediate
-   enforcement path already does for the identical condition
-   (Exec.enforce_insert_fk's "some local columns not found in table"),
-   rather than silently reporting "not violated" and letting a genuine
-   violation (parent (1,2) was never inserted) through at COMMIT. *)
-let deferred_recheck_errors_on_composite_fk_partial_drop () =
+(* A composite FK, DEFERRABLE, with a DROP COLUMN attempted on one of its
+   two local columns while its deferred check is pending: refused outright
+   (round 3), for the same reason as the plain RENAME case above -- this is
+   the exact shape round 2 fixed on the recheck side (fail loudly instead
+   of silently reporting "not violated"), and round 3's structural fix
+   means COMMIT is never reached to exercise that fallback at all. *)
+let alter_table_refuses_drop_of_pending_composite_fk_column () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
     exec db "CREATE TABLE p10 (x INTEGER, y INTEGER, PRIMARY KEY (x, y))";
@@ -439,17 +458,105 @@ let deferred_recheck_errors_on_composite_fk_partial_drop () =
        DEFERRABLE INITIALLY DEFERRED)";
     exec db "BEGIN";
     exec db "INSERT INTO c10 VALUES (1, 2)";
-    exec db "ALTER TABLE c10 DROP COLUMN a";
-    match exec_result db "COMMIT" with
-    | Ok () ->
-      Alcotest.fail
-        "COMMIT should refuse: the composite FK can no longer be evaluated, and parent \
-         (1,2) was never inserted anyway"
+    (match exec_result db "ALTER TABLE c10 DROP COLUMN a" with
+     | Ok () ->
+       Alcotest.fail
+         "DROP COLUMN should be refused: (a,b) has a deferred composite FK check pending"
+     | Error msg ->
+       Alcotest.(check bool)
+         (Printf.sprintf "refused with a clear conflict message (got %S)" msg)
+         true
+         (contains ~needle:"deferred check still pending" msg));
+    exec db "ROLLBACK")
+;;
+
+(* Round 3's own repro: DROP the FK's local column, then ADD a column back
+   under the IDENTICAL name -- a semantically unrelated column that
+   happens to fool a name-based (or count-based) staleness check, since
+   the name resolves again and the column count is unchanged. The first
+   statement (the DROP) is what round 3's structural fix refuses, so the
+   ADD is never reached at all; this pins that the two-statement sequence
+   is caught at its FIRST step, not "eventually, some other way". *)
+let alter_table_refuses_drop_that_would_precede_a_same_name_readd () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p11b (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c11b (pid INTEGER REFERENCES p11b(id) DEFERRABLE INITIALLY DEFERRED, \
+       junk INTEGER)";
+    exec db "BEGIN";
+    exec db "INSERT INTO c11b VALUES (999, 0)";
+    (match exec_result db "ALTER TABLE c11b DROP COLUMN pid" with
+     | Ok () ->
+       Alcotest.fail
+         "DROP COLUMN should be refused before the DROP+ADD desync can even be attempted"
+     | Error msg ->
+       Alcotest.(check bool)
+         (Printf.sprintf "refused with a clear conflict message (got %S)" msg)
+         true
+         (contains ~needle:"deferred check still pending" msg));
+    (* The would-be second statement (ADD COLUMN pid TEXT DEFAULT 'x') is
+       never reached: the DROP above already failed the transaction's first
+       ALTER, and [pid] is untouched -- there is nothing left for an ADD to
+       desync. *)
+    exec db "ROLLBACK")
+;;
+
+(* ------------------------------------------------------------------ *)
+(* PR #765 review round 3, item 2: precheck_update_fk/precheck_delete_fk    *)
+(* must fail loudly with an FK-specific message, matching the deferred    *)
+(* path, rather than a bare find_col_idx_by_name "column not found".      *)
+(*                                                                        *)
+(* Round 3's own structural refusal (above) prevents this from arising   *)
+(* via a mid-transaction race, but it is still reachable through #767's  *)
+(* standalone, non-transactional Cat.drop_column corruption: an autocommit *)
+(* DROP COLUMN with NO deferred check pending succeeds (out of scope to   *)
+(* prevent here -- that is #767's own remit), and a LATER, separate       *)
+(* UPDATE/DELETE against the now-corrupted constraint must not crash with *)
+(* an internal-looking message. *)
+(* ------------------------------------------------------------------ *)
+
+let precheck_update_fk_fails_loudly_not_with_bare_column_not_found () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p12 (id INTEGER PRIMARY KEY)";
+    exec db "CREATE TABLE c12 (pid INTEGER REFERENCES p12(id), junk INTEGER)";
+    exec db "INSERT INTO p12 VALUES (1)";
+    exec db "INSERT INTO c12 VALUES (1, 0)";
+    (* No pending deferred check here (autocommit, no BEGIN) -- #767's
+       corruption, reached deliberately so this test can pin the SEPARATE
+       fix (item 2) rather than round 3's refusal (which only fires while
+       an obligation is actually pending). *)
+    expect_ok db "ALTER TABLE c12 DROP COLUMN pid";
+    match exec_result db "UPDATE p12 SET id = 2 WHERE id = 1" with
+    | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
     | Error msg ->
       Alcotest.(check bool)
-        (Printf.sprintf "COMMIT reported an error, not a crash (got %S)" msg)
+        (Printf.sprintf
+           "a loud, FK-specific message, not a bare \"column not found\" (got %S)"
+           msg)
         true
-        (String.length msg > 0))
+        (contains ~needle:"FOREIGN KEY" msg))
+;;
+
+let precheck_delete_fk_fails_loudly_not_with_bare_column_not_found () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p13 (id INTEGER PRIMARY KEY)";
+    exec db "CREATE TABLE c13 (pid INTEGER REFERENCES p13(id), junk INTEGER)";
+    exec db "INSERT INTO p13 VALUES (1)";
+    exec db "INSERT INTO c13 VALUES (1, 0)";
+    expect_ok db "ALTER TABLE c13 DROP COLUMN pid";
+    match exec_result db "DELETE FROM p13 WHERE id = 1" with
+    | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "a loud, FK-specific message, not a bare \"column not found\" (got %S)"
+           msg)
+        true
+        (contains ~needle:"FOREIGN KEY" msg))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -566,19 +673,33 @@ let () =
             `Quick
             generated_virtual_fk_child_column_restrict_allows_when_unreferenced
         ] )
-    ; ( "review_round_2_rename_and_composite_drop"
+    ; ( "review_round_3_structural_refusal"
       , [ Alcotest.test_case
-            "RENAME COLUMN before COMMIT: deferred recheck still refuses"
+            "ALTER TABLE refuses RENAME of a pending-FK column"
             `Quick
-            deferred_recheck_survives_rename_column_and_still_refuses
+            alter_table_refuses_rename_of_pending_fk_column
         ; Alcotest.test_case
-            "RENAME COLUMN before COMMIT: deferred recheck still allows"
+            "ALTER TABLE allows RENAME of an unrelated column (no over-refusal)"
             `Quick
-            deferred_recheck_survives_rename_column_and_still_allows
+            alter_table_allows_rename_of_unrelated_column_with_pending_fk
         ; Alcotest.test_case
-            "composite FK partial DROP COLUMN: recheck errors, not silent"
+            "ALTER TABLE refuses DROP of a pending composite-FK column"
             `Quick
-            deferred_recheck_errors_on_composite_fk_partial_drop
+            alter_table_refuses_drop_of_pending_composite_fk_column
+        ; Alcotest.test_case
+            "ALTER TABLE refuses the DROP that would precede a same-name re-ADD"
+            `Quick
+            alter_table_refuses_drop_that_would_precede_a_same_name_readd
+        ] )
+    ; ( "review_round_3_item_2_immediate_path_loud_error"
+      , [ Alcotest.test_case
+            "precheck_update_fk fails loudly, not with bare \"column not found\""
+            `Quick
+            precheck_update_fk_fails_loudly_not_with_bare_column_not_found
+        ; Alcotest.test_case
+            "precheck_delete_fk fails loudly, not with bare \"column not found\""
+            `Quick
+            precheck_delete_fk_fails_loudly_not_with_bare_column_not_found
         ] )
     ; ( "review_item_5_without_rowid_child"
       , [ Alcotest.test_case

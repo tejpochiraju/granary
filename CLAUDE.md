@@ -441,16 +441,27 @@ things that were tried and rejected) is usually the point.
   (`Exec.child_index_key_types`) because its expression's actual runtime
   storage class can differ from its declared column type, unlike an ordinary
   or STORED column (`Row.encode_col_value` enforces that agreement only for
-  those). PR #765's review found the deferred-recheck path had the analogous
-  bug twice more, both fixed the same way: `Exec.make_fk_recheck` identifies
-  the FK constraint by **ordinal** (`Exec.fk_ordinal`, stable across a
-  mid-transaction `RENAME COLUMN` or `DROP COLUMN`) rather than trusting
-  ordinals or column-name strings captured at statement time, and raises
-  loudly — instead of silently reporting "not violated" — when a column a
-  `DROP COLUMN` removed leaves the constraint unresolvable, matching the
-  immediate enforcement path's own established refusal for the same
-  condition. Full write-up, including why a targeted fix was chosen over
-  refusing the mutation outright, in `docs/DECISIONS.md`.
+  those). PR #765's review chased the deferred-recheck path's identity
+  problem twice on the recheck side — `Exec.make_fk_recheck` re-resolving by
+  ordinal (`Exec.fk_ordinal`, stable across `RENAME COLUMN`) then raising
+  loudly instead of silently reporting "not violated" when `DROP COLUMN`
+  left a constraint unresolvable — before a THIRD mutation shape (`DROP
+  COLUMN` then `ADD COLUMN` reusing the identical name) showed that fixing
+  the recheck side can never get ahead of the next mutation shape, because
+  the recheck only ever sees the schema AFTER the mutation. Round 3 fixes
+  it at the source instead: `ALTER TABLE ... RENAME COLUMN` / `DROP COLUMN`
+  now **refuses outright** when the column still has a deferred FK
+  obligation pending in the current transaction (`Exec.fk_obligation_conflict`,
+  consulting `Cat.peek_pending_fk_checks`), matching this project's own
+  conservative-refusal precedent for the structurally identical problem
+  (`ALTER TABLE ... RENAME` refusing when a view/trigger depends on the
+  table, #673/#645). The recheck-side ordinal/loud-failure logic stays as
+  defence in depth. `precheck_update_fk`/`precheck_delete_fk` (the immediate
+  RESTRICT path) also now fail with the same loud, FK-specific message the
+  deferred path already gave, instead of a bare internal `Failure "column
+  not found"`. Full write-up — including the residual this does NOT close
+  (`RENAME TABLE`/`DROP TABLE` can still desync a pending check by table
+  name) — in `docs/DECISIONS.md`.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.

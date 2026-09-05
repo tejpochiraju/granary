@@ -3424,6 +3424,30 @@ let find_col_idxs schema col_names =
     col_names
 ;;
 
+(** #765 review round 3, item 2: resolve an FK's own column-name list
+    ([fk_local_cols] or [fk_parent_cols]) against [schema], or fail with a
+    loud, FK-specific message naming [table_name] and the missing columns —
+    the same shape {!enforce_insert_fk} already uses for an INSERT's
+    parent-column lookup — rather than {!find_col_idx_by_name}'s bare,
+    FK-context-free [Failure "column not found: <name>"]. [precheck_update_fk]
+    and [precheck_delete_fk] (the immediate RESTRICT precheck, as opposed to
+    {!make_fk_recheck}'s deferred recheck) did not get this treatment when
+    rounds 1 and 2 gave it to the deferred path, so a [DROP COLUMN] of an
+    FK-participating column (#767) surfaced there as an internal-looking
+    crash instead of a deliberate refusal. *)
+let resolve_fk_col_idxs ~table_name schema col_names : int list Lwt.t =
+  let idxs_opt = find_col_idxs schema col_names in
+  if List.for_all Option.is_some idxs_opt
+  then Lwt.return (List.filter_map Fun.id idxs_opt)
+  else
+    Lwt.fail_with
+      (Printf.sprintf
+         "FOREIGN KEY: some columns not found in table '%s' (expected %s) -- the \
+          constraint can no longer be evaluated"
+         table_name
+         (String.concat ", " col_names))
+;;
+
 (** Non-raising variant of find_col_idx_by_name: returns [None] if not found. *)
 let find_col_idx_by_name_opt schema col_name =
   let rec fi i = function
@@ -4103,58 +4127,85 @@ let make_fk_recheck (cat : Cat.t) ~child_name ~parent_name ~fk_ordinal ~parent_v
         with
         | None, _ | _, None -> Lwt.return false
         | Some child_now, Some parent_now ->
-          (match List.nth_opt child_now.Cat.fk_constraints fk_ordinal with
-           | None -> Lwt.return false
-           | Some fk_now ->
-             let cci =
-               List.filter_map
-                 (find_col_idx_by_name_opt child_now.Cat.columns)
-                 fk_now.Cat.fk_local_cols
-             in
-             let pci =
-               List.filter_map
-                 (find_col_idx_by_name_opt parent_now.Cat.columns)
-                 fk_now.Cat.fk_parent_cols
-             in
-             if
-               List.length cci <> List.length fk_now.Cat.fk_local_cols
-               || List.length pci <> List.length fk_now.Cat.fk_parent_cols
-             then
-               Lwt.fail_with
-                 (Printf.sprintf
-                    "FOREIGN KEY constraint on '%s' (%s) referencing '%s' (%s) can no \
-                     longer be evaluated: a participating column no longer exists"
-                    child_name
-                    (String.concat "," fk_now.Cat.fk_local_cols)
-                    parent_name
-                    (String.concat "," fk_now.Cat.fk_parent_cols))
-             else
-               let* has_child =
-                 fk_child_has_ref_multi_in_tx
-                   cat
-                   recheck_tx
-                   child_now
-                   ~child_col_idxs:cci
-                   ~parent_vals
-               in
-               if not has_child
-               then Lwt.return false
-               else
-                 let* has_parent =
-                   fk_parent_has_row_in_tx
-                     recheck_tx
-                     parent_now
-                     ~parent_idxs:pci
-                     ~parent_vals
-                 in
-                 Lwt.return (not has_parent)))
+          (* #765 review round 3, item 3: [List.nth_opt] raises
+             [Invalid_argument "List.nth"] for a NEGATIVE index rather than
+             answering [None] -- it only degrades gracefully for an
+             out-of-range POSITIVE one. [fk_ordinal] should never actually be
+             negative (every caller resolves it via {!fk_ordinal} against the
+             constraint it just built the recheck for), but every caller also
+             falls back to the sentinel [-1] if that resolution somehow came
+             back [None], so this guard turns an unreachable-in-practice
+             invariant violation into a clear internal error instead of an
+             [Invalid_argument] escaping a code path whose whole design intent
+             is graceful, loud handling. *)
+          if fk_ordinal < 0
+          then
+            Lwt.fail_with
+              (Printf.sprintf
+                 "internal error: no FK ordinal recorded for the pending check on '%s' \
+                  referencing '%s'"
+                 child_name
+                 parent_name)
+          else (
+            match List.nth_opt child_now.Cat.fk_constraints fk_ordinal with
+            | None -> Lwt.return false
+            | Some fk_now ->
+              let cci =
+                List.filter_map
+                  (find_col_idx_by_name_opt child_now.Cat.columns)
+                  fk_now.Cat.fk_local_cols
+              in
+              let pci =
+                List.filter_map
+                  (find_col_idx_by_name_opt parent_now.Cat.columns)
+                  fk_now.Cat.fk_parent_cols
+              in
+              if
+                List.length cci <> List.length fk_now.Cat.fk_local_cols
+                || List.length pci <> List.length fk_now.Cat.fk_parent_cols
+              then
+                Lwt.fail_with
+                  (Printf.sprintf
+                     "FOREIGN KEY constraint on '%s' (%s) referencing '%s' (%s) can no \
+                      longer be evaluated: a participating column no longer exists"
+                     child_name
+                     (String.concat "," fk_now.Cat.fk_local_cols)
+                     parent_name
+                     (String.concat "," fk_now.Cat.fk_parent_cols))
+              else
+                let* has_child =
+                  fk_child_has_ref_multi_in_tx
+                    cat
+                    recheck_tx
+                    child_now
+                    ~child_col_idxs:cci
+                    ~parent_vals
+                in
+                if not has_child
+                then Lwt.return false
+                else
+                  let* has_parent =
+                    fk_parent_has_row_in_tx
+                      recheck_tx
+                      parent_now
+                      ~parent_idxs:pci
+                      ~parent_vals
+                  in
+                  Lwt.return (not has_parent)))
   }
 ;;
 
 (** Helper for FK enforcement: routes a violation either to the pending
     queue (deferred) or raises immediately (immediate).  [recheck] is the
     closure invoked at commit time; it must return true iff the violation
-    is still present. *)
+    is still present.
+
+    [child_table]/[fk_ordinal] identify the SAME constraint [recheck] closes
+    over — every caller already computes both for {!make_fk_recheck} — and
+    are carried alongside the opaque closure (#765 review round 3) so an
+    ALTER TABLE mutation site can ask "does a pending obligation still need
+    this column" without invoking [recheck] itself, which performs the
+    actual re-check rather than answering that question. *)
 let fk_violation
       ~deferred
       (cat : Cat.t)
@@ -4163,6 +4214,8 @@ let fk_violation
       ~rowid
       ~msg
       ~(recheck : Cat.pending_fk_recheck)
+      ~child_table
+      ~fk_ordinal
   =
   if deferred
   then (
@@ -4173,6 +4226,8 @@ let fk_violation
       ; Cat.pfk_rowid = rowid
       ; Cat.pfk_message = msg
       ; Cat.pfk_recheck = recheck
+      ; Cat.pfk_child_table = child_table
+      ; Cat.pfk_fk_ordinal = fk_ordinal
       };
     Lwt.return_unit)
   else Lwt.fail_with msg
@@ -4235,12 +4290,13 @@ let enforce_insert_fk
                COLUMN or DROP COLUMN) and both column lists against the
                schema AT RECHECK TIME, rather than reusing anything captured
                here at INSERT time. *)
+            let ord = Option.value (fk_ordinal table_meta fk) ~default:(-1) in
             let recheck =
               make_fk_recheck
                 cat
                 ~child_name:table_name
                 ~parent_name:parent_meta_name
-                ~fk_ordinal:(Option.value (fk_ordinal table_meta fk) ~default:(-1))
+                ~fk_ordinal:ord
                 ~parent_vals:local_vals
             in
             fk_violation
@@ -4250,7 +4306,9 @@ let enforce_insert_fk
               ~table:table_name
               ~rowid:0L
               ~msg
-              ~recheck))))
+              ~recheck
+              ~child_table:table_name
+              ~fk_ordinal:ord))))
 ;;
 
 (* Evaluate all FK constraints for an INSERT of [row] before any writes. *)
@@ -6346,12 +6404,13 @@ and cascade_delete_restrict
        [make_fk_recheck] would not have propagated here. Calling it directly
        keeps this call site and every other deferred FK recheck agreeing by
        construction. *)
+    let ord = Option.value (fk_ordinal child_meta fk) ~default:(-1) in
     let recheck =
       make_fk_recheck
         cat
         ~child_name:child_meta_name
         ~parent_name:parent_meta_name
-        ~fk_ordinal:(Option.value (fk_ordinal child_meta fk) ~default:(-1))
+        ~fk_ordinal:ord
         ~parent_vals
     in
     fk_violation
@@ -6361,7 +6420,9 @@ and cascade_delete_restrict
       ~table:parent_meta_name
       ~rowid
       ~msg
-      ~recheck)
+      ~recheck
+      ~child_table:child_meta_name
+      ~fk_ordinal:ord)
   else Lwt.return_unit
 
 (* ON DELETE SET NULL: set each child FK column to NULL (rejecting NOT NULL),
@@ -7217,8 +7278,15 @@ let precheck_update_fk
   | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
   | Cat.FA_restrict | Cat.FA_no_action ->
     let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
-    let parent_col_idxs =
-      List.map (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols
+    (* #765 review round 3, item 2: [resolve_fk_col_idxs] fails loudly with an
+       FK-specific message rather than [find_col_idx_by_name]'s bare
+       [Failure "column not found: ..."], matching the deferred path's own
+       established behaviour for the identical condition. *)
+    let* parent_col_idxs =
+      resolve_fk_col_idxs
+        ~table_name:table_meta.Cat.name
+        table_meta.Cat.columns
+        fk.fk_parent_cols
     in
     let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
     let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
@@ -7229,9 +7297,12 @@ let precheck_update_fk
     then Lwt.return_unit
     else if any_null_val old_vals
     then Lwt.return_unit
-    else (
-      let child_col_idxs =
-        List.map (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols
+    else
+      let* child_col_idxs =
+        resolve_fk_col_idxs
+          ~table_name:child_meta.Cat.name
+          child_meta.Cat.columns
+          fk.fk_local_cols
       in
       let* has_ref =
         fk_child_has_ref_multi cat store child_meta ~child_col_idxs ~parent_vals:old_vals
@@ -7246,12 +7317,13 @@ let precheck_update_fk
             child_meta.Cat.name
             (String.concat "," fk.fk_local_cols)
         in
+        let ord = Option.value (fk_ordinal child_meta fk) ~default:(-1) in
         let recheck =
           make_fk_recheck
             cat
             ~child_name:child_meta.Cat.name
             ~parent_name:table_meta.Cat.name
-            ~fk_ordinal:(Option.value (fk_ordinal child_meta fk) ~default:(-1))
+            ~fk_ordinal:ord
             ~parent_vals:old_vals
         in
         fk_violation
@@ -7261,8 +7333,10 @@ let precheck_update_fk
           ~table:table_meta.Cat.name
           ~rowid:rowid_outer
           ~msg
-          ~recheck)
-      else Lwt.return_unit)
+          ~recheck
+          ~child_table:child_meta.Cat.name
+          ~fk_ordinal:ord)
+      else Lwt.return_unit
 ;;
 
 (* Pre-write FK RESTRICT check across all matched UPDATE rows. *)
@@ -7652,15 +7726,22 @@ let precheck_delete_fk
   | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
   | Cat.FA_restrict | Cat.FA_no_action ->
     let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
-    let parent_col_idxs =
-      List.map (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols
+    (* #765 review round 3, item 2: same fix as {!precheck_update_fk}. *)
+    let* parent_col_idxs =
+      resolve_fk_col_idxs
+        ~table_name:table_meta.Cat.name
+        table_meta.Cat.columns
+        fk.fk_parent_cols
     in
     let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
     if any_null_val parent_vals
     then Lwt.return_unit
-    else (
-      let child_col_idxs =
-        List.map (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols
+    else
+      let* child_col_idxs =
+        resolve_fk_col_idxs
+          ~table_name:child_meta.Cat.name
+          child_meta.Cat.columns
+          fk.fk_local_cols
       in
       let* has_ref =
         fk_child_has_ref_multi cat store child_meta ~child_col_idxs ~parent_vals
@@ -7675,12 +7756,13 @@ let precheck_delete_fk
             child_meta.Cat.name
             (String.concat "," fk.fk_local_cols)
         in
+        let ord = Option.value (fk_ordinal child_meta fk) ~default:(-1) in
         let recheck =
           make_fk_recheck
             cat
             ~child_name:child_meta.Cat.name
             ~parent_name:table_meta.Cat.name
-            ~fk_ordinal:(Option.value (fk_ordinal child_meta fk) ~default:(-1))
+            ~fk_ordinal:ord
             ~parent_vals
         in
         fk_violation
@@ -7690,8 +7772,10 @@ let precheck_delete_fk
           ~table:table_meta.Cat.name
           ~rowid:rowid_outer
           ~msg
-          ~recheck)
-      else Lwt.return_unit)
+          ~recheck
+          ~child_table:child_meta.Cat.name
+          ~fk_ordinal:ord)
+      else Lwt.return_unit
 ;;
 
 (* Pre-write FK RESTRICT check across all matched DELETE rows. *)
@@ -9027,6 +9111,88 @@ let alter_rename_table ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) new_nam
     Lwt.return 0
 ;;
 
+(** #765 review round 3: refuse a schema mutation rather than chase it on the
+    recheck side — closing the whole "FK constraint/column identity captured
+    at enqueue time desyncs from the catalog by the time a deferred recheck
+    runs" class at its source, matching this project's own conservative
+    precedent for a structurally identical problem ([ALTER TABLE ... RENAME]
+    refusing outright when a view or trigger depends on the table, rather
+    than trying to keep the dependent artifact consistent through the
+    rename — #673/#645).
+
+    Rounds 1 and 2 fixed this on the RECHECK side, twice, for two different
+    mutation shapes (a stale ordinal under [DROP COLUMN]; a stale NAME under
+    [RENAME COLUMN]) — each fix closed exactly the shape that prompted it and
+    no other, and round 3's [DROP COLUMN] + [ADD COLUMN] of the identical
+    name is a third. Fixing the recheck side can never get ahead of a new
+    mutation shape, because the recheck only ever sees the schema AFTER the
+    mutation; refusing the mutation WHILE a pending obligation still needs
+    the column removes the race instead of predicting its next shape.
+
+    [table_name]/[col_name] are the ALTER's own target column. Returns
+    [Some conflict_message] if some pending check's FK constraint — resolved
+    FRESH right now via {!Cat.peek_pending_fk_checks} and its
+    [pfk_fk_ordinal}, exactly as {!make_fk_recheck} resolves it at COMMIT —
+    still names [col_name] as one of its LOCAL columns on [table_name] (the
+    check's child side) or one of its PARENT columns on [table_name] (the
+    check's parent side); [None] if the column is free to mutate.
+
+    Deliberately narrow: only [RENAME COLUMN] and [DROP COLUMN] call this.
+    [ADD COLUMN] needs no check of its own — the only way it could
+    reintroduce a column a pending obligation cares about is if an earlier
+    statement in the SAME transaction dropped that very column, and that
+    drop is what this function refuses; there is no live conflict left for
+    [ADD COLUMN] to walk into. A column dropped in an EARLIER, already
+    committed transaction has no pending check left to conflict with either
+    (the queue is drained/cleared at every COMMIT/ROLLBACK) — that scenario
+    is #767's standalone, non-transactional [drop_column] corruption, a
+    pre-existing and separately-filed gap this function does not attempt to
+    close.
+
+    Residual NOT closed by this check, named explicitly rather than left
+    implicit: [ALTER TABLE ... RENAME TO] (renaming the WHOLE table) and
+    [DROP TABLE] can still desync a pending check by table name the same
+    way — [make_fk_recheck]'s [Cat.find_table_cached] returning [None]
+    reports "not violated", the same silent-wrong-answer shape the review's
+    RENAME COLUMN finding had for a column. Out of round 3's stated scope
+    (RENAME COLUMN / DROP COLUMN / ADD COLUMN); worth a future issue if it
+    proves reachable — filing it is simpler than a new mid-flight guard, and
+    matches how #767 was itself scoped out of this same PR. *)
+let fk_obligation_conflict (cat : Cat.t) ~table_name ~col_name : string option =
+  let check_conflict (chk : Cat.pending_fk_check) =
+    match Cat.find_table_cached cat ~name:chk.Cat.pfk_child_table with
+    | None -> None
+    | Some child_now ->
+      (match List.nth_opt child_now.Cat.fk_constraints chk.Cat.pfk_fk_ordinal with
+       | None -> None
+       | Some fk_now ->
+         if
+           String.equal chk.Cat.pfk_child_table table_name
+           && List.mem col_name fk_now.Cat.fk_local_cols
+         then
+           Some
+             (Printf.sprintf
+                "column '%s.%s' is the local side of a FOREIGN KEY referencing '%s' with \
+                 a deferred check still pending in this transaction"
+                table_name
+                col_name
+                fk_now.Cat.fk_parent_table)
+         else if
+           String.equal fk_now.Cat.fk_parent_table table_name
+           && List.mem col_name fk_now.Cat.fk_parent_cols
+         then
+           Some
+             (Printf.sprintf
+                "column '%s.%s' is referenced by a FOREIGN KEY on '%s' with a deferred \
+                 check still pending in this transaction"
+                table_name
+                col_name
+                chk.Cat.pfk_child_table)
+         else None)
+  in
+  List.find_map check_conflict (Cat.peek_pending_fk_checks cat)
+;;
+
 (* #405: which user table names an ALTER makes stale for a name-keyed external
    read cache.  Every ALTER form this engine has changes the table's OBSERVABLE
    contents, so all four mark:
@@ -9068,19 +9234,44 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
       | Ast.AA_rename_table new_name ->
         alter_rename_table ~txn:tx cat ~table_meta new_name
       | Ast.AA_rename_column (old_col, new_col) ->
-        let* result =
-          Cat.rename_column ~txn:tx cat ~table_name:table_meta.Cat.name ~old_col ~new_col
-        in
-        (match result with
-         | Error msg -> Lwt.fail_with msg
-         | Ok () ->
-           (* #553: the rename rewrites the CHECK / GENERATED expression SQL of
-              this table, and those caches are keyed by that SQL text — a stale
-              entry would keep a compiled expression resolved against the old
-              column list.  Same reasoning as [alter_drop_column]. *)
-           clear_table_expr_caches table_meta.Cat.name;
-           Lwt.return 0)
-      | Ast.AA_drop_column col_name -> alter_drop_column tx cat ~table_meta col_name)
+        (match
+           fk_obligation_conflict cat ~table_name:table_meta.Cat.name ~col_name:old_col
+         with
+         | Some conflict ->
+           Lwt.fail_with
+             (Printf.sprintf
+                "cannot rename column %s.%s: %s"
+                table_meta.Cat.name
+                old_col
+                conflict)
+         | None ->
+           let* result =
+             Cat.rename_column
+               ~txn:tx
+               cat
+               ~table_name:table_meta.Cat.name
+               ~old_col
+               ~new_col
+           in
+           (match result with
+            | Error msg -> Lwt.fail_with msg
+            | Ok () ->
+              (* #553: the rename rewrites the CHECK / GENERATED expression SQL
+                 of this table, and those caches are keyed by that SQL text — a
+                 stale entry would keep a compiled expression resolved against
+                 the old column list.  Same reasoning as [alter_drop_column]. *)
+              clear_table_expr_caches table_meta.Cat.name;
+              Lwt.return 0))
+      | Ast.AA_drop_column col_name ->
+        (match fk_obligation_conflict cat ~table_name:table_meta.Cat.name ~col_name with
+         | Some conflict ->
+           Lwt.fail_with
+             (Printf.sprintf
+                "cannot drop column %s.%s: %s"
+                table_meta.Cat.name
+                col_name
+                conflict)
+         | None -> alter_drop_column tx cat ~table_meta col_name))
   in
   mark_alter_dirty ~table_meta action;
   Lwt.return n

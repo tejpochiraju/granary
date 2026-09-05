@@ -468,58 +468,132 @@ useful reading order — search for the issue number instead.
     not found in table"). Deferred and immediate now agree, which is what
     this whole PR has been chasing at every turn.
 
-  **Targeted fix chosen over a structural one, and why.** The review floated
-  a broader alternative: detect at the `RENAME`/`DROP COLUMN` site that a
-  deferred FK check is pending against the column and refuse the mutation
-  outright, in the spirit of `ALTER TABLE ... RENAME`'s existing refusal when
-  a view or trigger depends on the table (#673/#645). Not taken, for three
-  reasons. First, the DROP COLUMN corruption this round found is **wider than
-  a pending-deferred-check race** — `Cat.drop_column` leaves a dangling FK
-  name behind unconditionally, for ANY drop of an FK-participating column,
-  with or without a deferred check in flight, and every future statement
-  against that constraint inherits it; that is a pre-existing gap in
-  `drop_column`/`alter_drop_column` themselves, not something this PR
-  introduced or is scoped to close. Second, the pending-FK-check queue
-  (`Cat.pending_fk_check`) holds `pfk_recheck`, an opaque `'m S.txn -> bool
-  Lwt.t` closure with no table/column metadata a mutation site could inspect
-  — teaching every `ALTER TABLE` mutation to introspect "is a column of mine
-  referenced by a pending check" would mean redesigning that queue's shape
-  across every enqueue call site, a materially larger and riskier change
-  mid-review. Third, the targeted fix directly closes both findings with no
-  new design surface, by finishing the same convergence (deferred agrees with
-  immediate) the whole #755/#765 arc has been doing since #755's own diff. If
-  a DROP COLUMN of an FK-participating column ever needs an outright refusal
-  — the `drop_column` gap above — that is worth its own issue.
+  **Round 2 chose the targeted fix over a structural one — and round 3
+  showed why that choice does not scale, 2026-09-05.** Round 2's own
+  write-up (preserved above for the record) declined refusing the mutation
+  outright, reasoning that the pending-FK-check queue held an opaque
+  closure with no table/column metadata a mutation site could inspect, and
+  that the targeted recheck-side fix closed both round-2 findings with no
+  new design surface. Round 3 found a THIRD mutation shape past the same
+  recheck-side approach: `DROP COLUMN pid` followed by `ADD COLUMN pid TEXT
+  DEFAULT 'x'` reintroduces the name `pid`, pointing at a semantically
+  unrelated column — `make_fk_recheck`'s name/ordinal resolution succeeds
+  (the name resolves, the column COUNT is unchanged), so it silently
+  compares the wrong column's value and reports whichever verdict that
+  produces. **The pattern across all three rounds is that a recheck-side
+  fix can only ever close the mutation shape that prompted it, because the
+  recheck runs AFTER the mutation and has no way to know what the schema
+  used to look like.** Fixing it a fourth time on the recheck side would
+  only buy time until a fourth shape.
 
-  Also cleaned up in the same round: the three near-identical
-  `List.for_all2 (fun ci pv -> compare_values row.(ci) pv = 0)` closures
-  (`seek_index_matches`'s per-candidate check and both functions' full-scan
-  fallback) are now one `Exec.fk_cols_match`; the NULL check in both
-  functions now runs BEFORE `Cat.find_index_covering_cols` and
-  `child_index_key_types` (two `Array.of_list` builds) rather than after,
-  since a NULL always falls through to the scan and previously paid for both
-  lookups first only to discard them; and `child_index_key_types`'s comment
-  no longer claims an out-of-range ordinal "degrades to the scan instead of
-  crashing" — the fallback scan's own predicate indexes the same ordinal and
-  would crash identically, one step later. What actually rules a stale
-  ordinal out is `make_fk_recheck`'s fresh resolution, not this function's
-  own (still worthwhile, still total) bounds check.
+  So round 3 does what round 2 considered and declined: `ALTER TABLE ...
+  RENAME COLUMN` / `DROP COLUMN` now REFUSE outright when the column still
+  has a deferred FK obligation pending in the CURRENT transaction, matching
+  `ALTER TABLE ... RENAME`'s own existing refusal when a view or trigger
+  depends on the table (#673/#645) — conservative by the same reasoning:
+  refusing a mutation that might have been harmless is cheaper than
+  attempting one that silently corrupts. What made this newly tractable
+  where round 2 judged it too invasive: the queue does not need a redesign,
+  only two more fields. `Cat.pending_fk_check` gained `pfk_child_table` and
+  `pfk_fk_ordinal` — the exact identity `Exec.make_fk_recheck` already
+  derives for its own resolution — carried ALONGSIDE the opaque
+  `pfk_recheck` closure rather than replacing it, and a new
+  `Cat.peek_pending_fk_checks` (non-destructive, unlike `drain_...`) lets a
+  mutation site read the queue without disturbing what COMMIT still needs
+  to run. `Exec.fk_obligation_conflict` walks that list, re-resolving each
+  pending check's constraint FRESH by ordinal (the same call
+  `make_fk_recheck` makes) to ask "does this constraint, AS IT STANDS RIGHT
+  NOW, still name the column this ALTER is about to touch, as either its
+  local or its parent side" — deliberately fresh rather than trusting
+  anything captured at enqueue time, for the same reason `fk_ordinal`
+  beat column names in round 2.
+
+  **Deliberately narrow, and the boundary is worth stating precisely.**
+  Only `RENAME COLUMN` and `DROP COLUMN` call the new check. `ADD COLUMN`
+  needs no check of its own: the only way it could reintroduce a column a
+  pending obligation cares about is if an earlier statement in the SAME
+  transaction dropped that very column, and that drop is exactly what is
+  now refused — there is no live conflict left for `ADD COLUMN` to walk
+  into. Two residuals are named rather than silently left:
+  - This closes the mid-transaction race, not `Cat.drop_column`'s standalone
+    corruption (filed separately, #767): a `DROP COLUMN` with NO deferred
+    check pending still succeeds and still leaves a dangling name in
+    `fk_constraints` forever, exactly as before. That gap is wider than this
+    PR's transaction-scoped remit and was correctly scoped out in round 2's
+    own write-up; round 3 does not reopen that scoping decision.
+  - `ALTER TABLE ... RENAME TO` (the whole TABLE) and `DROP TABLE` are OUT
+    of round 3's stated scope (RENAME COLUMN / DROP COLUMN / ADD COLUMN) and
+    can still desync a pending check by TABLE name the same way a column
+    rename used to: `make_fk_recheck`'s `Cat.find_table_cached` returning
+    `None` reports "not violated" — the identical silent-wrong-answer shape
+    round 2's RENAME COLUMN finding had, one level up. Not fixed here; worth
+    a future issue if it proves reachable, the same way #767 was filed
+    rather than folded in.
+
+  Item 2, fixed the same round regardless of which fix shape was chosen for
+  item 1: `precheck_update_fk`/`precheck_delete_fk` (the IMMEDIATE
+  RESTRICT precheck) were still reaching `Exec.find_col_idx_by_name`'s bare
+  `Failure "column not found: <name>"` on a corrupted constraint — reachable
+  via #767's standalone corruption, since nothing prevents that outside a
+  pending obligation — while `Exec.make_fk_recheck` (the DEFERRED path)
+  already raised a loud, FK-specific message for the identical condition
+  since round 2. New `Exec.resolve_fk_col_idxs` gives both immediate
+  functions the same graceful check `Exec.enforce_insert_fk` already had for
+  its own INSERT-side lookup: deferred and immediate now agree on every FK
+  column-resolution failure, not just the ones round 1 and round 2 happened
+  to touch.
+
+  Item 3, also independent of the structural-vs-targeted choice:
+  `make_fk_recheck`'s `List.nth_opt child_now.Cat.fk_constraints fk_ordinal`
+  raises `Invalid_argument "List.nth"` for a NEGATIVE index rather than
+  answering `None` — it only degrades gracefully for an out-of-range
+  POSITIVE one. Every caller falls back to the sentinel `-1` if
+  `Exec.fk_ordinal` somehow returns `None` (which should never happen: every
+  caller passes an `fk` literally drawn from the list `fk_ordinal` searches),
+  so this was a crash trap for an unreachable-in-practice case, in code whose
+  whole design intent is graceful, loud handling. `make_fk_recheck` now
+  guards `fk_ordinal < 0` explicitly and raises a clear internal-error
+  message instead of letting `List.nth` blow up if the sentinel is ever hit.
+
+  Also cleaned up in round 2, still true after round 3: the three
+  near-identical `List.for_all2 (fun ci pv -> compare_values row.(ci) pv =
+  0)` closures (`seek_index_matches`'s per-candidate check and both
+  functions' full-scan fallback) are one `Exec.fk_cols_match`; the NULL
+  check in both functions runs BEFORE `Cat.find_index_covering_cols` and
+  `child_index_key_types` (two `Array.of_list` builds) rather than after;
+  and `child_index_key_types`'s comment no longer claims an out-of-range
+  ordinal "degrades to the scan instead of crashing" — the fallback scan's
+  own predicate indexes the same ordinal and would crash identically, one
+  step later. What actually rules a stale ordinal out is
+  `make_fk_recheck`'s fresh resolution, not that function's own (still
+  worthwhile, still total) bounds check.
 
   Pinned by `test/test_fk_cross_numeric_755.ml`: the issue's own repro, the
   un-indexed regression guard, the reversed type order, a same-type
   no-false-refusal case, both cascade actions found in the audit (SET NULL,
-  CASCADE), the DROP COLUMN and RENAME COLUMN schema-drift repros (each with
-  a "still refuses" and a "still allows" case), the composite-FK
-  partial-drop repro, the VIRTUAL generated FK-child column repro, a WITHOUT
-  ROWID child-table repro, and a 200-case QCheck property tying RESTRICT's
-  refusal to genuine cross-numeric reference existence, indexed or not.
+  CASCADE), the VIRTUAL generated FK-child column repro, a WITHOUT ROWID
+  child-table repro, a 200-case QCheck property tying RESTRICT's refusal to
+  genuine cross-numeric reference existence (indexed or not), and — for
+  round 3 — the ALTER TABLE refusal itself (RENAME and DROP of a
+  pending-FK column; the DROP-then-ADD-same-name shape refused at its
+  first statement), a NO-OVER-REFUSAL case (renaming an unrelated column on
+  a table with an unrelated pending check still succeeds), and both
+  immediate-path loud-failure cases (item 2). Round 1 and round 2's own
+  DROP-COLUMN/RENAME-COLUMN mid-transaction tests were REWRITTEN rather than
+  kept as-is once round 3 landed: the ALTER itself now fails before COMMIT
+  is ever reached, so a test asserting "COMMIT still refuses/allows"
+  no longer exercises anything — asserting the ALTER's own refusal is the
+  version of that test that means something post-round-3.
   Verified by reverting to the pre-round-N code at each round (a WIP commit,
   checked out and restored — not `git stash`): round 1's DROP COLUMN test
   failed with the predicted `Invalid_argument("index out of bounds")` and
   the VIRTUAL generated-column test failed by wrongly allowing the DELETE;
   round 2's RENAME COLUMN and composite-drop tests failed against round 1's
   code exactly as predicted (a silent COMMIT success, and a silent "not
-  violated" respectively).
+  violated" respectively); round 3's five new/rewritten cases failed against
+  round 2's code as predicted (the ALTER succeeding when it should have been
+  refused, and the immediate path's bare "column not found" instead of a
+  loud FK message).
 
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does
