@@ -436,16 +436,21 @@ things that were tried and rejected) is usually the point.
   and `Exec.scan_child_rows_multi_tx` (the latter backs the immediate RESTRICT
   check AND SET NULL/SET DEFAULT/CASCADE) now seek the child index through
   `Exec.index_lookup_values`, keyed by the child column's declared type — the
-  same rule #743 gave the nested-loop join probe. Two follow-on findings from
-  PR #765's review, fixed in the same change: a deferred recheck now
-  re-resolves its column ordinals by NAME against the schema AT RECHECK TIME
-  (`Exec.make_fk_recheck`) rather than reusing ones captured at statement
-  time, which a mid-transaction `DROP COLUMN` can shift or invalidate; and a
-  VIRTUAL generated FK-child column is excluded from the indexed fast path
+  same rule #743 gave the nested-loop join probe. A VIRTUAL generated
+  FK-child column is excluded from the indexed fast path
   (`Exec.child_index_key_types`) because its expression's actual runtime
   storage class can differ from its declared column type, unlike an ordinary
   or STORED column (`Row.encode_col_value` enforces that agreement only for
-  those).
+  those). PR #765's review found the deferred-recheck path had the analogous
+  bug twice more, both fixed the same way: `Exec.make_fk_recheck` identifies
+  the FK constraint by **ordinal** (`Exec.fk_ordinal`, stable across a
+  mid-transaction `RENAME COLUMN` or `DROP COLUMN`) rather than trusting
+  ordinals or column-name strings captured at statement time, and raises
+  loudly — instead of silently reporting "not violated" — when a column a
+  `DROP COLUMN` removed leaves the constraint unresolvable, matching the
+  immediate enforcement path's own established refusal for the same
+  condition. Full write-up, including why a targeted fix was chosen over
+  refusing the mutation outright, in `docs/DECISIONS.md`.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.

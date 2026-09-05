@@ -361,6 +361,117 @@ let generated_virtual_fk_child_column_restrict_allows_when_unreferenced () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* PR #765 review, round 2: the by-NAME re-resolution round 1 added to    *)
+(* make_fk_recheck has the same failure class one level up (RENAME), and *)
+(* a genuinely broken composite FK must fail loudly, not silently.       *)
+(* ------------------------------------------------------------------ *)
+
+(* Round 1's fix re-resolved [pid] by NAME against the schema at recheck
+   time -- correct for a DROP of an unrelated column, but a RENAME of the
+   FK's OWN column moves the very name it was resolving. [Cat.rename_column]
+   rewrites the catalog's [fk_local_cols] to "pid2" immediately, so a
+   name-based lookup for "pid" finds nothing, its length check fails, and
+   (round 1's code) reported "not violated" -- COMMIT silently succeeded
+   despite parent 999 never existing. The fix identifies the constraint by
+   ORDINAL instead ([Exec.fk_ordinal]), which survives the rename, so
+   [fk_now.Cat.fk_local_cols] is already "pid2" when the recheck reads it. *)
+let deferred_recheck_survives_rename_column_and_still_refuses () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p8 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c8 (pid INTEGER REFERENCES p8(id) DEFERRABLE INITIALLY DEFERRED)";
+    exec db "BEGIN";
+    exec db "INSERT INTO c8 VALUES (999)";
+    exec db "ALTER TABLE c8 RENAME COLUMN pid TO pid2";
+    match exec_result db "COMMIT" with
+    | Ok () -> Alcotest.fail "COMMIT should refuse: parent 999 was never inserted"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "COMMIT failed with a FOREIGN KEY error, not a silent success (got %S)"
+           msg)
+        true
+        (contains ~needle:"FOREIGN KEY" msg))
+;;
+
+(* Same rename, but the parent row DOES arrive before COMMIT: the recheck
+   must resolve the renamed column correctly and let the transaction
+   through, not turn a spurious "column not found" into a false violation. *)
+let deferred_recheck_survives_rename_column_and_still_allows () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p9 (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c9 (pid INTEGER REFERENCES p9(id) DEFERRABLE INITIALLY DEFERRED)";
+    exec db "BEGIN";
+    exec db "INSERT INTO c9 VALUES (999)";
+    exec db "ALTER TABLE c9 RENAME COLUMN pid TO pid2";
+    exec db "INSERT INTO p9 VALUES (999)";
+    (match exec_result db "COMMIT" with
+     | Ok () -> ()
+     | Error msg -> Alcotest.failf "COMMIT should have succeeded, got %S" msg);
+    Alcotest.(check (list string))
+      "the child row is intact under its new column name"
+      [ "999" ]
+      (query_texts db "SELECT pid2 FROM c9"))
+;;
+
+(* A composite FK, DEFERRABLE, with one of its two local columns dropped
+   before COMMIT: [Cat.drop_column] does not touch [fk_constraints] at all,
+   so the catalog is left with a genuinely DANGLING column name in this
+   constraint -- not a "the constraint moved" case ordinal identification can
+   paper over, but a "this constraint can no longer be evaluated" one.
+   [make_fk_recheck] must fail LOUDLY here, the same way the immediate
+   enforcement path already does for the identical condition
+   (Exec.enforce_insert_fk's "some local columns not found in table"),
+   rather than silently reporting "not violated" and letting a genuine
+   violation (parent (1,2) was never inserted) through at COMMIT. *)
+let deferred_recheck_errors_on_composite_fk_partial_drop () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p10 (x INTEGER, y INTEGER, PRIMARY KEY (x, y))";
+    exec
+      db
+      "CREATE TABLE c10 (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES p10(x, y) \
+       DEFERRABLE INITIALLY DEFERRED)";
+    exec db "BEGIN";
+    exec db "INSERT INTO c10 VALUES (1, 2)";
+    exec db "ALTER TABLE c10 DROP COLUMN a";
+    match exec_result db "COMMIT" with
+    | Ok () ->
+      Alcotest.fail
+        "COMMIT should refuse: the composite FK can no longer be evaluated, and parent \
+         (1,2) was never inserted anyway"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf "COMMIT reported an error, not a crash (got %S)" msg)
+        true
+        (String.length msg > 0))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* PR #765 review item 5: the new seek path over a WITHOUT ROWID child   *)
+(* table, which addresses rows by their PK value rather than a rowid.   *)
+(* ------------------------------------------------------------------ *)
+
+let indexed_cross_numeric_restrict_refuses_without_rowid_child () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p11 (k INTEGER PRIMARY KEY, y INTEGER)";
+    exec db "CREATE UNIQUE INDEX p11_y ON p11(y)";
+    exec db "INSERT INTO p11 VALUES (1, 1)";
+    exec
+      db
+      "CREATE TABLE c11 (id INTEGER PRIMARY KEY, x REAL REFERENCES p11(y)) WITHOUT ROWID";
+    exec db "CREATE INDEX c11_x ON c11(x)";
+    expect_ok db "INSERT INTO c11 VALUES (1, 1.0)";
+    expect_fk_refused db "DELETE FROM p11 WHERE y = 1")
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Property: RESTRICT agrees with [=] regardless of indexing            *)
 (* ------------------------------------------------------------------ *)
 
@@ -454,6 +565,26 @@ let () =
             "VIRTUAL generated FK-child column: RESTRICT allows when unreferenced"
             `Quick
             generated_virtual_fk_child_column_restrict_allows_when_unreferenced
+        ] )
+    ; ( "review_round_2_rename_and_composite_drop"
+      , [ Alcotest.test_case
+            "RENAME COLUMN before COMMIT: deferred recheck still refuses"
+            `Quick
+            deferred_recheck_survives_rename_column_and_still_refuses
+        ; Alcotest.test_case
+            "RENAME COLUMN before COMMIT: deferred recheck still allows"
+            `Quick
+            deferred_recheck_survives_rename_column_and_still_allows
+        ; Alcotest.test_case
+            "composite FK partial DROP COLUMN: recheck errors, not silent"
+            `Quick
+            deferred_recheck_errors_on_composite_fk_partial_drop
+        ] )
+    ; ( "review_item_5_without_rowid_child"
+      , [ Alcotest.test_case
+            "indexed cross-numeric RESTRICT refuses (WITHOUT ROWID child)"
+            `Quick
+            indexed_cross_numeric_restrict_refuses_without_rowid_child
         ] )
     ; "property", List.map QCheck_alcotest.to_alcotest [ prop_restrict_matches_equality ]
     ]

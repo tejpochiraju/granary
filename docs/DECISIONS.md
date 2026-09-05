@@ -433,16 +433,93 @@ useful reading order — search for the issue number instead.
   check) or keep collecting (a locate-all scan) — a review cleanliness item,
   not a correctness one.
 
+  **Round 1's own fix reopened the same failure class one level up — round 2,
+  2026-09-05.** `make_fk_recheck`'s by-NAME re-resolution is exactly right for
+  a `DROP COLUMN` of an unrelated column, but has two further gaps `ALTER
+  TABLE` can open, both filed against the same PR (#765) rather than closed
+  one at a time:
+
+  - **`RENAME COLUMN` desyncs a by-name lookup from the catalog's own
+    already-updated FK metadata.** `Cat.rename_column` rewrites
+    `fk_local_cols`/`fk_parent_cols` in the catalog immediately, but a
+    closure that captured the OLD column name at enqueue time still looks
+    that name up at recheck time — finds nothing, its length check fails,
+    and (round 1's code) reported "not violated": COMMIT silently succeeded
+    despite the parent row never existing. Fixed by identifying the
+    constraint by **ordinal** (`Exec.fk_ordinal`, 0-based position within
+    `child_meta.Cat.fk_constraints`, found by physical equality) instead of
+    by column name. The ordinal survives every schema mutation touching
+    `fk_constraints` in this codebase: `rename_column_body` substitutes
+    names 1:1 via `List.map` (order and length preserved); `drop_column`
+    does not touch `fk_constraints` at all; `alter_add_column`'s inline FK
+    is appended at the list's end. Nothing removes or reorders an existing
+    entry. Re-fetching the constraint by ordinal at recheck time means its
+    `fk_local_cols`/`fk_parent_cols` are already current — the rename is
+    simply reflected in them.
+  - **A composite FK, partially broken by `DROP COLUMN`, must fail loudly,
+    not silently.** `Cat.drop_column` never touches `fk_constraints`, so
+    dropping one column of a two-column FK leaves a genuinely DANGLING name
+    behind — a "this constraint can no longer be evaluated" state, which
+    ordinal identification does not and should not paper over (the ordinal
+    finds the right, still-broken, constraint record). `make_fk_recheck`'s
+    column-count mismatch now raises instead of returning "not violated",
+    matching the immediate enforcement path's own established behaviour for
+    the identical condition (`Exec.enforce_insert_fk`'s "some local columns
+    not found in table"). Deferred and immediate now agree, which is what
+    this whole PR has been chasing at every turn.
+
+  **Targeted fix chosen over a structural one, and why.** The review floated
+  a broader alternative: detect at the `RENAME`/`DROP COLUMN` site that a
+  deferred FK check is pending against the column and refuse the mutation
+  outright, in the spirit of `ALTER TABLE ... RENAME`'s existing refusal when
+  a view or trigger depends on the table (#673/#645). Not taken, for three
+  reasons. First, the DROP COLUMN corruption this round found is **wider than
+  a pending-deferred-check race** — `Cat.drop_column` leaves a dangling FK
+  name behind unconditionally, for ANY drop of an FK-participating column,
+  with or without a deferred check in flight, and every future statement
+  against that constraint inherits it; that is a pre-existing gap in
+  `drop_column`/`alter_drop_column` themselves, not something this PR
+  introduced or is scoped to close. Second, the pending-FK-check queue
+  (`Cat.pending_fk_check`) holds `pfk_recheck`, an opaque `'m S.txn -> bool
+  Lwt.t` closure with no table/column metadata a mutation site could inspect
+  — teaching every `ALTER TABLE` mutation to introspect "is a column of mine
+  referenced by a pending check" would mean redesigning that queue's shape
+  across every enqueue call site, a materially larger and riskier change
+  mid-review. Third, the targeted fix directly closes both findings with no
+  new design surface, by finishing the same convergence (deferred agrees with
+  immediate) the whole #755/#765 arc has been doing since #755's own diff. If
+  a DROP COLUMN of an FK-participating column ever needs an outright refusal
+  — the `drop_column` gap above — that is worth its own issue.
+
+  Also cleaned up in the same round: the three near-identical
+  `List.for_all2 (fun ci pv -> compare_values row.(ci) pv = 0)` closures
+  (`seek_index_matches`'s per-candidate check and both functions' full-scan
+  fallback) are now one `Exec.fk_cols_match`; the NULL check in both
+  functions now runs BEFORE `Cat.find_index_covering_cols` and
+  `child_index_key_types` (two `Array.of_list` builds) rather than after,
+  since a NULL always falls through to the scan and previously paid for both
+  lookups first only to discard them; and `child_index_key_types`'s comment
+  no longer claims an out-of-range ordinal "degrades to the scan instead of
+  crashing" — the fallback scan's own predicate indexes the same ordinal and
+  would crash identically, one step later. What actually rules a stale
+  ordinal out is `make_fk_recheck`'s fresh resolution, not this function's
+  own (still worthwhile, still total) bounds check.
+
   Pinned by `test/test_fk_cross_numeric_755.ml`: the issue's own repro, the
   un-indexed regression guard, the reversed type order, a same-type
   no-false-refusal case, both cascade actions found in the audit (SET NULL,
-  CASCADE), the DROP COLUMN schema-drift repro from both review findings, the
-  VIRTUAL generated FK-child column repro, and a 200-case QCheck property
-  tying RESTRICT's refusal to genuine cross-numeric reference existence,
-  indexed or not. Verified by reverting to the pre-#765-review code: the
-  DROP COLUMN test fails with the predicted `Invalid_argument("index out of
-  bounds")` and the VIRTUAL generated-column test fails by wrongly allowing
-  the DELETE.
+  CASCADE), the DROP COLUMN and RENAME COLUMN schema-drift repros (each with
+  a "still refuses" and a "still allows" case), the composite-FK
+  partial-drop repro, the VIRTUAL generated FK-child column repro, a WITHOUT
+  ROWID child-table repro, and a 200-case QCheck property tying RESTRICT's
+  refusal to genuine cross-numeric reference existence, indexed or not.
+  Verified by reverting to the pre-round-N code at each round (a WIP commit,
+  checked out and restored — not `git stash`): round 1's DROP COLUMN test
+  failed with the predicted `Invalid_argument("index out of bounds")` and
+  the VIRTUAL generated-column test failed by wrongly allowing the DELETE;
+  round 2's RENAME COLUMN and composite-drop tests failed against round 1's
+  code exactly as predicted (a silent COMMIT success, and a silent "not
+  violated" respectively).
 
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does
