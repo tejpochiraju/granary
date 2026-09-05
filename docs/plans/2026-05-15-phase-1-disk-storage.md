@@ -685,7 +685,12 @@ Rowid suffix: append `Rowid.encode rowid` (8 bytes, same sign-flip big-endian as
 - [ ] **Step 3:** Write `test/test_index_key.ml`:
   - Unit: NULL < any non-null value (verify byte comparison).
   - Unit: INTEGER ordering: `encode_value (IK_int min_int) < encode_value (IK_int 0L) < encode_value (IK_int max_int)`.
-  - Unit: REAL ordering: `-1.0 < -0.0 < 0.0 < 1.0`.
+  - Unit: REAL ordering: `-1.0 < -0.0 < 1.0`. (**Superseded by #754, 2026-09-05**:
+    `-0.0` and `0.0` now encode to the SAME index key rather than `-0.0`
+    sorting strictly below `0.0` — `Exec.compare_values` has always treated
+    them as equal, and the original ordering here silently lost a seek for
+    `WHERE b = 0.0` against a stored `-0.0`. See `docs/DECISIONS.md`'s `#754`
+    section.)
   - Unit: TEXT ordering: `"a" < "aa" < "b"`.
   - Unit: NULL sorts before INTEGER, INTEGER before REAL, REAL before TEXT, TEXT before BLOB.
   - Unit: multi-column key `[IK_int 1L; IK_text "a"]` < `[IK_int 1L; IK_text "b"]`.

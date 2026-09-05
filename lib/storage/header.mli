@@ -29,7 +29,9 @@ type t =
     databases.  v1 = pre-#174 (no fingerprints); v2 = #174 (schema
     fingerprints, redundant catalog mirror, per-page fingerprint stamp); v3 =
     #578/#690 (renumbered {!Granary_encoding.Index_key} type tags, giving NaN
-    its own tag distinct from NULL). *)
+    its own tag distinct from NULL); v4 = #754 (that same module's [IK_real]
+    arm normalizes [-0.0] to [+0.0] before encoding, so a REAL equality seek
+    can find a stored [-0.0]). *)
 val current_format_version : int32
 
 (** Highest on-disk format version this build can open.  [read_live] fails
@@ -38,8 +40,9 @@ val max_supported_format_version : int32
 
 (** Lowest on-disk format version this build can open.  [read_live] fails with
     [Unsupported_format] for any database stamped below this — v3's index-key
-    tag renumbering (#578/#690) has no migration path, so an older file is
-    refused rather than silently misdecoded. *)
+    tag renumbering (#578/#690) and v4's [-0.0] key normalization (#754) both
+    have no migration path, so an older file is refused rather than silently
+    misdecoded or missing an indexed [-0.0] row. *)
 val min_supported_format_version : int32
 
 type error =

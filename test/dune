@@ -2204,6 +2204,17 @@
  (modules test_join_key_743)
  (libraries granary alcotest lwt.unix))
 
+; #754: -0.0 and +0.0 must agree across the indexed WHERE seek, the
+; unindexed WHERE scan, the #743 join probe, and the UNIQUE conflict probe —
+; all four read Index_key.encode_value's REAL encoding, which used to
+; disagree with Exec.compare_values about whether -0.0 and +0.0 are the same
+; key.
+
+(test
+ (name test_negative_zero_754)
+ (modules test_negative_zero_754)
+ (libraries granary alcotest lwt.unix))
+
 ; #416: the RO tree-root memo must never serve a root from a different
 ; committed generation (commits, DDL, rollback, as-of/live alternation), and
 ; the Op_project fusion into a rowid point lookup must project exactly what

@@ -214,6 +214,39 @@ only correct source, reached via the table's `table_meta.columns` at the
 column ordinal the aggregate targets — already available, since
 `Op_index_lookup` carries `table_meta` for exactly this kind of lookup.
 
+## REAL sign safety (#754, added retroactively)
+
+A second gate, discovered after this design shipped rather than anticipated
+by it: `MIN`/`MAX`'s covering path decodes the aggregated value straight off
+`Index_key.decode`'d bytes, exactly the mechanism this document describes
+above — and as of #754, `Index_key.encode_value`'s `IK_real` arm
+deliberately makes `-0.0` and `+0.0` encode to the SAME key bytes (so an
+equality seek for `0.0` finds a stored `-0.0`, closing a different silent
+row-loss bug). The cost of that fix is that the SIGN of a decoded zero is
+gone from the index key itself — `Index_key.decode` only ever produces
+`+0.0` now, for a key that could have been written from either `-0.0` or
+`+0.0`. A `MIN`/`MAX` reported straight off that decoded value is therefore
+wrong whenever the true extremal row was `-0.0`: this design's whole premise
+is "never touch the row," and the row is the only place that sign still
+lives (`Row.encode`/`decode` preserve it bit-for-bit; only the index-key
+*projection* of a REAL loses it).
+
+**The gate: `MIN`/`MAX`'s covering path additionally excludes REAL-typed
+columns.** `Exec.index_cover_minmax_ok` checks the aggregated column's
+declared `Row.ty` alongside the existing NOT NULL/position checks and
+declines the fast path for `Row.Real`, falling back to the general aggregate
+path (which fetches the row and therefore the correct sign) exactly the way
+a nullable column or a `range` already fall back elsewhere in this document.
+`COUNT` is unaffected — it never reads the value, only counts entries, so it
+keeps the covering path for REAL columns same as any other type. This is the
+gate the code comment on `Exec.index_cover_minmax_ok` refers to when it says
+its checks match "the design doc's stated scope exactly" — this section is
+that scope, recorded here after the fact so the claim stays true. See
+`docs/DECISIONS.md`'s `#754` section for the full incident writeup and why
+fetching the winning row from inside the covering walk (restoring
+correctness at the cost of this design's `rows_examined = 0` guarantee) was
+rejected in favour of this exclusion.
+
 ## Partial index-prefix coverage
 
 Two distinct "doesn't fully cover" cases, both already have a clean fallback:

@@ -402,52 +402,45 @@ let a_nan_join_key_matches_nan_and_no_number () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* The residual this fix does NOT close                                 *)
+(* The residual #743 could not close — now fixed by #754                *)
 (* ------------------------------------------------------------------ *)
 
-(* {b Negative zero: a known residual, pinned as such rather than endorsed.}
+(* {b Negative zero: was a known residual of the index encoding, closed by
+   #754.}
 
    [Float.compare (-0.) 0.] is [0], so [Exec.compare_values] — and therefore
    [=] — says [0], [0.0] and [-0.0] are all equal. [Index_key.encode_value]
-   deliberately does not: it encodes [-0.0] BELOW [+0.0] so the index's byte
-   order is IEEE's total order.
+   used to disagree: it encoded [-0.0] strictly BELOW [+0.0], so the index's
+   byte order distinguished a value [compare_values] calls equal.
 
-   That disagreement is NOT #743's and is not introduced here. It already
-   splits an indexed [WHERE] from an unindexed one on [main]: over a REAL
-   column holding [-0.0], [WHERE b = 0.0] returns the row with no index and
-   nothing with one (verified 2026-09-03, before this change). The join arms
-   inherit exactly that split and nothing wider — the canonical hash key agrees
-   with [compare_values], and the probe agrees with the indexed [WHERE] because
-   it calls the same [Exec.index_lookup_values].
+   That disagreement was not #743's and was not introduced there. It already
+   split an indexed [WHERE] from an unindexed one on [main]: over a REAL
+   column holding [-0.0], [WHERE b = 0.0] returned the row with no index and
+   nothing with one. The join arms inherited exactly that split and nothing
+   wider — the canonical hash key already agreed with [compare_values], and
+   only the index probe disagreed, because it called the same
+   [Exec.index_lookup_values] the indexed [WHERE] used.
 
-   sqlite3 answers the row for all of these ([-0.0 = 0.0] and [0 = -0.0] are
-   both [1]), so the hash arm is the one that is right.
-
-   Change this case as a DECISION: closing it means making the index encoding
-   or [compare_values] agree about +/-0, which moves index ordering and is a
-   different issue. *)
-let negative_zero_is_a_known_residual_of_the_index_encoding () =
-  let seed =
-    [ "CREATE TABLE l (a INTEGER)"
-    ; "CREATE TABLE r (b REAL)"
-    ; "INSERT INTO l VALUES (0)"
-    ; "INSERT INTO r VALUES (-0.0)"
-    ]
-  in
-  let hash_rows, hash_idx = run_join ~seed on_sql in
-  let nlj_rows, nlj_idx = run_join ~seed ~index:idx_r on_sql in
-  let filter_rows, _ = run_join ~seed where_sql in
-  Alcotest.(check bool) "un-indexed ON is a hash join" false hash_idx;
-  Alcotest.(check bool) "indexed ON is a nested-loop probe" true nlj_idx;
-  check_rows
-    ~label:"the hash key agrees with compare_values, and with sqlite3"
+   #754 fixed it at the source: [Index_key.encode_value] now normalizes
+   [-0.0]'s bit pattern to [+0.0]'s before the order-preserving transform, so
+   the two values encode IDENTICALLY rather than [-0.0] sorting first. That
+   closes the gap for every consumer of the encoding at once — the [WHERE]
+   seek, the UNIQUE probe, and this join probe — with no separate join-side
+   fix needed. sqlite3 answers the row for all three spellings ([-0.0 = 0.0]
+   and [0 = -0.0] are both [1]), and now so does granary. *)
+let negative_zero_now_matches_across_all_three_execution_paths () =
+  check_all_three
+    ~label:"-0.0 matches 0 in the hash join, the index probe, and the filter"
+    ~seed:
+      [ "CREATE TABLE l (a INTEGER)"
+      ; "CREATE TABLE r (b REAL)"
+      ; "INSERT INTO l VALUES (0)"
+      ; "INSERT INTO r VALUES (-0.0)"
+      ]
+    ~index:idx_r
+    ~on_sql
+    ~where_sql
     [ [ "int:0"; "real:-0" ] ]
-    hash_rows;
-  check_rows ~label:"as does the filter spelling" [ [ "int:0"; "real:-0" ] ] filter_rows;
-  check_rows
-    ~label:"the index probe does not — the encoding separates -0.0 from +0.0"
-    []
-    nlj_rows
 ;;
 
 let () =
@@ -495,9 +488,9 @@ let () =
         ] )
     ; ( "residuals"
       , [ Alcotest.test_case
-            "negative_zero_is_a_known_residual_of_the_index_encoding"
+            "negative_zero_now_matches_across_all_three_execution_paths"
             `Quick
-            negative_zero_is_a_known_residual_of_the_index_encoding
+            negative_zero_now_matches_across_all_three_execution_paths
         ] )
     ]
 ;;

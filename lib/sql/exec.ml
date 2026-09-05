@@ -409,9 +409,12 @@ let exact_real_of_int64 (n : int64) : float option =
      (matching [Float.compare nan nan = 0]) and none can collide with a number
      or with NULL's [0x00];
    - [-0.0] canonicalises to [IK_int 0], which is what makes it join [0.0] and
-     [0] alike — [Float.compare (-0.) 0. = 0], so [compare_values] agrees.  The
-     raw index encoding deliberately separates them ([-0.0 < +0.0], see
-     [Index_key.encode_value]), which is why the raw bytes could not be used;
+     [0] alike — [Float.compare (-0.) 0. = 0], so [compare_values] agrees.
+     Before #754 the raw index encoding separated [-0.0] from [+0.0]
+     ([-0.0 < +0.0]), which was why the raw bytes alone could not be used for
+     this canonical key; [Index_key.encode_value] now normalizes [-0.0] to
+     [+0.0]'s bits too, so the raw encoding and this canonical key agree on
+     every REAL value, not just the ones this function special-cases;
    - a cross-CLASS pair keeps distinct tag bytes and never joins, which is
      [compare_values]' answer too.
 
@@ -13361,10 +13364,29 @@ and index_cover_pred_ok ok_col (pred_opt : Plan.expr option) : bool =
   | None -> true
   | Some p -> plan_expr_reads_only_cols ok_col p
 
-(* MIN/MAX additionally require: no #517 [range], and the aggregated column is
+(* MIN/MAX additionally require: no #517 [range], the aggregated column is
    exactly the next unconstrained key column of the index (position
-   [n_eq]) — not merely SOME index column. *)
+   [n_eq]) — not merely SOME index column — and #754: the column is NOT a
+   REAL.
+
+   The REAL exclusion exists because [Index_key.encode_value] (#754)
+   deliberately makes [-0.0] and [+0.0] encode to the SAME key bytes, which
+   is exactly what makes an equality seek find a stored [-0.0] again — but it
+   also means the sign of a decoded zero is gone from the index key itself:
+   [Index_key.decode]'ing either one's key yields [+0.0], because that is the
+   only bit pattern ever written now. [run_index_cover_walk] reads the
+   MIN/MAX value straight off the decoded key (never touching the row, which
+   is the entire point of the covering optimisation), so for a REAL column it
+   would report [+0.0] as the answer even when the true extremal row, still
+   sitting in the table with its sign bit intact ([Row.encode]/[decode]
+   preserve it bit-for-bit), is [-0.0] — silently returning the wrong SIGN,
+   not merely the wrong row. Excluding REAL here sends such a query to the
+   general aggregate path instead, which fetches the actual row and therefore
+   the actual sign. This costs the covering optimisation only for REAL-typed
+   MIN/MAX, and only in exchange for correctness on a value class the index
+   key can no longer round-trip losslessly. *)
 and index_cover_minmax_ok
+      (table_meta : Cat.table_meta)
       (idx_ords : int array)
       (n_eq : int)
       (range : Plan.range option)
@@ -13377,7 +13399,12 @@ and index_cover_minmax_ok
     && n_eq < Array.length idx_ords
     &&
       (match s.Plan.col_ord with
-      | Some i -> idx_ords.(n_eq) = i
+      | Some i ->
+        idx_ords.(n_eq) = i
+        &&
+          (match List.nth_opt table_meta.Cat.columns i with
+          | Some (c : Row.column) -> c.Row.ty <> Row.Real
+          | None -> false)
       | None -> false)
   | _ -> true
 
@@ -13416,7 +13443,8 @@ and index_cover_eligible
        then None
        else if not (index_cover_pred_ok ok_col pred_opt)
        then None
-       else if not (List.for_all (index_cover_minmax_ok idx_ords n_eq range) aggs)
+       else if
+         not (List.for_all (index_cover_minmax_ok table_meta idx_ords n_eq range) aggs)
        then None
        else Some (idx_ords, index_cover_min_early_stop pred_opt aggs))
 
