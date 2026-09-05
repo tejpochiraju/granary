@@ -279,7 +279,23 @@ val plan : t -> string -> (Granary_sql.Plan.op, error) result Lwt.t
     {!stale_after_vacuum} answers [true], and {!close} on one is a safe no-op
     (the store is already closed).  There is no ROLLBACK recovery, unlike #555's
     poison — the caller must take a fresh worker handle off {e this} one.  Called
-    on a handle that is itself stale, VACUUM raises [Failure]. *)
+    on a handle that is itself stale, VACUUM raises [Failure].
+
+    {b #757: reactive-view generations survive VACUUM without colliding.}
+    VACUUM swaps in a brand-new underlying store, and a fresh store's
+    generation counter would otherwise restart at 0 — unlike the rowid
+    allocator, which reseeds itself correctly from the copied tree data, a
+    generation has nothing durable to recover it from. Before the swap
+    becomes visible on [t], the old store's generation bookkeeping is carried
+    into the new one ([Granary_store.Store.rv_carry_over_generations]), so a
+    generation minted before this VACUUM and one minted after it can never
+    collide, and {!reactive_view_generation} keeps its "strictly increasing
+    for this name, forever" guarantee across a VACUUM. This handle's own
+    {!reactive_view_generation} answers for a view unaffected by the VACUUM
+    do not change (nothing about {e this} handle's registry entries is
+    touched, only the counter that mints FUTURE ones) — the DDL-visibility
+    caveat above is what governs whether a SIBLING handle's later
+    drop-and-recreate is visible here, exactly as it does outside a VACUUM. *)
 val vacuum : t -> unit Lwt.t
 
 (** #634: whether this handle — or any ATTACHed schema on it — has been
@@ -787,7 +803,16 @@ val pp_view_callback : Format.formatter -> view_callback -> unit
     is that signal: equal means still the same incarnation, different means
     the name was recreated and the handle should be dropped and re-registered.
     See {!reactive_view_generation} for the monotonicity guarantee this
-    depends on. *)
+    depends on.
+
+    {b #766 (open, deliberately not closed here): a TOCTOU gap in that
+    re-registration pattern.} Nothing stops a SECOND drop-and-recreate landing
+    between a caller's generation comparison and its re-registration call, so
+    the re-registration can itself land against an incarnation that is
+    already stale by the time this function returns. Closing it needs an
+    atomic check-and-register (an optional expected-generation argument that
+    fails on mismatch rather than silently registering), which is a further
+    signature change beyond this one; tracked rather than rushed. *)
 val register_view_callback
   :  t
   -> view_name:string
@@ -815,7 +840,17 @@ val register_view_callback
     That is a snapshot, not a tombstone and not a refusal: removal is always
     accepted and never raises, and the visible effect is simply deferred to the
     next batch.  A registration made from inside a callback behaves the same
-    way — it starts firing from the next batch. *)
+    way — it starts firing from the next batch.
+
+    {b #766 (open, deliberately not closed here): [false] is also returned
+    when [h]'s view was dropped and a DIFFERENT incarnation recreated under
+    the same name} — the lookup is by view name, so a stale [h] finds the
+    new incarnation's (unrelated) callback list, fails to find [h]'s id in
+    it, and this reports [false] exactly as it would for "already
+    unregistered". A caller that needs to tell the two apart can compare
+    {!reactive_view_generation} itself; making this function do so natively
+    would need a 3-way result and is tracked, not rushed, in the same
+    follow-up as the TOCTOU note on {!register_view_callback}. *)
 val unregister_view_callback : t -> view_callback -> bool
 
 (** #437: the names of the live reactive views, sorted.  Read from the in-memory

@@ -48,13 +48,34 @@
       [reactive_view_generation] and [register_view_callback]'s returned
       generation agree with the parent's.
 
-    A companion fault-injection test for the OTHER review finding — a failed
-    [CREATE REACTIVE VIEW] used to leave a ghost registry entry with a live
-    generation when the durable [persist_reactive_view] write failed — lives
-    in [test_reactive_view_catalog_error_476.ml], which already has the
-    store-fault-injection harness this needs. *)
+    A companion fault-injection test for the OTHER round-1 review finding — a
+    failed [CREATE REACTIVE VIEW] used to leave a ghost registry entry with a
+    live generation when the durable [persist_reactive_view] write failed —
+    lives in [test_reactive_view_catalog_error_476.ml], which already has the
+    store-fault-injection harness this needs.
+
+    {b Round 2}: promoting the counter to [Store.t] closed the round-1 gaps but
+    opened two more, both pinned below:
+
+    - {b VACUUM.} VACUUM swaps in a brand-new [Store.t], and a fresh store's
+      generation counter restarts at 0 unless carried forward — unlike the
+      rowid allocator, a generation has nothing durable to reseed itself
+      from. [Db.vacuum] now calls
+      [Granary_store.Store.rv_carry_over_generations] before the swap becomes
+      visible; see [vacuum_does_not_reset_the_counter_to_collide_with_a_pre_vacuum_generation].
+    - {b Concurrent DROP vs CREATE.} [rv_drop]'s store-level cleanup was an
+      unconditional remove-by-name, which could delete a DIFFERENT, concurrent
+      CREATE's just-written generation for the same name if it landed in the
+      window between this drop capturing the generation it is retiring and its
+      cleanup running. Fixed with a compare-and-remove. Reproduced
+      deterministically (no scheduler-timing dependence needed, since the bug
+      is a state mismatch, not a timing window per se) in
+      [drop_does_not_clobber_a_concurrently_created_same_name_generation] by
+      directly installing the post-race state a real interleaving would
+      produce. *)
 
 module Db = Granary.Db
+module S = Granary_store.Store
 
 let run = Lwt_main.run
 
@@ -239,6 +260,139 @@ let worker_handle_over_the_same_store_reuses_the_parents_generation () =
            g_registered))
 ;;
 
+(* Round-2 review finding on PR #761, item 2: [rv_drop]'s store-level cleanup
+   used to be an unconditional [Hashtbl.remove] by name, which can clobber a
+   CONCURRENT, unrelated CREATE of the same name if that CREATE lands in the
+   window between this drop capturing the generation it is retiring and its
+   own cleanup running (rv_guard's body awaits across the catalog write).
+   Reproduced here WITHOUT depending on real scheduler timing: since the race
+   is about a mismatch between "what this handle's own registry entry says"
+   and "what the shared store map currently holds for the name", that exact
+   mismatched state is installed directly (mirroring exactly what
+   [rv_mint_generation] does for a real concurrent CREATE), and an ordinary
+   single-fiber DROP is run against it. The fix is a compare-and-remove: the
+   drop must recognise the map no longer holds the generation it captured
+   and leave the racer's entry alone. *)
+let drop_does_not_clobber_a_concurrently_created_same_name_generation () =
+  Lwt_main.run
+    (let open Lwt.Syntax in
+     let store = S.create () in
+     let* db = Db.of_store store in
+     let* r1 = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT)" in
+     (match r1 with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "create table: %a" Db.pp_error e);
+     let* r2 =
+       Db.execute db "CREATE REACTIVE VIEW v AS SELECT grp, COUNT(*) FROM t GROUP BY grp"
+     in
+     (match r2 with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "create view: %a" Db.pp_error e);
+     let g_before =
+       match Db.reactive_view_generation db "v" with
+       | Some g -> g
+       | None -> Alcotest.fail "v should be live"
+     in
+     (* Install the exact state a racing sibling's completed CREATE of the
+        SAME name would have left in the shared store map — [db]'s own
+        registry entry for "v" still reports [g_before], unaware that the
+        map has moved on, exactly as it would be mid-guard in the real
+        race. *)
+     let g_racer = S.rv_next_generation store in
+     Hashtbl.replace (S.rv_generations store) "v" g_racer;
+     Alcotest.(check bool)
+       "the injected racer generation differs"
+       true
+       (g_racer <> g_before);
+     let* r3 = Db.execute db "DROP REACTIVE VIEW v" in
+     (match r3 with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "drop view: %a" Db.pp_error e);
+     Alcotest.(check (option int))
+       "the racer's generation record survives this drop untouched (compare-and-remove, \
+        not unconditional remove)"
+       (Some g_racer)
+       (Hashtbl.find_opt (S.rv_generations store) "v");
+     Lwt.return_unit)
+;;
+
+(* Round-2 review finding, item 1: VACUUM swaps in a brand-new [Store.t], and
+   a fresh store's generation counter would otherwise restart at 0 — unlike
+   the rowid allocator, which reseeds itself correctly from the copied tree
+   data, a generation has nothing durable to recover it from. Without
+   carrying it forward, a generation minted before a VACUUM and one minted
+   after (via a drop-and-recreate) could collide on the same integer, which
+   is exactly what [reactive_view_generation]'s "strictly greater than every
+   generation ever assigned to this name before" guarantee promises never
+   happens. VACUUM needs a file-backed store, so this uses [Granary_unix]. *)
+module UDb = struct
+  include Granary.Db
+
+  let open_file = Granary_unix.open_file
+end
+
+let () = Granary_unix.install ()
+
+let fresh_vacuum_test_path =
+  let counter = ref 0 in
+  fun () ->
+    incr counter;
+    let path =
+      Printf.sprintf "/tmp/granary_rv757_vacuum_%d_%d.db" (Unix.getpid ()) !counter
+    in
+    List.iter
+      (fun suffix ->
+         try Unix.unlink (path ^ suffix) with
+         | _ -> ())
+      [ ""; "-wal"; ".aslog"; ".vacuum-tmp"; ".vacuum-tmp-wal" ];
+    path
+;;
+
+let vacuum_does_not_reset_the_counter_to_collide_with_a_pre_vacuum_generation () =
+  let path = fresh_vacuum_test_path () in
+  let db =
+    match run (UDb.open_file ~path ()) with
+    | Ok db -> db
+    | Error e -> Alcotest.failf "open_file: %a" Db.pp_error e
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      try run (Db.close db) with
+      | _ -> ())
+    (fun () ->
+       exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT)";
+       create_view db "v";
+       let g_before_vacuum =
+         match Db.reactive_view_generation db "v" with
+         | Some g -> g
+         | None -> Alcotest.fail "v should be live before VACUUM"
+       in
+       run (Db.vacuum db);
+       (* This handle's OWN registry entry for "v" is untouched by VACUUM (it
+          is not reloaded), so it still reports the same generation — that is
+          expected and correct, not the bug: nothing about this incarnation
+          changed. *)
+       Alcotest.(check (option int))
+         "this handle's own view of v is unaffected by VACUUM itself"
+         (Some g_before_vacuum)
+         (Db.reactive_view_generation db "v");
+       drop_view db "v";
+       create_view db "v";
+       let g_after_vacuum_recreate =
+         match Db.reactive_view_generation db "v" with
+         | Some g -> g
+         | None -> Alcotest.fail "v should be live after the post-VACUUM recreate"
+       in
+       Alcotest.(check bool)
+         "a generation minted after VACUUM never collides with one minted before it"
+         true
+         (g_after_vacuum_recreate <> g_before_vacuum);
+       Alcotest.(check bool)
+         "and it is strictly greater, matching the documented monotonicity guarantee"
+         true
+         (g_after_vacuum_recreate > g_before_vacuum))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* QCheck property: interleaved churn on the target name and on OTHER names
    must never let two incarnations of the target collide, and the target's own
@@ -356,6 +510,18 @@ let () =
             "a worker handle reuses the parent's generation"
             `Quick
             worker_handle_over_the_same_store_reuses_the_parents_generation
+        ] )
+    ; ( "round 2: concurrent DROP vs CREATE"
+      , [ Alcotest.test_case
+            "a drop does not clobber a concurrently created same-name generation"
+            `Quick
+            drop_does_not_clobber_a_concurrently_created_same_name_generation
+        ] )
+    ; ( "round 2: VACUUM"
+      , [ Alcotest.test_case
+            "VACUUM does not reset the counter to collide with a pre-VACUUM generation"
+            `Quick
+            vacuum_does_not_reset_the_counter_to_collide_with_a_pre_vacuum_generation
         ] )
     ]
 ;;

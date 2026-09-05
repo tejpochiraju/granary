@@ -2211,4 +2211,12 @@
 (test
  (name test_reactive_view_generation_757)
  (modules test_reactive_view_generation_757)
- (libraries granary alcotest lwt.unix qcheck-core qcheck-alcotest))
+ (libraries
+  granary
+  granary.store
+  granary.unix
+  alcotest
+  lwt.unix
+  unix
+  qcheck-core
+  qcheck-alcotest))

@@ -77,6 +77,29 @@ val rv_generations : t -> rv_generations
     same name or different ones. *)
 val rv_next_generation : t -> int
 
+(** #757: carry [from]'s reactive-view generation bookkeeping forward into
+    [to_] — every recorded name/generation pair, and the counter raised to at
+    least [from]'s.  For {!Db.vacuum} to call right after it rebuilds a
+    store's data into a fresh backing file and BEFORE any [Db.t] starts
+    minting generations against the new [t]: a freshly-opened store (this
+    function's own [create]/[open_block]) always starts with an EMPTY
+    {!rv_generations} and its counter at 0, because unlike {!rowid_counters}
+    — whose correct value is always recoverable by rescanning the copied data
+    tree or reading a persisted AUTOINCREMENT high-water mark — a generation
+    is pure process-local bookkeeping with nothing durable to reconstruct it
+    from; {!rv_next_generation}'s copied tree data for [sys_reactive_views]
+    carries the view SQL forward but not this counter. Without this call, a
+    rebuilt store's counter restarting at 0 lets a generation minted before
+    the VACUUM and one minted after collide on the same integer, which
+    directly breaks the "strictly greater than every generation ever assigned
+    to this name before" guarantee {!Db.reactive_view_generation} documents.
+    Idempotent and safe to call on a [to_] that already has entries — an
+    existing entry for a name also in [from] is overwritten with [from]'s
+    value (the two would already agree if [to_] had never independently
+    minted for that name, since nothing mints against [to_] until this
+    returns). *)
+val rv_carry_over_generations : from:t -> to_:t -> unit
+
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
 type error =

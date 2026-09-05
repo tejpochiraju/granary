@@ -519,6 +519,14 @@ let rv_next_generation t =
   t.rv_gen_next
 ;;
 
+(* #757: see the [.mli] doc comment — [Db.vacuum]'s one call site. *)
+let rv_carry_over_generations ~from ~to_ =
+  Hashtbl.iter
+    (fun name g -> Hashtbl.replace to_.rv_generations name g)
+    from.rv_generations;
+  if from.rv_gen_next > to_.rv_gen_next then to_.rv_gen_next <- from.rv_gen_next
+;;
+
 type ro_snapshot =
   { rs_store : t
   ; rs_snap_txn_id : int64

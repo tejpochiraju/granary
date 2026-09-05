@@ -754,6 +754,17 @@ let vacuum t : unit Lwt.t =
                 let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
                 Lwt.fail_with msg
               | Ok new_store ->
+                (* #757: carry the OLD store's reactive-view generation
+                   bookkeeping into the new one BEFORE anything can mint
+                   against it.  [t.store] still names the pre-VACUUM store
+                   here — the swap below hasn't run yet — so this is the last
+                   point at which both stores are reachable.  Without it, the
+                   new store's counter would restart at 0 (see
+                   [S.rv_carry_over_generations]'s doc comment for why a
+                   generation, unlike a rowid counter, has nothing durable to
+                   reseed itself from), and a generation minted before this
+                   VACUUM could collide with one minted after it. *)
+                S.rv_carry_over_generations ~from:t.store ~to_:new_store;
                 (* #634: the fresh catalog deliberately gets FRESH rowid counters
                  (no [?rowid_counters]).  It must: the counters the old catalog
                  held describe the pre-VACUUM file, and this one is re-seeded
@@ -4479,6 +4490,19 @@ let rv_drop top ~name ~if_exists =
     (* Live in the registry?  Decided once, up front: it selects the erase
        strategy and, below, whether there is any in-memory state to drop. *)
     let live = Hashtbl.mem top.reactive_views name in
+    (* #757: capture the generation THIS drop is retiring before [rv_guard]'s
+       body runs — it awaits across the catalog write, during which a
+       DIFFERENT handle's CREATE of this SAME name can complete and mint a
+       fresh generation into the store-wide map.  See the compare-and-remove
+       below for why this is captured now rather than re-read after. *)
+    let dropped_generation =
+      if live
+      then
+        Option.map
+          (fun (e : rv_entry) -> e.rv_generation)
+          (Hashtbl.find_opt top.reactive_views name)
+      else None
+    in
     let* r =
       rv_guard top (fun () ->
         if live
@@ -4490,14 +4514,25 @@ let rv_drop top ~name ~if_exists =
     | Ok () when not live -> Lwt.return (Ok ())
     | Ok () ->
       Hashtbl.remove top.reactive_views name;
-      (* #757: also forget the store-wide generation record for [name].  Not
-         load-bearing for correctness — a subsequent CREATE always mints a
-         fresh generation via [rv_mint_generation] regardless of what this map
-         says — but it keeps the map from answering for a name no handle
-         should currently find live, and it means a hypothetical future load
-         path can never resurrect a dropped view's old identity by consulting
-         this table. *)
-      Hashtbl.remove (S.rv_generations top.store) name;
+      (* #757: compare-and-remove, not an unconditional remove.  An
+         unconditional [Hashtbl.remove] here would be racy: if a sibling
+         handle's CREATE REACTIVE VIEW of this SAME name completed during
+         [rv_guard]'s await above (see [dropped_generation]'s comment) and
+         minted its own fresh generation into this map, an unconditional
+         remove would delete THAT live, unrelated incarnation's entry rather
+         than the stale one this drop is actually cleaning up — and a later
+         load (e.g. another [create_worker_handle]) would then mint yet
+         another generation disagreeing with the concurrent creator's own
+         in-memory copy. Only remove the map entry if it still holds the
+         exact generation this drop is retiring; if it holds something else,
+         a newer CREATE already claimed the name and this drop has nothing
+         of its own left to clean up here. *)
+      (match dropped_generation with
+       | Some g ->
+         (match Hashtbl.find_opt (S.rv_generations top.store) name with
+          | Some g' when g' = g -> Hashtbl.remove (S.rv_generations top.store) name
+          | _ -> ())
+       | None -> ());
       (* Forget pending base-table deltas no remaining view depends on.
          Currently dead code: in autocommit [rv_flush_inner]'s finalizer empties
          [rv_pending] after every statement, so it can only ever accumulate
