@@ -19,7 +19,11 @@
       [~init_if_corrupt:true] under the new default -- it is not a
       distinct, "just works" case;
     - a QCheck property: an [Error]-returning open never mutates the
-      device's on-disk bytes, for arbitrary (non-header-shaped) garbage. *)
+      device's on-disk bytes, for arbitrary (non-header-shaped) garbage;
+    - #763 review finding: [Db.open_block] must invoke the caller's
+      [~close] callback exactly once when it returns [Error] (there is no
+      [Db.t] for [Db.close] to reach later), and must NOT invoke it on an
+      [Ok] return -- that stays the caller's responsibility via [Db.close]. *)
 
 open Lwt.Syntax
 module FI = Granary_unix.Fault_inject
@@ -79,32 +83,26 @@ let read_file path =
 (* Open [path] through the same read_page/write_page/sync/resize/close
    callback shape [Db.open_block] expects, via the fault-injection wrapper
    with no faults configured (it is used here purely as a Unix-file-backed
-   callback source, matching how other tests in this suite reuse it). *)
+   callback source, matching how other tests in this suite reuse it).
+
+   #753/#763: [Db.open_block] itself closes [~close] on any [Error] return
+   (there is no [Db.t] to hang it off), so callers must NOT close again on
+   that path -- this helper deliberately does nothing extra here, and
+   [test_close_invoked_once_on_error] below pins that the callback is
+   actually invoked rather than merely trusting the doc comment. *)
 let open_db ?init_if_corrupt path =
   let* _handle, read_page, write_page, sync, resize, n_pages, close =
     FI.open_with_faults ~path ~size_bytes ~config:FI.default_config
   in
-  let* r =
-    Granary.Db.open_block
-      ?init_if_corrupt
-      ~read_page
-      ~write_page
-      ~sync
-      ~resize
-      ~n_pages
-      ~close
-      ()
-  in
-  match r with
-  | Ok db -> Lwt.return (Ok db)
-  | Error e ->
-    (* No [Db.t] was constructed, so [close] was never wired to anything
-       that will call it (see [Store.open_block]: the [close_fn] is stashed
-       on the store record it never gets to build).  Close the fd here so
-       the test suite doesn't leak file descriptors across dozens of
-       QCheck iterations. *)
-    let* () = close () in
-    Lwt.return (Error e)
+  Granary.Db.open_block
+    ?init_if_corrupt
+    ~read_page
+    ~write_page
+    ~sync
+    ~resize
+    ~n_pages
+    ~close
+    ()
 ;;
 
 let contains hay needle =
@@ -264,7 +262,93 @@ let test_fresh_zeroed_device_needs_explicit_init () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* 4. QCheck: an Error-returning open never mutates on-disk bytes       *)
+(* 4. #763: close-on-error is wired, and only on the error path         *)
+(* ------------------------------------------------------------------ *)
+
+(* Wrap the callbacks from [FI.open_with_faults] with a counting [close] so
+   we can observe how many times [Db.open_block] itself invokes it,
+   independent of any [Db.close] the test calls afterwards. *)
+let open_db_counting_closes ?init_if_corrupt path =
+  let* _handle, read_page, write_page, sync, resize, n_pages, close =
+    FI.open_with_faults ~path ~size_bytes ~config:FI.default_config
+  in
+  let close_calls = ref 0 in
+  let counting_close () =
+    incr close_calls;
+    close ()
+  in
+  let* r =
+    Granary.Db.open_block
+      ?init_if_corrupt
+      ~read_page
+      ~write_page
+      ~sync
+      ~resize
+      ~n_pages
+      ~close:counting_close
+      ()
+  in
+  Lwt.return (r, close_calls)
+;;
+
+let test_close_invoked_once_on_error () =
+  let path = tmp_path () in
+  Lwt_main.run
+    (Lwt.finalize
+       (fun () ->
+          ensure_sized path;
+          corrupt_headers path;
+          let* r, close_calls = open_db_counting_closes path in
+          let* () =
+            match r with
+            | Ok db ->
+              let* () = Granary.Db.close db in
+              Alcotest.fail "expected Error for a corrupt header"
+            | Error _ -> Lwt.return_unit
+          in
+          Alcotest.(check int)
+            "Db.open_block invokes ~close exactly once when it returns Error (no Db.t \
+             exists to hang the caller's handle off, so this is the only place it can be \
+             released -- otherwise every refused open under the new default leaks the \
+             fd)"
+            1
+            !close_calls;
+          Lwt.return_unit)
+       (fun () ->
+          safe_unlink path;
+          Lwt.return_unit))
+;;
+
+let test_close_not_invoked_early_on_ok () =
+  let path = tmp_path () in
+  Lwt_main.run
+    (Lwt.finalize
+       (fun () ->
+          ensure_sized path;
+          let* r, close_calls = open_db_counting_closes ~init_if_corrupt:true path in
+          match r with
+          | Error e ->
+            Alcotest.failf
+              "expected Ok provisioning a fresh device, got: %s"
+              (error_msg e)
+          | Ok db ->
+            Alcotest.(check int)
+              "~close is not invoked by Db.open_block itself on an Ok return"
+              0
+              !close_calls;
+            let* () = Granary.Db.close db in
+            Alcotest.(check int)
+              "~close is invoked exactly once, by Db.close, once the caller is done"
+              1
+              !close_calls;
+            Lwt.return_unit)
+       (fun () ->
+          safe_unlink path;
+          Lwt.return_unit))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* 5. QCheck: an Error-returning open never mutates on-disk bytes       *)
 (* ------------------------------------------------------------------ *)
 
 let arb_header_pair =
@@ -331,6 +415,16 @@ let () =
             "fresh zeroed device also needs explicit true"
             `Quick
             test_fresh_zeroed_device_needs_explicit_init
+        ] )
+    ; ( "close-on-error (#763)"
+      , [ Alcotest.test_case
+            "close invoked once on Error"
+            `Quick
+            test_close_invoked_once_on_error
+        ; Alcotest.test_case
+            "close not invoked early on Ok"
+            `Quick
+            test_close_not_invoked_early_on_ok
         ] )
     ; "properties", qcheck_tests
     ]

@@ -70,7 +70,13 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
     Use with [Granary_mirage_block.Mirage_backend.Make(B)] to build
     the callbacks from a [Mirage_block.S] device.  Pass [~n_pages:0L]
     for Mirage adapters; the adapter handles device-capacity bounds
-    internally.  [~close] is called by [Db.close].
+    internally.  On success, [~close] is called later by [Db.close]; on
+    {b any} [Error] return (#753/#763) [~close] is called here, once,
+    before the error is returned — [Granary_store.Store.open_block] never
+    wires it into a store record on that path (there is no store), so this
+    is the only place it can be invoked, and skipping it would leak the
+    caller's underlying handle (fd, block device, ...) on every refused
+    open.  The caller must not call [~close] itself in that case.
 
     [clock] and [durability] are open-options forwarded to [of_store]:
     [durability] sets the database-wide durability knob (full/batched/off)

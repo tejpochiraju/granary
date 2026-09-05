@@ -553,7 +553,16 @@ let open_block
       ()
   in
   match result with
-  | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
+  | Error e ->
+    (* #753/#763: on any open error, [Store.open_block] never wires [close]
+       into a store record for [Db.close] to reach later -- there is no
+       store.  Close here instead, matching [Granary_unix.Store.open_file]'s
+       identical workaround, so a caller that (correctly, per the new
+       [~init_if_corrupt:false] default) treats a corrupt-header device as a
+       routine, expected outcome doesn't leak the underlying fd/handle on
+       every such open. *)
+    let* () = close () in
+    Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
   | Ok store ->
     let* db = of_store ?clock ?durability store in
     Lwt.return (Ok db)

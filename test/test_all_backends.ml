@@ -98,12 +98,22 @@ let with_file_db path f =
   | Ok db -> Lwt.finalize (fun () -> f db) (fun () -> DB.close db)
 ;;
 
-let with_mirage_db path f =
+(* #753/#763: [init_if_corrupt] defaults to [true] here because every
+   caller except [test_mirage_reopen_persists]'s second call opens a fresh,
+   zeroed [tmp_file ()] that has never had a header written to it -- the
+   legitimate provisioning case.  A REOPEN of an already-initialised store
+   must pass [~init_if_corrupt:false] explicitly (the new [Db.open_block]
+   default) instead: a real reopen of a just-written store should never
+   need to reformat, and if it ever silently did (a durability regression
+   in the mirage backend between close and reopen), passing [true]
+   unconditionally here would mask that by reinitialising to an empty store
+   rather than raising -- exactly the failure mode #753 closes. *)
+let with_mirage_db ?(init_if_corrupt = true) path f =
   let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
   let* adapter = MB.connect dev in
   let* r =
     DB.open_block
-      ~init_if_corrupt:true (* fresh, zeroed 4MB temp file: #753 *)
+      ~init_if_corrupt
       ~read_page:(MB.read_page adapter)
       ~write_page:(MB.write_page adapter)
       ~sync:(MB.sync adapter)
@@ -187,7 +197,8 @@ let test_mirage_reopen_persists () =
             execute_ok db "INSERT INTO persist (x) VALUES (42)"));
        let rows =
          Lwt_main.run
-           (with_mirage_db path (fun db -> query_rows db "SELECT x FROM persist"))
+           (with_mirage_db ~init_if_corrupt:false path (fun db ->
+              query_rows db "SELECT x FROM persist"))
        in
        Alcotest.(check (list string))
          "persisted across reopen"
