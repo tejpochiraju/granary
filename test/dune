@@ -2164,6 +2164,16 @@
  (modules test_view_callback_746)
  (libraries granary alcotest lwt.unix))
 
+; #752: OCaml-side before/after row-mutation hooks (Db.register_row_hook /
+; Db.unregister_row_hook), the seam camel#75 needs for typed veto/observe
+; hooks without a SQL CREATE TRIGGER. In-memory is enough: registration is
+; process state, not durable state, exactly like #746's view callbacks.
+
+(test
+ (name test_row_hooks_752)
+ (modules test_row_hooks_752)
+ (libraries granary alcotest qcheck-core qcheck-alcotest lwt.unix))
+
 ; #750: a compound-root CREATE REACTIVE VIEW is refused. base_tables_of
 ; answered [] for an S_compound root, so the view registered with no base
 ; tables and served its creation-time snapshot forever with no error. Carries

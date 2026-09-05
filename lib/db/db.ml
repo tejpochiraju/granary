@@ -30,6 +30,29 @@ type view_callback =
   ; vcb_id : int
   }
 
+(* #752: one row-mutation delivered to an OCaml [register_row_hook] callback.
+   INSERT: [old_row = None], [new_row = Some _].  DELETE: the reverse.
+   UPDATE: both [Some _].  Mirrors the [~new_row ~old_row] option pair
+   {!make_trigger_hook} already threads through the write path for SQL
+   triggers — a row hook receives exactly what a trigger body would see via
+   [NEW]/[OLD]. *)
+type row_mutation =
+  { table : string
+  ; new_row : Row.t option
+  ; old_row : Row.t option
+  }
+
+(* #752: the opaque handle {!register_row_hook} returns and
+   {!unregister_row_hook} consumes.  Carries the (table, timing, event) key
+   it was registered under, so removal never needs — and can never get wrong —
+   a second copy of that key from the caller. *)
+type row_hook =
+  { rh_table : string
+  ; rh_timing : [ `Before | `After ]
+  ; rh_event : [ `Insert | `Update | `Delete ]
+  ; rh_id : int
+  }
+
 type rv_entry =
   { rv_name : string
   ; rv_query : Sql.Ast.stmt
@@ -135,6 +158,18 @@ type t =
         explicit transactions should use today. *)
   ; views : (string, Sql.Ast.stmt) Hashtbl.t
   ; triggers : (string, Sql.Ast.stmt) Hashtbl.t (* trigger_name -> S_create_trigger AST *)
+  ; row_hooks :
+      ( string * [ `Before | `After ] * [ `Insert | `Update | `Delete ]
+        , (int * (row_mutation -> (unit, string) result Lwt.t)) list )
+        Hashtbl.t
+    (** #752: OCaml-side row-mutation hooks registered via
+        {!register_row_hook}, keyed by (table, timing, event).  Held
+        NEWEST-FIRST per key, like {!rv_callbacks} (#746) — registration is
+        O(1) and the firing site ({!make_combined_hook}) reverses to restore
+        registration order.  Not persisted and not shared across [Db.t]
+        handles over the same store: a {!create_worker_handle} sibling starts
+        with an empty registry, exactly as it does for reactive-view
+        callbacks. *)
   ; mutable savepoint_names : string list (* active savepoints, newest first *)
   ; mutable auto_began : bool (* txn started implicitly by SAVEPOINT *)
   ; mutable last_changes : int (** rows affected by the last DML statement *)
@@ -441,6 +476,7 @@ let open_in_memory ?clock () =
     ; txn_poisoned = false
     ; views = Hashtbl.create 4
     ; triggers = Hashtbl.create 4
+    ; row_hooks = Hashtbl.create 4
     ; savepoint_names = []
     ; auto_began = false
     ; last_changes = 0
@@ -534,6 +570,7 @@ let of_store ?clock ?durability ?file_path ?cohort store =
     ; txn_poisoned = false
     ; views
     ; triggers
+    ; row_hooks = Hashtbl.create 4
     ; savepoint_names = []
     ; auto_began = false
     ; last_changes = 0
@@ -1669,6 +1706,86 @@ and make_trigger_hook t table_meta ~timing ~event =
                    m.trig_body)
             matching))
 
+(** #752: layer OCaml {!register_row_hook} callbacks over {!make_trigger_hook}'s
+    SQL-trigger closure for one (table, timing, event), returning a single
+    combined hook in the same [~tx -> ~new_row -> ~old_row -> unit Lwt.t]
+    shape the write path already threads for triggers — call sites that used
+    to build [before_hook]/[after_hook] from {!make_trigger_hook} alone now
+    go through this instead, so an OCaml row hook fires everywhere a SQL
+    trigger does: plain INSERT/UPDATE/DELETE, an [INSERT OR REPLACE]'s
+    displaced-row DELETE, an UPSERT [DO UPDATE], and nested DML inside a
+    trigger body.  [None] (the fast path) exactly when neither a matching SQL
+    trigger nor a registered row hook exists, so a table with no hooks of
+    either kind pays no extra cost.
+
+    {b Ordering (design decision, #752).}  OCaml hooks and SQL triggers are
+    "sandwiched" rather than interleaved by some cross-kind registration
+    order: for [`Before] the OCaml hooks run FIRST, then the SQL BEFORE
+    triggers; for [`After] the SQL AFTER triggers run FIRST, then the OCaml
+    hooks.  This makes OCaml hooks the outer gate — a [`Before] veto pre-empts
+    every SQL trigger's nested DML for that statement (nothing to roll back),
+    and a [`After] hook observes the row only once every SQL-trigger side
+    effect from this statement has already applied.  Multiple OCaml hooks on
+    the same key fire in their own registration order, matching {!rv_callbacks}'
+    #746 contract; [row_hooks] is held newest-first and reversed here.
+
+    {b Veto (design decision, #752).}  Both timings share the identical
+    [Error msg -> Lwt.fail_with msg] translation, so an [`After] hook's error
+    aborts the statement exactly like a [`Before] hook's veto or a failing SQL
+    AFTER trigger body does today — both run inside the same not-yet-committed
+    write transaction via this closure, so there is no "the write already
+    landed" case to treat more leniently.  A vetoing [`Before] hook aborts via
+    the SAME [Lwt.fail] path a raising [BEFORE INSERT] trigger body already
+    takes, with the same scope: full rollback in autocommit, but — inside an
+    explicit transaction the caller opened — only the primary write is
+    prevented; #631's statement-level savepoint is a narrower mechanism for
+    the non-raising [OR IGNORE]/NOT NULL {e skip} path specifically
+    ([execute_insert] takes it only when [on_conflict = Some Ast.CA_ignore]),
+    not for a raise, so it does not additionally unwind a vetoing hook's own
+    nested DML in a borrowed transaction — see {!Db.register_row_hook}'s doc
+    comment for the full accounting. What a veto DOES get for free from the
+    ordering decision above: it runs before any matching SQL [BEFORE] trigger,
+    so a veto pre-empts that trigger's body — including its nested DML —
+    from running at all. *)
+and make_combined_hook t table_meta ~timing ~event =
+  let sql_hook = make_trigger_hook t table_meta ~timing ~event in
+  let ocaml_hooks =
+    match timing with
+    | (`Before | `After) as narrow_timing ->
+      (match Hashtbl.find_opt t.row_hooks (table_meta.Cat.name, narrow_timing, event) with
+       | None -> []
+       (* held newest-first (O(1) registration, #746's pattern); reverse here
+          to fire in registration order. *)
+       | Some lst -> List.rev lst)
+    | `Instead_of -> []
+  in
+  match sql_hook, ocaml_hooks with
+  | None, [] -> None
+  | _ ->
+    Some
+      (fun ~tx ~new_row ~old_row ->
+        let run_ocaml_hooks () =
+          Lwt_list.iter_s
+            (fun (_id, fn) ->
+               let* r = fn { table = table_meta.Cat.name; new_row; old_row } in
+               match r with
+               | Ok () -> Lwt.return_unit
+               | Error msg -> Lwt.fail_with msg)
+            ocaml_hooks
+        in
+        let run_sql_hook () =
+          match sql_hook with
+          | None -> Lwt.return_unit
+          | Some f -> f ~tx ~new_row ~old_row
+        in
+        match timing with
+        | `Before ->
+          let* () = run_ocaml_hooks () in
+          run_sql_hook ()
+        | `After | `Instead_of ->
+          let* () = run_sql_hook () in
+          run_ocaml_hooks ())
+
 (** Build the REPLACE-conflict-delete and UPSERT-conflict-update hooks for
     an INSERT-ish op.  These fire when [INSERT OR REPLACE] conflicts on a
     UNIQUE index (DELETE triggers on the displaced row) or when the UPSERT
@@ -1691,10 +1808,10 @@ and insert_replace_upsert_hooks t op =
   match table_meta_opt with
   | None -> None, None, None, None
   | Some tm ->
-    let delete_before_hook = make_trigger_hook t tm ~timing:`Before ~event:`Delete in
-    let delete_after_hook = make_trigger_hook t tm ~timing:`After ~event:`Delete in
-    let update_before_hook = make_trigger_hook t tm ~timing:`Before ~event:`Update in
-    let update_after_hook = make_trigger_hook t tm ~timing:`After ~event:`Update in
+    let delete_before_hook = make_combined_hook t tm ~timing:`Before ~event:`Delete in
+    let delete_after_hook = make_combined_hook t tm ~timing:`After ~event:`Delete in
+    let update_before_hook = make_combined_hook t tm ~timing:`Before ~event:`Update in
+    let update_after_hook = make_combined_hook t tm ~timing:`After ~event:`Update in
     let on_replace_delete_before =
       Option.map
         (fun hook -> fun ~tx ~old_row -> hook ~tx ~new_row:None ~old_row:(Some old_row))
@@ -1744,8 +1861,8 @@ and run_trigger_op t ~tx b =
   let before_hook, after_hook =
     match table_meta_opt, event_opt with
     | Some tm, Some ev ->
-      ( make_trigger_hook t tm ~timing:`Before ~event:ev
-      , make_trigger_hook t tm ~timing:`After ~event:ev )
+      ( make_combined_hook t tm ~timing:`Before ~event:ev
+      , make_combined_hook t tm ~timing:`After ~event:ev )
     | _ -> None, None
   in
   let ( on_replace_delete_before
@@ -2434,14 +2551,14 @@ let dml_hooks t op =
     match op with
     | Sql.Plan.Op_insert { table_meta; _ } | Sql.Plan.Op_insert_select { table_meta; _ }
       ->
-      ( make_trigger_hook t table_meta ~timing:`Before ~event:`Insert
-      , make_trigger_hook t table_meta ~timing:`After ~event:`Insert )
+      ( make_combined_hook t table_meta ~timing:`Before ~event:`Insert
+      , make_combined_hook t table_meta ~timing:`After ~event:`Insert )
     | Sql.Plan.Op_update { table_meta; _ } ->
-      ( make_trigger_hook t table_meta ~timing:`Before ~event:`Update
-      , make_trigger_hook t table_meta ~timing:`After ~event:`Update )
+      ( make_combined_hook t table_meta ~timing:`Before ~event:`Update
+      , make_combined_hook t table_meta ~timing:`After ~event:`Update )
     | Sql.Plan.Op_delete { table_meta; _ } ->
-      ( make_trigger_hook t table_meta ~timing:`Before ~event:`Delete
-      , make_trigger_hook t table_meta ~timing:`After ~event:`Delete )
+      ( make_combined_hook t table_meta ~timing:`Before ~event:`Delete
+      , make_combined_hook t table_meta ~timing:`After ~event:`Delete )
     | _ -> None, None
   in
   let insert_table_name =
@@ -3128,17 +3245,17 @@ let run_core st ~params =
     let before_hook, after_hook =
       match st.plan with
       | Sql.Plan.Op_insert { table_meta; _ } ->
-        ( make_trigger_hook t table_meta ~timing:`Before ~event:`Insert
-        , make_trigger_hook t table_meta ~timing:`After ~event:`Insert )
+        ( make_combined_hook t table_meta ~timing:`Before ~event:`Insert
+        , make_combined_hook t table_meta ~timing:`After ~event:`Insert )
       | Sql.Plan.Op_insert_select { table_meta; _ } ->
-        ( make_trigger_hook t table_meta ~timing:`Before ~event:`Insert
-        , make_trigger_hook t table_meta ~timing:`After ~event:`Insert )
+        ( make_combined_hook t table_meta ~timing:`Before ~event:`Insert
+        , make_combined_hook t table_meta ~timing:`After ~event:`Insert )
       | Sql.Plan.Op_update { table_meta; _ } ->
-        ( make_trigger_hook t table_meta ~timing:`Before ~event:`Update
-        , make_trigger_hook t table_meta ~timing:`After ~event:`Update )
+        ( make_combined_hook t table_meta ~timing:`Before ~event:`Update
+        , make_combined_hook t table_meta ~timing:`After ~event:`Update )
       | Sql.Plan.Op_delete { table_meta; _ } ->
-        ( make_trigger_hook t table_meta ~timing:`Before ~event:`Delete
-        , make_trigger_hook t table_meta ~timing:`After ~event:`Delete )
+        ( make_combined_hook t table_meta ~timing:`Before ~event:`Delete
+        , make_combined_hook t table_meta ~timing:`After ~event:`Delete )
       | _ -> None, None
     in
     let ( on_replace_delete_before
@@ -4715,6 +4832,52 @@ let unregister_view_callback top h =
 ;;
 
 let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
+
+(* #752: one process-global counter for row-hook ids, on the same rationale as
+   {!rv_cb_seq} — no two [row_hook] handles ever collide, including across
+   [Db.t] handles over one store. *)
+let row_hook_seq = ref 0
+
+let register_row_hook t ~table ~timing ~event fn =
+  if not (Cat.table_exists t.catalog ~name:table)
+  then Error (`Unknown_table table)
+  else (
+    incr row_hook_seq;
+    let id = !row_hook_seq in
+    let key = table, timing, event in
+    let existing = Option.value (Hashtbl.find_opt t.row_hooks key) ~default:[] in
+    (* O(1): prepend, like {!register_view_callback}; {!make_combined_hook}
+       reverses at the firing site to restore registration order. *)
+    Hashtbl.replace t.row_hooks key ((id, fn) :: existing);
+    Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id })
+;;
+
+let unregister_row_hook t h =
+  let key = h.rh_table, h.rh_timing, h.rh_event in
+  match Hashtbl.find_opt t.row_hooks key with
+  | None -> ()
+  | Some lst ->
+    (* [List.filter] builds a new list, so an unregister from inside a
+       currently-firing hook cannot perturb the batch {!make_combined_hook}
+       already snapshotted via [List.rev] — same reasoning as
+       {!unregister_view_callback} (#746). *)
+    Hashtbl.replace t.row_hooks key (List.filter (fun (id, _) -> id <> h.rh_id) lst)
+;;
+
+let pp_row_hook fmt h =
+  let timing_s =
+    match h.rh_timing with
+    | `Before -> "before"
+    | `After -> "after"
+  in
+  let event_s =
+    match h.rh_event with
+    | `Insert -> "insert"
+    | `Update -> "update"
+    | `Delete -> "delete"
+  in
+  Format.fprintf fmt "%s:%s:%s#%d" h.rh_table timing_s event_s h.rh_id
+;;
 
 let () =
   rv_create_hook := rv_create;

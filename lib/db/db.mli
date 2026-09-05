@@ -985,6 +985,133 @@ val is_reactive_view : t -> string -> bool
     own. *)
 val reactive_view_generation : t -> string -> int option
 
+(** #752: one row-mutation delivered to a {!register_row_hook} callback,
+    modeled on the [NEW]/[OLD] pair a SQL trigger body sees.
+
+    - INSERT: [old_row = None], [new_row = Some _].
+    - DELETE: [old_row = Some _], [new_row = None].
+    - UPDATE: both [Some _].
+
+    [table] is always the table the hook was registered against — a
+    convenience for a callback shared across more than one
+    {!register_row_hook} call, so it need not close over the table name
+    itself to tell which registration fired it. *)
+type row_mutation =
+  { table : string
+  ; new_row : row option
+  ; old_row : row option
+  }
+
+(** #752: an opaque handle for one registered OCaml row-mutation hook,
+    returned by {!register_row_hook} and consumed by {!unregister_row_hook}.
+    Mirrors {!view_callback} (#746/#437): it carries the (table, timing,
+    event) key it was registered under, so there is no way to present it
+    together with a mismatched key at removal time, and it is minted from a
+    process-global counter, so a handle presented to a different {!t} over
+    the same store matches nothing rather than removing an unrelated hook. *)
+type row_hook
+
+(** Render a handle as [table:timing:event#id] (e.g. [orders:before:insert#3]).
+    For logging and test failure messages; the id is an opaque serial number
+    with no meaning beyond identity. *)
+val pp_row_hook : Format.formatter -> row_hook -> unit
+
+(** #752: register [fn] to run on every [event] mutation of [table] at
+    [timing], as an OCaml closure rather than a SQL [CREATE TRIGGER] body —
+    the seam camel#75 needs for a GADT-certified program's [before:]/[after:]
+    hooks, which are typed OCaml, not SQL, by design (camel#1).
+
+    Returns [Error (`Unknown_table table)] — registering nothing — when
+    [table] does not exist at the instant of the call, mirroring
+    {!register_view_callback}'s [`Unknown_view] (#437): a caller wiring hooks
+    from config can tell a typo from a successful registration. The error is a
+    closed polymorphic variant rather than the module-wide {!error} for the
+    same reason #437 gives — this is {!register_row_hook}'s only failure, and
+    widening {!error} would add a case no other function returning
+    [(_, error) result] can produce.
+
+    {b Veto ([`Before] only).}  [fn] returns [(unit, string) result Lwt.t].
+    [Ok ()] lets the write proceed (or, for [`After], simply completes).
+    [Error msg] is a {b veto} for a [`Before] hook: the write this statement
+    was about to make never happens and [msg] surfaces to the statement's
+    caller as a {!Runtime} error — {e exactly} the path a failing
+    [BEFORE INSERT] trigger body already takes today, because a [`Before] veto
+    is implemented as the identical [Lwt.fail]: the write path's
+    [before_hook]/[after_hook] pair does not distinguish a hook that raised
+    from a hook that returned [Error]; both unwind the same way.
+
+    {b What "unwind" gets you, precisely — this is narrower than #631's
+    OR-IGNORE guarantee and deliberately not widened here.}  In autocommit,
+    a veto rolls back the statement's own transaction outright: the primary
+    write, and anything the vetoing hook itself wrote via nested DML on this
+    [t], are both gone. Inside an explicit transaction the caller opened,
+    only the {e primary} write is prevented — a [`Before] hook's own nested
+    DML, if it performed any before returning [Error], is {b not} specially
+    unwound, for the same reason a raising [BEFORE INSERT] trigger's own
+    nested DML is not: #631's statement-level savepoint exists only for the
+    non-raising [OR IGNORE]/NOT NULL {e skip} path ([execute_insert] takes it
+    exactly when [on_conflict = Some Ast.CA_ignore]), not for a raise, and a
+    raise's partial effects surviving a borrowed transaction is a pre-existing,
+    documented property of that path (see [execute_insert]'s exception
+    handler) — not a new gap this feature introduces, and not one this issue
+    closes. A hook wanting true no-residue nested DML on veto should perform
+    it, if at all, only after every other [`Before] hook and check has
+    already had a chance to veto — or avoid nested DML from a vetoing path
+    entirely.
+
+    {b The common case is unaffected by that caveat.}  A [`Before] hook that
+    coexists with a SQL [BEFORE] trigger on the same table vetoes {e before}
+    the trigger ever runs (see Ordering, below) — the trigger's body,
+    including any nested DML it would have performed, simply never executes,
+    which is a stronger and simpler guarantee than rolling it back.
+
+    {b [`After] hook errors also abort the statement}, deliberately the same
+    as [`Before]'s veto rather than a log-and-continue: an [`After] hook runs
+    inside the same not-yet-committed write transaction a [`Before] hook and a
+    SQL [AFTER] trigger body run in (all three are threaded through the one
+    [before_hook]/[after_hook] pair {!make_trigger_hook} already built for SQL
+    triggers), so there is no "the write is already durable" case that would
+    make swallowing the error meaningful — an [AFTER] trigger's body failing
+    aborts the statement today for the identical reason, and giving [`After]
+    row hooks quieter failure semantics than that would be a surprising
+    asymmetry with no upside. A hook that truly wants log-and-continue
+    semantics can catch its own errors and always return [Ok ()].
+
+    {b Ordering against SQL [CREATE TRIGGER]s (design decision, #752).} OCaml
+    row hooks and SQL triggers on the same (table, timing, event) are
+    sandwiched, not interleaved by a shared registration order: at [`Before]
+    every registered row hook runs {b before} any matching SQL [BEFORE]
+    trigger; at [`After] every matching SQL [AFTER] trigger runs {b before}
+    the row hooks. Row hooks are therefore always the outer gate — a
+    [`Before] veto pre-empts a SQL trigger's nested DML for that statement
+    entirely, and an [`After] hook always observes the row after every SQL
+    [AFTER] trigger this statement fired has already applied its own writes.
+
+    {b Multiple hooks on the same (table, timing, event) fire in registration
+    order}, sequentially — the firing site awaits each in turn — matching
+    {!register_view_callback}'s #746 contract for view callbacks.
+
+    {b Not persisted, and not shared across handles.} Unlike a SQL trigger,
+    a row hook is an in-memory OCaml closure: it does not survive closing and
+    reopening the database, and a sibling handle from
+    {!create_worker_handle} starts with none registered, exactly as it does
+    for {!register_view_callback}. *)
+val register_row_hook
+  :  t
+  -> table:string
+  -> timing:[ `Before | `After ]
+  -> event:[ `Insert | `Update | `Delete ]
+  -> (row_mutation -> (unit, string) result Lwt.t)
+  -> (row_hook, [ `Unknown_table of string ]) result
+
+(** #752: detach the row hook [h] names. Idempotent and never raises: calling
+    it a second time, on a hook whose table no longer has any hooks
+    registered, or on a handle minted by a different {!t}, is simply a no-op
+    — unlike {!unregister_view_callback} this reports no [bool], since a row
+    hook has no analogous "mid-flush" caller who needs to know whether its own
+    removal request was the one that mattered. *)
+val unregister_row_hook : t -> row_hook -> unit
+
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
     a best-effort name per result column: a SELECT alias or bare column name
