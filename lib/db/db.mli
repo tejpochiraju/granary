@@ -76,7 +76,10 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
     wires it into a store record on that path (there is no store), so this
     is the only place it can be invoked, and skipping it would leak the
     caller's underlying handle (fd, block device, ...) on every refused
-    open.  The caller must not call [~close] itself in that case.
+    open.  The caller must not call [~close] itself in that case.  This
+    call is guarded: an exception or a rejected promise from [~close] is
+    swallowed rather than surfaced, so a misbehaving [~close] cannot
+    clobber the store error this function is in the middle of returning.
 
     [clock] and [durability] are open-options forwarded to [of_store]:
     [durability] sets the database-wide durability knob (full/batched/off)

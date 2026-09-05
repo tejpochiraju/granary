@@ -23,7 +23,10 @@
     - #763 review finding: [Db.open_block] must invoke the caller's
       [~close] callback exactly once when it returns [Error] (there is no
       [Db.t] for [Db.close] to reach later), and must NOT invoke it on an
-      [Ok] return -- that stays the caller's responsibility via [Db.close]. *)
+      [Ok] return -- that stays the caller's responsibility via [Db.close];
+    - #763 second review finding: a [~close] that raises must not clobber
+      the [Header_error] [Db.open_block] is in the middle of returning --
+      the call is guarded, and the store error still surfaces. *)
 
 open Lwt.Syntax
 module FI = Granary_unix.Fault_inject
@@ -347,6 +350,53 @@ let test_close_not_invoked_early_on_ok () =
           Lwt.return_unit))
 ;;
 
+(* A caller's [~close] is not required to swallow its own errors the way
+   this repo's [Unix_file] / [Fault_inject] callbacks do.  If it raises
+   synchronously, [Db.open_block] must still return the store's
+   [Header_error] rather than letting the exception escape and clobber it
+   (#763 review). *)
+let test_close_raising_does_not_clobber_error () =
+  let path = tmp_path () in
+  Lwt_main.run
+    (Lwt.finalize
+       (fun () ->
+          ensure_sized path;
+          corrupt_headers path;
+          let* _handle, read_page, write_page, sync, resize, n_pages, real_close =
+            FI.open_with_faults ~path ~size_bytes ~config:FI.default_config
+          in
+          let raising_close () : unit Lwt.t = failwith "close blew up (test double)" in
+          let* r =
+            Granary.Db.open_block
+              ~read_page
+              ~write_page
+              ~sync
+              ~resize
+              ~n_pages
+              ~close:raising_close
+              ()
+          in
+          let* () =
+            match r with
+            | Ok db ->
+              let* () = Granary.Db.close db in
+              Alcotest.fail "expected Error for a corrupt header"
+            | Error e ->
+              let msg = error_msg e in
+              Alcotest.(check bool)
+                "a raising ~close is swallowed; the store's Header_error still surfaces"
+                true
+                (contains msg "Header_error");
+              Lwt.return_unit
+          in
+          (* [raising_close] never actually released the underlying fd, by
+             design; do it here so this test doesn't leak it. *)
+          Lwt.catch (fun () -> real_close ()) (fun _ -> Lwt.return_unit))
+       (fun () ->
+          safe_unlink path;
+          Lwt.return_unit))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* 5. QCheck: an Error-returning open never mutates on-disk bytes       *)
 (* ------------------------------------------------------------------ *)
@@ -425,6 +475,10 @@ let () =
             "close not invoked early on Ok"
             `Quick
             test_close_not_invoked_early_on_ok
+        ; Alcotest.test_case
+            "a raising close does not clobber the Header_error"
+            `Quick
+            test_close_raising_does_not_clobber_error
         ] )
     ; "properties", qcheck_tests
     ]
