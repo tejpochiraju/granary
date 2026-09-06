@@ -1112,19 +1112,45 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
       {!create_worker_handle}'s existing VACUUM-invalidation caveat still
       applies to everything else about a sibling handle's view of the store.
 
-    {b Registering inside an explicit transaction is undone by its ROLLBACK
-    (#752 review).} [register_row_hook] is an OCaml call, not a SQL statement,
-    so it does not automatically share in a transaction's rollback the way
-    DDL run through {!execute} does. Without special handling,
+    {b Registering is undone by a rollback of whatever write is currently in
+    flight, when there is one to be undone by (#752 review, revised round
+    8).} [register_row_hook] is an OCaml call, not a SQL statement, so it
+    does not automatically share in a rollback the way DDL run through
+    {!execute} does. Without special handling,
     [BEGIN; CREATE TABLE t(...); (* register_row_hook here *); ROLLBACK]
     would leave the hook attached even though [t] never really existed — and
-    a {e later, unrelated} [CREATE TABLE t] would silently reattach it. When
-    a transaction is open at the moment of registration, the registration is
-    therefore undone if that transaction rolls back (including a
-    [ROLLBACK TO] that unwinds past the point of registration), via the same
-    #269 schema-undo mechanism the view/trigger caches use. Registering
-    outside an explicit transaction is unaffected — there is no rollback to
-    protect against.
+    a {e later, unrelated} [CREATE TABLE t] would silently reattach it. Via
+    the same #269 schema-undo mechanism the view/trigger caches use, two
+    cases are protected:
+    - {b Called with an explicit transaction open} (from anywhere, including
+      top-level application code): its ROLLBACK undoes the registration
+      (including a [ROLLBACK TO] that unwinds past the point of
+      registration).
+    - {b Called from inside a row hook's OWN body — [`Before]/[`After],
+      firing for either this same [t] or a {!create_worker_handle} sibling
+      sharing this store — with no explicit transaction open (#752 review
+      round 8).} This is the nested-hook-mutation pattern documented below: a
+      hook mutates the registry as part of handling one row, and the
+      mutation must be undone alongside whatever else the {e firing
+      statement} — not the hook itself — rolls back, since that statement is
+      the only scope protecting it. If a {e later} hook firing for the
+      {e same} statement then vetoes or raises, this registration is undone
+      together with the row-store write, even in autocommit with no [BEGIN]
+      anywhere; if the statement instead succeeds, the undo is discarded
+      exactly as DDL discards its own at [Auto]-mode COMMIT, so a hook that
+      never mutates the registry mid-statement, or does so only in a
+      statement that always succeeds, pays nothing for this. Before round 8
+      this case was missed entirely: the registration survived a statement
+      whose own primary effect never happened, because nothing recorded how
+      to undo a mutation made outside an explicit transaction.
+
+    {b Called from plain top-level application code with neither of the
+    above true is genuinely unaffected} — there is no rollback of anything to
+    protect the registration against, so nothing is recorded (an
+    unconditional recording here, tried and rejected during round 8, would
+    instead leak: nothing would ever consume it, so it would sit on the
+    shared log to be wrongly replayed by whatever unrelated ROLLBACK, or
+    failed autocommit statement, happens next on this store).
 
     {b Veto ([`Before] only).}  [fn] returns [(unit, string) result Lwt.t].
     [Ok ()] lets the write proceed (or, for [`After], simply completes).
@@ -1293,12 +1319,22 @@ val register_row_hook
     caller who needs to know whether its own removal request was the one
     that mattered.
 
-    {b Undone by an enclosing transaction's ROLLBACK, symmetrically with
-    {!register_row_hook} (#752 review round 3, item 3).} Calling this inside
-    an explicit transaction that later rolls back re-attaches [h] exactly as
-    it was — otherwise [BEGIN; unregister_row_hook h; ROLLBACK] would leave
-    [h] permanently detached even though nothing else about the transaction
-    survived. Registering outside an explicit transaction is unaffected.
+    {b Undone by a rollback of whatever write is currently in flight, when
+    there is one, symmetrically with {!register_row_hook} (#752 review round
+    3, item 3; revised round 8).} Calling this inside an explicit transaction
+    that later rolls back re-attaches [h] exactly as it was — otherwise
+    [BEGIN; unregister_row_hook h; ROLLBACK] would leave [h] permanently
+    detached even though nothing else about the transaction survived. {b The
+    same is true when this is called from inside a row hook's OWN body, with
+    no explicit transaction open (#752 review round 8):} if a hook's body
+    calls [unregister_row_hook] on its own handle (or a
+    {!create_worker_handle} sibling's) and a {e later} hook firing for the
+    {e same} statement then vetoes or raises, [h] is re-attached alongside
+    whatever else that autocommit statement rolls back, even though no
+    [BEGIN] was ever issued — see {!register_row_hook}'s doc comment for the
+    full mechanism, why round 3-7's "outside an explicit transaction is
+    unaffected" claim was incomplete, and why a plain top-level call with
+    neither condition true remains genuinely unaffected.
 
     {b Always acts on the store's registry directly, including during the
     VACUUM race window {!register_row_hook} refuses with [`Store_closing]

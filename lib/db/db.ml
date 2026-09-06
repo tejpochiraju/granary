@@ -1804,9 +1804,25 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
      this hook may run through a DIFFERENT [Db.t] sharing this store
      ({!create_worker_handle}), and it is still the SAME logical recursion, so
      a per-handle counter would let a chain alternating handles nest well past
-     the cap before either handle's own copy noticed. *)
+     the cap before either handle's own copy noticed.
+
+     #752 (review round 8, item 2): the CHECK below reads
+     [Store.row_hook_effective_depth], not [Store.row_hook_depth] directly.
+     The store-wide counter [row_hook_depth_incr]/[_decr] bracket is still
+     maintained (it is what [row_hook_effective_depth] falls back to when
+     there is no ambient row-hook scope for this store), but a hook that
+     fires, unconditionally reschedules its own recursive step via
+     [Lwt.async], and returns immediately releases its claim on that counter
+     — via [Lwt.finalize] below — long before the scheduled step actually
+     runs. Reading the counter alone would then see 0 (or whatever it has
+     been left at by unrelated activity) every time, and this guard would
+     never trip no matter how many times the chain re-entered. See
+     [Store.row_hook_effective_depth]'s doc comment for the full mechanism:
+     it recovers the correct depth from the causally-inherited row-hook
+     scope even once that scope's own [rhs_active] flag has flipped. *)
   let reg = S.row_hooks t.store in
-  if S.row_hook_depth reg >= max_row_hook_depth
+  let depth = S.row_hook_effective_depth t.store reg in
+  if depth >= max_row_hook_depth
   then
     Lwt.fail_with
       (Printf.sprintf
@@ -1829,8 +1845,14 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
             from an unrelated sibling statement ordinarily queued behind the
             writer lock. Nested DML that reuses an ALREADY-open explicit
             transaction never reaches [Store.rw_begin] at all, so it is
-            unaffected — this only closes the autocommit/fresh-BEGIN case. *)
-         S.run_in_row_hook_scope t.store (fun () ->
+            unaffected — this only closes the autocommit/fresh-BEGIN case.
+
+            [~depth:(depth + 1)] (round 8, item 2): the depth THIS invocation
+            is running at, so a later firing causally descended from it —
+            synchronous, or resumed from a deferred [Lwt.async] continuation
+            — recovers it via [Store.row_hook_effective_depth] regardless of
+            what the store-wide counter has done in the meantime. *)
+         S.run_in_row_hook_scope t.store ~depth:(depth + 1) (fun () ->
            Lwt.catch
              (fun () ->
                 let* r = fn mutation in
@@ -5025,15 +5047,37 @@ let register_row_hook t ~table ~timing ~event fn =
        regardless of which (table, timing, event) key a RENAME registered
        either before or after this call has since moved it to — no LIFO
        ordering between this undo and a rename's is needed for correctness
-       any more. *)
-      (match t.explicit_txn with
-       | None -> ()
-       | Some _ ->
-         Cat.register_schema_undo t.catalog (fun () ->
-           (* Discards the returned re-undo closure: once this fires the
-            enclosing transaction is already being rolled back, so there is
-            nothing further to protect this removal against. *)
-           ignore (S.row_hook_unregister (S.row_hooks t.store) id : unit -> unit)));
+       any more.
+
+       #752 (review round 8, item 1): registers the undo whenever there is a
+       SCOPE to replay it in — an open explicit transaction (round 3's
+       original gate, unchanged), OR this call is itself running from inside
+       a row hook's own body ({!Store.in_row_hook_for}), in which case that
+       hook's firing statement — [Sql.Exec.execute_insert]/[execute_update]/
+       [execute_delete] — is the scope: its own [owned]-mode exception handler
+       replays this undo on failure, and [Sql.Exec.release_txn] discards it
+       on success, exactly mirroring [with_ddl_txn]'s DDL branches. Neither
+       check alone was enough: gating on [explicit_txn] alone (round 3-7)
+       missed a hook mutating the registry from inside an AUTOCOMMIT
+       statement's own body — nothing replayed the undo when a LATER hook in
+       that same statement then vetoed or raised, so the mutation outlived a
+       statement whose primary effect never happened. Pushing UNCONDITIONALLY
+       instead (this round's first draft) is equally wrong the other
+       direction: ordinary top-level application code calling
+       {!register_row_hook} with no ambient transaction and no hook currently
+       firing has no scope that will EVER replay or discard the entry, so it
+       would linger on the log forever, to be wrongly replayed by whatever
+       unrelated ROLLBACK or failed autocommit statement happens next on this
+       [t.catalog] — corrupting a completely unrelated statement's rollback.
+       [in_row_hook_for] is exactly the causal-descendant test that tells
+       those two cases apart. *)
+      if Option.is_some t.explicit_txn || S.in_row_hook_for t.store
+      then
+        Cat.register_schema_undo t.catalog (fun () ->
+          (* Discards the returned re-undo closure: once this fires the
+           enclosing scope is already being rolled back, so there is nothing
+           further to protect this removal against. *)
+          ignore (S.row_hook_unregister (S.row_hooks t.store) id : unit -> unit));
       Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id })
 ;;
 
@@ -5073,10 +5117,15 @@ let unregister_row_hook t h =
      transactional undo — an unregister issued mid-transaction must be
      reversible by that transaction's ROLLBACK, or [BEGIN;
      unregister_row_hook h; ROLLBACK] leaves [h] permanently detached even
-     though nothing else about the transaction survived. *)
-  match t.explicit_txn with
-  | None -> ()
-  | Some _ -> Cat.register_schema_undo t.catalog undo
+     though nothing else about the transaction survived.
+
+     #752 (review round 8, item 1): registered whenever there is a scope to
+     replay it in, matching {!register_row_hook}'s identical round-8 fix —
+     see its comment for why this needs BOTH the pre-existing
+     [t.explicit_txn] check AND {!Store.in_row_hook_for}, and why neither
+     alone, nor an unconditional push, is correct. *)
+  if Option.is_some t.explicit_txn || S.in_row_hook_for t.store
+  then Cat.register_schema_undo t.catalog undo
 ;;
 
 let pp_row_hook fmt h =

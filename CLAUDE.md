@@ -609,7 +609,34 @@ things that were tried and rejected) is usually the point.
   plain, synchronous `Hashtbl` mutation safe to run at any point. A row
   hook's own nested `BEGIN`/`SAVEPOINT` (as opposed to nested DML through
   `Db.execute`) still bypasses the `Ok`/`Error` contract and raises instead,
-  tracked as #770. Full detail in `docs/DECISIONS.md`.
+  tracked as #770. **Round 8 fixed the same recurring shape (a mechanism torn
+  down or snapshotted at the wrong time) one level further out, in two more
+  places.** An autocommit statement's hook-registry mutation — a hook calling
+  `register_row_hook`/`unregister_row_hook` on itself, per the documented
+  nested-hook-mutation pattern — now rolls back correctly when a LATER hook in
+  that same statement raises or vetoes: `register_row_hook`/
+  `unregister_row_hook` push a #269 schema-undo entry whenever
+  `Store.in_row_hook_for` holds (a mutation made from inside a currently-firing
+  row hook's own body), not only when an explicit transaction is open, and
+  `Sql.Exec.release_txn`/`execute_insert`/`execute_update`/`execute_delete`
+  commit or replay that log symmetrically with `with_ddl_txn`'s existing DDL
+  branches. Pushing the undo *unconditionally* was tried and rejected: a plain
+  top-level `register_row_hook` call with no explicit transaction and no hook
+  currently firing has nothing that will ever commit or roll back the entry,
+  so it would leak onto the shared log and get wrongly replayed by an
+  unrelated later rollback. Separately, `max_row_hook_depth` — meant to fail
+  cleanly on runaway recursion — did not bound a chain of hooks that each
+  re-trigger the same hook via a deferred `Lwt.async` write, because the depth
+  counter was released as soon as a hook's own synchronous extent ended, well
+  before its scheduled continuation ran. Fixed by giving the round-7 mutable
+  reentrancy-guard record an additional immutable `rhs_depth` field, read back
+  via a new `Store.row_hook_effective_depth` that prefers the ambient scope's
+  captured depth over the plain store-wide counter whenever the current
+  continuation is a causal descendant of one for this store — which correctly
+  survives past the point the reentrancy guard's own `rhs_active` flag flips to
+  `false`. A statement-level `unregister_row_hook` still has no effect on the
+  REST of that same statement's already-snapshotted fire list, tracked as
+  #771. Full detail in `docs/DECISIONS.md`.
 
 ## Repository structure
 

@@ -870,13 +870,34 @@ type row_hook_scope =
             from the deferred continuation observes the CURRENT truth
             through that shared, mutable cell rather than the stale
             snapshot the immutable version would have frozen in. *)
+  ; rhs_depth : int
+    (** #752 (review round 8, item 2): the recursion depth THIS hook
+            invocation is running at, captured once at scope creation --
+            immutable, unlike [rhs_active], because a re-entrant firing
+            causally descended from this scope (whether a genuinely
+            synchronous nested call, or one chained off a deferred
+            [Lwt.async] continuation constructed while [rhs_active] was
+            still [true]) must be attributed against THIS number regardless
+            of what the store-wide {!row_hook_depth} counter has done in the
+            meantime. That counter is decremented as soon as [rhs_active]
+            flips to [false] -- i.e. as soon as the hook's own synchronous
+            extent ends -- which for a hook that merely SCHEDULES its
+            recursive step via [Lwt.async] and returns immediately happens
+            long before the scheduled step actually runs. Without this
+            field, {!row_hook_effective_depth} would read the store-wide
+            counter at that point, see it back at its pre-firing value, and
+            let a chain of such hooks re-enter unboundedly -- the exact gap
+            {!max_row_hook_depth} exists to close. See
+            {!row_hook_effective_depth}. *)
   }
 
 let in_row_hook_key : row_hook_scope Lwt.key = Lwt.new_key ()
 
 (* Run [f] tagged as "executing inside a row hook callback fired for [t]" --
    see [in_row_hook_key] and {!row_hook_scope} above. Called once, around the
-   whole hook invocation, by [Db.fire_ocaml_row_hook].
+   whole hook invocation, by [Db.fire_ocaml_row_hook]. [depth] is the
+   recursion depth this particular invocation is running at (#752 review
+   round 8, item 2) -- see {!row_hook_effective_depth}.
 
    [rhs_active] starts [true] and is flipped to [false] under [Lwt.finalize]
    once [f]'s own promise settles -- i.e. once the hook's synchronous
@@ -889,9 +910,10 @@ let in_row_hook_key : row_hook_scope Lwt.key = Lwt.new_key ()
    [rhs_active = false] and is correctly treated as no longer inside the
    hook -- even though [Lwt.get in_row_hook_key] itself still answers
    [Some scope], because the snapshot reinstated at that bind site is this
-   very (now-mutated) record. *)
-let run_in_row_hook_scope (t : t) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
-  let scope = { rhs_store = t; rhs_active = true } in
+   very (now-mutated) record. [rhs_depth] stays put through that same flip,
+   which is exactly what lets {!row_hook_effective_depth} still see it. *)
+let run_in_row_hook_scope (t : t) ~depth (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+  let scope = { rhs_store = t; rhs_active = true; rhs_depth = depth } in
   Lwt.finalize
     (fun () -> Lwt.with_value in_row_hook_key (Some scope) f)
     (fun () ->
@@ -914,6 +936,36 @@ let in_row_hook_for (t : t) =
   match Lwt.get in_row_hook_key with
   | Some scope -> scope.rhs_active && scope.rhs_store == t
   | None -> false
+;;
+
+(* #752 (review round 8, item 2): the recursion depth to attribute a NEW row
+   hook firing for [t] against, given [reg] (this store's [row_hooks]).
+
+   Deliberately NOT just [row_hook_depth reg]: that store-wide counter is
+   decremented the instant a hook's own synchronous extent ends (see
+   {!row_hook_scope}'s [rhs_active]), so a hook that fires, unconditionally
+   SCHEDULES its recursive next step via [Lwt.async], and returns
+   immediately has already released its claim on the counter by the time
+   the scheduled step actually runs -- letting a chain of such hooks re-fire
+   this same hook forever without ever appearing to nest.
+
+   When the currently-running continuation is a causal descendant of a row
+   hook scope for THIS store -- whether still synchronously inside it
+   ([rhs_active = true]) or resumed later from a deferred [Lwt.async]
+   continuation constructed while it was ([rhs_active] since flipped to
+   [false], but [rhs_depth] unaffected) -- that scope's [rhs_depth] is the
+   truth: it is the exact depth this new firing is nesting from, regardless
+   of what unrelated firings elsewhere have since done to the store-wide
+   counter. Only when there is no such ambient scope (a fresh top-level
+   statement, or one on a sibling {!Db.t} with no causal Lwt link to any
+   in-flight hook -- {!Db.create_worker_handle}, #589) does the store-wide
+   counter serve as the fallback, which is what keeps recursion attributed
+   correctly across sibling handles for a genuinely synchronous nested chain
+   (round 4). *)
+let row_hook_effective_depth (t : t) (reg : row_hooks) =
+  match Lwt.get in_row_hook_key with
+  | Some scope when scope.rhs_store == t -> scope.rhs_depth
+  | _ -> reg.row_hook_depth
 ;;
 
 type ro_snapshot =

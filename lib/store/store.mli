@@ -315,8 +315,62 @@ val row_hook_depth_decr : row_hooks -> unit
     cannot tell an ordinary, unrelated writer legitimately queued behind the
     writer lock from the one case that is a genuine self-deadlock. [Db]'s
     [fire_ocaml_row_hook] is the sole caller, wrapping its call to the
-    hook's own [fn]. *)
-val run_in_row_hook_scope : t -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+    hook's own [fn].
+
+    [~depth] is the recursion depth this particular invocation is running
+    at (#752 review round 8, item 2) — see {!row_hook_effective_depth},
+    which is how a later, causally-descended firing recovers it. *)
+val run_in_row_hook_scope : t -> depth:int -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+
+(** #752 (review round 8, item 2): the recursion depth to attribute a NEW row
+    hook firing for [t] against, given [t]'s [row_hooks]. [Db]'s
+    [fire_ocaml_row_hook] consults this instead of {!row_hook_depth} directly
+    for its recursion-limit check.
+
+    {!row_hook_depth} is a store-wide counter that is decremented the
+    instant a hook's own synchronous extent ends — including when that
+    extent ends because the hook merely SCHEDULED its recursive next step
+    via [Lwt.async] and returned immediately, well before the scheduled step
+    actually runs. A chain of such hooks — each firing, scheduling its own
+    reinvocation, and returning — would therefore never appear to nest by
+    {!row_hook_depth}'s reading alone, letting {!max_row_hook_depth}'s bound
+    in [Db] go unenforced indefinitely.
+
+    This function instead prefers the depth captured on the row-hook scope
+    (see {!run_in_row_hook_scope}) of the currently-running continuation, if
+    it is a causal descendant of one for THIS store — which remains valid
+    even after that scope's own synchronous extent has ended, exactly
+    covering the deferred-[Lwt.async] case above — and falls back to the
+    plain {!row_hook_depth} counter only when there is no such ambient
+    scope (a fresh top-level statement, or a genuinely synchronous nested
+    chain reached through a sibling {!Db.t} with no causal Lwt link to the
+    firing hook — {!Db.create_worker_handle}, #589 — the case round 4's
+    shared-counter test exercises). *)
+val row_hook_effective_depth : t -> row_hooks -> int
+
+(** [true] iff the currently-running continuation is a causal descendant of a
+    row hook callback firing for [t] AND still within that hook invocation's
+    genuine dynamic extent — i.e. it has not yet returned (synchronously), nor
+    settled via a deferred [Lwt.async] continuation constructed while it was
+    still running. See {!row_hook_scope} and {!run_in_row_hook_scope}'s doc
+    comments for the full mechanism ({!rw_begin} is the original consumer).
+
+    #752 (review round 8, item 1): [Db.register_row_hook]/
+    [Db.unregister_row_hook] consult this to decide whether a registry
+    mutation needs a #269 schema-undo entry — a mutation made from a hook's
+    OWN body (this predicate [true]) is reversible by whatever write is
+    currently in flight (an explicit transaction's ROLLBACK, or — when there
+    is none — the autocommit DML statement that fired the hook, via
+    {!Sql.Exec.execute_insert}/[execute_update]/[execute_delete]'s own
+    [owned]-mode rollback), so it must always be tracked. A mutation made from
+    ordinary top-level application code (this predicate [false], no ambient
+    hook firing) has no such statement or transaction to be undone by unless
+    ONE happens to be explicitly open — {!Db.explicit_txn}'s pre-existing,
+    unchanged check — and must NOT be tracked otherwise: nothing would ever
+    consume (commit or roll back) an undo pushed there, and it would linger on
+    the log to be wrongly replayed by whatever unrelated rollback happens
+    next. *)
+val in_row_hook_for : t -> bool
 
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)

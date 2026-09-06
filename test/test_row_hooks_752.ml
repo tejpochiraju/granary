@@ -735,6 +735,97 @@ let test_row_hook_recursion_limit_is_shared_across_sibling_handles () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* max_row_hook_depth bounds a deferred Lwt.async self-chain (review        *)
+(* round 8, item 2)                                                        *)
+(* ------------------------------------------------------------------ *)
+
+(* [test_row_hook_self_recursion_is_bounded] above proves the guard catches
+   a SYNCHRONOUS nested chain. It says nothing about a hook that instead
+   re-triggers itself by SCHEDULING its next step via [Lwt.async] and
+   returning immediately -- which is exactly the [`After] hook whose own
+   nested DML the [register_row_hook] doc comment recommends deferring past
+   the firing statement's commit (see
+   [test_deferred_write_via_lwt_async_after_pause_is_not_spuriously_refused]
+   above). Before this round's fix, [Store.row_hook_depth] -- the counter
+   the guard checks -- was decremented the instant the hook's OWN
+   synchronous extent ended, which for a hook that merely schedules and
+   returns happens before the scheduled step ever runs. A chain of such
+   hooks therefore never appeared to nest, however many times it re-entered.
+
+   [cutoff] is a safety net, not part of what is being proved: pre-fix, the
+   chain never trips the real 32-deep limit on its own, and without a cutoff
+   this test would not fail cleanly -- it would run forever (or until the
+   process exhausts file descriptors on the growing chain of open
+   connections' worth of state). Set well past [max_row_hook_depth] (32) so
+   the fixed guard is certain to have already tripped by the time it could
+   ever be reached. *)
+let async_chain_cutoff = 200
+
+(* One step of the chain: increments [iterations], and either (a) gives up
+   past [cutoff] and reports that the guard never tripped, or (b) schedules
+   the next INSERT via [Lwt.async] after a [Lwt.pause] -- exactly the
+   deferred-write shape the doc comment recommends -- which will itself
+   re-fire this same hook once it runs. Factored to a top-level function
+   (matching [hook_fn]/[deferred_insert_after_pause] above) purely to keep
+   nesting under merlint's depth-4 cap. *)
+let async_chain_step db ~next_id ~iterations ~result _mutation =
+  let open Lwt.Syntax in
+  incr iterations;
+  if !iterations > async_chain_cutoff
+  then (
+    Lwt.async (fun () ->
+      Lwt_mvar.put
+        result
+        (Error
+           "cutoff reached without the recursion-limit guard ever tripping -- the \
+            deferred Lwt.async chain was never bounded"));
+    Lwt.return (Ok ()))
+  else (
+    Lwt.async (fun () ->
+      let* () = Lwt.pause () in
+      let id = !next_id in
+      next_id := id + 1;
+      let* r = exec_ok_lwt db (Printf.sprintf "INSERT INTO t VALUES (%d)" id) in
+      match r with
+      | Ok () -> Lwt.return_unit
+      | Error msg -> Lwt_mvar.put result (Ok msg));
+    Lwt.return (Ok ()))
+;;
+
+let msg_contains needle msg =
+  let nl = String.length needle
+  and hl = String.length msg in
+  let rec go i = i + nl <= hl && (String.sub msg i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+;;
+
+let test_deferred_lwt_async_self_chain_is_bounded () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    let next_id = ref 2 in
+    let iterations = ref 0 in
+    let result = Lwt_mvar.create_empty () in
+    let _h =
+      attach
+        db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (async_chain_step db ~next_id ~iterations ~result)
+    in
+    exec db "INSERT INTO t VALUES (1)";
+    match run (Lwt_mvar.take result) with
+    | Ok msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "expected the chain to fail with a recursion-limit message, got %S"
+           msg)
+        true
+        (msg_contains "recursion limit" msg)
+    | Error msg -> Alcotest.fail msg)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Transactional unregister (review round 3, item 3)                     *)
 (* ------------------------------------------------------------------ *)
 
@@ -1226,6 +1317,56 @@ let test_deferred_write_via_lwt_async_after_pause_is_not_spuriously_refused () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* Autocommit hook-registry rollback (review round 8, item 1)              *)
+(* ------------------------------------------------------------------ *)
+
+(* [test_rolled_back_unregister_restores_the_hook] above proves this for an
+   EXPLICIT transaction's ROLLBACK. This is the autocommit counterpart the
+   round 8 review found missing: [h1] mutates the registry (unregistering
+   [h0]) from inside its own body, mid-statement, with no [BEGIN] anywhere --
+   and a LATER hook in the very same statement ([h2]) then vetoes. The whole
+   autocommit statement rolls back, including the primary write; before this
+   round's fix, [h1]'s registry mutation did not roll back with it, because
+   [register_row_hook]/[unregister_row_hook] only pushed an undo onto
+   [Catalog]'s #269 schema-undo log when an explicit transaction was open --
+   autocommit had nothing recorded to replay. *)
+let test_autocommit_registry_mutation_rolls_back_on_same_statement_failure () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    let h0_fired = ref 0 in
+    let h0 =
+      attach
+        db
+        ~table:"t"
+        ~timing:`Before
+        ~event:`Insert
+        (ok_hook (fun _ -> incr h0_fired))
+    in
+    let _h1 =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        Db.unregister_row_hook db h0;
+        Lwt.return (Ok ()))
+    in
+    let h2 =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        Lwt.return (Error "veto"))
+    in
+    (* Registration order [h0; h1; h2] fires in that order: [h0] fires (its
+       own primary effect, [h0_fired := 1]), [h1] unregisters [h0], [h2]
+       vetoes -- aborting the whole autocommit statement. *)
+    exec_error db ~needle:"veto" "INSERT INTO t VALUES (1)";
+    (* Detach the permanent veto before proving the connection still works --
+       otherwise every subsequent INSERT would re-hit [h2]. *)
+    Db.unregister_row_hook db h2;
+    exec db "INSERT INTO t VALUES (2)";
+    Alcotest.(check int)
+      "h0 must still be attached: h1's mid-statement unregister was rolled back along \
+       with the rest of the failed statement"
+      2
+      !h0_fired)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* QCheck: registered/unregistered set matches what fires               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1432,6 +1573,10 @@ let () =
             "the recursion limit is shared across sibling handles"
             `Quick
             test_row_hook_recursion_limit_is_shared_across_sibling_handles
+        ; Alcotest.test_case
+            "a deferred Lwt.async self-chain is bounded (review round 8, item 2)"
+            `Quick
+            test_deferred_lwt_async_self_chain_is_bounded
         ] )
     ; ( "transactional unregister"
       , [ Alcotest.test_case
@@ -1486,6 +1631,12 @@ let () =
             "a deferred write via Lwt.async after Lwt.pause is not spuriously refused"
             `Quick
             test_deferred_write_via_lwt_async_after_pause_is_not_spuriously_refused
+        ] )
+    ; ( "autocommit hook-registry rollback (review round 8, item 1)"
+      , [ Alcotest.test_case
+            "a mid-statement registry mutation rolls back on the same statement's failure"
+            `Quick
+            test_autocommit_registry_mutation_rolls_back_on_same_statement_failure
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest prop_fired_matches_registered ]
     ]

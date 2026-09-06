@@ -3232,7 +3232,29 @@ let acquire_txn store mode =
    dirtied by nested In_txn DML (e.g. trigger inserts) are persisted, then
    persist any dirty columnar stores before committing.  After commit
    succeeds, clear the dirty flag on the stores that were persisted so the
-   next cycle only flushes new mutations. *)
+   next cycle only flushes new mutations.
+
+   #752 (review round 8, item 1): also discards [cat]'s #269 schema-undo log
+   via [Cat.commit_schema_changes], mirroring [with_ddl_txn]'s [owned]
+   success branch exactly. [owned] means this call opened its own txn with no
+   ambient explicit transaction borrowing it -- i.e. this DML statement IS
+   the schema-undo scope, the same role an [Auto]-mode DDL statement plays
+   for [with_ddl_txn]. [Db.register_row_hook]/[Db.unregister_row_hook], when
+   called from inside a row hook's OWN body with no explicit transaction open
+   ([Store.in_row_hook_for]), push onto that log too (not just inside an
+   explicit transaction, #752 review round 7's gate) so that a hook mutating
+   the row-hook registry from inside another hook's body, mid-statement, is
+   reversible by THIS statement's own rollback (see the paired
+   [Cat.rollback_schema_changes] call in [execute_insert]/[execute_update]/
+   [execute_delete]'s exception handlers) -- which means every successful
+   [owned] statement must equally discard whatever it pushed, or the log
+   would carry a stale, already-applied undo forward into whatever
+   transaction happens to roll back next. Safe to call even when nothing was
+   pushed (DML paths with no [before_hook]/[after_hook], FTS, columnar,
+   PRAGMA repair, ...): the writer lock's exclusivity guarantees nothing else
+   could have pushed onto [cat]'s undo log during this call's dynamic
+   extent, so discarding it here can never drop someone else's pending
+   undo. *)
 let release_txn ?cat tx owned =
   if owned
   then (
@@ -3244,6 +3266,9 @@ let release_txn ?cat tx owned =
         Cat.persist_dirty_columnar_stores c tx
     in
     let* () = S.commit tx in
+    (match cat with
+     | None -> ()
+     | Some c -> Cat.commit_schema_changes c);
     List.iter Granary_columnar.Col_store.mark_clean saved;
     Lwt.return_unit)
   else Lwt.return_unit
@@ -5431,10 +5456,30 @@ let execute_insert
           owes itself a mark: whatever a raising statement left in the delta
           log is discarded, and the views are rebuilt from the base tables.
           A mark here is still correct and is kept, because it also serves the
-          non-raising SKIP path through [stmt_savepoint_finish]. *)
+          non-raising SKIP path through [stmt_savepoint_finish].
+
+          #752 (review round 8, item 1): also runs [Cat.rollback_schema_changes]
+          alongside [S.rollback] when [owned], mirroring [with_ddl_txn]'s own
+          [owned] failure branch. [before_hook]/[after_hook] above can invoke a
+          row hook whose body itself calls [Db.register_row_hook] /
+          [Db.unregister_row_hook] on this same [t] (the documented nested-
+          hook-mutation pattern) — those push onto [cat]'s #269 schema-undo log
+          whenever [Store.in_row_hook_for] is true, not just inside an
+          explicit transaction. In autocommit ([owned]), THIS statement is
+          that undo log's whole scope
+          — nothing else could reach it, since the writer lock this call holds
+          is exclusive — so if a LATER hook in this same statement then raises
+          or vetoes, the row-hook registry mutation must be undone alongside
+          the row-store rollback below, or it would survive a statement whose
+          primary effect never happened. When [not owned] (a borrowed, ambient
+          explicit transaction), this is deliberately a no-op exactly as
+          before: the pushed undo stays queued for that outer transaction's own
+          eventual COMMIT/ROLLBACK, matching [register_row_hook]'s pre-existing
+          behavior for that case. *)
        let* () = stmt_savepoint_release ~cat tx sp in
        if owned then changes_restore mark;
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       if owned then Cat.rollback_schema_changes cat;
        Lwt.fail exn)
 ;;
 
@@ -7536,6 +7581,15 @@ let execute_update
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       (* #752 (review round 8, item 1): see [execute_insert]'s exception
+          handler for the full rationale — [before_hook]/[after_hook] above can
+          fire a row hook whose body mutates the row-hook registry via
+          [Db.register_row_hook]/[Db.unregister_row_hook], which push onto
+          [cat]'s #269 schema-undo log while [Store.in_row_hook_for] holds; in
+          autocommit ([owned]) this statement is that log's whole scope, so a
+          later hook raising here must undo it alongside the row-store
+          rollback above. *)
+       if owned then Cat.rollback_schema_changes cat;
        Lwt.fail exn)
 ;;
 
@@ -7842,6 +7896,14 @@ let execute_delete
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       (* #752 (review round 8, item 1): see [execute_insert]'s exception
+          handler for the full rationale — [before_hook]/[after_hook] above can
+          fire a row hook whose body mutates the row-hook registry, which
+          pushes onto [cat]'s #269 schema-undo log while
+          [Store.in_row_hook_for] holds; in autocommit ([owned]) this
+          statement is that log's whole scope, so a later hook raising here
+          must undo it alongside the row-store rollback above. *)
+       if owned then Cat.rollback_schema_changes cat;
        Lwt.fail exn)
 ;;
 

@@ -3619,3 +3619,82 @@ a raw uncaught exception instead of the documented result type. Deliberately
 not fixed in round 7 (the user's instruction was to defer it). Tracked as
 #770.
 
+**Round 8 fixed two more instances of the same recurring shape — a
+mechanism torn down or snapshotted at the wrong time — one level further out
+than round 7 fixed it, in the depth guard and the schema-undo log rather
+than the reentrancy guard and the unregister race.**
+
+- **The autocommit hook-registry mutation was not rolled back on a
+  same-statement failure.** `register_row_hook`/`unregister_row_hook` only
+  called `Cat.register_schema_undo` when an explicit transaction was open
+  (`t.explicit_txn = Some _`); in autocommit, the mutation was a plain,
+  untracked `Hashtbl` write. This is invisible for the common case (a hook
+  mutating the registry with nothing else in the statement failing), but a
+  hook that itself calls `register_row_hook`/`unregister_row_hook` on its
+  own handle (the documented nested-hook-mutation pattern) followed by a
+  LATER hook in the SAME autocommit statement raising or vetoing left the
+  registry mutation in place even though the row-store write it accompanied
+  was rolled back via `S.rollback`. DDL's own `with_ddl_txn` already treats
+  an `Auto`-mode statement as a schema-undo scope symmetrically (discarding
+  the log via `Cat.commit_schema_changes` on success, replaying it via
+  `Cat.rollback_schema_changes` on failure) — `Sql.Exec.release_txn` and
+  `execute_insert`/`execute_update`/`execute_delete`'s exception handlers now
+  do the same. The harder part was deciding WHEN `register_row_hook`/
+  `unregister_row_hook` should push an undo at all: pushing unconditionally
+  (the first draft) is a **different, worse bug** — a plain top-level
+  application call to `register_row_hook`, made outside any hook and outside
+  any explicit transaction, has no statement or transaction that will ever
+  commit or roll back the pushed entry, so it lingers on `Catalog`'s shared
+  undo log to be wrongly replayed by whatever UNRELATED rollback happens
+  next (this was caught by the round-8 "confirm the test fails before the
+  fix, and PASSES only after" methodology — the first-draft fix made the new
+  test fail a *different* way, by unregistering hooks that had nothing to do
+  with the failing statement). The correct condition is
+  `Option.is_some t.explicit_txn || Store.in_row_hook_for t.store`: the
+  first covers a mutation made from anywhere while an explicit transaction
+  is open (unchanged from round 3-7), the second is the new case — a
+  mutation made from INSIDE a row hook's own body currently firing, whether
+  for `t` or a `create_worker_handle` sibling sharing the same store, which
+  is always reversible by whatever wrote-then-rolled-back statement fired
+  that hook. A plain top-level call with neither condition true remains
+  genuinely unaffected, exactly as round 3-7 documented — that claim was
+  merely incomplete, not wrong.
+- **`max_row_hook_depth` did not bound a chain of hooks that each re-trigger
+  the same hook via a deferred `Lwt.async` write.** The depth counter
+  (`Store.row_hook_depth_incr`/`_decr`) was incremented before firing a hook
+  and decremented under `Lwt.finalize` around only the hook's OWN
+  synchronous promise — the same timing round 7's reentrancy-guard fix had
+  to work around, but nobody had applied the analogous fix to this
+  mechanism yet. A hook that fires, schedules its own recursive next step via
+  `Lwt.async (fun () -> ...)`, and returns `Ok ()` immediately releases the
+  counter back down before the scheduled step ever runs — so a chain of such
+  hooks, each re-entering after the previous one already "finished," never
+  appeared to nest no matter how many times it re-entered. Fixed by giving
+  `Store.row_hook_scope` (round 7's mutable reentrancy-guard record) a
+  second, immutable field, `rhs_depth`, capturing the depth THIS invocation
+  is running at; a new `Store.row_hook_effective_depth` reads it off the
+  ambient scope (via the same `Lwt.with_value` dynamic-extent propagation
+  round 7 established, which survives past `rhs_active` flipping to `false`)
+  when the currently-running continuation is a causal descendant of one for
+  this store, and falls back to the plain store-wide counter only when there
+  is no such ambient scope — which is exactly the case the round-4
+  shared-across-sibling-handles test exercises, and which still needs the
+  plain counter since two independent Lwt fibers share no `Lwt.with_value`
+  storage. Confirmed via the same revert-and-confirm-failure methodology: a
+  hook that unconditionally reschedules itself via `Lwt.async`, tested with a
+  cutoff far past the 32-deep limit as a safety net (so a still-buggy guard
+  fails the test cleanly instead of the test hanging), ran to the cutoff
+  without tripping the limit pre-fix and hit the limit well before the
+  cutoff post-fix.
+
+**Deliberately not fixed in round 8: a statement-level `unregister_row_hook`
+has no effect on the REST of that same statement.** `S.row_hook_fire_list`
+is snapshotted once per statement in `make_combined_hook`, before any
+per-row loop runs — mirroring pre-existing SQL-trigger snapshot behavior,
+but undocumented for row hooks and easier to trip over, since row hooks are
+explicitly designed to be mutated mid-flight by other hooks. A hook that
+unregisters another hook mid-statement (e.g. H1 unregisters H2 while
+handling row N of a multi-row statement) still has H2 fire for every
+remaining row of that statement; the detach only takes effect starting with
+the next statement. Tracked as #771.
+
