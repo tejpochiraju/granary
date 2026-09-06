@@ -467,9 +467,22 @@ things that were tried and rejected) is usually the point.
   corrupted-column condition) — plus a reopened `List.nth_opt` negative-index
   crash trap in round 3's own new `Exec.fk_obligation_conflict`. All now
   route through `Exec.resolve_fk_col_idxs` / guard the sentinel explicitly.
-  Full write-up — including the residual this does NOT close (`RENAME
-  TABLE`/`DROP TABLE` can still desync a pending check by table name,
-  tracked as #768) — in `docs/DECISIONS.md`.
+  Round 5 found `cascade_update_fk` was the one FK call site missing the
+  `any_null_val` guard every other one has (reachable via a second-level
+  `ON UPDATE CASCADE` fan-out over a nullable composite FK column — fixed
+  with the same guard, no new logic), and separately narrowed
+  `child_index_key_types`'s blanket VIRTUAL-column disqualification: a
+  VIRTUAL column whose expression is a top-level `CAST` to its own
+  declared type is now trusted like an ordinary column (`Exec.eval_cast`
+  is a total, exhaustive match on the target type, so it GUARANTEES that
+  storage class regardless of the inner expression), closing a
+  performance cliff for a composite FK with one generated helper column
+  without weakening round 1's original fix for the general case.
+  `Exec.child_index_key_types` is now exposed in `exec.mli` so a test can
+  confirm the fast-path/full-scan decision directly. Full write-up —
+  including the residual this does NOT close (`RENAME TABLE`/`DROP TABLE`
+  can still desync a pending check by table name, tracked as #768) — in
+  `docs/DECISIONS.md`.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.

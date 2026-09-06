@@ -44,6 +44,8 @@
     already-located row by rowid and needed no change. *)
 
 module Db = Granary.Db
+module Schema = Granary.Schema
+module Row = Granary_encoding.Row
 
 let run = Lwt_main.run
 
@@ -712,6 +714,157 @@ let cascade_update_fk_fails_loudly () =
    is what carries the invariant here. *)
 
 (* ------------------------------------------------------------------ *)
+(* PR #765 review round 5, item 1: cascade_update_fk was the one FK call  *)
+(* site in this file missing the any_null_val guard every other one has, *)
+(* because compare_values (via fk_cols_match's full-scan fallback) treats *)
+(* [V_null, V_null] as equal -- structural equality for ordering, not the *)
+(* FK three-valued-logic rule that a NULL component never really matched *)
+(* anything. Reachable through a SECOND-LEVEL ON UPDATE CASCADE fan-out   *)
+(* over a nullable composite FK column: m's own reference to p uses ONE   *)
+(* column (pa); c's reference to m is a DIFFERENT, composite pair         *)
+(* (pa, qb) where qb is NULL. When p's cascade changes m.pa,               *)
+(* cascade_update_fk computes m's OLD (pa, qb) to find c's matching rows  *)
+(* -- and qb's NULL must not let a c row that merely ALSO holds NULL in   *)
+(* that column (but never validly referenced m, since qb's NULL already  *)
+(* meant no real match ever existed) get swept into the cascade.         *)
+(* ------------------------------------------------------------------ *)
+
+let cascade_update_fk_does_not_cascade_a_null_composite_match () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p20 (a INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE m20 (id INTEGER PRIMARY KEY, pa INTEGER REFERENCES p20(a) ON UPDATE \
+       CASCADE, qb INTEGER, UNIQUE (pa, qb))";
+    exec
+      db
+      "CREATE TABLE c20 (ca INTEGER, cb INTEGER, junk INTEGER, FOREIGN KEY (ca, cb) \
+       REFERENCES m20(pa, qb) ON UPDATE CASCADE)";
+    exec db "INSERT INTO p20 VALUES (1)";
+    (* m20's own reference to p20 is via pa alone; qb is unrelated and NULL. *)
+    exec db "INSERT INTO m20 VALUES (100, 1, NULL)";
+    (* c20's row structurally matches m20's (pa, qb) = (1, NULL), but never
+       validly referenced it: qb/cb being NULL means c20's own FK check at
+       INSERT time was skipped (three-valued logic), not satisfied. *)
+    exec db "INSERT INTO c20 VALUES (1, NULL, 0)";
+    expect_ok db "UPDATE p20 SET a = 2 WHERE a = 1";
+    Alcotest.(check (list string))
+      "m20's own reference cascaded correctly"
+      [ "2|NULL" ]
+      (query_texts db "SELECT pa, qb FROM m20");
+    Alcotest.(check (list string))
+      "c20 was NOT cascaded: it never validly referenced m20 through a NULL component"
+      [ "1|NULL" ]
+      (query_texts db "SELECT ca, cb FROM c20"))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* PR #765 review round 5, item 2: child_index_key_types disqualified the *)
+(* WHOLE composite key's indexed fast path if ANY column was VIRTUAL,     *)
+(* even when the other columns were ordinary and a covering index         *)
+(* existed -- a performance cliff on exactly the code path this PR       *)
+(* exists to fix. Narrowed: a VIRTUAL column whose expression is a        *)
+(* top-level CAST to its own declared type is now trusted like an        *)
+(* ordinary column, since eval_cast's interpreter is a total, exhaustive *)
+(* match on the target type and so GUARANTEES that storage class          *)
+(* regardless of what the inner expression would otherwise produce.       *)
+(* Verified two ways: directly against Exec.child_index_key_types         *)
+(* (exposed for exactly this — "was the indexed path chosen" IS whether   *)
+(* it returns [Some] or [None], more precisely than inferring it from     *)
+(* timing), and end-to-end to confirm the narrowing does not break        *)
+(* correctness for the case it newly trusts.                              *)
+(* ------------------------------------------------------------------ *)
+
+let child_index_key_types_of db ~table_name ~col_names =
+  match run (Schema.find_table (Db.schema db) ~name:table_name) with
+  | None -> Alcotest.failf "table %s not found" table_name
+  | Some (table : Schema.table) ->
+    let idx_of name =
+      match
+        List.find_index (fun (c : Row.column) -> c.Row.name = name) table.Schema.columns
+      with
+      | Some i -> i
+      | None -> Alcotest.failf "column %s not found in %s" name table_name
+    in
+    Granary_sql.Exec.child_index_key_types
+      ~table_name:table.Schema.name
+      ~columns:table.Schema.columns
+      (List.map idx_of col_names)
+;;
+
+let show_ty = function
+  | Row.Integer -> "INTEGER"
+  | Row.Text -> "TEXT"
+  | Row.Real -> "REAL"
+  | Row.Blob -> "BLOB"
+;;
+
+let show_tys_result = function
+  | None -> "None"
+  | Some tys -> "Some [" ^ String.concat "; " (List.map show_ty tys) ^ "]"
+;;
+
+(* A composite FK (a, b) where [a] is VIRTUAL via a top-level CAST to its
+   own declared type: the indexed fast path must be trusted for the WHOLE
+   key, not disqualified because one column happens to be generated. *)
+let child_index_key_types_trusts_cast_matched_virtual_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE p22 (x INTEGER, y INTEGER, PRIMARY KEY (x, y))";
+    exec
+      db
+      "CREATE TABLE c22 (raw_a INTEGER, a INTEGER GENERATED ALWAYS AS (CAST(raw_a AS \
+       INTEGER)) VIRTUAL, b INTEGER, FOREIGN KEY (a, b) REFERENCES p22(x, y))";
+    exec db "CREATE INDEX c22_ab ON c22(a, b)";
+    let result = child_index_key_types_of db ~table_name:"c22" ~col_names:[ "a"; "b" ] in
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "the CAST-matched VIRTUAL column is trusted for the whole composite key (got %s)"
+         (show_tys_result result))
+      true
+      (match result with
+       | Some [ Row.Integer; Row.Integer ] -> true
+       | _ -> false))
+;;
+
+(* Regression guard: round 1's own repro (a VIRTUAL column whose expression
+   is NOT cast to its declared type) must still be disqualified -- the
+   narrowing must not weaken the original fix. *)
+let child_index_key_types_still_declines_uncast_mismatched_virtual_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE p23 (x INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE c23 (y INTEGER, a REAL GENERATED ALWAYS AS (y) VIRTUAL, FOREIGN KEY \
+       (a) REFERENCES p23(x))";
+    exec db "CREATE INDEX c23_a ON c23(a)";
+    let result = child_index_key_types_of db ~table_name:"c23" ~col_names:[ "a" ] in
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "an uncast, type-mismatched VIRTUAL column is still declined (got %s)"
+         (show_tys_result result))
+      true
+      (Option.is_none result))
+;;
+
+(* End-to-end: the narrowing must not break correctness for the case it
+   newly trusts -- the same CAST-matched composite key from above, wired
+   into an actual RESTRICT check. *)
+let indexed_cast_matched_virtual_composite_fk_restrict_refuses () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = 1";
+    exec db "CREATE TABLE p24 (x INTEGER, y INTEGER, PRIMARY KEY (x, y))";
+    exec db "INSERT INTO p24 VALUES (1, 2)";
+    exec
+      db
+      "CREATE TABLE c24 (raw_a INTEGER, a INTEGER GENERATED ALWAYS AS (CAST(raw_a AS \
+       INTEGER)) VIRTUAL, b INTEGER, FOREIGN KEY (a, b) REFERENCES p24(x, y))";
+    exec db "CREATE INDEX c24_ab ON c24(a, b)";
+    expect_ok db "INSERT INTO c24(raw_a, b) VALUES (1, 2)";
+    expect_fk_refused db "DELETE FROM p24 WHERE x = 1 AND y = 2")
+;;
+
+(* ------------------------------------------------------------------ *)
 (* PR #765 review item 5: the new seek path over a WITHOUT ROWID child   *)
 (* table, which addresses rows by their PK value rather than a rowid.   *)
 (* ------------------------------------------------------------------ *)
@@ -870,6 +1023,26 @@ let () =
             "cascade_update_fk fails loudly"
             `Quick
             cascade_update_fk_fails_loudly
+        ] )
+    ; ( "review_round_5_item_1_null_guard"
+      , [ Alcotest.test_case
+            "cascade_update_fk does not cascade a NULL composite match"
+            `Quick
+            cascade_update_fk_does_not_cascade_a_null_composite_match
+        ] )
+    ; ( "review_round_5_item_2_virtual_column_fast_path"
+      , [ Alcotest.test_case
+            "child_index_key_types trusts a CAST-matched VIRTUAL column"
+            `Quick
+            child_index_key_types_trusts_cast_matched_virtual_column
+        ; Alcotest.test_case
+            "child_index_key_types still declines an uncast mismatched VIRTUAL column"
+            `Quick
+            child_index_key_types_still_declines_uncast_mismatched_virtual_column
+        ; Alcotest.test_case
+            "indexed CAST-matched VIRTUAL composite FK RESTRICT refuses"
+            `Quick
+            indexed_cast_matched_virtual_composite_fk_restrict_refuses
         ] )
     ; ( "review_item_5_without_rowid_child"
       , [ Alcotest.test_case

@@ -670,6 +670,90 @@ useful reading order — search for the issue number instead.
   the silent-no-op case for `cascade_delete_fk` and the bare
   `Failure "column not found: <name>"` for the other three.
 
+  **Round 5 found one more disagreement in the surviving raw NULL handling,
+  and — separately — that round 1's blanket VIRTUAL-column disqualification
+  was safe but overly conservative, 2026-09-06.**
+
+  `cascade_update_fk` was the one FK call site in this file still missing
+  the `any_null_val` guard every other one has before scanning for
+  matching child rows. `compare_values` (which `fk_cols_match`'s
+  full-scan fallback uses) treats `[V_null, V_null]` as equal — structural
+  equality for ordering, correct for that purpose — but that is NOT the
+  FK reference rule: a NULL component means the row never matched
+  anything under three-valued logic, so scanning for it can wrongly
+  cascade into a child row that merely holds NULL in the same column
+  too, not one that ever actually referenced the parent. Reachable
+  through a SECOND-LEVEL `ON UPDATE CASCADE` fan-out where the parent's
+  own reference uses one column and its child's reference to it is a
+  DIFFERENT, composite pair with a NULL member — `m`'s reference to `p`
+  via `pa` alone, `c`'s reference to `m` via `(pa, qb)` where `qb` is
+  NULL: when `p`'s cascade changes `m.pa`, `cascade_update_fk` computes
+  `m`'s OLD `(pa, qb)` to find `c`'s matching rows, and without the
+  guard a `c` row with `(ca, cb) = (pa_old, NULL)` gets swept in even
+  though its own NULL `cb` meant it was never validly checked at INSERT
+  time either. Fixed with the identical `any_null_val` guard
+  `cascade_delete_fk`/`apply_update_cascade_fk`/`apply_delete_cascade_fk`
+  already had — a small, consistent addition, not new logic.
+
+  Separately: `child_index_key_types` disqualified the indexed fast path
+  for the WHOLE composite key if ANY single column was VIRTUAL, even with
+  a covering index and otherwise-ordinary columns — a composite FK with
+  one generated helper column lost the index entirely, the exact
+  performance cliff this PR exists to avoid. VIRTUAL columns are
+  ordinarily indexable in this engine (nothing in the index-build path
+  refuses one); round 1's disqualification was about trusting the
+  DECLARED type as the physical index-key storage class, not about
+  VIRTUAL columns being unindexable in general. The round-1 concern is
+  real whenever the generated expression's result can differ in storage
+  class from the column's declaration (`x REAL GENERATED ALWAYS AS (y)
+  VIRTUAL` where `y` is INTEGER stores `IK_int`, not `IK_real`) — but one
+  shape is PROVABLY safe regardless: a top-level `CAST(_ AS ty)` where
+  `ty` matches the column's own declared type. `Exec.eval_cast` (the
+  interpreter for `Plan.P_cast`) is a total, exhaustive match on the
+  target type — every non-NULL branch for `Ast.Ty_real` returns
+  `Row.V_real`, every branch for `Ast.Ty_int` returns `Row.V_int`, and so
+  on — so a CAST to the column's own type GUARANTEES that storage class
+  no matter what the inner expression would otherwise have produced.
+  New `Exec.virtual_col_cast_matches_declared_type` checks for exactly
+  that shape (parses the GENERATED expression via the existing
+  `compile_generated_expr` cache, so repeated checks are cheap); a
+  VIRTUAL column matching it is now trusted like an ordinary column,
+  and only a VIRTUAL column WITHOUT that guarantee still disqualifies
+  the seek — still for the WHOLE composite key, since a B-tree seek
+  needs every prefix column translated together, not some of them.
+  Proving anything past a bare CAST safe (arithmetic, a bare column
+  reference, a function call) would need real static type inference
+  over the expression grammar, which this engine does not have and does
+  not try to approximate here — deliberately narrow, not a general
+  VIRTUAL-column type-inference feature.
+
+  `child_index_key_types` and its new helper were also changed to take
+  `~table_name`/`~columns` rather than a full `Cat.table_meta` (the
+  `storage`/`fk_constraints` fields were never used), and
+  `child_index_key_types` is now exposed in `exec.mli` — purely so a test
+  can ask the fast-path/full-scan question directly (`Some` vs `None`
+  IS the answer to "was the index trusted"), rather than needing to
+  infer it from timing or a new `GRANARY_BENCH_*` scaling gate.
+
+  Pinned by five more `test/test_fk_cross_numeric_755.ml` cases:
+  `cascade_update_fk_does_not_cascade_a_null_composite_match` builds the
+  `p -> m -> c` second-level fan-out above and asserts `c`'s row is
+  untouched while `m`'s own cascade still applies correctly;
+  `child_index_key_types_trusts_cast_matched_virtual_column` and
+  `child_index_key_types_still_declines_uncast_mismatched_virtual_column`
+  call the newly-exposed function directly (`Some [...]` for a
+  CAST-matched composite key, `None` for round 1's own uncast repro,
+  pinning that the narrowing does not weaken it); and
+  `indexed_cast_matched_virtual_composite_fk_restrict_refuses` confirms
+  end-to-end that the narrowed rule does not break RESTRICT's
+  correctness for the case it newly trusts. Verified against the
+  pre-round-5 code (a WIP commit, checked out and restored — not `git
+  stash`): the NULL-guard case failed exactly as predicted (`c`'s row
+  wrongly cascaded); the two `child_index_key_types` unit tests could not
+  even be built against the pre-round-5 `exec.mli` (the function did not
+  exist to call), which is itself the strongest possible confirmation
+  that the capability was genuinely new.
+
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does
   for UNIQUE. `OR IGNORE` skips the offending row — consistent with the UNIQUE

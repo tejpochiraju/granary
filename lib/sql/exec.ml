@@ -3835,10 +3835,45 @@ let full_scan_collect tx (meta : Cat.table_meta) (pred : Row.t -> bool)
   Lwt.return (List.rev !buf)
 ;;
 
-(** #755/#765 review item 2: the CHILD index column types [index_lookup_values]
-    should translate [parent_vals] through for a seek on [child_col_idxs], or
-    [None] if the DECLARED type cannot be trusted as the column's ACTUAL
-    index-key storage class.
+(** #765 review round 5, item 2: does [ci]'s GENERATED VIRTUAL expression
+    provably produce the column's DECLARED storage class, regardless of
+    what its own operands would otherwise produce?
+
+    Only one shape is trusted: the expression is a top-level
+    [CAST(_ AS ty)] whose target [ty] is exactly [col.ty]. [eval_cast]
+    (the interpreter for [Plan.P_cast]) is a total, exhaustive match on the
+    target type — for [Ast.Ty_real] every non-NULL input branch returns
+    [Row.V_real], for [Ast.Ty_int] every branch returns [Row.V_int], and so
+    on — so a CAST to [col.ty] GUARANTEES a value of that storage class no
+    matter what the inner expression evaluates to (NULL passes through
+    unchanged, which is fine: {!index_lookup_values} declines NULL before
+    this question is ever asked). Anything else — a bare column reference,
+    arithmetic, a function call with no enclosing CAST — is NOT trusted:
+    proving those safe in general needs full static type inference over
+    the expression grammar, which this engine does not have, and does not
+    try to approximate here. *)
+let virtual_col_cast_matches_declared_type
+      ~table_name
+      ~(columns : Row.column list)
+      ci
+      sql
+      ty
+  =
+  match compile_generated_expr table_name ci columns sql with
+  | Plan.P_cast (_, cast_ty) ->
+    (match cast_ty, ty with
+     | Ast.Ty_int, Row.Integer
+     | Ast.Ty_text, Row.Text
+     | Ast.Ty_real, Row.Real
+     | Ast.Ty_blob, Row.Blob -> true
+     | _ -> false)
+  | _ -> false
+;;
+
+(** #755/#765 review item 2 (round 1), narrowed in round 5: the CHILD index
+    column types [index_lookup_values] should translate [parent_vals]
+    through for a seek on [child_col_idxs], or [None] if the DECLARED type
+    cannot be trusted as the column's ACTUAL index-key storage class.
 
     [Row.encode]'s [encode_col_value] enforces that invariant for every
     ordinary and STORED-generated column — a value whose runtime tag disagrees
@@ -3850,6 +3885,19 @@ let full_scan_collect tx (meta : Cat.table_meta) (pred : Row.t -> bool)
     value, not the declared type, is what [row_value_to_index_value] put in
     the index. Seeking by the declared type would then walk a prefix keyed to
     a variant the index never holds.
+
+    Round 1 disqualified every VIRTUAL column unconditionally, for the WHOLE
+    composite key, on that basis — sound, but overly conservative: a
+    composite FK with one generated helper column and otherwise-ordinary
+    columns lost the indexed fast path entirely, the exact performance
+    cliff this PR exists to avoid. Round 5 narrows it to columns that are
+    ACTUALLY unsafe, via {!virtual_col_cast_matches_declared_type}: a
+    VIRTUAL column whose expression is a top-level CAST to its own declared
+    type is trusted like an ordinary column (the CAST interpreter
+    guarantees the storage class regardless of the inner expression), and
+    only a VIRTUAL column WITHOUT that guarantee still disqualifies the
+    seek — for the WHOLE key, since a composite B-tree seek needs every
+    prefix column translated, not just some of them.
 
     [None] here means "the index cannot be trusted for this seek", which the
     caller must treat as "fall back to the full scan" — {b not} as
@@ -3869,11 +3917,19 @@ let full_scan_collect tx (meta : Cat.table_meta) (pred : Row.t -> bool)
     is {!make_fk_recheck} re-resolving [fk_ordinal] and every column ordinal
     fresh against the schema AT RECHECK TIME (#765 review, rounds 1 and 2) —
     this function's own out-of-range check is defence in depth for a case
-    that should not arise, not the mechanism that rules it out. *)
-let child_index_key_types (child_meta : Cat.table_meta) (child_col_idxs : int list)
+    that should not arise, not the mechanism that rules it out.
+
+    Takes [table_name]/[columns] rather than a full [Cat.table_meta] —
+    everything else on that record ([storage], [fk_constraints]) is unused
+    here — so this decision can be exercised directly in tests (see
+    [exec.mli]) without constructing a full table handle. *)
+let child_index_key_types
+      ~table_name
+      ~(columns : Row.column list)
+      (child_col_idxs : int list)
   : Row.ty list option
   =
-  let cols = Array.of_list child_meta.Cat.columns in
+  let cols = Array.of_list columns in
   let n = Array.length cols in
   let rec go acc = function
     | [] -> Some (List.rev acc)
@@ -3882,7 +3938,16 @@ let child_index_key_types (child_meta : Cat.table_meta) (child_col_idxs : int li
       then None
       else (
         match cols.(ci).Row.generated_as with
-        | Some (_, false) -> None (* VIRTUAL: declared type is not trustworthy *)
+        | Some (sql, false) ->
+          if
+            virtual_col_cast_matches_declared_type
+              ~table_name
+              ~columns
+              ci
+              sql
+              cols.(ci).Row.ty
+          then go (cols.(ci).Row.ty :: acc) rest
+          else None (* VIRTUAL, and not provably cast to its declared type *)
         | _ -> go (cols.(ci).Row.ty :: acc) rest)
   in
   go [] child_col_idxs
@@ -3984,7 +4049,10 @@ let fk_child_has_ref_multi_in_tx
           cat
           ~table_name:child_meta.Cat.name
           ~col_idxs:child_col_idxs
-      , child_index_key_types child_meta child_col_idxs )
+      , child_index_key_types
+          ~table_name:child_meta.Cat.name
+          ~columns:child_meta.Cat.columns
+          child_col_idxs )
     with
     | Some idx, Some child_tys ->
       (* #755: seek the index through {!index_lookup_values}'s exact
@@ -6094,7 +6162,10 @@ let scan_child_rows_multi_tx
           cat
           ~table_name:child_meta.Cat.name
           ~col_idxs:child_col_idxs
-      , child_index_key_types child_meta child_col_idxs )
+      , child_index_key_types
+          ~table_name:child_meta.Cat.name
+          ~columns:child_meta.Cat.columns
+          child_col_idxs )
     with
     | Some idx, Some child_tys ->
       (* #755: same fix as {!fk_child_has_ref_multi_in_tx} — this scan backs
@@ -6618,61 +6689,76 @@ and cascade_update_fk
     resolve_fk_col_idxs ~table_name:meta.Cat.name meta.Cat.columns fk.Cat.fk_parent_cols
   in
   let all_parent_vals_old = List.map (fun i -> row.(i)) all_parent_col_idxs in
-  match fk.Cat.fk_on_update with
-  | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
-  | Cat.FA_cascade ->
-    let* all_child_col_idxs =
-      resolve_fk_col_idxs
-        ~table_name:child_meta.Cat.name
-        child_meta.Cat.columns
-        fk.Cat.fk_local_cols
-    in
-    let* child_rows =
-      scan_child_rows_multi_tx
-        cat
+  (* #765 review round 5, item 1: every other FK call site in this file
+     guards a NULL component before scanning for matching child rows
+     (e.g. {!cascade_delete_fk}, {!apply_update_cascade_fk},
+     {!apply_delete_cascade_fk}) -- this one did not. [compare_values]
+     (via {!fk_cols_match}'s full-scan fallback) treats [V_null, V_null]
+     as equal for ordering purposes, which is NOT the FK reference rule:
+     a NULL component means the row never matched anything under
+     three-valued logic, so scanning for it here would wrongly cascade
+     into a child row that merely holds NULL in the same column, not one
+     that ever actually referenced this parent. Reachable through a
+     second-level ON UPDATE CASCADE fan-out over a nullable composite FK
+     column. *)
+  if any_null_val all_parent_vals_old
+  then Lwt.return_unit
+  else (
+    match fk.Cat.fk_on_update with
+    | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
+    | Cat.FA_cascade ->
+      let* all_child_col_idxs =
+        resolve_fk_col_idxs
+          ~table_name:child_meta.Cat.name
+          child_meta.Cat.columns
+          fk.Cat.fk_local_cols
+      in
+      let* child_rows =
+        scan_child_rows_multi_tx
+          cat
+          tx
+          child_meta
+          ~child_col_idxs:all_child_col_idxs
+          ~parent_vals:all_parent_vals_old
+      in
+      Lwt_list.iter_s
+        (fun (crid, crow) ->
+           cascade_update_col_in_tx
+             tx
+             cat
+             ~visited
+             clock
+             params
+             child_meta
+             ~rowid:crid
+             ~row:crow
+             ~col_idx:child_col_idx
+             ~new_val)
+        child_rows
+    | Cat.FA_set_null ->
+      cascade_update_set_null
         tx
+        cat
+        visited
+        clock
+        params
         child_meta
-        ~child_col_idxs:all_child_col_idxs
-        ~parent_vals:all_parent_vals_old
-    in
-    Lwt_list.iter_s
-      (fun (crid, crow) ->
-         cascade_update_col_in_tx
-           tx
-           cat
-           ~visited
-           clock
-           params
-           child_meta
-           ~rowid:crid
-           ~row:crow
-           ~col_idx:child_col_idx
-           ~new_val)
-      child_rows
-  | Cat.FA_set_null ->
-    cascade_update_set_null
-      tx
-      cat
-      visited
-      clock
-      params
-      child_meta
-      fk
-      ~child_col_idx
-      ~child_col_name
-      ~parent_vals_old:all_parent_vals_old
-  | Cat.FA_set_default ->
-    cascade_update_set_default
-      tx
-      cat
-      visited
-      clock
-      params
-      child_meta
-      fk
-      ~child_col_idx
-      ~child_col_name
-      ~parent_vals_old:all_parent_vals_old
+        fk
+        ~child_col_idx
+        ~child_col_name
+        ~parent_vals_old:all_parent_vals_old
+    | Cat.FA_set_default ->
+      cascade_update_set_default
+        tx
+        cat
+        visited
+        clock
+        params
+        child_meta
+        fk
+        ~child_col_idx
+        ~child_col_name
+        ~parent_vals_old:all_parent_vals_old)
 
 (* ON UPDATE SET NULL for one fk's child column. *)
 and cascade_update_set_null

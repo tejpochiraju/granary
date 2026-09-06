@@ -385,3 +385,25 @@ val fts_doclen_scan_ratio : unit -> int
     strategy over the same data and prove the two agree — the choice is a cost
     estimate, never a correctness one, and production code never calls this. *)
 val set_fts_doclen_scan_ratio : int -> unit
+
+(** #765 review round 5, item 2: the FK-check machinery's own decision of
+    whether an index on [child_col_idxs] (ordinals into [columns]) can be
+    trusted for a seek, or must fall back to a full table scan — [Some tys]
+    is "yes, seek with these declared column types"; [None] is "no, scan".
+    A composite FK's declared type is untrustworthy only for a VIRTUAL
+    generated column whose expression is not a top-level [CAST] to its own
+    declared type (see the [.ml] for why that one shape is safe and nothing
+    else is proven to be).
+
+    Exposed only so a test can confirm this decision directly — [Some] vs
+    [None] IS "was the indexed fast path taken", without needing to
+    provoke it through a full DML statement and infer the answer from
+    timing or a wall-clock scaling gate. Production code (the FK RESTRICT
+    and cascade paths) never calls this from outside [exec.ml]; [table_name]
+    is used only to name the table in the parse-error message a malformed
+    GENERATED expression would raise. *)
+val child_index_key_types
+  :  table_name:string
+  -> columns:Granary_encoding.Row.column list
+  -> int list
+  -> Granary_encoding.Row.ty list option
