@@ -429,8 +429,60 @@ things that were tried and rejected) is usually the point.
 - **A cross-numeric JOIN KEY equality matches, in both join executors
   (#743).** #738 fixed this for `col = literal`; the hash join's canonical key
   and the nested-loop probe's typed index seek closed the same gap for `ON
-  l.a = r.b`. The FK child-reference probe has the analogous bug, filed as
-  #755 and deliberately not fixed here.
+  l.a = r.b`. The FK child-reference probe had the analogous bug; fixed
+  separately in #755 (below).
+- **A cross-numeric FK child reference is found by RESTRICT and every
+  cascade action, indexed or not (#755).** `Exec.fk_child_has_ref_multi{,_in_tx}`
+  and `Exec.scan_child_rows_multi_tx` (the latter backs the immediate RESTRICT
+  check AND SET NULL/SET DEFAULT/CASCADE) now seek the child index through
+  `Exec.index_lookup_values`, keyed by the child column's declared type — the
+  same rule #743 gave the nested-loop join probe. A VIRTUAL generated
+  FK-child column is excluded from the indexed fast path
+  (`Exec.child_index_key_types`) because its expression's actual runtime
+  storage class can differ from its declared column type, unlike an ordinary
+  or STORED column (`Row.encode_col_value` enforces that agreement only for
+  those). PR #765's review chased the deferred-recheck path's identity
+  problem twice on the recheck side — `Exec.make_fk_recheck` re-resolving by
+  ordinal (`Exec.fk_ordinal`, stable across `RENAME COLUMN`) then raising
+  loudly instead of silently reporting "not violated" when `DROP COLUMN`
+  left a constraint unresolvable — before a THIRD mutation shape (`DROP
+  COLUMN` then `ADD COLUMN` reusing the identical name) showed that fixing
+  the recheck side can never get ahead of the next mutation shape, because
+  the recheck only ever sees the schema AFTER the mutation. Round 3 fixes
+  it at the source instead: `ALTER TABLE ... RENAME COLUMN` / `DROP COLUMN`
+  now **refuses outright** when the column still has a deferred FK
+  obligation pending in the current transaction (`Exec.fk_obligation_conflict`,
+  consulting `Cat.peek_pending_fk_checks`), matching this project's own
+  conservative-refusal precedent for the structurally identical problem
+  (`ALTER TABLE ... RENAME` refusing when a view/trigger depends on the
+  table, #673/#645). The recheck-side ordinal/loud-failure logic stays as
+  defence in depth. `precheck_update_fk`/`precheck_delete_fk` (the immediate
+  RESTRICT path) also now fail with the same loud, FK-specific message the
+  deferred path already gave, instead of a bare internal `Failure "column
+  not found"`. Round 4 found the same disagreement one layer further down —
+  four CASCADE-dispatch functions (`cascade_delete_fk`, `apply_update_cascade_fk`,
+  `apply_delete_cascade_fk`, `cascade_update_fk`) resolved FK columns with
+  the raw `find_col_idx_by_name{,_opt}` and disagreed with each other and
+  with RESTRICT (a silent no-op, or a bare crash, for the identical
+  corrupted-column condition) — plus a reopened `List.nth_opt` negative-index
+  crash trap in round 3's own new `Exec.fk_obligation_conflict`. All now
+  route through `Exec.resolve_fk_col_idxs` / guard the sentinel explicitly.
+  Round 5 found `cascade_update_fk` was the one FK call site missing the
+  `any_null_val` guard every other one has (reachable via a second-level
+  `ON UPDATE CASCADE` fan-out over a nullable composite FK column — fixed
+  with the same guard, no new logic), and separately narrowed
+  `child_index_key_types`'s blanket VIRTUAL-column disqualification: a
+  VIRTUAL column whose expression is a top-level `CAST` to its own
+  declared type is now trusted like an ordinary column (`Exec.eval_cast`
+  is a total, exhaustive match on the target type, so it GUARANTEES that
+  storage class regardless of the inner expression), closing a
+  performance cliff for a composite FK with one generated helper column
+  without weakening round 1's original fix for the general case.
+  `Exec.child_index_key_types` is now exposed in `exec.mli` so a test can
+  confirm the fast-path/full-scan decision directly. Full write-up —
+  including the residual this does NOT close (`RENAME TABLE`/`DROP TABLE`
+  can still desync a pending check by table name, tracked as #768) — in
+  `docs/DECISIONS.md`.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.

@@ -247,13 +247,14 @@ useful reading order — search for the issue number instead.
   rather than assumed.** One column can never hold both `1` and `1.0`
   (`INSERT 1.0` into an INTEGER column is a sema error), so the UNIQUE
   conflict probe and the index put/del encodings are genuinely unaffected. The
-  **FK child-reference probe is not** — a child column and its parent column
-  may be declared with different numeric types — and it is broken today:
-  `Exec.fk_child_has_ref` seeks the child index with raw bytes when one exists
-  and falls back to a `compare_values` scan when one does not, so an indexed
-  cross-numeric child reference is MISSED and `ON DELETE RESTRICT` orphans the
-  row. Filed as **#755**, deliberately not fixed in #743 (different site, and
-  the cascade paths want auditing with it).
+  **FK child-reference probe was not** — a child column and its parent column
+  may be declared with different numeric types — and was broken as of #743:
+  `Exec.fk_child_has_ref` seeked the child index with raw bytes when one
+  existed and fell back to a `compare_values` scan when one did not, so an
+  indexed cross-numeric child reference was MISSED and `ON DELETE RESTRICT`
+  orphaned the row. Deliberately not fixed in #743 itself (different site, and
+  the cascade paths wanted auditing with it); fixed separately by **#755**,
+  below.
 
   **The one residual #743 could not close was `-0.0`, and it was not #743's —
   fixed by #754, see below.** `Float.compare (-0.) 0.` is `0`, so
@@ -356,6 +357,422 @@ useful reading order — search for the issue number instead.
   Verified by mutation: with promotion restored, four cases in that file fail,
   including both properties. An assertion on a single fixed input order catches
   none of it.
+
+- **A cross-numeric FK child reference is found by RESTRICT and every
+  cascade action, indexed or not (#755, decided 2026-09-05).** The gap #743
+  left open (above): `Exec.fk_child_has_ref_multi_in_tx` (the deferred-recheck
+  path) and `Exec.scan_child_rows_multi_tx` (the shared "locate the child
+  rows" primitive — used not only by the immediate RESTRICT check but by
+  `FA_set_null`, `FA_set_default` and `FA_cascade` on both DELETE and UPDATE)
+  each seeked the child FK index with raw `row_value_to_index_value` bytes, so
+  a parent value of one numeric class and a child column of the other missed
+  each other in the index even though `=` (via `compare_values`, exact since
+  #579/#738) says they are equal. So a cross-numeric-indexed child row was
+  silently skipped by SET NULL/SET DEFAULT/CASCADE too, not just RESTRICT —
+  arguably worse, since nothing raises and a stale FK value is left behind.
+
+  Both functions now resolve the child index's declared column types from
+  `child_meta.Cat.columns` and route the seek through
+  `Exec.index_lookup_values`, keyed by the CHILD column's declared type — the
+  same rule #743 gave the nested-loop join probe. `None` from that translation
+  means "no key of the child column's type can equal this parent value",
+  which for the FK case is the honest "no child row can reference this, so
+  the action is safe" answer, not a reason to fall back to the scan.
+  `Cat.find_index_covering_cols` has exactly two callers in `lib/sql/exec.ml`
+  and both are fixed; `update_col_in_tx` needed no change (it updates an
+  already-located row by rowid, never seeks by value).
+
+  **Two follow-on defects surfaced in PR #765's review, both fixed in the
+  same change rather than filed separately:**
+
+  - **A deferred recheck must not reuse a column ordinal a mid-transaction
+    schema change has invalidated.** `enforce_insert_fk`'s deferred-recheck
+    closure used to capture `child_col_idxs` (an ordinal) at INSERT time and
+    reuse it unchanged when the recheck ran at COMMIT; an `ALTER TABLE ...
+    DROP COLUMN` on the same table before COMMIT, in the same explicit
+    transaction, can shift or invalidate that ordinal by the time the recheck
+    actually runs — reachable as an uncaught `Invalid_argument`/`Failure
+    "nth"`, or a silently wrong column comparison that lets a live reference
+    through as "no match". `Exec.make_fk_recheck` already existed with the
+    correct pattern (used by the UPDATE-side RESTRICT and the general cascade
+    recheck): it re-resolves both column lists **by NAME**
+    (`find_col_idx_by_name_opt`) against the schema fetched fresh AT RECHECK
+    TIME, and if a name no longer resolves (dropped), reports "not violated"
+    — the same "nothing left to enforce" answer a table drop already gives an
+    FK. `enforce_insert_fk` now calls it instead of hand-rolling its own
+    closure with the stale-ordinal bug, which also deleted the duplicate
+    logic.
+  - **A VIRTUAL generated FK-child column's declared type is not a reliable
+    key for the seek.** `Row.encode_col_value` enforces that a column's
+    runtime value tag matches its declared type for every ordinary and
+    STORED-generated column — a mismatch raises there, so it can never reach
+    storage — but a VIRTUAL generated column is always encoded as NULL and
+    recomputed on read (`compute_virtual_generated_cols`) with **no** such
+    check, so its expression's result can be a different storage class than
+    the column declares (e.g. `x REAL GENERATED ALWAYS AS (y) VIRTUAL` where
+    `y` is INTEGER — the index physically holds `IK_int`, never `IK_real`).
+    Seeking by the declared type would then walk a prefix the index never
+    holds, silently treating a real reference as absent — reopening the same
+    failure class for a different reason. `Exec.child_index_key_types`
+    excludes a VIRTUAL generated column from the indexed fast path entirely
+    (returns `None`, meaning "do not trust the index for this seek"), falling
+    back to the scan, which recomputes the row and compares by VALUE
+    regardless of what storage class the index physically holds. No
+    equivalent problem exists for a STORED generated FK-child column, by the
+    `encode_col_value` argument above. This is a narrower instance of a wider,
+    pre-existing and NOT fixed here gap — nothing anywhere casts a GENERATED
+    column's evaluated value to its declared type, so an ordinary indexed
+    `WHERE`/`JOIN` seek against a VIRTUAL generated column with a
+    declared-vs-actual type mismatch has the analogous exposure. Not
+    addressed in #755's scope; worth its own issue if it proves reachable in
+    practice.
+
+  `Exec.seek_index_matches` also factors the seek-and-prefix-walk mechanics
+  the two fixed functions shared near-verbatim into one helper, parameterised
+  by an `on_match` callback that returns whether to stop early (an existence
+  check) or keep collecting (a locate-all scan) — a review cleanliness item,
+  not a correctness one.
+
+  **Round 1's own fix reopened the same failure class one level up — round 2,
+  2026-09-05.** `make_fk_recheck`'s by-NAME re-resolution is exactly right for
+  a `DROP COLUMN` of an unrelated column, but has two further gaps `ALTER
+  TABLE` can open, both filed against the same PR (#765) rather than closed
+  one at a time:
+
+  - **`RENAME COLUMN` desyncs a by-name lookup from the catalog's own
+    already-updated FK metadata.** `Cat.rename_column` rewrites
+    `fk_local_cols`/`fk_parent_cols` in the catalog immediately, but a
+    closure that captured the OLD column name at enqueue time still looks
+    that name up at recheck time — finds nothing, its length check fails,
+    and (round 1's code) reported "not violated": COMMIT silently succeeded
+    despite the parent row never existing. Fixed by identifying the
+    constraint by **ordinal** (`Exec.fk_ordinal`, 0-based position within
+    `child_meta.Cat.fk_constraints`, found by physical equality) instead of
+    by column name. The ordinal survives every schema mutation touching
+    `fk_constraints` in this codebase: `rename_column_body` substitutes
+    names 1:1 via `List.map` (order and length preserved); `drop_column`
+    does not touch `fk_constraints` at all; `alter_add_column`'s inline FK
+    is appended at the list's end. Nothing removes or reorders an existing
+    entry. Re-fetching the constraint by ordinal at recheck time means its
+    `fk_local_cols`/`fk_parent_cols` are already current — the rename is
+    simply reflected in them.
+  - **A composite FK, partially broken by `DROP COLUMN`, must fail loudly,
+    not silently.** `Cat.drop_column` never touches `fk_constraints`, so
+    dropping one column of a two-column FK leaves a genuinely DANGLING name
+    behind — a "this constraint can no longer be evaluated" state, which
+    ordinal identification does not and should not paper over (the ordinal
+    finds the right, still-broken, constraint record). `make_fk_recheck`'s
+    column-count mismatch now raises instead of returning "not violated",
+    matching the immediate enforcement path's own established behaviour for
+    the identical condition (`Exec.enforce_insert_fk`'s "some local columns
+    not found in table"). Deferred and immediate now agree, which is what
+    this whole PR has been chasing at every turn.
+
+  **Round 2 chose the targeted fix over a structural one — and round 3
+  showed why that choice does not scale, 2026-09-05.** Round 2's own
+  write-up (preserved above for the record) declined refusing the mutation
+  outright, reasoning that the pending-FK-check queue held an opaque
+  closure with no table/column metadata a mutation site could inspect, and
+  that the targeted recheck-side fix closed both round-2 findings with no
+  new design surface. Round 3 found a THIRD mutation shape past the same
+  recheck-side approach: `DROP COLUMN pid` followed by `ADD COLUMN pid TEXT
+  DEFAULT 'x'` reintroduces the name `pid`, pointing at a semantically
+  unrelated column — `make_fk_recheck`'s name/ordinal resolution succeeds
+  (the name resolves, the column COUNT is unchanged), so it silently
+  compares the wrong column's value and reports whichever verdict that
+  produces. **The pattern across all three rounds is that a recheck-side
+  fix can only ever close the mutation shape that prompted it, because the
+  recheck runs AFTER the mutation and has no way to know what the schema
+  used to look like.** Fixing it a fourth time on the recheck side would
+  only buy time until a fourth shape.
+
+  So round 3 does what round 2 considered and declined: `ALTER TABLE ...
+  RENAME COLUMN` / `DROP COLUMN` now REFUSE outright when the column still
+  has a deferred FK obligation pending in the CURRENT transaction, matching
+  `ALTER TABLE ... RENAME`'s own existing refusal when a view or trigger
+  depends on the table (#673/#645) — conservative by the same reasoning:
+  refusing a mutation that might have been harmless is cheaper than
+  attempting one that silently corrupts. What made this newly tractable
+  where round 2 judged it too invasive: the queue does not need a redesign,
+  only two more fields. `Cat.pending_fk_check` gained `pfk_child_table` and
+  `pfk_fk_ordinal` — the exact identity `Exec.make_fk_recheck` already
+  derives for its own resolution — carried ALONGSIDE the opaque
+  `pfk_recheck` closure rather than replacing it, and a new
+  `Cat.peek_pending_fk_checks` (non-destructive, unlike `drain_...`) lets a
+  mutation site read the queue without disturbing what COMMIT still needs
+  to run. `Exec.fk_obligation_conflict` walks that list, re-resolving each
+  pending check's constraint FRESH by ordinal (the same call
+  `make_fk_recheck` makes) to ask "does this constraint, AS IT STANDS RIGHT
+  NOW, still name the column this ALTER is about to touch, as either its
+  local or its parent side" — deliberately fresh rather than trusting
+  anything captured at enqueue time, for the same reason `fk_ordinal`
+  beat column names in round 2.
+
+  **Deliberately narrow, and the boundary is worth stating precisely.**
+  Only `RENAME COLUMN` and `DROP COLUMN` call the new check. `ADD COLUMN`
+  needs no check of its own: the only way it could reintroduce a column a
+  pending obligation cares about is if an earlier statement in the SAME
+  transaction dropped that very column, and that drop is exactly what is
+  now refused — there is no live conflict left for `ADD COLUMN` to walk
+  into. Two residuals are named rather than silently left:
+  - This closes the mid-transaction race, not `Cat.drop_column`'s standalone
+    corruption (filed separately, #767): a `DROP COLUMN` with NO deferred
+    check pending still succeeds and still leaves a dangling name in
+    `fk_constraints` forever, exactly as before. That gap is wider than this
+    PR's transaction-scoped remit and was correctly scoped out in round 2's
+    own write-up; round 3 does not reopen that scoping decision.
+  - `ALTER TABLE ... RENAME TO` (the whole TABLE) and `DROP TABLE` are OUT
+    of round 3's stated scope (RENAME COLUMN / DROP COLUMN / ADD COLUMN) and
+    can still desync a pending check by TABLE name the same way a column
+    rename used to: `make_fk_recheck`'s `Cat.find_table_cached` returning
+    `None` reports "not violated" — the identical silent-wrong-answer shape
+    round 2's RENAME COLUMN finding had, one level up. Not fixed here; worth
+    a future issue if it proves reachable, the same way #767 was filed
+    rather than folded in.
+
+  Item 2, fixed the same round regardless of which fix shape was chosen for
+  item 1: `precheck_update_fk`/`precheck_delete_fk` (the IMMEDIATE
+  RESTRICT precheck) were still reaching `Exec.find_col_idx_by_name`'s bare
+  `Failure "column not found: <name>"` on a corrupted constraint — reachable
+  via #767's standalone corruption, since nothing prevents that outside a
+  pending obligation — while `Exec.make_fk_recheck` (the DEFERRED path)
+  already raised a loud, FK-specific message for the identical condition
+  since round 2. New `Exec.resolve_fk_col_idxs` gives both immediate
+  functions the same graceful check `Exec.enforce_insert_fk` already had for
+  its own INSERT-side lookup: deferred and immediate now agree on every FK
+  column-resolution failure, not just the ones round 1 and round 2 happened
+  to touch.
+
+  Item 3, also independent of the structural-vs-targeted choice:
+  `make_fk_recheck`'s `List.nth_opt child_now.Cat.fk_constraints fk_ordinal`
+  raises `Invalid_argument "List.nth"` for a NEGATIVE index rather than
+  answering `None` — it only degrades gracefully for an out-of-range
+  POSITIVE one. Every caller falls back to the sentinel `-1` if
+  `Exec.fk_ordinal` somehow returns `None` (which should never happen: every
+  caller passes an `fk` literally drawn from the list `fk_ordinal` searches),
+  so this was a crash trap for an unreachable-in-practice case, in code whose
+  whole design intent is graceful, loud handling. `make_fk_recheck` now
+  guards `fk_ordinal < 0` explicitly and raises a clear internal-error
+  message instead of letting `List.nth` blow up if the sentinel is ever hit.
+
+  Also cleaned up in round 2, still true after round 3: the three
+  near-identical `List.for_all2 (fun ci pv -> compare_values row.(ci) pv =
+  0)` closures (`seek_index_matches`'s per-candidate check and both
+  functions' full-scan fallback) are one `Exec.fk_cols_match`; the NULL
+  check in both functions runs BEFORE `Cat.find_index_covering_cols` and
+  `child_index_key_types` (two `Array.of_list` builds) rather than after;
+  and `child_index_key_types`'s comment no longer claims an out-of-range
+  ordinal "degrades to the scan instead of crashing" — the fallback scan's
+  own predicate indexes the same ordinal and would crash identically, one
+  step later. What actually rules a stale ordinal out is
+  `make_fk_recheck`'s fresh resolution, not that function's own (still
+  worthwhile, still total) bounds check.
+
+  Pinned by `test/test_fk_cross_numeric_755.ml`: the issue's own repro, the
+  un-indexed regression guard, the reversed type order, a same-type
+  no-false-refusal case, both cascade actions found in the audit (SET NULL,
+  CASCADE), the VIRTUAL generated FK-child column repro, a WITHOUT ROWID
+  child-table repro, a 200-case QCheck property tying RESTRICT's refusal to
+  genuine cross-numeric reference existence (indexed or not), and — for
+  round 3 — the ALTER TABLE refusal itself (RENAME and DROP of a
+  pending-FK column; the DROP-then-ADD-same-name shape refused at its
+  first statement), a NO-OVER-REFUSAL case (renaming an unrelated column on
+  a table with an unrelated pending check still succeeds), and both
+  immediate-path loud-failure cases (item 2). Round 1 and round 2's own
+  DROP-COLUMN/RENAME-COLUMN mid-transaction tests were REWRITTEN rather than
+  kept as-is once round 3 landed: the ALTER itself now fails before COMMIT
+  is ever reached, so a test asserting "COMMIT still refuses/allows"
+  no longer exercises anything — asserting the ALTER's own refusal is the
+  version of that test that means something post-round-3.
+  Verified by reverting to the pre-round-N code at each round (a WIP commit,
+  checked out and restored — not `git stash`): round 1's DROP COLUMN test
+  failed with the predicted `Invalid_argument("index out of bounds")` and
+  the VIRTUAL generated-column test failed by wrongly allowing the DELETE;
+  round 2's RENAME COLUMN and composite-drop tests failed against round 1's
+  code exactly as predicted (a silent COMMIT success, and a silent "not
+  violated" respectively); round 3's five new/rewritten cases failed against
+  round 2's code as predicted (the ALTER succeeding when it should have been
+  refused, and the immediate path's bare "column not found" instead of a
+  loud FK message).
+
+  **Round 4 found the same disagreement one layer further down — the
+  CASCADE-application functions, not just the RESTRICT paths — and a
+  reopened crash trap in round 3's own new function, 2026-09-05.** Every
+  fix through round 3 converged the RESTRICT surface — `make_fk_recheck`
+  (deferred), `precheck_update_fk`/`precheck_delete_fk` (immediate) — on
+  one behaviour for a corrupted column: fail loudly with an FK-specific
+  message. Round 4's review found four CASCADE-dispatch functions never
+  got the same treatment, and disagreed with each other as well as with
+  RESTRICT:
+  - `cascade_delete_fk` (the NESTED cascade dispatch, reached when a
+    CASCADE recursively deletes a further child's own children) used
+    `find_col_idx_by_name_opt` and, on a miss, **silently `Lwt.return_unit`**
+    — the cascade action (SET NULL/SET DEFAULT/CASCADE/RESTRICT) never
+    runs, nothing raised. Worse than RESTRICT's own loud refusal for the
+    identical condition, and the literal "nothing errors" failure mode
+    this issue's own cascade-path audit (#755's original diff) called out
+    for the cross-numeric bug — reopened here for the corrupted-column
+    case instead.
+  - `apply_update_cascade_fk` / `apply_delete_cascade_fk` (the TOP-LEVEL
+    cascade dispatch for a direct child of the row being updated/deleted)
+    and `cascade_update_fk` (the nested UPDATE-side sibling of
+    `cascade_delete_fk`, plus its `cascade_update_set_null`/
+    `cascade_update_set_default` call chain) all used the raw, crashing
+    `find_col_idx_by_name` — a bare `Failure "column not found: <name>"`
+    with no FK context, a third behaviour for the same condition.
+
+  All four (and, as a non-blocking cleanup folded in the same round since
+  it was cheap, `enforce_insert_fk`'s own inline resolution, which
+  predated `resolve_fk_col_idxs` and duplicated its logic with a
+  slightly different message) now go through `Exec.resolve_fk_col_idxs`
+  — one behaviour for "an FK column can no longer be resolved," everywhere
+  in the FK surface, deferred or immediate, RESTRICT or CASCADE.
+
+  **A second, independent finding in the same round: `fk_obligation_conflict`
+  (round 3's own new function) reopened round 3's `make_fk_recheck`
+  crash trap in the function that was supposed to prevent needing it.**
+  `List.nth_opt child_now.Cat.fk_constraints chk.Cat.pfk_fk_ordinal` raises
+  `Invalid_argument` for a NEGATIVE index rather than answering `None` —
+  the identical gap `make_fk_recheck` guards against explicitly — and
+  every `pfk_fk_ordinal` can be the `-1` sentinel if `Exec.fk_ordinal`
+  ever fails to resolve at enqueue time. Reachable (in principle) from
+  ANY `RENAME COLUMN`/`DROP COLUMN` in a transaction that shares the
+  queue with one corrupted pending check, crashing an otherwise-unrelated
+  ALTER instead of refusing it. Guarded the same way: check
+  `pfk_fk_ordinal < 0` first and treat it as "no conflict from this
+  entry" (this pending check can never be resolved either way, so it
+  cannot be the reason to refuse someone else's ALTER).
+
+  Neither finding needed a structural-vs-targeted reassessment — both are
+  "make an existing loud-failure convention apply somewhere it was missed"
+  and "add the same defensive guard a sibling function already has,"
+  not a new mutation shape past the round-3 refusal.
+
+  Pinned by four new `test/test_fk_cross_numeric_755.ml` cases, one per
+  CASCADE-dispatch function, each reached via #767's same standalone
+  autocommit `DROP COLUMN` (no pending check, so round 3's refusal does
+  not intervene): `apply_delete_cascade_fk_fails_loudly` and
+  `apply_update_cascade_fk_fails_loudly` hit the two top-level dispatch
+  functions directly; `cascade_delete_fk_fails_loudly_not_silently` and
+  `cascade_update_fk_fails_loudly` reach the two NESTED dispatch functions
+  by building a two-level cascade chain (`p -> m -> c`, corrupting `c`'s
+  column) so the recursive call actually exercises them rather than the
+  top-level pair. `fk_obligation_conflict`'s negative-ordinal guard is
+  deliberately NOT given a dedicated SQL-level test, for the same reason
+  `make_fk_recheck`'s round-3 sibling guard was not: both `fk_ordinal` and
+  `fk_obligation_conflict` are private to `exec.ml` (no `val` in
+  `exec.mli`), and forcing the `-1` sentinel from outside the module would
+  need either a test-only seam into private state or a schema-corruption
+  bug this PR's own `fk_ordinal` (physical-equality lookup against a list
+  every caller draws its argument from) rules out by construction. All
+  four new cases verified to fail against the pre-round-4 code exactly as
+  predicted (a WIP commit, checked out and restored — not `git stash`):
+  the silent-no-op case for `cascade_delete_fk` and the bare
+  `Failure "column not found: <name>"` for the other three.
+
+  **Round 5 found one more disagreement in the surviving raw NULL handling,
+  and — separately — that round 1's blanket VIRTUAL-column disqualification
+  was safe but overly conservative, 2026-09-06.**
+
+  `cascade_update_fk` was the one FK call site in this file still missing
+  the `any_null_val` guard every other one has before scanning for
+  matching child rows. `compare_values` (which `fk_cols_match`'s
+  full-scan fallback uses) treats `[V_null, V_null]` as equal — structural
+  equality for ordering, correct for that purpose — but that is NOT the
+  FK reference rule: a NULL component means the row never matched
+  anything under three-valued logic, so scanning for it can wrongly
+  cascade into a child row that merely holds NULL in the same column
+  too, not one that ever actually referenced the parent. Reachable
+  through a SECOND-LEVEL `ON UPDATE CASCADE` fan-out where the parent's
+  own reference uses one column and its child's reference to it is a
+  DIFFERENT, composite pair with a NULL member — `m`'s reference to `p`
+  via `pa` alone, `c`'s reference to `m` via `(pa, qb)` where `qb` is
+  NULL: when `p`'s cascade changes `m.pa`, `cascade_update_fk` computes
+  `m`'s OLD `(pa, qb)` to find `c`'s matching rows, and without the
+  guard a `c` row with `(ca, cb) = (pa_old, NULL)` gets swept in even
+  though its own NULL `cb` meant it was never validly checked at INSERT
+  time either. Fixed with the identical `any_null_val` guard
+  `cascade_delete_fk`/`apply_update_cascade_fk`/`apply_delete_cascade_fk`
+  already had — a small, consistent addition, not new logic.
+
+  Separately: `child_index_key_types` disqualified the indexed fast path
+  for the WHOLE composite key if ANY single column was VIRTUAL, even with
+  a covering index and otherwise-ordinary columns — a composite FK with
+  one generated helper column lost the index entirely, the exact
+  performance cliff this PR exists to avoid. VIRTUAL columns are
+  ordinarily indexable in this engine (nothing in the index-build path
+  refuses one); round 1's disqualification was about trusting the
+  DECLARED type as the physical index-key storage class, not about
+  VIRTUAL columns being unindexable in general. The round-1 concern is
+  real whenever the generated expression's result can differ in storage
+  class from the column's declaration (`x REAL GENERATED ALWAYS AS (y)
+  VIRTUAL` where `y` is INTEGER stores `IK_int`, not `IK_real`) — but one
+  shape is PROVABLY safe regardless: a top-level `CAST(_ AS ty)` where
+  `ty` matches the column's own declared type. `Exec.eval_cast` (the
+  interpreter for `Plan.P_cast`) is a total, exhaustive match on the
+  target type — every non-NULL branch for `Ast.Ty_real` returns
+  `Row.V_real`, every branch for `Ast.Ty_int` returns `Row.V_int`, and so
+  on — so a CAST to the column's own type GUARANTEES that storage class
+  no matter what the inner expression would otherwise have produced.
+  New `Exec.virtual_col_cast_matches_declared_type` checks for exactly
+  that shape (parses the GENERATED expression via the existing
+  `compile_generated_expr` cache, so repeated checks are cheap); a
+  VIRTUAL column matching it is now trusted like an ordinary column,
+  and only a VIRTUAL column WITHOUT that guarantee still disqualifies
+  the seek — still for the WHOLE composite key, since a B-tree seek
+  needs every prefix column translated together, not some of them.
+  Proving anything past a bare CAST safe (arithmetic, a bare column
+  reference, a function call) would need real static type inference
+  over the expression grammar, which this engine does not have and does
+  not try to approximate here — deliberately narrow, not a general
+  VIRTUAL-column type-inference feature.
+
+  `child_index_key_types` and its new helper were also changed to take
+  `~table_name`/`~columns` rather than a full `Cat.table_meta` (the
+  `storage`/`fk_constraints` fields were never used), and
+  `child_index_key_types` is now exposed in `exec.mli` — purely so a test
+  can ask the fast-path/full-scan question directly (`Some` vs `None`
+  IS the answer to "was the index trusted"), rather than needing to
+  infer it from timing or a new `GRANARY_BENCH_*` scaling gate.
+
+  Pinned by five more `test/test_fk_cross_numeric_755.ml` cases:
+  `cascade_update_fk_does_not_cascade_a_null_composite_match` builds the
+  `p -> m -> c` second-level fan-out above and asserts `c`'s row is
+  untouched while `m`'s own cascade still applies correctly;
+  `child_index_key_types_trusts_cast_matched_virtual_column` and
+  `child_index_key_types_still_declines_uncast_mismatched_virtual_column`
+  call the newly-exposed function directly (`Some [...]` for a
+  CAST-matched composite key, `None` for round 1's own uncast repro,
+  pinning that the narrowing does not weaken it); and
+  `indexed_cast_matched_virtual_composite_fk_restrict_refuses` confirms
+  end-to-end that the narrowed rule does not break RESTRICT's
+  correctness for the case it newly trusts. Verified against the
+  pre-round-5 code (a WIP commit, checked out and restored — not `git
+  stash`): the NULL-guard case failed exactly as predicted (`c`'s row
+  wrongly cascaded); the two `child_index_key_types` unit tests could not
+  even be built against the pre-round-5 `exec.mli` (the function did not
+  exist to call), which is itself the strongest possible confirmation
+  that the capability was genuinely new.
+
+  **Round 6 re-confirmed round 5's fixes and closed with no new blocking
+  code issue, but named a compatibility cost of round 4's own fix worth
+  recording, 2026-09-06.** Round 4's fix of `cascade_delete_fk` (silent
+  no-op → `Lwt.fail_with` on an unresolvable FK column, above) and the
+  equivalent fix in `make_fk_recheck` (silent "not violated" →
+  `Lwt.fail_with`, round 3's own write-up) both now raise on the
+  pre-existing, out-of-scope corruption class `Cat.drop_column` can leave
+  behind (#767: a standalone `DROP COLUMN` with no pending obligation
+  still leaves a dangling `fk_constraints` entry, forever). Loud beats
+  silently wrong, but it is not free: a table already corrupted by #767 —
+  where an unrelated DELETE/UPDATE used to succeed with the cascade
+  silently skipped — now has every DML statement that reaches that
+  cascade dispatch fail outright, with no repair path short of recreating
+  the table. Anyone upgrading a deployment with pre-existing
+  #767-corrupted on-disk state should read this as the compatibility note
+  it is, not a new defect it introduces. Round 6 also produced a concrete
+  repro for the `RENAME TABLE`/`DROP TABLE` residual round 3 named above
+  (#768) — no new action follows; it stays the same already-filed,
+  already-scoped-out gap, just no longer hypothetical.
 
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does

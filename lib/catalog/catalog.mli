@@ -54,6 +54,14 @@ type pending_fk_check =
 
         Returns true if STILL violated; false if the violation has been
         resolved (e.g. parent row now exists, child row now deleted). *)
+  ; pfk_child_table : string
+    (** The CHILD table's name, naming the FK constraint alongside
+        [pfk_fk_ordinal] so a schema-mutation site can identify which
+        constraint this check depends on without invoking [pfk_recheck]. *)
+  ; pfk_fk_ordinal : int
+    (** The constraint's 0-based position within [pfk_child_table]'s
+        [fk_constraints], stable across a [RENAME COLUMN] or [DROP COLUMN]
+        elsewhere in the same transaction (see [Exec.fk_ordinal]). *)
   }
 
 type storage =
@@ -970,6 +978,14 @@ val clear_pending_fk_checks : t -> unit
 
 (** Peek at the current pending FK check count (debugging/tests). *)
 val pending_fk_check_count : t -> int
+
+(** A non-destructive read of the pending FK check list, in enqueue order —
+    unlike {!drain_pending_fk_checks}, does not clear it. Lets an ALTER TABLE
+    mutation site check whether a column it would touch still has a
+    deferred FK obligation pending in the current transaction, without
+    disturbing the checks a later COMMIT still needs to run (#765 review
+    round 3). *)
+val peek_pending_fk_checks : t -> pending_fk_check list
 
 (** Underlying store handle. Exposed so subsystems (FK deferred rechecks)
     can open their own RO snapshots without threading the store through

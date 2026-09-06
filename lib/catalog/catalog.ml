@@ -80,6 +80,15 @@ type pending_fk_check =
   ; pfk_rowid : int64
   ; pfk_message : string
   ; pfk_recheck : pending_fk_recheck
+  ; pfk_child_table : string
+    (** #765 review round 3: the CHILD table's name and the FK constraint's
+        ordinal within its [fk_constraints] -- the same identity
+        [Exec.make_fk_recheck] resolves fresh at COMMIT via [Exec.fk_ordinal]
+        -- carried alongside the opaque [pfk_recheck] closure so a
+        schema-mutation site (ALTER TABLE) can ask "does a pending
+        obligation still need this column" WITHOUT invoking the closure
+        (which runs the actual re-check, not a query). *)
+  ; pfk_fk_ordinal : int
   }
 
 type storage =
@@ -4524,6 +4533,13 @@ let drain_pending_fk_checks t =
 
 let clear_pending_fk_checks t = t.pending_fk_checks <- []
 let pending_fk_check_count t = List.length t.pending_fk_checks
+
+(** #765 review round 3: a non-destructive read of the pending queue, in
+    enqueue order -- unlike {!drain_pending_fk_checks}, this does not clear
+    it. Lets an ALTER TABLE mutation site ask "is anything pending" without
+    disturbing the checks a later COMMIT still needs to run. *)
+let peek_pending_fk_checks t = List.rev t.pending_fk_checks
+
 let store t = t.store
 
 [@@@ai_disclosure "ai-generated"]
