@@ -579,6 +579,23 @@ things that were tried and rejected) is usually the point.
   the #674 covering-index MIN/MAX fast path (the index key can no longer
   carry the true sign of a decoded zero, so that path now falls back to
   fetching the row instead of answering `+0.0` for a stored `-0.0` minimum).
+- **OCaml row-mutation hooks (`Db.register_row_hook`) share one registry
+  across every handle over a store, and every rollback-undo in it merges
+  rather than replaces (#752).** `Store.row_hooks` lives on `Store.t`, not
+  `Db.t` (mirrors `rowid_counters`/`rv_generations`, #633/#757), so a hook
+  registered, fired, purged (`DROP TABLE`) or migrated (`RENAME`) is
+  consistent across `create_worker_handle` siblings. `row_hook_unregister`,
+  `row_hooks_purge_table` and `move_row_hook_key` each had the identical
+  blind-snapshot-replace rollback-undo bug, fixed one at a time across two
+  review rounds — a concurrent sibling registration landing on the same key
+  in the DDL-visibility window (#589/#633) must never be lost or misfiled by
+  a later `ROLLBACK`'s undo. A hook's own nested DML with no already-open
+  explicit transaction now fails fast with a clear error instead of
+  deadlocking on the non-reentrant writer lock (#740) — detected via a
+  dynamic-extent marker (`Lwt.with_value`), not a store-wide counter, so an
+  unrelated sibling statement merely queued behind the same lock is not
+  mistaken for the genuine self-deadlock case. Full detail, including a
+  known-accepted fire-order residual (#769), in `docs/DECISIONS.md`.
 
 ## Repository structure
 

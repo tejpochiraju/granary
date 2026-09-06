@@ -241,12 +241,29 @@ val row_hooks_purge_table : row_hooks -> string -> unit -> unit
 (** Move every hook registered on [old_name] to [new_name], for every
     (timing, event), and return a closure that reverses exactly that move.
     A no-op (returning a no-op closure) if the two names are equal.
+
+    {b The reverse move is restricted to exactly the entries the forward
+    move actually moved, merged into whatever the destination key holds at
+    undo time — never a blind replace (#752 review round 6, item 1).}
     [ALTER TABLE ... RENAME] refuses a target name that already names a
-    table, so nothing can already be registered at [new_name] when this
-    runs — the reverse move's own idempotence follows from the same fact
-    {!row_hook_unregister} relies on: the second run finds its source key
-    already empty. Used by every RENAME-TABLE execution path — see
-    [Sql.Exec.execute_alter_table]. *)
+    table, so nothing can already be registered at [new_name] when the
+    FORWARD move runs — but a sibling handle can still see [new_name] as
+    live before this transaction commits (the documented DDL-visibility
+    leak, #589/#633) and register a hook directly against it while the
+    rename's transaction is still open. A ROLLBACK then replays this
+    function's returned closure with the names swapped; grabbing "whatever
+    is currently at [new_name]'s key" at that point — as an earlier
+    revision did — would sweep the sibling's brand-new, unrelated
+    registration back onto [old_name] along with the entries that
+    genuinely moved, misfiling it under a table name it never named (full
+    veto power included, for a [`Before] hook). Restricting the reverse to
+    the ids the forward call actually moved, and merging rather than
+    replacing at the destination, is the same fix round 5 applied to
+    {!row_hook_unregister} and {!row_hooks_purge_table} for the identical
+    reason — the reverse move's idempotence still follows from the same
+    fact {!row_hook_unregister} relies on: replaying it a second time finds
+    none of the originally-moved ids left at the source key. Used by every
+    RENAME-TABLE execution path — see [Sql.Exec.execute_alter_table]. *)
 val row_hooks_migrate_table
   :  row_hooks
   -> old_name:string
@@ -279,6 +296,27 @@ val row_hook_depth_incr : row_hooks -> unit
 (** Decrement {!row_hook_depth} by one — call (under [Lwt.finalize], so it
     runs even if the body raised) after a row hook's body returns. *)
 val row_hook_depth_decr : row_hooks -> unit
+
+(** Run [f] tagged, for its whole dynamic extent (every synchronous and
+    asynchronous continuation it creates, via [Lwt.with_value]), as
+    "executing inside a row hook callback fired for [t]" (#752 review round
+    6, item 2). {!rw_begin} consults this tag to refuse — immediately, with a
+    clear error — a hook's own nested attempt to open a SECOND write
+    transaction on the SAME store while the transaction that fired it is
+    still open, which would otherwise deadlock: the writer lock
+    (non-reentrant, #740) is released only by that outer transaction's
+    commit/rollback, and the outer transaction cannot reach its
+    commit/rollback until this nested call returns.
+
+    Deliberately a dynamic-extent tag, not a plain counter like
+    {!row_hook_depth}: two logically independent statements can be
+    interleaved by the Lwt scheduler on the same store (sibling handles,
+    #589), and a bare "is any hook firing anywhere on this store" flag
+    cannot tell an ordinary, unrelated writer legitimately queued behind the
+    writer lock from the one case that is a genuine self-deadlock. [Db]'s
+    [fire_ocaml_row_hook] is the sole caller, wrapping its call to the
+    hook's own [fn]. *)
+val run_in_row_hook_scope : t -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
@@ -477,7 +515,15 @@ val ro_begin_as_of : t -> History.target -> ro txn Lwt.t
 exception History_error of error
 
 (** Begin a read-write transaction. Only one RW txn may be active at a
-    time; this call blocks until the previous one commits or rolls back. *)
+    time; this call blocks until the previous one commits or rolls back.
+
+    {b Refuses immediately, rather than blocking forever, when called from
+    inside a row hook callback that is itself still running as part of an
+    outer, not-yet-committed write transaction on THIS store (#752 review
+    round 6, item 2).} See {!run_in_row_hook_scope}'s doc comment for why —
+    in short, the outer transaction's own writer-lock release is
+    unreachable until this nested call returns, so blocking on the lock
+    here would never resolve. *)
 val rw_begin : t -> rw txn Lwt.t
 
 (** Commit a read-write transaction, making its mutations durable. *)

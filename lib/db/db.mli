@@ -1216,6 +1216,39 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
     store is still counted as the same recursion, so a chain that alternates
     handles cannot nest past the cap by splitting its frames across them.
 
+    {b Nested DML that would need a FRESH write transaction on this store
+    fails immediately, rather than hanging, and the fix is what this
+    paragraph exists to spell out (#752 review round 6, item 2).} [fn]
+    running is itself part of the write transaction that fired it, still
+    open (not yet committed) and still holding this store's writer lock —
+    the same lock any DML on this store must acquire. If [fn] calls
+    {!execute}/{!execute_change_count}/{!query} — on this [t], or on a
+    {!create_worker_handle} sibling sharing this store — WITHOUT an explicit
+    transaction already open on that handle, the call computes autocommit
+    mode and tries to open a brand-new write transaction, which needs the
+    very lock the still-running outer statement already holds. Because that
+    lock is deliberately not re-entrant (#740), and because the outer
+    transaction cannot reach its own commit/rollback (which is what would
+    release the lock) until this nested call returns, that nested call would
+    block forever with no way to ever unblock — a genuine, guaranteed
+    self-deadlock, not a timing-dependent one. [Store.rw_begin] now detects
+    this specific shape and refuses immediately with a descriptive
+    [Failure] (surfacing as a {!Runtime} error) instead of hanging.
+
+    {b The safe pattern: open the transaction BEFORE the statement that
+    fires the hook, so the hook's nested DML reuses it.} [BEGIN]; the
+    statement that will fire the hook; inside the hook body, further
+    {!execute} calls on the SAME already-open handle (or a sibling sharing
+    that same explicit transaction) join that transaction instead of trying
+    to start a new one, and are safe — this is the documented recursion
+    path just above, and how every nested-DML test in this feature's test
+    suite is written. A hook that always needs a transaction of its own,
+    with no ambient one to join, cannot safely perform autocommit nested DML
+    from inside its own firing and must be restructured — e.g. deferring
+    that work until after the firing statement's transaction has
+    committed — rather than attempting a fresh [BEGIN] or an autocommit
+    write from inside the callback.
+
     {b A hook that raises is treated exactly like one that returns [Error]
     (#752 review).} [fn]'s documented failure path is [Error msg], but a hook
     that raises an OCaml exception instead ([Not_found], a failed pattern

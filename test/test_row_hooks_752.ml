@@ -912,6 +912,128 @@ let test_purge_rollback_does_not_clobber_a_concurrent_registration () =
       !fired_new)
 ;;
 
+(* #752 (review round 6, item 1) -- see [move_row_hook_key]'s doc comment in
+   store.ml. Constructed directly against the Store-level primitive,
+   mirroring the round-5 concurrent-registration tests above but for the
+   third sibling function (move, not unregister/purge): register a hook
+   under "Foo", forward-migrate it to "Bar" (mirroring what
+   [ALTER TABLE ... RENAME] does), have a DIFFERENT hook register directly
+   on "Bar" -- simulating the sibling handle that can see "Bar" as live
+   before the rename's transaction commits (#589/#633) -- then replay the
+   migration's undo (as a ROLLBACK does). The sibling's hook must still be
+   registered under "Bar"; it must never be swept onto "Foo", a table name
+   it never named. *)
+let test_rolled_back_rename_does_not_steal_a_concurrent_registration_at_the_target () =
+  let store = Store.create () in
+  let noop_fn (_ : Store.row_mutation) = Lwt.return (Ok ()) in
+  let reg = Store.row_hooks store in
+  let moved_id =
+    Store.row_hook_register reg ~table:"Foo" ~timing:`After ~event:`Insert noop_fn
+  in
+  let undo = Store.row_hooks_migrate_table reg ~old_name:"Foo" ~new_name:"Bar" in
+  (* The sibling's concurrent registration, landing directly on the rename's
+     target name while the renaming transaction is (per the repro) still
+     open. *)
+  let sibling_id =
+    Store.row_hook_register reg ~table:"Bar" ~timing:`After ~event:`Insert noop_fn
+  in
+  (* ROLLBACK replays the migration's undo. *)
+  undo ();
+  let at_foo = Store.row_hook_fire_list reg ~table:"Foo" ~timing:`After ~event:`Insert in
+  let at_bar = Store.row_hook_fire_list reg ~table:"Bar" ~timing:`After ~event:`Insert in
+  Alcotest.(check (list int))
+    "the originally-migrated hook is restored under the original name"
+    [ moved_id ]
+    (List.map fst at_foo);
+  Alcotest.(check (list int))
+    "the sibling's hook, registered directly on the target name, is NOT stolen onto the \
+     original name"
+    [ sibling_id ]
+    (List.map fst at_bar)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Reentrant-write guard (review round 6, item 2)                        *)
+(* ------------------------------------------------------------------ *)
+
+(* Before this fix, a hook's own nested [Db.execute] with no explicit
+   transaction open computed autocommit mode and tried to open a SECOND
+   write transaction on the same store while the statement that fired the
+   hook still held the writer lock -- not re-entrant (#740) -- and hung
+   forever. [Store.rw_begin] now refuses immediately instead. This test
+   would never have terminated before the fix; terminating at all is part
+   of what it proves (a test that can hang is not acceptable here). *)
+let test_reentrant_autocommit_nested_dml_fails_fast_instead_of_hanging () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    let nested_result = ref None in
+    let h =
+      attach db ~table:"t" ~timing:`After ~event:`Insert (fun _ ->
+        let open Lwt.Syntax in
+        (* No BEGIN anywhere -- the statement that fires this hook is itself
+           autocommit, so this nested INSERT has no open explicit
+           transaction to join and must attempt a fresh one. *)
+        let* r = exec_ok_lwt db "INSERT INTO t VALUES (2)" in
+        nested_result := Some r;
+        Lwt.return r)
+    in
+    exec_error db ~needle:"refused" "INSERT INTO t VALUES (1)";
+    (match !nested_result with
+     | Some (Error msg) ->
+       Alcotest.(check bool)
+         (Printf.sprintf "the nested write's own error mentions the refusal (got %S)" msg)
+         true
+         (let nl = String.length "refused"
+          and hl = String.length msg in
+          let rec go i =
+            i + nl <= hl && (String.sub msg i nl = "refused" || go (i + 1))
+          in
+          go 0)
+     | Some (Ok ()) ->
+       Alcotest.fail "expected the reentrant nested write to fail, not succeed"
+     | None -> Alcotest.fail "expected the hook's nested Db.execute to run and report");
+    (* The whole outer statement -- primary write included -- rolled back
+       with the hook's [Error], and the attempted nested write never got far
+       enough to write anything either (rw_begin refused before touching the
+       tree). Detach the hook before proving the connection still works:
+       otherwise this next INSERT would refire the very same failing hook. *)
+    Db.unregister_row_hook db h;
+    exec db "INSERT INTO t VALUES (3)";
+    Alcotest.(check (list string))
+      "nothing from the failed attempt persisted, and the connection still works \
+       afterwards -- the refusal did not wedge the writer lock the way an actual \
+       deadlock would have"
+      [ "3" ]
+      (texts db "SELECT * FROM t"))
+;;
+
+(* The sibling-handle variant of the same hazard: a worker-handle sibling's
+   autocommit nested DML shares the SAME store, and therefore the SAME
+   writer lock, as the handle whose statement fired the hook. Previously
+   documented (see
+   [test_row_hook_recursion_limit_is_shared_across_sibling_handles]'s own
+   comment) as "cannot be constructed without deadlocking." It can be
+   constructed now, because it no longer deadlocks -- it fails fast. *)
+let test_reentrant_autocommit_nested_dml_across_sibling_handles_fails_fast () =
+  with_db (fun a_db ->
+    exec a_db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    let b_db = run (Db.create_worker_handle a_db) in
+    let nested_result = ref None in
+    let _h =
+      attach a_db ~table:"t" ~timing:`After ~event:`Insert (fun _ ->
+        let open Lwt.Syntax in
+        let* r = exec_ok_lwt b_db "INSERT INTO t VALUES (2)" in
+        nested_result := Some r;
+        Lwt.return r)
+    in
+    exec_error a_db ~needle:"refused" "INSERT INTO t VALUES (1)";
+    match !nested_result with
+    | Some (Error _) -> ()
+    | Some (Ok ()) ->
+      Alcotest.fail "expected the sibling's reentrant write to fail, not succeed"
+    | None -> Alcotest.fail "expected the sibling's nested Db.execute to run and report")
+;;
+
 (* ------------------------------------------------------------------ *)
 (* QCheck: registered/unregistered set matches what fires               *)
 (* ------------------------------------------------------------------ *)
@@ -1145,6 +1267,20 @@ let () =
             "purge's rollback does not clobber a concurrent registration"
             `Quick
             test_purge_rollback_does_not_clobber_a_concurrent_registration
+        ; Alcotest.test_case
+            "rename's rollback does not steal a concurrent registration at the target"
+            `Quick
+            test_rolled_back_rename_does_not_steal_a_concurrent_registration_at_the_target
+        ] )
+    ; ( "reentrant write guard (round 6, item 2)"
+      , [ Alcotest.test_case
+            "a hook's own reentrant autocommit nested DML fails fast instead of hanging"
+            `Quick
+            test_reentrant_autocommit_nested_dml_fails_fast_instead_of_hanging
+        ; Alcotest.test_case
+            "the same guard covers a sibling handle's reentrant autocommit nested DML"
+            `Quick
+            test_reentrant_autocommit_nested_dml_across_sibling_handles_fails_fast
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest prop_fired_matches_registered ]
     ]

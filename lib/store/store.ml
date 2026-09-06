@@ -710,26 +710,73 @@ let row_hooks_purge_table (reg : row_hooks) name =
       removed
 ;;
 
-let move_row_hook_key (reg : row_hooks) ~old_name ~new_name (timing, event) =
+(* #752 (review round 6, item 1): move entries at [old_name]'s composite key
+   over to [new_name]'s -- merging with, never replacing, whatever the
+   destination key already holds. The same fix round 5 applied to
+   {!row_hook_unregister} and {!row_hooks_purge_table}, left open in this
+   third sibling function until now.
+
+   [~only]: [None] (the initial, forward call {!row_hooks_migrate_table}
+   makes) moves every entry currently at [old_name]'s key, as before.
+   [Some ids] moves only the entries in [ids] that are STILL present at the
+   key, leaving anything else there untouched -- in particular a
+   registration that landed on the key after [ids] was captured.
+   {!row_hooks_migrate_table}'s undo closure always passes [Some ids] with
+   exactly the ids the forward call returned, so a ROLLBACK's reverse move
+   can never sweep up a sibling registration that landed on the renamed
+   table's key in the meantime: the documented DDL-visibility leak
+   (#589/#633) lets a sibling handle see the rename's target name as live
+   before the renaming transaction commits and register directly against
+   it, and "whatever is currently at this key" is not the same set as "what
+   I moved" -- conflating the two is exactly the bug round 5 fixed in the
+   other two functions.
+
+   Returns the ids actually moved, so a caller building an undo can pass
+   them back as [~only] on the reverse call. *)
+let move_row_hook_key ?only (reg : row_hooks) ~old_name ~new_name (timing, event) =
   let old_key = old_name, timing, event in
   match Hashtbl.find_opt reg.row_hook_tbl old_key with
-  | None -> ()
-  | Some entries ->
-    Hashtbl.remove reg.row_hook_tbl old_key;
+  | None -> []
+  | Some current_old ->
+    let moving, staying =
+      match only with
+      | None -> current_old, []
+      | Some ids -> List.partition (fun (id, _) -> List.mem id ids) current_old
+    in
+    (match staying with
+     | [] -> Hashtbl.remove reg.row_hook_tbl old_key
+     | _ -> Hashtbl.replace reg.row_hook_tbl old_key staying);
+    List.iter (fun (id, _) -> Hashtbl.remove reg.row_hook_index id) moving;
     let new_key = new_name, timing, event in
-    Hashtbl.replace reg.row_hook_tbl new_key entries;
-    index_entries reg new_key entries
+    let current_new =
+      Option.value (Hashtbl.find_opt reg.row_hook_tbl new_key) ~default:[]
+    in
+    let to_add =
+      List.filter (fun (id, _) -> not (List.mem_assoc id current_new)) moving
+    in
+    (match current_new @ to_add with
+     | [] -> Hashtbl.remove reg.row_hook_tbl new_key
+     | merged -> Hashtbl.replace reg.row_hook_tbl new_key merged);
+    index_entries reg new_key moving;
+    List.map fst moving
 ;;
 
 let row_hooks_migrate_table (reg : row_hooks) ~old_name ~new_name =
   if String.equal old_name new_name
   then fun () -> ()
   else (
-    List.iter (move_row_hook_key reg ~old_name ~new_name) all_row_hook_timings_events;
+    let moved =
+      List.map
+        (fun te -> te, move_row_hook_key reg ~old_name ~new_name te)
+        all_row_hook_timings_events
+    in
     fun () ->
       List.iter
-        (move_row_hook_key reg ~old_name:new_name ~new_name:old_name)
-        all_row_hook_timings_events)
+        (fun (te, ids) ->
+           ignore
+             (move_row_hook_key reg ~only:ids ~old_name:new_name ~new_name:old_name te
+              : row_hook_id list))
+        moved)
 ;;
 
 let row_hooks_carry_over ~from ~to_ =
@@ -748,6 +795,58 @@ let row_hooks_carry_over ~from ~to_ =
 let row_hook_depth (reg : row_hooks) = reg.row_hook_depth
 let row_hook_depth_incr (reg : row_hooks) = reg.row_hook_depth <- reg.row_hook_depth + 1
 let row_hook_depth_decr (reg : row_hooks) = reg.row_hook_depth <- reg.row_hook_depth - 1
+
+(* #752 (review round 6, item 2): a dynamic-extent marker for "the
+   continuation now running is a synchronous descendant of a row hook
+   callback firing for THIS store's currently-open write transaction" --
+   [Lwt.with_value]'s per-fiber storage, not a plain counter.
+
+   [row_hook_depth] above already counts "how many row hooks are currently
+   firing on this store," but that count is store-WIDE and says nothing
+   about WHICH call chain incremented it. Two logically independent
+   statements can be interleaved by the Lwt scheduler on the same store
+   (sibling handles sharing one [t], #589): one can be legitimately,
+   ordinarily blocked in {!acquire_writer} waiting its turn while a
+   completely unrelated statement on a sibling handle happens to be
+   mid-hook at that instant. A bare "is any hook firing anywhere on this
+   store" check cannot tell that ordinary queued waiter from the one case
+   that is actually a self-deadlock: a hook's OWN nested DML trying to open
+   a SECOND write transaction on the very store whose FIRST transaction --
+   the one that fired the hook -- it is still synchronously running inside
+   of, and can therefore never finish waiting on: the writer lock is
+   released only by that outer transaction's commit/rollback, and the outer
+   transaction cannot reach its commit/rollback until this nested call
+   returns first.
+
+   [Lwt.with_value]'s dynamic extent draws exactly that line: the marker is
+   visible to every synchronous and asynchronous continuation created
+   inside the scope ([Db]'s [fire_ocaml_row_hook] wraps its call to
+   [fn mutation] in it), and invisible to any OTHER, concurrently-scheduled
+   fiber -- including one racing against it on the very same store --
+   because Lwt's sequence-associated storage follows the causal call chain,
+   not global mutable state. The same mechanism [Db] already uses for a
+   transaction's owner token (#585, [txn_scope_key]) and [Sql.Exec]'s
+   per-query mode/stats keys. *)
+let in_row_hook_key : t Lwt.key = Lwt.new_key ()
+
+(* Run [f] tagged as "executing inside a row hook callback fired for [t]" --
+   see [in_row_hook_key] above. Called once, around the whole hook
+   invocation, by [Db.fire_ocaml_row_hook]. *)
+let run_in_row_hook_scope (t : t) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+  Lwt.with_value in_row_hook_key (Some t) f
+;;
+
+(* [true] iff the currently-running continuation is a causal descendant of a
+   row hook callback firing for [t] specifically -- see [in_row_hook_key]
+   above. Consulted by [rw_begin] to refuse, rather than hang forever on, a
+   hook's own nested attempt to open a second write transaction on the SAME
+   store while the transaction that fired it is still open (#740's
+   non-reentrant writer lock; #752 review round 6, item 2). *)
+let in_row_hook_for (t : t) =
+  match Lwt.get in_row_hook_key with
+  | Some t' -> t' == t
+  | None -> false
+;;
 
 type ro_snapshot =
   { rs_store : t
@@ -1961,56 +2060,72 @@ let note_checkpoint_success (st : bt_state) : unit =
    under the write lock). *)
 let active_txn_id (st : bt_state) = Int64.add st.current_header.txn_id 1L
 
+(* #752 (review round 6, item 2): the message for the one refusal below --
+   see [in_row_hook_for]'s doc comment for the full reasoning. *)
+let reentrant_row_hook_write_msg =
+  "Store.rw_begin: refused — a row hook callback attempted to open a new write \
+   transaction on this store while the statement that fired it still holds the writer \
+   lock (#752 review round 6, item 2).  The writer lock is not re-entrant (#740), so \
+   this would deadlock the connection rather than ever completing.  A row hook's own \
+   nested DML must reuse a transaction that was ALREADY open before the statement that \
+   fired the hook ran (BEGIN; the statement; the hook's nested Db.execute then reuses \
+   that transaction) rather than starting a fresh one on an autocommit call — see \
+   Db.register_row_hook's doc comment."
+;;
+
 let rw_begin t =
-  (* #718: [Txn] is released by [commit]/[rollback], not here, so one recorded
-     hold spans the whole transaction — BEGIN through the mid-COMMIT unlock.
-     That span is the critical section a sibling writer queues behind, which is
-     the quantity #716 could not separate from service time. *)
-  let* () = acquire_writer t Lock_stats.Txn in
-  let is_follower =
-    match t.backend with
-    | Btree st -> st.follower
-    | Mem _ -> false
-  in
-  if is_closing t
-  then (
-    (* #338 (review r2 #4): fail fast on a write begun after [close] signalled
+  if in_row_hook_for t
+  then Lwt.fail_with reentrant_row_hook_write_msg
+  else
+    (* #718: [Txn] is released by [commit]/[rollback], not here, so one recorded
+       hold spans the whole transaction — BEGIN through the mid-COMMIT unlock.
+       That span is the critical section a sibling writer queues behind, which is
+       the quantity #716 could not separate from service time. *)
+    let* () = acquire_writer t Lock_stats.Txn in
+    let is_follower =
+      match t.backend with
+      | Btree st -> st.follower
+      | Mem _ -> false
+    in
+    if is_closing t
+    then (
+      (* #338 (review r2 #4): fail fast on a write begun after [close] signalled
        teardown, rather than letting the commit surface an obscure EBADF from a
        torn-down fd.  [close] does not take [t.lock], so a write can still race
        in here; this is best-effort, paired with the quiesce-before-close
        contract documented on [close]. *)
-    release_writer t;
-    Lwt.fail_with "Store.rw_begin: store is closing — write transactions are rejected")
-  else if is_follower
-  then (
-    release_writer t;
-    Lwt.fail_with
-      "Store.rw_begin: store is in follower mode — write transactions are rejected while \
-       following")
-  else (
-    (match t.backend with
-     | Mem trees ->
-       let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
-       t.mem_rw_shadow <- Some snap;
-       t.mem_savepoints <- []
-     | Btree st ->
-       let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
-       emit_event st (Store_event.Txn_begin { txn_id = current_rw_txn_id });
-       Pager.set_txn_id st.pager current_rw_txn_id;
-       let min_safe =
-         match min_active_reader_txn st with
-         | None -> current_rw_txn_id
-         | Some m -> Int64.min current_rw_txn_id m
-       in
-       (* #266: cap [min_safe] at the retention floor so pages reachable from
+      release_writer t;
+      Lwt.fail_with "Store.rw_begin: store is closing — write transactions are rejected")
+    else if is_follower
+    then (
+      release_writer t;
+      Lwt.fail_with
+        "Store.rw_begin: store is in follower mode — write transactions are rejected \
+         while following")
+    else (
+      (match t.backend with
+       | Mem trees ->
+         let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+         t.mem_rw_shadow <- Some snap;
+         t.mem_savepoints <- []
+       | Btree st ->
+         let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
+         emit_event st (Store_event.Txn_begin { txn_id = current_rw_txn_id });
+         Pager.set_txn_id st.pager current_rw_txn_id;
+         let min_safe =
+           match min_active_reader_txn st with
+           | None -> current_rw_txn_id
+           | Some m -> Int64.min current_rw_txn_id m
+         in
+         (* #266: cap [min_safe] at the retention floor so pages reachable from
           roots >= the floor are never reused by the allocator. *)
-       let min_safe =
-         match st.history_floor with
-         | None -> min_safe
-         | Some f -> Int64.min min_safe (Int64.add f 1L)
-       in
-       Pager.set_alloc_min_safe st.pager min_safe;
-       (* #297: same-txn page reuse happens via the txn_owned_pool (pages
+         let min_safe =
+           match st.history_floor with
+           | None -> min_safe
+           | Some f -> Int64.min min_safe (Int64.add f 1L)
+         in
+         Pager.set_alloc_min_safe st.pager min_safe;
+         (* #297: same-txn page reuse happens via the txn_owned_pool (pages
           allocated above n_pages_at_rw_begin), NOT the main freelist, so
           alloc_min_safe is unchanged from the pre-#297 baseline.  The
           None branch (no readers) and Some m branch (reader exists) both
@@ -2019,11 +2134,11 @@ let rw_begin t =
           main freelist regardless of reader state.  The txn_owned_pool,
           checked before the main freelist by Pager.alloc, provides
           same-txn reuse independently of the freelist guard. *)
-       Pager.set_n_pages_at_rw_begin st.pager (Pager.n_pages st.pager);
-       (* #297: defensive reset — any leftover from the previous txn is stale. *)
-       Pager.txn_owned_pool_set st.pager [];
-       st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
-    Lwt.return (Rw t))
+         Pager.set_n_pages_at_rw_begin st.pager (Pager.n_pages st.pager);
+         (* #297: defensive reset — any leftover from the previous txn is stale. *)
+         Pager.txn_owned_pool_set st.pager [];
+         st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
+      Lwt.return (Rw t))
 ;;
 
 let ro_end (Ro snap : ro txn) =

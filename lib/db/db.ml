@@ -1818,23 +1818,36 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
     S.row_hook_depth_incr reg;
     Lwt.finalize
       (fun () ->
-         Lwt.catch
-           (fun () ->
-              let* r = fn mutation in
-              match r with
-              | Ok () -> Lwt.return_unit
-              | Error msg ->
-                Lwt.fail_with
-                  (Printf.sprintf "%s row hook on '%s': %s" label table_name msg))
-           (function
-             | Failure _ as exn -> Lwt.fail exn
-             | exn ->
-               Lwt.fail_with
-                 (Printf.sprintf
-                    "%s row hook on '%s' raised: %s"
-                    label
-                    table_name
-                    (Printexc.to_string exn))))
+         (* #752 (review round 6, item 2): tag the hook's own dynamic extent so
+            a nested [Db.execute] on this same store — Auto mode, or an
+            explicit BEGIN — that tries to open a SECOND write transaction
+            while this one (the one that fired the hook) is still open fails
+            immediately with a clear error instead of deadlocking on the
+            non-reentrant writer lock (#740). See
+            [Store.run_in_row_hook_scope]'s doc comment for why a dynamic
+            extent, not a plain flag, is what correctly distinguishes this
+            from an unrelated sibling statement ordinarily queued behind the
+            writer lock. Nested DML that reuses an ALREADY-open explicit
+            transaction never reaches [Store.rw_begin] at all, so it is
+            unaffected — this only closes the autocommit/fresh-BEGIN case. *)
+         S.run_in_row_hook_scope t.store (fun () ->
+           Lwt.catch
+             (fun () ->
+                let* r = fn mutation in
+                match r with
+                | Ok () -> Lwt.return_unit
+                | Error msg ->
+                  Lwt.fail_with
+                    (Printf.sprintf "%s row hook on '%s': %s" label table_name msg))
+             (function
+               | Failure _ as exn -> Lwt.fail exn
+               | exn ->
+                 Lwt.fail_with
+                   (Printf.sprintf
+                      "%s row hook on '%s' raised: %s"
+                      label
+                      table_name
+                      (Printexc.to_string exn)))))
       (fun () ->
          S.row_hook_depth_decr reg;
          Lwt.return_unit))

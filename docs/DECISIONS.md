@@ -3496,3 +3496,61 @@ diff did not reach, and both are now closed.**
    #754 removes. Annotated in place rather than silently rewritten, since the
    surrounding document is a historical plan, not living reference material.
 
+### OCaml row-mutation hooks share one store-wide registry, every rollback-undo merges rather than replaces, and a hook's own reentrant nested write fails fast (#752, decided 2026-09-06)
+
+`Db.register_row_hook`/`unregister_row_hook` add typed OCaml before/after
+callbacks for row mutations — the seam a GADT-certified caller needs for a
+`before:`/`after:` hook without going through a SQL `CREATE TRIGGER` body.
+The registry (`Store.row_hooks`) lives on `Store.t`, not on `Db.t`, for the
+same reason `rowid_counters`/`rv_generations` do (#633/#757): a hook
+registered through one handle must be visible to, and purged/migrated by,
+every sibling handle sharing the same store (`create_worker_handle`,
+#589/#633).
+
+**Every rollback-undo in this registry — `row_hook_unregister`,
+`row_hooks_purge_table`, and `move_row_hook_key` — merges the entries it is
+restoring into whatever currently occupies the destination key, rather than
+replacing it outright. The same shape, fixed one function at a time across
+two review rounds** (round 5 for the first two; round 6 for
+`move_row_hook_key`, the last of the three to still do a blind replace). A
+blind snapshot-and-replace undo can lose or misfile a hook a *different*,
+concurrent handle registers on the same key in the window between the
+original mutation and the `ROLLBACK` that undoes it — made possible by the
+pre-existing, documented DDL-visibility leak that lets a sibling handle see
+an in-flight DROP/RENAME's effect before the transaction performing it
+commits (#589/#633). `move_row_hook_key`'s fix additionally restricts which
+entries the reverse move even looks at: it threads the ids the forward move
+actually moved through the closure, so a `ROLLBACK`'s reverse move only
+ever touches those specific ids at the (now-source) key — never "whatever
+is registered there now," which could include a sibling's brand-new,
+unrelated registration landing on the rename's target name mid-transaction.
+
+**A row hook's own nested DML, run with no explicit transaction already
+open, cannot open a second write transaction on the same store — it fails
+immediately with a descriptive error instead of deadlocking (round 6, item
+2).** The firing statement's own transaction still holds `Store`'s
+non-reentrant writer lock (#740) for the hook's whole invocation; a nested
+autocommit call (or a fresh `BEGIN`) needs that same lock and cannot get it
+until the outer transaction commits or rolls back — which cannot happen
+until the nested call returns. Two fixes were on the table (documented in
+`Db.register_row_hook`'s doc comment): detect and refuse immediately, or
+make the writer lock re-entrant for this specific case. The refusal was
+chosen — matching the project's `#740` precedent of refusing rather than
+redesigning locking for a narrow deadlock shape. `Store.rw_begin` detects
+it via a dynamic-extent marker (`Lwt.with_value`, tagging the causal call
+chain a row hook fires within — the same mechanism `Db`'s `#585`
+`txn_scope_key` and `Sql.Exec`'s per-query keys already use), not a
+store-wide counter: two logically independent statements can be
+interleaved by the Lwt scheduler on one store (sibling handles), and a bare
+"is any hook firing anywhere on this store" flag cannot tell an unrelated
+sibling statement ordinarily queued behind the writer lock from the one
+case that is a genuine self-deadlock.
+
+**Known, accepted residual: `row_hook_unregister`'s rollback-undo restores
+a resurrected hook at the front of its key's list, so it fires LAST rather
+than in its original registration position — contradicting the documented
+"hooks fire in registration order" contract (round 6, item 3).** Narrower
+than the merge-vs-replace fixes above: no hook is lost or misfiled onto the
+wrong table, only fired out of order relative to hooks the rollback never
+touched. Deliberately not fixed in round 6. Tracked as #769.
+
