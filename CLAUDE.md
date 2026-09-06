@@ -589,13 +589,27 @@ things that were tried and rejected) is usually the point.
   blind-snapshot-replace rollback-undo bug, fixed one at a time across two
   review rounds — a concurrent sibling registration landing on the same key
   in the DDL-visibility window (#589/#633) must never be lost or misfiled by
-  a later `ROLLBACK`'s undo. A hook's own nested DML with no already-open
-  explicit transaction now fails fast with a clear error instead of
-  deadlocking on the non-reentrant writer lock (#740) — detected via a
-  dynamic-extent marker (`Lwt.with_value`), not a store-wide counter, so an
+  a later `ROLLBACK`'s undo; `row_hook_unregister`'s undo also prepended
+  where its two siblings append, misordering a restored hook relative to a
+  concurrent registration — fixed, closing #769. A hook's own nested DML
+  with no already-open explicit transaction now fails fast with a clear
+  error instead of deadlocking on the non-reentrant writer lock (#740) —
+  detected via a dynamic-extent marker (`Lwt.with_value` over a *mutable*
+  scope record, not a store-wide counter or a plain `t option`), so an
   unrelated sibling statement merely queued behind the same lock is not
-  mistaken for the genuine self-deadlock case. Full detail, including a
-  known-accepted fire-order residual (#769), in `docs/DECISIONS.md`.
+  mistaken for the genuine self-deadlock case, and — the mutability is why —
+  a write correctly deferred via `Lwt.async` past the firing transaction's
+  commit is not mistaken for one either, even though `Lwt.with_value`'s own
+  bind-capture semantics reinstate the tag long after the hook's dynamic
+  extent should be considered over. `unregister_row_hook` also had a VACUUM
+  race the opposite way round from `register_row_hook`'s: it could make a
+  hook *survive* detachment during the pre-carry-over window rather than
+  merely fail to attach a new one — fixed by always removing it from the
+  store's registry regardless of `is_closing`, since that removal is a
+  plain, synchronous `Hashtbl` mutation safe to run at any point. A row
+  hook's own nested `BEGIN`/`SAVEPOINT` (as opposed to nested DML through
+  `Db.execute`) still bypasses the `Ok`/`Error` contract and raises instead,
+  tracked as #770. Full detail in `docs/DECISIONS.md`.
 
 ## Repository structure
 

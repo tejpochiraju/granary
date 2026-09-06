@@ -5038,27 +5038,45 @@ let register_row_hook t ~table ~timing ~event fn =
 ;;
 
 let unregister_row_hook t h =
-  (* #752 (review round 5, item 1): same race window as {!register_row_hook}
-     — a silent no-op here, matching this function's existing "idempotent,
-     never raises" contract for a hook that is not (or no longer) registered
-     anywhere. [h]'s table is presumed gone with the store regardless: the
-     ONLY legal operation on a stale handle is close (#634), and there is
-     nothing left in this (already-abandoned) store's registry worth
-     removing [h] from — [Store.row_hooks_carry_over] already moved whatever
-     survives to the new store, which THIS call cannot reach without a fresh
-     handle. *)
-  if S.is_closing t.store
-  then ()
-  else (
-    let undo = S.row_hook_unregister (S.row_hooks t.store) h.rh_id in
-    (* #752 review (round 3, item 3): mirrors {!register_row_hook}'s own
-       transactional undo — an unregister issued mid-transaction must be
-       reversible by that transaction's ROLLBACK, or [BEGIN;
-       unregister_row_hook h; ROLLBACK] leaves [h] permanently detached even
-       though nothing else about the transaction survived. *)
-    match t.explicit_txn with
-    | None -> ()
-    | Some _ -> Cat.register_schema_undo t.catalog undo)
+  (* #752 (review round 7, item 1): DO NOT special-case [S.is_closing] here
+     the way {!register_row_hook} does — that was round 5's fix for THIS
+     function, and it had the opposite and worse effect from what it
+     intended: it made a hook SURVIVE detachment it should not have.
+
+     [Db.vacuum] calls [S.close t.store] (which flips [is_closing] at its
+     very first line) and only calls {!Store.row_hooks_carry_over} several
+     Lwt-yielding steps later (tmp-file rename, reopen, [Cat.open_],
+     [Cat.load_columnar_stores]). A sibling handle whose [t.store] still
+     names that closing-but-not-yet-carried-over store can call this
+     function during that exact window. The round-5 no-op left [h]'s entry
+     untouched in the OLD store's registry — still there, including a
+     [`Before] veto's power to block writes — so [row_hooks_carry_over] then
+     copied it verbatim into the new store, and this call had returned
+     [unit] (its documented success shape) despite detaching nothing at
+     all.
+
+     [S.row_hook_unregister] is a plain, synchronous, non-blocking [Hashtbl]
+     mutation — no transaction, no yield of its own — so calling it
+     unconditionally is correct in both states this store can be in:
+     - BEFORE {!Store.row_hooks_carry_over} runs (the race window above):
+       this removes [h] from the very table that call is about to copy, so
+       it is never carried over into the new store. This is the fix.
+     - AFTER carry-over, i.e. a VACUUM already completed elsewhere and this
+       handle's store is a permanently abandoned husk: [h]'s entry (if any)
+       is removed from a [Hashtbl] nobody consults again — a genuine no-op,
+       identical in effect to round 5's short-circuit. The hook itself lives
+       only in the new store by then, unreachable from this stale handle
+       without a fresh one (#634); that part of round 5's reasoning was
+       correct and is unchanged. *)
+  let undo = S.row_hook_unregister (S.row_hooks t.store) h.rh_id in
+  (* #752 review (round 3, item 3): mirrors {!register_row_hook}'s own
+     transactional undo — an unregister issued mid-transaction must be
+     reversible by that transaction's ROLLBACK, or [BEGIN;
+     unregister_row_hook h; ROLLBACK] leaves [h] permanently detached even
+     though nothing else about the transaction survived. *)
+  match t.explicit_txn with
+  | None -> ()
+  | Some _ -> Cat.register_schema_undo t.catalog undo
 ;;
 
 let pp_row_hook fmt h =

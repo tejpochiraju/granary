@@ -3546,11 +3546,76 @@ interleaved by the Lwt scheduler on one store (sibling handles), and a bare
 sibling statement ordinarily queued behind the writer lock from the one
 case that is a genuine self-deadlock.
 
-**Known, accepted residual: `row_hook_unregister`'s rollback-undo restores
-a resurrected hook at the front of its key's list, so it fires LAST rather
-than in its original registration position — contradicting the documented
-"hooks fire in registration order" contract (round 6, item 3).** Narrower
-than the merge-vs-replace fixes above: no hook is lost or misfiled onto the
-wrong table, only fired out of order relative to hooks the rollback never
-touched. Deliberately not fixed in round 6. Tracked as #769.
+**`row_hook_unregister`'s rollback-undo used to restore a resurrected hook
+at the front of its key's list instead of appending it, contradicting its
+own two sibling functions (round 6, item 3) — fixed in round 7, closing
+#769.** `row_hooks_purge_table`'s `current @ to_restore` and
+`move_row_hook_key`'s `current_new @ to_add` both append the restored
+entries onto whatever is currently at the destination key; `row_hook_unregister`
+alone prepended (`(id, fn) :: now`). Because the registry stores entries
+newest-first and `row_hook_fire_list` reverses that for firing order,
+prepending put the *restored* (chronologically earlier) hook at the *back*
+of the fire order — firing after a hook registered later, while it was
+unregistered — where append correctly restores it to fire *before* that
+later registration, matching the other two siblings' documented contract.
+One-line fix (`now @ [ id, fn ]`); pinned by a Store-level test mirroring
+the round-6 `move_row_hook_key` concurrent-registration test.
+
+**Round 7 also closed a genuine VACUUM-race gap in `unregister_row_hook`
+itself — the mirror image of the `register_row_hook` race round 5 fixed —
+and a false-positive in the round-6 reentrancy guard.**
+
+- **`unregister_row_hook`'s round-5 `is_closing` short-circuit made a hook
+  *survive* detachment during the pre-carry-over VACUUM window, rather than
+  merely failing to attach a new one the way it does on the register side.**
+  `Db.vacuum` flips `is_closing` on the old store (`S.close t.store`, its
+  very first line) several Lwt-yielding steps before it calls
+  `Store.row_hooks_carry_over`. A sibling handle's `unregister_row_hook`
+  landing in that window used to no-op (mirroring `register_row_hook`'s
+  refusal), which looks symmetric but is not: the hook was still fully
+  present in the old store's registry at that point, so the no-op left it
+  there for `row_hooks_carry_over` to copy verbatim into the new store —
+  the caller believed (the call returns `unit` unconditionally) it had
+  detached the hook, including a `` `Before `` veto's power to block writes,
+  but it kept firing regardless. Fixed by always calling
+  `Store.row_hook_unregister` — a plain, synchronous `Hashtbl` mutation with
+  no transaction and no yield of its own, so it is safe to call
+  unconditionally in both states this store can be in: before carry-over it
+  removes the entry the copy is about to pick up; after carry-over (a
+  permanently abandoned store from a VACUUM that already completed) it is a
+  genuine no-op on a table nobody reads again, identical in effect to the
+  old short-circuit's intended case.
+- **The round-6 reentrancy guard (`Store.in_row_hook_key`,
+  `run_in_row_hook_scope`) spuriously refused the exact deferred-write
+  pattern `register_row_hook`'s own doc comment recommends as the safe
+  workaround.** `Lwt.with_value`'s snapshot is captured at bind-construction
+  time and reinstated whenever the bound continuation actually runs,
+  however much later — not re-evaluated against "is this dynamic extent
+  still live." A hook body that defers unconditional write work via
+  `Lwt.async (fun () -> let* () = <something that yields> in Db.execute db
+  sql)` constructs that bind synchronously while still inside the hook's
+  extent, so the deferred continuation's captured snapshot said "inside a
+  row hook" even when it actually ran long after the firing transaction had
+  committed and released the writer lock — `rw_begin` then refused a write
+  that was in no danger of deadlocking. Fixed by making the tagged value a
+  *mutable* record (`row_hook_scope`, holding the store and an `rhs_active`
+  flag) rather than an immutable `t option`: the flag is flipped to `false`
+  under `Lwt.finalize` once the hook invocation's own promise settles,
+  and — because a bind captures the record by reference, not a copy of its
+  fields — a deferred continuation holding the same reference observes that
+  flip even though `Lwt.get` still hands back `Some scope`. Confirmed via
+  the PR's established revert-and-confirm-failure methodology: a test
+  constructing exactly the `Lwt.async`-after-`Lwt.pause` shape failed
+  against the pre-fix guard and passes against the fix.
+
+**Known, accepted residual: a row hook's own nested `BEGIN`/`SAVEPOINT`
+bypasses `Db.execute`'s `Ok`/`Error` contract and raises instead (round 7,
+item 2).** `begin_txn`/`savepoint_txn` call `S.rw_begin` directly with no
+`Lwt.catch`, unlike `run_dml`, which wraps and converts any raised exception
+(including the round-6 reentrancy guard's `Lwt.fail_with`) into
+`Error (Runtime _)`. A hook whose nested DML happens to be an explicit
+`BEGIN`/`SAVEPOINT` rather than ordinary `Db.execute` DML can therefore see
+a raw uncaught exception instead of the documented result type. Deliberately
+not fixed in round 7 (the user's instruction was to defer it). Tracked as
+#770.
 

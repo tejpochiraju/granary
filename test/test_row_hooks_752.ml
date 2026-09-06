@@ -798,7 +798,18 @@ let test_register_refuses_once_the_store_is_closing () =
            "expected `Store_closing: the store was already closing at the call")
 ;;
 
-let test_unregister_is_a_silent_noop_once_the_store_is_closing () =
+(* #752 (review round 7, item 1): renamed from
+   "..._is_a_silent_noop_once_the_store_is_closing" -- round 5's short-circuit
+   made this a total no-op (registry untouched); round 7 fixed
+   [unregister_row_hook] to always call [Store.row_hook_unregister]
+   regardless of [is_closing], since it is a plain, synchronous [Hashtbl]
+   mutation with nothing to unsafely touch on a closing (or already fully
+   closed) store. What this test pins is unchanged from before the fix --
+   the call must not raise -- but it is no longer a no-op in the sense its
+   old name claimed; see
+   [test_unregister_during_pre_carry_over_window_does_not_survive_vacuum]
+   below for the property that DID change. *)
+let test_unregister_does_not_raise_once_the_store_is_fully_closed () =
   let store = fresh_file_store () in
   let db = run (Db.of_store store) in
   Fun.protect
@@ -822,6 +833,66 @@ let test_unregister_is_a_silent_noop_once_the_store_is_closing () =
           mask a raise here anyway, so the absence of a crash is checked by
           the test simply reaching this point. *)
        Db.unregister_row_hook db h)
+;;
+
+(* #752 (review round 7, item 1): the actual race the round-5 short-circuit
+   got backwards for [unregister_row_hook]. [Db.vacuum] flips [is_closing] on
+   the OLD store ([S.close t.store], its very first line) well before it
+   calls [Store.row_hooks_carry_over] -- several Lwt-yielding steps later
+   (tmp-file rename, reopen, [Cat.open_], [Cat.load_columnar_stores]). A
+   sibling handle whose [t.store] still names that closing-but-not-yet-
+   carried-over store can call [unregister_row_hook] inside that window; the
+   round-5 no-op left the hook fully present in the OLD store's registry,
+   which [row_hooks_carry_over] then copied verbatim into the NEW store --
+   so the caller believed (the call always returns [unit]) it had detached
+   the hook, but it kept firing regardless, including a [`Before] veto's
+   power to block writes.
+
+   Rather than racing real fibers against [Db.vacuum]'s exact timing (the
+   existing "vacuum race window" tests above take the same approach), this
+   reconstructs the two steps of that window directly and deterministically:
+   close the store object itself (matching [S.close t.store] having already
+   run), call [Db.unregister_row_hook] the way a sibling would inside the
+   window, THEN perform the carry-over [Db.vacuum] would perform next, and
+   check the hook did not survive into the destination store. *)
+let test_unregister_during_pre_carry_over_window_does_not_survive_vacuum () =
+  let store = fresh_file_store () in
+  let db = run (Db.of_store store) in
+  Fun.protect
+    ~finally:(fun () ->
+      try run (Store.close store) with
+      | _ -> ())
+    (fun () ->
+       exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+       let h =
+         attach db ~table:"t" ~timing:`After ~event:`Insert (ok_hook (fun _ -> ()))
+       in
+       (* Matches [S.close t.store] having already run inside [Db.vacuum],
+          before [row_hooks_carry_over] is reached. *)
+       run (Store.close store);
+       Db.unregister_row_hook db h;
+       (* The rest of [Db.vacuum]: carry the (still-closing) store's row-hook
+          registry into a freshly opened destination store, exactly as
+          [Store.row_hooks_carry_over ~from:t.store ~to_:new_store] does. *)
+       let new_store = fresh_file_store () in
+       Fun.protect
+         ~finally:(fun () ->
+           try run (Store.close new_store) with
+           | _ -> ())
+         (fun () ->
+            Store.row_hooks_carry_over ~from:store ~to_:new_store;
+            let survivors =
+              Store.row_hook_fire_list
+                (Store.row_hooks new_store)
+                ~table:"t"
+                ~timing:`After
+                ~event:`Insert
+            in
+            Alcotest.(check int)
+              "a hook unregistered during the pre-carry-over window must not survive \
+               into the store VACUUM carries it over to"
+              0
+              (List.length survivors)))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -952,6 +1023,56 @@ let test_rolled_back_rename_does_not_steal_a_concurrent_registration_at_the_targ
     (List.map fst at_bar)
 ;;
 
+(* #769 (the trivial one-liner round 7 flagged): [row_hook_unregister]'s own
+   rollback-undo used to prepend the restored entry ([(id, fn) :: now]),
+   inconsistent with both its siblings' undo -- [row_hooks_purge_table]'s
+   [current @ to_restore] and [move_row_hook_key]'s [current_new @ to_add] --
+   which both append, putting whatever is CURRENT at undo-time first (in
+   {!Store.row_hooks}' newest-first raw storage) and the restored entry(ies)
+   after. Constructed directly against the Store-level primitive, mirroring
+   [test_rolled_back_rename_does_not_steal_a_concurrent_registration_at_the_target]
+   just above: register a hook, unregister it, have a DIFFERENT hook
+   register on the exact same key while the first is unregistered (the same
+   #589/#633 concurrent-registration window the other two siblings are
+   pinned against), then replay the unregister's undo (as a ROLLBACK does).
+
+   Appending the restored entry to the RAW newest-first list places it
+   BEHIND the concurrent entry there, which {!Store.row_hook_fire_list}'s
+   reversal turns into firing BEFORE it -- correct, because the restored
+   hook was registered earlier in wall-clock time than the concurrent one
+   (it existed, was unregistered, and only THEN did the concurrent
+   registration happen), so once restored it belongs back in that earlier
+   chronological position. This is the same fire-order the purge sibling's
+   own doc comment states outright ("newer (current) entries sort before
+   the restored (older) ones, matching row_hook_fire_list's newest-first
+   storage order"). The prepend bug produced the opposite: the restored
+   (chronologically-earlier) hook firing AFTER the concurrent
+   (chronologically-later) one. *)
+let test_unregister_rollback_undo_restores_the_hooks_original_chronological_position () =
+  let store = Store.create () in
+  let noop_fn (_ : Store.row_mutation) = Lwt.return (Ok ()) in
+  let reg = Store.row_hooks store in
+  let original_id =
+    Store.row_hook_register reg ~table:"t" ~timing:`After ~event:`Insert noop_fn
+  in
+  let undo = Store.row_hook_unregister reg original_id in
+  (* The sibling's concurrent registration, landing on the exact same key
+     while [original_id] is unregistered. *)
+  let concurrent_id =
+    Store.row_hook_register reg ~table:"t" ~timing:`After ~event:`Insert noop_fn
+  in
+  (* ROLLBACK replays the unregister's undo. *)
+  undo ();
+  let fired = Store.row_hook_fire_list reg ~table:"t" ~timing:`After ~event:`Insert in
+  Alcotest.(check (list int))
+    "the restored hook, registered earlier in wall-clock time, fires BEFORE the \
+     concurrent registration made while it was unregistered -- matching \
+     move_row_hook_key's and row_hooks_purge_table's append undo and their shared \
+     newest-first storage convention (#769)"
+    [ original_id; concurrent_id ]
+    (List.map fst fired)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Reentrant-write guard (review round 6, item 2)                        *)
 (* ------------------------------------------------------------------ *)
@@ -1032,6 +1153,76 @@ let test_reentrant_autocommit_nested_dml_across_sibling_handles_fails_fast () =
     | Some (Ok ()) ->
       Alcotest.fail "expected the sibling's reentrant write to fail, not succeed"
     | None -> Alcotest.fail "expected the sibling's nested Db.execute to run and report")
+;;
+
+(* ------------------------------------------------------------------ *)
+(* A deferred write via Lwt.async does not falsely trip the reentrant       *)
+(* write guard (review round 7, item 3)                                    *)
+(* ------------------------------------------------------------------ *)
+
+(* [db.mli]'s own [register_row_hook] doc comment recommends exactly this
+   shape as the safe workaround for a hook that needs a transaction of its
+   own: "deferring that work until after the firing statement's transaction
+   has committed" via [Lwt.async]. [Lwt.with_value]'s snapshot, though, is
+   captured at BIND-CONSTRUCTION time and reinstated whenever the resulting
+   continuation actually runs, however much later. [Lwt.async (fun () -> let*
+   () = Lwt.pause () in ...)] constructs that bind chain SYNCHRONOUSLY, while
+   [run_in_row_hook_scope]'s [in_row_hook_key] is still [Some store] -- so the
+   continuation that runs after [Lwt.pause ()] resolves (well after the
+   firing statement has committed and released the writer lock) still finds
+   [in_row_hook_for store] answering [true], and [rw_begin] refuses it as a
+   false self-deadlock even though nothing is deadlocked: the lock was
+   released long ago. *)
+(* Both factored out of the test below purely to keep merlint's nesting-depth
+   check happy (max 4) -- with [hook_fn] defined as a closure INSIDE the test
+   function, the [with_db]/[hook_fn]/[if]/[Lwt.async] chain sits one level
+   too deep. As free-standing top-level functions, [hook_fn]'s own nesting
+   ([if] then [Lwt.async]'s lambda) stays well within the limit, and neither
+   needs anything from the test function's scope that isn't passed in. *)
+let deferred_insert_after_pause db deferred_result =
+  let open Lwt.Syntax in
+  let* () = Lwt.pause () in
+  let* r = exec_ok_lwt db "INSERT INTO t VALUES (2)" in
+  Lwt_mvar.put deferred_result r
+;;
+
+(* Guard against the SAME hook re-firing (and re-scheduling another deferred
+   write) when its own deferred INSERT lands -- the test wants exactly one
+   deferred write, not an unbounded chain. *)
+let hook_fn scheduled db deferred_result _mutation =
+  if not !scheduled
+  then (
+    scheduled := true;
+    Lwt.async (fun () -> deferred_insert_after_pause db deferred_result));
+  Lwt.return (Ok ())
+;;
+
+let test_deferred_write_via_lwt_async_after_pause_is_not_spuriously_refused () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    let deferred_result = Lwt_mvar.create_empty () in
+    let scheduled = ref false in
+    let _h =
+      attach
+        db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (hook_fn scheduled db deferred_result)
+    in
+    exec db "INSERT INTO t VALUES (1)";
+    (match run (Lwt_mvar.take deferred_result) with
+     | Ok () -> ()
+     | Error msg ->
+       Alcotest.failf
+         "expected the deferred write (Lwt.async after Lwt.pause, the pattern \
+          register_row_hook's own doc comment recommends) to succeed once the firing \
+          statement had committed and released the writer lock, got %S"
+         msg);
+    Alcotest.(check (list string))
+      "both the primary write and the deferred one persisted"
+      [ "1"; "2" ]
+      (texts db "SELECT * FROM t"))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1254,9 +1445,14 @@ let () =
             `Quick
             test_register_refuses_once_the_store_is_closing
         ; Alcotest.test_case
-            "unregister is a silent no-op once the store is closing"
+            "unregister does not raise once the store is fully closed"
             `Quick
-            test_unregister_is_a_silent_noop_once_the_store_is_closing
+            test_unregister_does_not_raise_once_the_store_is_fully_closed
+        ; Alcotest.test_case
+            "unregister during the pre-carry-over window does not survive VACUUM (round \
+             7, item 1)"
+            `Quick
+            test_unregister_during_pre_carry_over_window_does_not_survive_vacuum
         ] )
     ; ( "concurrent registration survives a rollback's undo"
       , [ Alcotest.test_case
@@ -1271,8 +1467,13 @@ let () =
             "rename's rollback does not steal a concurrent registration at the target"
             `Quick
             test_rolled_back_rename_does_not_steal_a_concurrent_registration_at_the_target
+        ; Alcotest.test_case
+            "unregister's rollback undo restores the hook's original chronological \
+             position (#769)"
+            `Quick
+            test_unregister_rollback_undo_restores_the_hooks_original_chronological_position
         ] )
-    ; ( "reentrant write guard (round 6, item 2)"
+    ; ( "reentrant write guard (round 6, item 2 / round 7, item 3)"
       , [ Alcotest.test_case
             "a hook's own reentrant autocommit nested DML fails fast instead of hanging"
             `Quick
@@ -1281,6 +1482,10 @@ let () =
             "the same guard covers a sibling handle's reentrant autocommit nested DML"
             `Quick
             test_reentrant_autocommit_nested_dml_across_sibling_handles_fails_fast
+        ; Alcotest.test_case
+            "a deferred write via Lwt.async after Lwt.pause is not spuriously refused"
+            `Quick
+            test_deferred_write_via_lwt_async_after_pause_is_not_spuriously_refused
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest prop_fired_matches_registered ]
     ]

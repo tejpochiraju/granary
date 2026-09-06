@@ -648,11 +648,20 @@ let row_hook_unregister (reg : row_hooks) id =
        | Some fn ->
          (* Idempotent per-id: if [id] is already present (a second replay, or
            because some other path already restored it), re-adding it is a
-           no-op rather than a duplicate entry. *)
+           no-op rather than a duplicate entry.
+
+           #769: append, not prepend — [move_row_hook_key]'s [current_new @
+           to_add] and [row_hooks_purge_table]'s [current @ to_restore] both
+           put whatever is CURRENT at undo-time first and the restored
+           entry(ies) after, so a hook registered on this key while [id] was
+           unregistered fires BEFORE the restored one once the undo replays.
+           Prepending here was the odd one out among the three siblings: it
+           put the restored (older) registration first, ahead of a
+           registration made later in wall-clock time. *)
          let now = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
          if not (List.mem_assoc id now)
          then (
-           Hashtbl.replace reg.row_hook_tbl key ((id, fn) :: now);
+           Hashtbl.replace reg.row_hook_tbl key (now @ [ id, fn ]);
            Hashtbl.replace reg.row_hook_index id key))
 ;;
 
@@ -826,25 +835,84 @@ let row_hook_depth_decr (reg : row_hooks) = reg.row_hook_depth <- reg.row_hook_d
    because Lwt's sequence-associated storage follows the causal call chain,
    not global mutable state. The same mechanism [Db] already uses for a
    transaction's owner token (#585, [txn_scope_key]) and [Sql.Exec]'s
-   per-query mode/stats keys. *)
-let in_row_hook_key : t Lwt.key = Lwt.new_key ()
+   per-query mode/stats keys.
+
+   #752 (review round 7, item 3): the marker's VALUE is a mutable record,
+   not [t] directly, and that mutability is load-bearing -- see
+   {!row_hook_scope} and {!run_in_row_hook_scope} below for why a bare
+   [t Lwt.key] (round 6's original shape) spuriously refused the exact
+   deferred-write pattern this module's own [Db.register_row_hook] doc
+   comment recommends. *)
+type row_hook_scope =
+  { rhs_store : t
+  ; mutable rhs_active : bool
+    (** [true] only for the hook invocation's own synchronous dynamic
+            extent -- see {!run_in_row_hook_scope}. Flipped to [false] once
+            [f]'s promise settles, by which point the writer lock the hook
+            fired under has been released (commit or rollback already ran).
+            [Lwt.with_value]'s snapshot mechanism cannot express this by
+            itself: {!Lwt.bind} (and hence [let*]) captures the CURRENT
+            storage at BIND-CONSTRUCTION time and reinstates that exact
+            snapshot whenever the bound continuation actually runs, however
+            much later. A hook body that defers unconditional write work via
+            [Lwt.async (fun () -> let* () = <something that yields> in
+            Db.execute db sql)] constructs that bind synchronously, while
+            still inside the hook's extent -- so the snapshot it captures is
+            [Some scope] with [rhs_active] still [true] at that instant. If
+            the marker's value were immutable (round 6's plain [Some t]),
+            the deferred continuation would see that same frozen answer no
+            matter how long after the hook returned it actually ran,
+            because bind-capture reinstates the OLD snapshot rather than
+            asking "is this dynamic extent still live." A mutable field
+            inside the captured VALUE sidesteps that entirely: the captured
+            reference is the SAME record the still-running
+            {!run_in_row_hook_scope} call is about to flip, so a check made
+            from the deferred continuation observes the CURRENT truth
+            through that shared, mutable cell rather than the stale
+            snapshot the immutable version would have frozen in. *)
+  }
+
+let in_row_hook_key : row_hook_scope Lwt.key = Lwt.new_key ()
 
 (* Run [f] tagged as "executing inside a row hook callback fired for [t]" --
-   see [in_row_hook_key] above. Called once, around the whole hook
-   invocation, by [Db.fire_ocaml_row_hook]. *)
+   see [in_row_hook_key] and {!row_hook_scope} above. Called once, around the
+   whole hook invocation, by [Db.fire_ocaml_row_hook].
+
+   [rhs_active] starts [true] and is flipped to [false] under [Lwt.finalize]
+   once [f]'s own promise settles -- i.e. once the hook's synchronous
+   dynamic extent (including anything chained directly off [f]'s returned
+   promise) is over, NOT once every fiber it ever spawned finishes. A
+   continuation dispatched via [Lwt.async] from inside [f] and still pending
+   when [f] settles keeps the SAME [scope] record (captured by reference at
+   bind-construction time, per the [rhs_active] doc comment), so when that
+   continuation eventually runs and consults {!in_row_hook_for}, it sees
+   [rhs_active = false] and is correctly treated as no longer inside the
+   hook -- even though [Lwt.get in_row_hook_key] itself still answers
+   [Some scope], because the snapshot reinstated at that bind site is this
+   very (now-mutated) record. *)
 let run_in_row_hook_scope (t : t) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
-  Lwt.with_value in_row_hook_key (Some t) f
+  let scope = { rhs_store = t; rhs_active = true } in
+  Lwt.finalize
+    (fun () -> Lwt.with_value in_row_hook_key (Some scope) f)
+    (fun () ->
+       scope.rhs_active <- false;
+       Lwt.return_unit)
 ;;
 
-(* [true] iff the currently-running continuation is a causal descendant of a
-   row hook callback firing for [t] specifically -- see [in_row_hook_key]
-   above. Consulted by [rw_begin] to refuse, rather than hang forever on, a
-   hook's own nested attempt to open a second write transaction on the SAME
-   store while the transaction that fired it is still open (#740's
-   non-reentrant writer lock; #752 review round 6, item 2). *)
+(* [true] iff the currently-running continuation is BOTH a causal descendant
+   of a row hook callback firing for [t] specifically AND still within that
+   hook invocation's genuine dynamic extent -- see {!row_hook_scope} and
+   {!run_in_row_hook_scope} above for why the second half of that
+   conjunction is necessary. Consulted by [rw_begin] to refuse, rather than
+   hang forever on, a hook's own nested attempt to open a second write
+   transaction on the SAME store while the transaction that fired it is
+   still open (#740's non-reentrant writer lock; #752 review round 6, item
+   2) -- without also, incorrectly, refusing a deferred write dispatched via
+   [Lwt.async] that runs after the firing transaction has already committed
+   or rolled back and released the lock (#752 review round 7, item 3). *)
 let in_row_hook_for (t : t) =
   match Lwt.get in_row_hook_key with
-  | Some t' -> t' == t
+  | Some scope -> scope.rhs_active && scope.rhs_store == t
   | None -> false
 ;;
 

@@ -1300,14 +1300,32 @@ val register_row_hook
     [h] permanently detached even though nothing else about the transaction
     survived. Registering outside an explicit transaction is unaffected.
 
-    {b Also a silent no-op during the same VACUUM race window
-    {!register_row_hook} refuses with [`Store_closing] (#752 review round
-    5).} Unlike registration this has no error channel to report the race
-    through — [h]'s table is presumed gone with the store regardless: the
-    only legal operation on a handle a sibling's VACUUM has invalidated is
-    close (#634), and this store's registry is already abandoned
-    ({!Granary_store.Store.row_hooks_carry_over} moved whatever survives to
-    the new store, which this call — bound to the old one — cannot reach). *)
+    {b Always acts on the store's registry directly, including during the
+    VACUUM race window {!register_row_hook} refuses with [`Store_closing]
+    (#752 review round 7, item 1 — revised from round 5).} Unlike
+    registration, unregistration has no error channel to report the race
+    through, and — unlike round 5's short-circuit, which treated
+    [`Granary_store.Store.is_closing`] as reason to no-op unconditionally —
+    silently skipping the removal is only ever safe on ONE side of that
+    window. {!vacuum} flips [is_closing] on the old store well before it
+    calls {!Granary_store.Store.row_hooks_carry_over} (several Lwt-yielding
+    steps later: tmp-file rename, reopen, catalog reload); a sibling handle
+    whose [t] still names that closing-but-not-yet-carried-over store can
+    call this function inside that window, and [h]'s hook — including a
+    [`Before] veto — is still fully present in the OLD store's registry,
+    not yet copied anywhere. A no-op there left it in place for
+    [row_hooks_carry_over] to copy verbatim into the new store, so the
+    caller's successful-looking (always [unit]) detach request left the
+    hook attached and firing regardless. This call now always resolves [h]
+    through {!Granary_store.Store.row_hook_unregister} — a plain,
+    synchronous [Hashtbl] mutation with no transaction and no yield of its
+    own, so doing so unconditionally is correct on the other side of the
+    window too: once a sibling's VACUUM has already completed and carried
+    the registry over, this store is a permanently abandoned husk and [h]'s
+    entry (if still present) is removed from a table nobody consults again
+    — a genuine no-op, as it always was. The hook itself lives only in the
+    new store from that point on, unreachable from this handle without a
+    fresh one (#634) — that part of round 5's reasoning is unchanged. *)
 val unregister_row_hook : t -> row_hook -> unit
 
 (** #387: the projected output column names for a row-returning [sql], without
