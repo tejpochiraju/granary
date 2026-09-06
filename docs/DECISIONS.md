@@ -754,6 +754,26 @@ useful reading order — search for the issue number instead.
   exist to call), which is itself the strongest possible confirmation
   that the capability was genuinely new.
 
+  **Round 6 re-confirmed round 5's fixes and closed with no new blocking
+  code issue, but named a compatibility cost of round 4's own fix worth
+  recording, 2026-09-06.** Round 4's fix of `cascade_delete_fk` (silent
+  no-op → `Lwt.fail_with` on an unresolvable FK column, above) and the
+  equivalent fix in `make_fk_recheck` (silent "not violated" →
+  `Lwt.fail_with`, round 3's own write-up) both now raise on the
+  pre-existing, out-of-scope corruption class `Cat.drop_column` can leave
+  behind (#767: a standalone `DROP COLUMN` with no pending obligation
+  still leaves a dangling `fk_constraints` entry, forever). Loud beats
+  silently wrong, but it is not free: a table already corrupted by #767 —
+  where an unrelated DELETE/UPDATE used to succeed with the cascade
+  silently skipped — now has every DML statement that reaches that
+  cascade dispatch fail outright, with no repair path short of recreating
+  the table. Anyone upgrading a deployment with pre-existing
+  #767-corrupted on-disk state should read this as the compatibility note
+  it is, not a new defect it introduces. Round 6 also produced a concrete
+  repro for the `RENAME TABLE`/`DROP TABLE` residual round 3 named above
+  (#768) — no new action follows; it stays the same already-filed,
+  already-scoped-out gap, just no longer hypothetical.
+
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does
   for UNIQUE. `OR IGNORE` skips the offending row — consistent with the UNIQUE
