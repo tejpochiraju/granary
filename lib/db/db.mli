@@ -1051,6 +1051,27 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
     GENERATED column on a [USING COLUMNSTORE] table being refused at DDL
     (#660) rather than silently accepted and then never honoured.
 
+    {b Returns [Error `Store_closing] during a narrow VACUUM race window on a
+    SIBLING handle (#752 review round 5).} [row_hooks] lives on the store
+    (see below) and this call never opens a transaction, so it is not
+    naturally refused the way ordinary DML is once a store starts closing.
+    {!vacuum} closes the old store, carries its row-hook registry over to the
+    new one, and only THEN swaps [t.store] to the new store and marks sibling
+    handles stale — with Lwt-yielding work (re-opening the catalog) in
+    between. A sibling whose [t.store] still names that already-closed store
+    during this window would otherwise register a hook into a registry
+    {!Granary_store.Store.row_hooks_carry_over} has already finished copying
+    out of (silently never firing). Detected via
+    {!Granary_store.Store.is_closing} — the same check {!Granary_store.Store.rw_begin}
+    already applies to ordinary writes — rather than the VACUUM-staleness
+    check every ordinary statement is refused with, which this window
+    predates (the shared cohort generation bumps only after the swap, so a
+    part-way-failed VACUUM leaves it untouched). Retry is not meaningful: by
+    the time this returns, the caller's handle is doomed the same way #634
+    already documents for any other operation racing a sibling's VACUUM —
+    obtain a fresh handle via {!create_worker_handle} on the handle that ran
+    it.
+
     {b A hook is tied to the table it was registered against, not to the
     name — DROP TABLE purges it; RENAME migrates it, from ANY execution path
     and for EVERY handle sharing this store (#752 review round 3).} The
@@ -1218,7 +1239,12 @@ val register_row_hook
   -> timing:[ `Before | `After ]
   -> event:[ `Insert | `Update | `Delete ]
   -> (row_mutation -> (unit, string) result Lwt.t)
-  -> (row_hook, [ `Unknown_table of string | `Columnstore_unsupported of string ]) result
+  -> ( row_hook
+       , [ `Unknown_table of string
+         | `Columnstore_unsupported of string
+         | `Store_closing
+         ] )
+       result
 
 (** #752: detach the row hook [h] names — for every handle sharing [h]'s
     store (#752 review round 3): the removal acts on
@@ -1239,7 +1265,16 @@ val register_row_hook
     an explicit transaction that later rolls back re-attaches [h] exactly as
     it was — otherwise [BEGIN; unregister_row_hook h; ROLLBACK] would leave
     [h] permanently detached even though nothing else about the transaction
-    survived. Registering outside an explicit transaction is unaffected. *)
+    survived. Registering outside an explicit transaction is unaffected.
+
+    {b Also a silent no-op during the same VACUUM race window
+    {!register_row_hook} refuses with [`Store_closing] (#752 review round
+    5).} Unlike registration this has no error channel to report the race
+    through — [h]'s table is presumed gone with the store regardless: the
+    only legal operation on a handle a sibling's VACUUM has invalidated is
+    close (#634), and this store's registry is already abandoned
+    ({!Granary_store.Store.row_hooks_carry_over} moved whatever survives to
+    the new store, which this call — bound to the old one — cannot reach). *)
 val unregister_row_hook : t -> row_hook -> unit
 
 (** #387: the projected output column names for a row-returning [sql], without

@@ -560,6 +560,22 @@ let geometry t =
   | Btree st -> Pager.geom st.pager
 ;;
 
+(* #338/#752 (review round 5): [true] once {!close} has signalled teardown on
+   this store object — set at the very start of [close] (before any of its
+   own awaits) and never cleared, since a closed store is never reused.
+   [rw_begin]/[ro_begin] already refuse once this is set (see their own
+   comments); exposing it publicly lets a caller outside this module apply
+   the identical "this exact store object is being torn down" check without
+   opening a transaction just to provoke that refusal — e.g. [Db]'s row-hook
+   registry accessors, which touch [row_hooks] directly and never go through
+   [rw_begin]/[ro_begin] at all. Always [false] for [Mem], which has no
+   teardown state. *)
+let is_closing t =
+  match t.backend with
+  | Mem _ -> false
+  | Btree st -> st.closing
+;;
+
 (* #633: the one accessor.  Handing the table out rather than wrapping it keeps
    the catalog's [patch]/[publish] hot path a plain [Hashtbl] lookup. *)
 let rowid_counters t = t.rowid_counters
@@ -613,18 +629,31 @@ let row_hook_unregister (reg : row_hooks) id =
   | None -> fun () -> ()
   | Some key ->
     Hashtbl.remove reg.row_hook_index id;
-    let snapshot = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
-    (match List.filter (fun (i, _) -> i <> id) snapshot with
+    let current = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+    (* #752 (review round 5, item 2): capture the ONE removed entry, not the
+       whole prior list at [key] — a blind snapshot-and-replace undo would
+       silently discard a hook a DIFFERENT caller registers on this exact key
+       between this removal and a later ROLLBACK replaying the undo below
+       (that registration's [row_hook_index] entry would survive, pointing at
+       a list entry the blind replace had just erased). Merging the removed
+       entry back into whatever is CURRENT at undo-time, instead of replacing
+       outright, cannot lose a concurrent registration. *)
+    let removed_fn = List.assoc_opt id current in
+    (match List.filter (fun (i, _) -> i <> id) current with
      | [] -> Hashtbl.remove reg.row_hook_tbl key
      | kept -> Hashtbl.replace reg.row_hook_tbl key kept);
-    (* Exact snapshot-and-restore, mirroring {!row_hooks_purge_table} at a
-       single-key granularity: idempotent because replaying it re-sets the
-       SAME fixed value rather than re-deriving one from current state — the
-       index entry is restored alongside the list entry so a SECOND undo
-       replay (or a later lookup) still resolves [id] correctly. *)
     fun () ->
-      Hashtbl.replace reg.row_hook_tbl key snapshot;
-      Hashtbl.replace reg.row_hook_index id key
+      (match removed_fn with
+       | None -> ()
+       | Some fn ->
+         (* Idempotent per-id: if [id] is already present (a second replay, or
+           because some other path already restored it), re-adding it is a
+           no-op rather than a duplicate entry. *)
+         let now = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+         if not (List.mem_assoc id now)
+         then (
+           Hashtbl.replace reg.row_hook_tbl key ((id, fn) :: now);
+           Hashtbl.replace reg.row_hook_index id key))
 ;;
 
 let row_hook_fire_list (reg : row_hooks) ~table ~timing ~event =
@@ -646,7 +675,7 @@ let all_row_hook_timings_events : (row_hook_timing * row_hook_event) list =
 ;;
 
 let row_hooks_purge_table (reg : row_hooks) name =
-  let snapshot =
+  let removed =
     List.filter_map
       (fun (timing, event) ->
          let key = name, timing, event in
@@ -657,13 +686,28 @@ let row_hooks_purge_table (reg : row_hooks) name =
     (fun (key, entries) ->
        Hashtbl.remove reg.row_hook_tbl key;
        List.iter (fun (id, _) -> Hashtbl.remove reg.row_hook_index id) entries)
-    snapshot;
+    removed;
+  (* #752 (review round 5, item 2): merge the removed entries back into
+     whatever is CURRENTLY at each key, rather than replacing it outright —
+     the same fix as {!row_hook_unregister}, for the same reason. A table
+     this purge dropped can be re-created (with the same name) and get a
+     fresh registration before a later ROLLBACK undoes the DROP; a blind
+     snapshot-replace here would silently erase that fresh registration's
+     list entry while leaving its [row_hook_index] entry dangling. Newer
+     (current) entries sort before the restored (older) ones, matching
+     [row_hook_fire_list]'s newest-first storage order. *)
   fun () ->
     List.iter
       (fun (key, entries) ->
-         Hashtbl.replace reg.row_hook_tbl key entries;
+         let current = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+         let to_restore =
+           List.filter (fun (id, _) -> not (List.mem_assoc id current)) entries
+         in
+         (match current @ to_restore with
+          | [] -> Hashtbl.remove reg.row_hook_tbl key
+          | merged -> Hashtbl.replace reg.row_hook_tbl key merged);
          index_entries reg key entries)
-      snapshot
+      removed
 ;;
 
 let move_row_hook_key (reg : row_hooks) ~old_name ~new_name (timing, event) =
@@ -1928,12 +1972,7 @@ let rw_begin t =
     | Btree st -> st.follower
     | Mem _ -> false
   in
-  let is_closing =
-    match t.backend with
-    | Btree st -> st.closing
-    | Mem _ -> false
-  in
-  if is_closing
+  if is_closing t
   then (
     (* #338 (review r2 #4): fail fast on a write begun after [close] signalled
        teardown, rather than letting the commit surface an obscure EBADF from a

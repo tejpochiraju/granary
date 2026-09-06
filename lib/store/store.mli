@@ -25,6 +25,23 @@ val pp : Format.formatter -> t -> unit
     chosen at open time.  VACUUM reads this to rebuild at the same page_size. *)
 val geometry : t -> Geometry.t
 
+(** #338/#752 (review round 5): [true] once {!close} has signalled teardown
+    on this exact store object — set at the very start of {!close}, before
+    any of its own awaits, and never cleared, since a closed store is never
+    reused (a VACUUM that swaps in a rebuilt store gives the caller a
+    brand-new {!t}, not a resurrection of this one). {!rw_begin}/{!ro_begin}
+    already refuse once this is set; this is the same check, exposed so a
+    caller that mutates store-level state directly — without opening a
+    transaction — can apply it too.  This is exactly [Db]'s situation for its
+    row-hook registry accessors: a sibling handle whose [t.store] still names
+    a store a concurrent {!Db.vacuum} has already closed (but not yet swapped
+    out on the vacuuming handle — a real window, since {!Db.vacuum} awaits
+    between the two) could otherwise register or unregister a hook against a
+    registry nobody will ever look at again, with no error. Always [false]
+    for the in-memory backend, which has no teardown state and on which
+    {!Db.vacuum} refuses to run at all. *)
+val is_closing : t -> bool
+
 (** Phantom types for transaction modes. *)
 type ro
 

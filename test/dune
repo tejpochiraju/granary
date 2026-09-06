@@ -2175,6 +2175,7 @@
  (libraries
   granary
   granary.store
+  granary.unix
   alcotest
   qcheck-core
   qcheck-alcotest

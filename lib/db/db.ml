@@ -4961,25 +4961,44 @@ let unregister_view_callback top h =
 let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
 
 let register_row_hook t ~table ~timing ~event fn =
-  match Cat.find_table_cached t.catalog ~name:table with
-  | None -> Error (`Unknown_table table)
-  (* #752 review: a COLUMNSTORE table's INSERT calls [Col_store.insert_rows]
+  (* #752 (review round 5, item 1): [S.is_closing] catches a VACUUM race
+     window a bare [is_stale t] check cannot — [Db.vacuum] closes [t.store]
+     (line ~802 as of this comment) well before it bumps the cohort
+     generation that [is_stale] reads (only after the swap, so a
+     part-way-failed VACUUM leaves the cohort untouched), and awaits
+     ([Cat.open_], [Cat.load_columnar_stores]) in between.  A SIBLING handle's
+     [t.store] still names the just-closed old store for that whole window
+     (its own [t.store] field is never touched by another handle's VACUUM),
+     yet [is_stale] on that sibling would still answer [false] until the
+     bump.  [row_hooks], unlike ordinary DML, never opens a transaction
+     ([S.rw_begin]/[S.ro_begin] already refuse once a store is closing) — so
+     without this check a sibling could register a hook that lands in the
+     registry {!Store.row_hooks_carry_over} already carried out of (never
+     firing again) or unregister one already carried over (removing it from
+     the abandoned store only — it keeps firing from the new one, and the
+     caller believes they detached a [`Before] veto). *)
+  if S.is_closing t.store
+  then Error `Store_closing
+  else (
+    match Cat.find_table_cached t.catalog ~name:table with
+    | None -> Error (`Unknown_table table)
+    (* #752 review: a COLUMNSTORE table's INSERT calls [Col_store.insert_rows]
      directly, bypassing [before_hook]/[after_hook] entirely, and its
      UPDATE/DELETE are refused outright — so a hook registered here could
      NEVER fire, for any (timing, event).  Refusing at registration matches
      the #660 precedent (a GENERATED column on a COLUMNSTORE table is refused
      at DDL rather than half-wired); wiring the columnar write path to fire
      hooks is a larger, separate change than #752 or this fixup owes. *)
-  | Some tm when Cat.is_columnar tm -> Error (`Columnstore_unsupported table)
-  | Some _ ->
-    (* #752 (review round 3): the registration itself lives on
+    | Some tm when Cat.is_columnar tm -> Error (`Columnstore_unsupported table)
+    | Some _ ->
+      (* #752 (review round 3): the registration itself lives on
        {!Store.row_hooks} — shared by every [Db.t] over this store
        (#589/#633) — rather than on [t], so a hook registered through one
        handle fires from every sibling's write path too, and a DROP/RENAME
        executed by ANY handle purges/migrates it for all of them (see
        [Sql.Exec.execute_drop_table] / [execute_alter_table]). *)
-    let id = S.row_hook_register (S.row_hooks t.store) ~table ~timing ~event fn in
-    (* #752 review: without the undo below, [BEGIN; CREATE TABLE t(...);
+      let id = S.row_hook_register (S.row_hooks t.store) ~table ~timing ~event fn in
+      (* #752 review: without the undo below, [BEGIN; CREATE TABLE t(...);
        register_row_hook ~table:"t" ...; ROLLBACK] would leave the hook
        attached even though the table it was registered against never really
        existed — a LATER, unrelated [CREATE TABLE t] then silently reattaches
@@ -4994,27 +5013,39 @@ let register_row_hook t ~table ~timing ~event fn =
        either before or after this call has since moved it to — no LIFO
        ordering between this undo and a rename's is needed for correctness
        any more. *)
-    (match t.explicit_txn with
-     | None -> ()
-     | Some _ ->
-       Cat.register_schema_undo t.catalog (fun () ->
-         (* Discards the returned re-undo closure: once this fires the
+      (match t.explicit_txn with
+       | None -> ()
+       | Some _ ->
+         Cat.register_schema_undo t.catalog (fun () ->
+           (* Discards the returned re-undo closure: once this fires the
             enclosing transaction is already being rolled back, so there is
             nothing further to protect this removal against. *)
-         ignore (S.row_hook_unregister (S.row_hooks t.store) id : unit -> unit)));
-    Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id }
+           ignore (S.row_hook_unregister (S.row_hooks t.store) id : unit -> unit)));
+      Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id })
 ;;
 
 let unregister_row_hook t h =
-  let undo = S.row_hook_unregister (S.row_hooks t.store) h.rh_id in
-  (* #752 review (round 3, item 3): mirrors {!register_row_hook}'s own
-     transactional undo — an unregister issued mid-transaction must be
-     reversible by that transaction's ROLLBACK, or [BEGIN;
-     unregister_row_hook h; ROLLBACK] leaves [h] permanently detached even
-     though nothing else about the transaction survived. *)
-  match t.explicit_txn with
-  | None -> ()
-  | Some _ -> Cat.register_schema_undo t.catalog undo
+  (* #752 (review round 5, item 1): same race window as {!register_row_hook}
+     — a silent no-op here, matching this function's existing "idempotent,
+     never raises" contract for a hook that is not (or no longer) registered
+     anywhere. [h]'s table is presumed gone with the store regardless: the
+     ONLY legal operation on a stale handle is close (#634), and there is
+     nothing left in this (already-abandoned) store's registry worth
+     removing [h] from — [Store.row_hooks_carry_over] already moved whatever
+     survives to the new store, which THIS call cannot reach without a fresh
+     handle. *)
+  if S.is_closing t.store
+  then ()
+  else (
+    let undo = S.row_hook_unregister (S.row_hooks t.store) h.rh_id in
+    (* #752 review (round 3, item 3): mirrors {!register_row_hook}'s own
+       transactional undo — an unregister issued mid-transaction must be
+       reversible by that transaction's ROLLBACK, or [BEGIN;
+       unregister_row_hook h; ROLLBACK] leaves [h] permanently detached even
+       though nothing else about the transaction survived. *)
+    match t.explicit_txn with
+    | None -> ()
+    | Some _ -> Cat.register_schema_undo t.catalog undo)
 ;;
 
 let pp_row_hook fmt h =

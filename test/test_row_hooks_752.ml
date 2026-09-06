@@ -34,8 +34,30 @@
 module Db = Granary.Db
 module Row = Granary_encoding.Row
 module Store = Granary_store.Store
+module Ustore = Granary_unix.Store
 
+let () = Granary_unix.install ()
 let run = Lwt_main.run
+
+(* A file-backed store, for the {!Store.is_closing} tests below --
+   [Store.is_closing] is [false] unconditionally for the in-memory backend,
+   which has no teardown state. Each call gets its own path so tests can run
+   in any order without colliding. *)
+let file_db_counter = ref 0
+
+let fresh_file_store () =
+  let n = !file_db_counter in
+  incr file_db_counter;
+  let path = Printf.sprintf "/tmp/granary_row_hooks_752_test_%04d.db" n in
+  List.iter
+    (fun suffix ->
+       try Unix.unlink (path ^ suffix) with
+       | _ -> ())
+    [ ""; "-wal"; ".aslog" ];
+  match run (Ustore.open_file ~path ()) with
+  | Ok store -> store
+  | Error e -> Alcotest.failf "open_file: %a" Store.pp_error e
+;;
 
 let with_db f =
   let db = run (Db.open_in_memory ()) in
@@ -101,6 +123,7 @@ let attach db ~table ~timing ~event fn =
   | Error (`Unknown_table t) -> Alcotest.failf "expected %S to be a known table" t
   | Error (`Columnstore_unsupported t) ->
     Alcotest.failf "expected %S to be a non-columnstore table" t
+  | Error `Store_closing -> Alcotest.fail "expected the store not to be closing"
 ;;
 
 let ok_hook fn m =
@@ -121,6 +144,7 @@ let test_unknown_table_reports_and_registers_nothing () =
     | Error (`Unknown_table t) -> Alcotest.(check string) "names the table" "nope" t
     | Error (`Columnstore_unsupported t) ->
       Alcotest.failf "expected `Unknown_table, got `Columnstore_unsupported %S" t
+    | Error `Store_closing -> Alcotest.fail "expected `Unknown_table, got `Store_closing"
     | Ok _ -> Alcotest.fail "expected `Unknown_table")
 ;;
 
@@ -519,6 +543,8 @@ let test_columnstore_table_refuses_registration () =
       Alcotest.(check string) "names the table" "c" t
     | Error (`Unknown_table t) ->
       Alcotest.failf "expected `Columnstore_unsupported, got `Unknown_table %S" t
+    | Error `Store_closing ->
+      Alcotest.fail "expected `Columnstore_unsupported, got `Store_closing"
     | Ok _ -> Alcotest.fail "expected `Columnstore_unsupported")
 ;;
 
@@ -724,6 +750,166 @@ let test_rolled_back_unregister_restores_the_hook () =
     exec db "ROLLBACK";
     exec db "INSERT INTO t VALUES (1, 10)";
     Alcotest.(check int) "the rolled-back unregister leaves the hook attached" 1 !fired)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* VACUUM race window (review round 5, item 1)                           *)
+(* ------------------------------------------------------------------ *)
+
+(* Db.vacuum closes the OLD store, carries the row-hook registry over to the
+   new one, and only THEN swaps t.store / bumps the invalidation cohort --
+   with real Lwt-yielding work (Cat.open_, Cat.load_columnar_stores) in
+   between. A sibling handle whose t.store still names that already-closed
+   store during this window is not yet "stale" by the cohort-generation
+   check (which only flips after the swap), so without a dedicated check
+   register_row_hook/unregister_row_hook -- which never open a transaction,
+   unlike ordinary DML -- would silently operate on an abandoned registry.
+
+   Rather than racing real concurrent fibers against Db.vacuum's exact
+   timing (no existing test in this codebase does that for VACUUM; every
+   existing test, e.g. test_vacuum_worker_634.ml, runs VACUUM to completion
+   and then checks a sibling), this reconstructs the SAME store-level
+   condition directly and deterministically: open a file-backed Store.t,
+   wrap it as a Db.t, then close the STORE OBJECT ITSELF underneath the
+   handle -- exactly the property the race window has (t.store already
+   closing) -- without needing VACUUM's file-rebuild machinery or any
+   interleaving at all. *)
+
+let test_register_refuses_once_the_store_is_closing () =
+  let store = fresh_file_store () in
+  let db = run (Db.of_store store) in
+  Fun.protect
+    ~finally:(fun () ->
+      try run (Store.close store) with
+      | _ -> ())
+    (fun () ->
+       exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+       run (Store.close store);
+       match
+         Db.register_row_hook db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+           Lwt.return (Ok ()))
+       with
+       | Error `Store_closing -> ()
+       | Error (`Unknown_table t) -> Alcotest.failf "expected `Store_closing, got %S" t
+       | Error (`Columnstore_unsupported t) ->
+         Alcotest.failf "expected `Store_closing, got `Columnstore_unsupported %S" t
+       | Ok _ ->
+         Alcotest.fail
+           "expected `Store_closing: the store was already closing at the call")
+;;
+
+let test_unregister_is_a_silent_noop_once_the_store_is_closing () =
+  let store = fresh_file_store () in
+  let db = run (Db.of_store store) in
+  Fun.protect
+    ~finally:(fun () ->
+      try run (Store.close store) with
+      | _ -> ())
+    (fun () ->
+       exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+       let fired = ref 0 in
+       let h =
+         attach
+           db
+           ~table:"t"
+           ~timing:`After
+           ~event:`Insert
+           (ok_hook (fun _ -> incr fired))
+       in
+       run (Store.close store);
+       (* Must not raise, matching unregister_row_hook's existing
+          "idempotent, never raises" contract -- Fun.protect's finally would
+          mask a raise here anyway, so the absence of a crash is checked by
+          the test simply reaching this point. *)
+       Db.unregister_row_hook db h)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Concurrent registration survives a rollback's undo (review round 5,      *)
+(* item 2)                                                                  *)
+(* ------------------------------------------------------------------ *)
+
+(* Round-5 review #2: the undo Db.unregister_row_hook schedules for a
+   ROLLBACK must not blindly replace the whole (table, timing, event) list
+   with a pre-removal snapshot -- if a DIFFERENT caller registers a hook on
+   that exact key before the ROLLBACK replays, a blind replace would erase
+   that hook's list entry (its row_hook_index entry would survive, pointing
+   at a list that no longer contains it) with no error to anyone. The
+   concurrent registration goes through a SIBLING handle so its own
+   registration-time transactional undo (which would apply if it were
+   registered on a_db while a_db's transaction is open) cannot itself be
+   the reason it survives -- isolating the property under test to the
+   unregister-undo's merge behaviour alone. *)
+let test_unregister_rollback_does_not_clobber_a_concurrent_registration () =
+  with_db (fun a_db ->
+    exec a_db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let b_db = run (Db.create_worker_handle a_db) in
+    let fired_a = ref 0 in
+    let fired_b = ref 0 in
+    let a =
+      attach
+        a_db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (ok_hook (fun _ -> incr fired_a))
+    in
+    exec a_db "BEGIN";
+    Db.unregister_row_hook a_db a;
+    let _b =
+      attach
+        b_db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (ok_hook (fun _ -> incr fired_b))
+    in
+    exec a_db "ROLLBACK";
+    exec a_db "INSERT INTO t VALUES (1, 10)";
+    Alcotest.(check int) "a's rolled-back removal fires again" 1 !fired_a;
+    Alcotest.(check int)
+      "b, registered by a sibling handle in the interim, still fires"
+      1
+      !fired_b)
+;;
+
+(* Round-5 review #2, the purge half: DROP TABLE's row-hook purge is undone
+   by the same blind-snapshot mechanism prior to this fix. b_db's own
+   catalog cache still describes the pre-drop "t" (the pre-existing,
+   documented cross-handle DDL-visibility caveat, #589/#633/#634), so it can
+   register on "t" while a_db's DROP is only provisionally in effect --
+   exactly the interleaving the review names. *)
+let test_purge_rollback_does_not_clobber_a_concurrent_registration () =
+  with_db (fun a_db ->
+    exec a_db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let fired_old = ref 0 in
+    let _old_hook =
+      attach
+        a_db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (ok_hook (fun _ -> incr fired_old))
+    in
+    let b_db = run (Db.create_worker_handle a_db) in
+    exec a_db "BEGIN";
+    exec a_db "DROP TABLE t";
+    let fired_new = ref 0 in
+    let _new_hook =
+      attach
+        b_db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (ok_hook (fun _ -> incr fired_new))
+    in
+    exec a_db "ROLLBACK";
+    exec a_db "INSERT INTO t VALUES (1, 10)";
+    Alcotest.(check int) "the rolled-back purge restores the old hook" 1 !fired_old;
+    Alcotest.(check int)
+      "the hook registered by a sibling in the interim still fires"
+      1
+      !fired_new)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -939,6 +1125,26 @@ let () =
             "a rolled-back unregister restores the hook"
             `Quick
             test_rolled_back_unregister_restores_the_hook
+        ] )
+    ; ( "vacuum race window"
+      , [ Alcotest.test_case
+            "register refuses once the store is closing"
+            `Quick
+            test_register_refuses_once_the_store_is_closing
+        ; Alcotest.test_case
+            "unregister is a silent no-op once the store is closing"
+            `Quick
+            test_unregister_is_a_silent_noop_once_the_store_is_closing
+        ] )
+    ; ( "concurrent registration survives a rollback's undo"
+      , [ Alcotest.test_case
+            "unregister's rollback does not clobber a concurrent registration"
+            `Quick
+            test_unregister_rollback_does_not_clobber_a_concurrent_registration
+        ; Alcotest.test_case
+            "purge's rollback does not clobber a concurrent registration"
+            `Quick
+            test_purge_rollback_does_not_clobber_a_concurrent_registration
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest prop_fired_matches_registered ]
     ]
