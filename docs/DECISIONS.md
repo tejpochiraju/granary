@@ -4580,7 +4580,7 @@ fixed, per instruction): FK `ON DELETE`/`ON UPDATE` `CASCADE`/`SET NULL`/
 `cascade_delete_row_in_tx`/`cascade_update_col_in_tx` route through
 `delete_row_in_tx`/`update_col_in_tx` without ever building the
 `before_hook`/`after_hook` closures the direct DELETE/UPDATE paths construct —
-tracked as #773. Separately, `row_hooks_carry_over` did not carry a row hook's
+tracked as #773 (fixed since — see its own entry below). Separately, `row_hooks_carry_over` did not carry a row hook's
 recursion depth across a VACUUM store-swap — filed as #774 and **fixed
 separately (below)**.
 
@@ -4631,3 +4631,157 @@ the restored entry past a registration made while it was detached; the new
 one has nothing concurrent at all, so it pins that the restored entry goes
 back *ahead* of an entry that was already there.
 
+
+### An FK cascade's child write and `PRAGMA not_null_repair`'s victim delete both fire OCaml row hooks, and a `` `Before `` veto on either refuses the whole statement rather than skipping the row (#773/#775, decided 2026-09-10)
+
+Round 9 of #752 filed two write paths that removed or modified rows with no
+row-hook plumbing at all: the six FK actions (`ON DELETE`/`ON UPDATE`
+`CASCADE`/`SET NULL`/`SET DEFAULT`, #773) and `PRAGMA not_null_repair`'s bulk
+delete (#775). They are one bug with two spellings —
+`Exec.cascade_delete_row_in_tx`/`cascade_update_col_in_tx` route through
+`delete_row_in_tx`/`update_col_in_tx`, and the repair calls `apply_delete_row`
+directly; none of those three takes a `before_hook`/`after_hook` at all, so a
+write that a plain `DELETE`/`UPDATE` against the same table would have offered
+to a hook was made silently.
+
+**The consequence is a veto hole, not a missing notification.**
+`Db.register_row_hook`'s doc comment promises that a `` `Before `` hook's
+`Error` prevents the write. Before this, an application could hold that
+guarantee on a child table and have it bypassed by anyone writing to the
+*parent* — or by an operator typing `PRAGMA not_null_repair`. That is a
+correctness/security property quietly not holding, which is why this was worth
+fixing rather than filing as a nice-to-have.
+
+**Transport: an `Lwt` dynamically-scoped lookup, not one more threaded
+parameter.** `execute`/`execute_with_count`'s existing `?before_hook`/
+`?after_hook` pair is built by `Db` for the ONE table the statement names, and
+structurally cannot cover these paths: an FK cascade discovers its child tables
+a level at a time as the fan-out runs, and the repair deletes from every table
+in the database. So the write path needs to resolve a hook *by name,
+mid-statement*. `Exec.row_hook_lookup` is that resolver;
+`Exec.with_row_hooks` installs one for a statement's dynamic extent, and `Db`
+wraps every `Exec.execute`/`execute_with_count`/`query` call it makes in one
+(`Db.make_row_hook_lookup`).
+
+Threading a parameter instead was the alternative, and it was rejected on the
+same grounds `record_change` was: the cascade group is ~20 mutually-recursive
+functions and the repair has its own call chain through a forward reference
+(`not_null_repair_run_ref`) and through `to_stream`, whose ~25 recursive call
+sites would all have grown an argument for one PRAGMA. The change feed
+(#417) — which the very same cascade sites already call, for the very same
+"this must reach a nested write" reason — established the `Lwt` key here first,
+as did `dirty_tables_acc` (#240) and `dml_seek_stats` (#514). A caller that
+installs nothing fires nothing, which is exactly the pre-#773 behaviour and
+what a direct `Exec` caller (a storage-level test) still gets.
+
+**Deliberately NOT a direct read of `Store.row_hooks`, even though the registry
+is on the store and therefore already in scope down there.** Firing a hook
+means going through `Db.fire_ocaml_row_hook`: the `max_row_hook_depth` guard
+via `Store.row_hook_effective_depth` (so a cascade-fired hook that defers work
+with `Lwt.async` is still bounded — #752 round 8), the dynamic-extent
+reentrancy scope that turns a hook's own fresh-transaction nested DML into a
+clean error instead of a writer-lock deadlock (#740, #752 rounds 6-7), the
+ambient undo target a registry mutation made from inside the hook lands on
+(#752 round 9), and the error normalisation that keeps every failure shape in
+the `Failure` class. All of that lives above `Exec` in the dependency graph. A
+raw registry read in `Exec` would have reproduced the *firing* half of the
+feature while silently dropping every guard nine review rounds put around it —
+so the closure `Db` hands down is the whole point, not an implementation
+detail.
+
+**A vetoed cascade step fails the whole parent statement. It cannot be a
+skip.** This is the design decision the issue asked for, and the argument is
+short: the cascade exists to maintain the FK constraint. Skipping one cascaded
+child delete leaves that child row pointing at a parent row the statement just
+removed — precisely the dangling reference `ON DELETE CASCADE` was declared to
+prevent. Skipping a cascaded `SET NULL`/`SET DEFAULT`/`ON UPDATE CASCADE` is
+the same hole through a different door. There is no per-row outcome that both
+honours the veto and preserves referential integrity, so the only coherent
+reading of "this write must not happen" is "then this statement must not
+happen": the veto raises, the exception unwinds through the cascade and out of
+`execute_delete`/`execute_update`'s `Lwt.catch`, and the statement rolls back
+whole. A `` `Before `` veto also pre-empts the fan-out *below* the step it
+vetoes, because it fires ahead of the recursion rather than merely ahead of the
+row's own removal — the same outer-gate position #752 gave a `` `Before `` hook
+relative to a SQL BEFORE trigger's nested DML. `` `After `` errors abort
+identically, per #752's own rule, and for the same reason: everything runs
+inside one not-yet-committed transaction, so there is no "already durable" case
+to be lenient about.
+
+The scope of that unwind is #752's, unchanged and not widened here: in
+autocommit the statement's own transaction rolls back outright; inside an
+explicit transaction the caller opened, only the primary write is prevented and
+a vetoing hook's own nested DML is not specially undone (#631's savepoint
+covers the non-raising `OR IGNORE` *skip* path only).
+
+**The repair PRAGMA's veto outcome is the same shape, one level bigger.** All
+of `not_null_repair_run`'s per-table work shares one transaction, so a veto
+anywhere rolls back *every* table's repair, not just the vetoing table's, and
+the PRAGMA fails reporting nothing deleted. That is the same all-or-nothing
+scope the columnstore comment in `repair_not_null_table` already reasons about,
+and it is why a vetoing hook here reads as "refuse the repair" rather than "exempt
+these rows from it" — there is no per-table spelling of this PRAGMA to fall back
+on. Both of #588's entry points are covered: the hooks fire whether the repair
+is reached through `Db.execute` (the change-count spelling) or `Db.query` (the
+report-streaming one), because the deletes happen eagerly while the stream is
+being *constructed*, inside the extent `query_impl` installs, not when the
+caller drains it.
+
+**Bracketing.** A cascade step fires `` `Before `` before anything it will
+write — including its own fan-out — and `` `After `` once the entire subtree of
+writes it caused has been applied, so the pair brackets the step's whole
+effect and nests correctly at every level of a multi-level cascade. The
+repair instead mirrors `execute_delete` exactly: ALL of a table's
+`` `Before `` hooks run before ANY of its victims is removed, then the
+removals, then all the `` `After `` hooks — because the repair IS a multi-row
+DELETE and a per-row interleaving would be a statement-visible divergence from
+the spelling it is supposed to be indistinguishable from (#563).
+
+**OCaml hooks only — SQL triggers on a cascaded child write still do not
+fire.** `Db.make_row_hook_lookup` deliberately does not layer
+`make_trigger_hook` in the way `make_combined_hook` does. That matches SQLite,
+whose FK actions fire triggers only under `PRAGMA recursive_triggers` (off by
+default); it is the pre-#773 behaviour for triggers, so nothing regresses; and
+#773 is about the veto guarantee `register_row_hook` makes, which SQL triggers
+never made. Widening it is a separate, larger change with its own recursion
+story.
+
+**One deliberate difference from #771's snapshot rule.** The direct path
+snapshots its fire list once per statement in `make_combined_hook`, so a hook
+registered mid-statement does not fire for the rest of it. The cascade path
+resolves the lookup at the moment each write happens, because a cascade's child
+tables are not known until the fan-out reaches them and there is no earlier
+point at which a snapshot could be taken. A hook registered by an earlier hook
+in the same statement therefore DOES fire for a later cascade step.
+
+**Error messages name the path.** A hook failure raised from a cascade step is
+re-raised prefixed `FOREIGN KEY cascade on '<child>': `, and one from the
+repair `PRAGMA not_null_repair on '<table>': `, ahead of
+`fire_ocaml_row_hook`'s own `before row hook on '<table>': ` prefix — so a
+caller matching the `Runtime` message text can tell a vetoed cascade from a
+veto of the statement's own table without a new `error` variant (the same
+reasoning #752 gives for not widening `error`).
+
+**Known residual, deliberately out of scope: `INSERT`/`UPDATE`/`DELETE ...
+RETURNING` executed through the QUERY path fires no row hooks.**
+`Exec.stream_insert_returning`/`stream_update_returning`/
+`stream_delete_returning` call `execute_insert`/`execute_update`/
+`execute_delete` with no `before_hook`/`after_hook` at all, so `Db.query
+"DELETE ... RETURNING ..."` writes without firing what the identical statement
+through `Db.execute` fires. It is the same family as #773/#775 and the new
+lookup makes it a small fix, but it is a third behaviour change with its own
+tests owed, and neither issue names it. Tracked separately as #778.
+
+The two round-9 residuals this entry does NOT touch remain open: `#774`
+(`row_hooks_carry_over` omitting `row_hook_depth` across a VACUUM store-swap)
+and `#770` (a hook's own nested `BEGIN`/`SAVEPOINT` raising instead of
+returning `Error`).
+
+Pinned by `test/test_cascade_row_hooks_773.ml`: one case per FK action on both
+sides, a three-level cascade asserting the nesting order, a veto per action
+shape asserting that BOTH tables are left untouched, the repair PRAGMA on both
+entry points, the repair's own cascade into a child table, and a group of
+negative tests that the #752 semantics are unchanged — registration order, no
+double-firing on the direct path, and the reentrancy guard still refusing a
+cascade-fired hook's autocommit nested DML while the ambient-transaction
+pattern still works.

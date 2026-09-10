@@ -154,6 +154,85 @@ let with_dirty (acc : dirty_tables_acc) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
 
 let current_dirty_acc () : dirty_tables_acc option = Lwt.get dirty_tables_key
 
+(* #773/#775: the row-hook firing closure for one (table, timing, event), as
+   the write paths BELOW the statement's own hook plumbing see it.
+
+   [Sql.Exec.execute]/[execute_with_count] already take a [?before_hook]/
+   [?after_hook] pair for the ONE table the statement names, built by [Db]
+   before the op runs.  That is enough for a plain INSERT/UPDATE/DELETE and
+   cannot be enough for anything else: an FK cascade's child tables are not
+   known until the fan-out runs (a multi-level cascade discovers them a level
+   at a time), and [PRAGMA not_null_repair] deletes from EVERY table in the
+   database.  So those paths need to resolve a hook for an arbitrary table,
+   mid-statement, by name — which is what this is.
+
+   The lookup rides Lwt sequence-associated storage for the same reason
+   {!dirty_tables_acc} and {!dml_seek_stats} do (see their comments above):
+   the alternative is threading one more parameter through every one of the
+   ~20 mutually-recursive cascade functions and the repair PRAGMA's own call
+   chain, and the change-feed's [record_change] — which the very same cascade
+   sites already call, for the very same reason — established that shape here
+   first (#417).  [Db] installs it with {!with_row_hooks} around each
+   statement's [Exec] call; a caller that installs none (a direct [Exec]
+   caller, e.g. a storage-level test) fires no hooks, exactly as before.
+
+   Deliberately NOT a lookup on [Store.row_hooks] directly, even though the
+   registry is right there on the store: firing a hook means going through
+   [Db.fire_ocaml_row_hook]'s depth guard ([max_row_hook_depth]), its
+   dynamic-extent reentrancy scope (#752 rounds 6-8), its undo-target capture
+   (#752 round 9) and its error normalisation, all of which live above this
+   module in the dependency graph.  A raw registry read here would reproduce
+   the write half of the feature while silently dropping every guard nine
+   review rounds put around it. *)
+type row_hook_lookup =
+  table:string
+  -> timing:[ `Before | `After ]
+  -> event:[ `Insert | `Update | `Delete ]
+  -> (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option
+
+let row_hook_lookup_key : row_hook_lookup Lwt.key = Lwt.new_key ()
+
+let with_row_hooks (lookup : row_hook_lookup) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+  Lwt.with_value row_hook_lookup_key (Some lookup) f
+;;
+
+(* Resolve the hook for one (table, timing, event), or [None] when no lookup is
+   installed or nothing is registered.  Resolved at the moment the write
+   happens, NOT snapshotted per statement the way [make_combined_hook]'s fire
+   list is (#771): a cascade's child tables are not known until the fan-out
+   reaches them, so there is no earlier point at which a snapshot could be
+   taken.  A hook registered by an earlier hook in the same statement therefore
+   DOES fire for a later cascade step, where on the direct path it would not
+   until the next statement. *)
+let row_hook_for ~table ~timing ~event =
+  match Lwt.get row_hook_lookup_key with
+  | None -> None
+  | Some lookup -> lookup ~table ~timing ~event
+;;
+
+(* Run one resolved hook, prefixing whatever it fails with by [ctx] so the
+   error names the write that fired it.  A [`Before] hook's [Error] arrives
+   here as [Failure] (Db's [fire_ocaml_row_hook] normalises every failure
+   shape to that one class), and re-raising it is the whole veto mechanism:
+   the exception unwinds through the cascade, out of [execute_delete]/
+   [execute_update]'s [Lwt.catch], and rolls the statement back.  See
+   [docs/DECISIONS.md] (#773) for why a cascade veto CANNOT be a per-row skip. *)
+let run_row_hook ~ctx hook ~tx ~new_row ~old_row : unit Lwt.t =
+  match hook with
+  | None -> Lwt.return_unit
+  | Some f ->
+    Lwt.catch
+      (fun () -> f ~tx ~new_row ~old_row)
+      (function
+        | Failure msg -> Lwt.fail_with (ctx ^ msg)
+        | exn -> Lwt.fail exn)
+;;
+
+(* The [ctx] prefix for a hook fired by an FK cascade step on [table]. *)
+let fk_cascade_hook_ctx table =
+  Printf.sprintf "FOREIGN KEY cascade on '%s': " table
+;;
+
 (* Drain to the public shape: user tables only, deduplicated, sorted. *)
 let dirty_elements ({ names; _ } : dirty_tables_acc) : string list =
   Hashtbl.fold
@@ -6315,6 +6394,19 @@ let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   Cat.note_rowid_deleted cat ~name:meta.Cat.name ~rowid tx
 ;;
 
+(* #773: the row a single-column cascade write ([ON DELETE]/[ON UPDATE]
+   [CASCADE]/[SET NULL]/[SET DEFAULT]) will store, computed from the pre-image.
+   Factored out of {!update_col_in_tx} so the [`Before]/[`After] UPDATE row
+   hooks {!cascade_update_col_in_tx} fires observe EXACTLY the row that write
+   stores — including its STORED generated columns — rather than a second,
+   independently maintained reconstruction of it that could drift. *)
+let cascade_updated_row (meta : Cat.table_meta) (row : Row.t) ~col_idx ~new_val =
+  let new_row = Array.copy row in
+  new_row.(col_idx) <- new_val;
+  compute_stored_generated_cols None [||] meta new_row;
+  new_row
+;;
+
 (** Update one column to [new_val] in a row within an existing RW transaction.
     Also updates index entries for any index that covers [col_idx]. *)
 let update_col_in_tx
@@ -6327,9 +6419,7 @@ let update_col_in_tx
       ~new_val
   =
   mark_dirty meta.Cat.name;
-  let new_row = Array.copy row in
-  new_row.(col_idx) <- new_val;
-  compute_stored_generated_cols None [||] meta new_row;
+  let new_row = cascade_updated_row meta row ~col_idx ~new_val in
   let indexes = Cat.indexes_for_table cat ~table:meta.Cat.name in
   (* #693: this is the third and last [write_row_rekeyed] caller (ON UPDATE
      CASCADE / SET NULL / SET DEFAULT) — plain UPDATE has
@@ -6421,6 +6511,24 @@ let rec cascade_delete_row_in_tx
   then Lwt.return_unit
   else (
     Hashtbl.add visited visited_key ();
+    (* #773: an OCaml row hook registered on THIS table fires for the cascaded
+       delete exactly as it would for the same row deleted by a plain [DELETE].
+       [`Before] fires ahead of the fan-out below, not merely ahead of this
+       row's own removal, so a veto pre-empts every grandchild write this step
+       would have caused — the same outer-gate position #752 gave a [`Before]
+       hook relative to a SQL BEFORE trigger's nested DML; [`After] fires once
+       the whole subtree rooted at this row has been applied.  The [visited]
+       guard above is checked FIRST, so a row reached twice by a cyclic cascade
+       fires nothing the second time: no write happens either. *)
+    let ctx = fk_cascade_hook_ctx meta.Cat.name in
+    let* () =
+      run_row_hook
+        ~ctx
+        (row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Delete)
+        ~tx
+        ~new_row:None
+        ~old_row:(Some row)
+    in
     let* child_refs =
       if Cat.get_fk_enforcement cat
       then build_child_refs cat ~parent_table_name:meta.Cat.name
@@ -6445,7 +6553,13 @@ let rec cascade_delete_row_in_tx
              fks)
         child_refs
     in
-    delete_row_in_tx tx cat meta ~rowid ~row)
+    let* () = delete_row_in_tx tx cat meta ~rowid ~row in
+    run_row_hook
+      ~ctx
+      (row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Delete)
+      ~tx
+      ~new_row:None
+      ~old_row:(Some row))
 
 (* Apply the ON DELETE action of one [fk] (child_meta references meta) while
    deleting [row] of [meta] at [rowid]. *)
@@ -6699,42 +6813,62 @@ and cascade_update_col_in_tx
   then Lwt.return_unit
   else (
     Hashtbl.add visited visited_key ();
+    (* #773: same contract as {!cascade_delete_row_in_tx}'s, for the five
+       cascade actions that WRITE a column rather than remove a row —
+       [ON DELETE SET NULL], [ON DELETE SET DEFAULT], [ON UPDATE CASCADE],
+       [ON UPDATE SET NULL] and [ON UPDATE SET DEFAULT] all funnel through
+       here.  The post-image is built with the same {!cascade_updated_row} the
+       write below uses, and only when a hook is actually registered for this
+       table: a cascade over a table with no hooks pays one [Hashtbl] miss per
+       row, not a row copy. *)
+    let ctx = fk_cascade_hook_ctx meta.Cat.name in
+    let bh = row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Update in
+    let ah = row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Update in
+    let hook_new_row =
+      if Option.is_none bh && Option.is_none ah
+      then None
+      else Some (cascade_updated_row meta row ~col_idx ~new_val)
+    in
+    let* () = run_row_hook ~ctx bh ~tx ~new_row:hook_new_row ~old_row:(Some row) in
     let* () = update_col_in_tx tx cat meta ~rowid ~row ~col_idx ~new_val in
-    if not (Cat.get_fk_enforcement cat)
-    then Lwt.return_unit
-    else (
-      let parent_col_name = (List.nth meta.Cat.columns col_idx).Row.name in
-      let* all_child_refs = build_child_refs cat ~parent_table_name:meta.Cat.name in
-      let col_child_refs =
-        List.filter_map
+    let* () =
+      if not (Cat.get_fk_enforcement cat)
+      then Lwt.return_unit
+      else (
+        let parent_col_name = (List.nth meta.Cat.columns col_idx).Row.name in
+        let* all_child_refs = build_child_refs cat ~parent_table_name:meta.Cat.name in
+        let col_child_refs =
+          List.filter_map
+            (fun (child_meta, fks) ->
+               let matching_fks =
+                 List.filter
+                   (fun (fk : Cat.fk_constraint) ->
+                      List.mem parent_col_name fk.Cat.fk_parent_cols)
+                   fks
+               in
+               if matching_fks = [] then None else Some (child_meta, matching_fks))
+            all_child_refs
+        in
+        Lwt_list.iter_s
           (fun (child_meta, fks) ->
-             let matching_fks =
-               List.filter
-                 (fun (fk : Cat.fk_constraint) ->
-                    List.mem parent_col_name fk.Cat.fk_parent_cols)
-                 fks
-             in
-             if matching_fks = [] then None else Some (child_meta, matching_fks))
-          all_child_refs
-      in
-      Lwt_list.iter_s
-        (fun (child_meta, fks) ->
-           Lwt_list.iter_s
-             (fun (fk : Cat.fk_constraint) ->
-                cascade_update_fk
-                  tx
-                  cat
-                  visited
-                  clock
-                  params
-                  meta
-                  ~row
-                  ~new_val
-                  ~parent_col_name
-                  child_meta
-                  fk)
-             fks)
-        col_child_refs))
+             Lwt_list.iter_s
+               (fun (fk : Cat.fk_constraint) ->
+                  cascade_update_fk
+                    tx
+                    cat
+                    visited
+                    clock
+                    params
+                    meta
+                    ~row
+                    ~new_val
+                    ~parent_col_name
+                    child_meta
+                    fk)
+               fks)
+          col_child_refs)
+    in
+    run_row_hook ~ctx ah ~tx ~new_row:hook_new_row ~old_row:(Some row))
 
 (* Apply the ON UPDATE action of one [fk] when [parent_col_name] of [meta]
    changes to [new_val]. *)
@@ -15343,6 +15477,35 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~
        kept because THIS is where the ordering the delete depends on is
        required, and it must not become an accident of the scan. *)
     let victims = List.sort_uniq (fun (a, _) (b, _) -> Int64.compare a b) victims in
+    (* #775: the repair is a DELETE (#588), so it owes the same OCaml row hooks
+       the [DELETE FROM ...] spelling of the identical write fires — a
+       [`Before `Delete] veto has power over a repaired row, and an [`After]
+       audit hook observes it.  The bracketing mirrors {!execute_delete}'s
+       exactly, and deliberately so: ALL [`Before] hooks for this table's
+       victims run before ANY of them is removed, then the removals, then all
+       the [`After] hooks.  A per-row Before/delete/After interleaving would be
+       a different, statement-visible order from the one the direct path pins.
+
+       Veto outcome (documented in [docs/DECISIONS.md], #775): the raise
+       unwinds through {!not_null_repair_run}, whose [Lwt.catch] rolls the
+       whole repair back — every table's, not just this one's, since they share
+       one transaction.  The PRAGMA reports nothing deleted and fails; that is
+       the same all-or-nothing scope the columnstore comment above already
+       reasons about, and the reason a vetoing hook is a refusal of the repair
+       rather than a way to exempt individual rows from it. *)
+    let ctx = Printf.sprintf "PRAGMA not_null_repair on '%s': " meta.Cat.name in
+    let bh = row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Delete in
+    let ah = row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Delete in
+    let fire hook =
+      match hook with
+      | None -> Lwt.return_unit
+      | Some _ ->
+        Lwt_list.iter_s
+          (fun (_rowid, row) ->
+             run_row_hook ~ctx hook ~tx ~new_row:None ~old_row:(Some row))
+          victims
+    in
+    let* () = fire bh in
     let* () =
       Lwt_list.iter_s
         (fun ((rowid, row) as m) ->
@@ -15361,6 +15524,7 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~
            Lwt.return_unit)
         victims
     in
+    let* () = fire ah in
     mark_dirty meta.Cat.name;
     Lwt.return (not_null_report_rows meta ~counted:Fun.id counts, List.length victims))
 

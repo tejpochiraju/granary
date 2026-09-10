@@ -1336,6 +1336,43 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
     asymmetry with no upside. A hook that truly wants log-and-continue
     semantics can catch its own errors and always return [Ok ()].
 
+    {b Fires for an FK cascade's child writes and for [PRAGMA
+    not_null_repair]'s deletes too, and a veto there refuses the WHOLE
+    statement (#773/#775).} Until #773 those two paths wrote rows without
+    building a [before_hook]/[after_hook] pair at all, so a [`Before] veto held
+    on a child table could be bypassed by writing to the PARENT (an
+    [ON DELETE CASCADE]/[SET NULL]/[SET DEFAULT] or [ON UPDATE CASCADE]/
+    [SET NULL]/[SET DEFAULT] step), or by an operator running the repair
+    PRAGMA. Both now fire the same hooks the equivalent direct
+    [DELETE]/[UPDATE] against that table fires, at any cascade depth.
+
+    A vetoing [`Before] hook on a cascade step {b cannot} simply skip that
+    row: the cascade exists to maintain the FK constraint, and skipping one
+    cascaded child write leaves exactly the dangling reference the action was
+    declared to prevent. The veto therefore fails the whole parent statement,
+    which rolls back with the scope described above. It also pre-empts the
+    fan-out {e below} the step it vetoes — a [`Before] hook fires ahead of the
+    recursion, not merely ahead of its own row's write — which is the same
+    outer-gate position it has relative to a SQL BEFORE trigger's body. A veto
+    raised during [PRAGMA not_null_repair] rolls back {e every} table's
+    repair, not just the vetoing table's: they share one transaction and the
+    PRAGMA has no per-table spelling to fall back on, so a veto there reads as
+    "refuse the repair" rather than "exempt these rows from it".
+
+    The message is prefixed with the path before the ordinary
+    ["before row hook on '<table>': "] prefix — ["FOREIGN KEY cascade on
+    '<child>': "] or ["PRAGMA not_null_repair on '<table>': "] — so a caller
+    matching the {!Runtime} text can tell the two apart.
+
+    {b Two consequences worth knowing.} SQL [CREATE TRIGGER] bodies are
+    {e not} fired for a cascaded child write (matching SQLite, whose FK
+    actions fire triggers only under [PRAGMA recursive_triggers]); and, unlike
+    the direct path's per-statement snapshot (#771), the cascade path resolves
+    the registered hooks at the moment each write happens — a cascade's child
+    tables are not known until the fan-out reaches them — so a hook registered
+    by an earlier hook in the same statement DOES fire for a later cascade
+    step.
+
     {b Ordering against SQL [CREATE TRIGGER]s (design decision, #752).} OCaml
     row hooks and SQL triggers on the same (table, timing, event) are
     sandwiched, not interleaved by a shared registration order: at [`Before]

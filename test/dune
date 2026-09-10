@@ -2194,6 +2194,26 @@
   qcheck-alcotest
   lwt.unix))
 
+; #773/#775: an FK cascade's child writes and PRAGMA not_null_repair's victim
+; deletes both fire the OCaml row hooks the equivalent direct DELETE/UPDATE
+; fires, and both honour a `Before veto by failing the whole statement. Needs
+; a FILE-backed store for the #775 half: the only route to a stored NULL in a
+; NOT NULL column is the pre-#530 legacy-file fixture #567 established, which
+; reopens the catalog to re-derive the constraint.
+
+(test
+ (name test_cascade_row_hooks_773)
+ (modules test_cascade_row_hooks_773)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
+
 ; #750: a compound-root CREATE REACTIVE VIEW is refused. base_tables_of
 ; answered [] for an S_compound root, so the view registered with no base
 ; tables and served its creation-time snapshot forever with no error. Carries

@@ -749,11 +749,35 @@ things that were tried and rejected) is usually the point.
   landed on the CALLING handle's catalog rather than the FIRING statement's
   — fixed by threading a `(unit -> unit) -> unit` undo-target closure through
   the ambient row-hook scope itself (`Store.row_hook_ambient_undo_target`),
-  captured by whichever handle is actually firing the hook. FK
-  `CASCADE`/`SET NULL`/`SET DEFAULT` bypassing OCaml row hooks entirely is
-  tracked as #773 (not fixed); `row_hooks_carry_over` omitting
-  `row_hook_depth` across a VACUUM store-swap is tracked as #774 (not
-  fixed). Full detail in `docs/DECISIONS.md`.
+  captured by whichever handle is actually firing the hook.
+  `row_hooks_carry_over` omitting `row_hook_depth` across a VACUUM
+  store-swap is tracked as #774 (not fixed). Full detail in
+  `docs/DECISIONS.md`.
+- **An FK cascade's child write and `PRAGMA not_null_repair`'s victim delete
+  both fire OCaml row hooks, and a `Before` veto on either refuses the whole
+  statement rather than skipping the row (#773/#775).** Both paths
+  (`Exec.cascade_delete_row_in_tx`/`cascade_update_col_in_tx`, and the
+  repair's direct `apply_delete_row`) wrote rows with no
+  `before_hook`/`after_hook` at all, so a `Before` veto held on a child table
+  was bypassable by writing to the PARENT — the veto guarantee
+  `Db.register_row_hook` documents, quietly not holding. Fixed with
+  `Exec.row_hook_lookup` / `Exec.with_row_hooks`, an `Lwt`
+  dynamically-scoped resolver `Db` installs around every statement (the
+  transport `record_change`/#417 already uses for the identical
+  reach-into-the-cascade problem) — the statement-level
+  `?before_hook`/`?after_hook` pair structurally cannot cover a fan-out whose
+  child tables are discovered a level at a time, nor a PRAGMA that deletes
+  from every table. Firing still goes through `Db.fire_ocaml_row_hook`, so
+  the depth bound, the reentrancy/deadlock guard and the ambient undo target
+  all apply unchanged; reading `Store.row_hooks` directly from `Exec` was
+  rejected precisely because it would drop them. **A vetoed cascade step
+  cannot be a skip**: skipping it leaves the dangling reference the cascade
+  exists to prevent, so the veto raises and the whole parent statement rolls
+  back, and a veto during the repair rolls back EVERY table's repair (one
+  shared transaction, no per-table spelling to fall back on). SQL triggers on
+  a cascaded child write still do not fire (SQLite's default, and
+  pre-existing). `RETURNING` DML executed via the QUERY path fires no row
+  hooks either — same family, deliberately out of scope, tracked as #778.
 
 ## Repository structure
 
