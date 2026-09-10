@@ -1013,11 +1013,7 @@ val register_view_callback
 val unregister_view_callback
   :  t
   -> view_callback
-  -> [ `Removed
-     | `Not_registered
-     | `Stale_generation of int
-     | `Unknown_view of string
-     ]
+  -> [ `Removed | `Not_registered | `Stale_generation of int | `Unknown_view of string ]
 
 (** #437: the names of the live reactive views, sorted.  Read from the in-memory
     registry, so — unlike probing the catalog for [_rv_<name>] — a user table
