@@ -202,7 +202,10 @@ let test_callbacks () =
          Lwt.return_unit)
      with
      | Ok ((_ : Db.view_callback), (_ : int)) -> ()
-     | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n);
+     | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n
+     | Error (`Stale_generation g) ->
+       (* #766 widened the error type; unreachable without ~expected_generation. *)
+       Alcotest.failf "unexpected `Stale_generation %d from a plain registration" g);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "one commit fired one batch" 1 (List.length !fired);
     (match !fired with
@@ -368,7 +371,10 @@ let test_drop_stops_callbacks () =
          Lwt.return_unit)
      with
      | Ok ((_ : Db.view_callback), (_ : int)) -> ()
-     | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n);
+     | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n
+     | Error (`Stale_generation g) ->
+       (* #766 widened the error type; unreachable without ~expected_generation. *)
+       Alcotest.failf "unexpected `Stale_generation %d from a plain registration" g);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "callback fires while live" 1 !fired;
     exec db "DROP REACTIVE VIEW cnt";

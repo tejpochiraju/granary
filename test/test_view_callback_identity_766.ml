@@ -317,8 +317,7 @@ let pp_renders_the_generation () =
     Alcotest.(check bool)
       (Printf.sprintf "%S should render as cnt#<id>@%d" rendered g)
       true
-      (String.starts_with ~prefix:"cnt#" rendered
-       && String.ends_with ~suffix rendered))
+      (String.starts_with ~prefix:"cnt#" rendered && String.ends_with ~suffix rendered))
 ;;
 
 (* ------------------------------- mid-flush -------------------------------- *)

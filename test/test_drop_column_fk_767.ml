@@ -154,7 +154,9 @@ let issue_repro_drop_of_local_fk_column_is_refused () =
 let drop_of_parent_side_column_is_refused () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
-    exec db "CREATE TABLE pp (id INTEGER PRIMARY KEY, code TEXT UNIQUE, note TEXT)";
+    exec
+      db
+      "CREATE TABLE pp (id INTEGER PRIMARY KEY, code TEXT, note TEXT, UNIQUE (code))";
     exec db "CREATE TABLE cc (pcode TEXT REFERENCES pp(code))";
     exec db "INSERT INTO pp VALUES (1, 'x', 'n')";
     exec db "INSERT INTO cc VALUES ('x')";
@@ -169,7 +171,9 @@ let drop_of_parent_side_column_is_refused () =
    the object the user has to go and recreate. *)
 let parent_side_refusal_names_the_referencing_table () =
   with_db (fun db ->
-    exec db "CREATE TABLE pn (id INTEGER PRIMARY KEY, code TEXT UNIQUE, note TEXT)";
+    exec
+      db
+      "CREATE TABLE pn (id INTEGER PRIMARY KEY, code TEXT, note TEXT, UNIQUE (code))";
     exec db "CREATE TABLE cn (pcode TEXT REFERENCES pn(code))";
     match exec_result db "ALTER TABLE pn DROP COLUMN code" with
     | Ok () -> Alcotest.fail "expected a refusal"
@@ -269,7 +273,7 @@ let drop_of_an_unrelated_column_still_works () =
 let unrelated_table_with_the_same_column_name_still_drops () =
   with_db (fun db ->
     exec db "CREATE TABLE ps (id INTEGER PRIMARY KEY)";
-    exec db "CREATE TABLE cs (pid INTEGER REFERENCES ps(id))";
+    exec db "CREATE TABLE cs (pid INTEGER REFERENCES ps(id), filler INTEGER)";
     (* [unrel.pid] shares only the NAME with [cs.pid]. *)
     exec db "CREATE TABLE unrel (pid INTEGER, keep INTEGER)";
     exec db "INSERT INTO unrel VALUES (5, 6)";
@@ -292,7 +296,7 @@ let unrelated_table_with_the_same_column_name_still_drops () =
 let refusal_does_not_depend_on_pragma_foreign_keys () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 0";
-    exec db "CREATE TABLE pf (id INTEGER PRIMARY KEY, code TEXT UNIQUE)";
+    exec db "CREATE TABLE pf (id INTEGER PRIMARY KEY, code TEXT, UNIQUE (code))";
     exec db "CREATE TABLE cf (pid INTEGER REFERENCES pf(id), junk INTEGER)";
     (* Enforcement really is off: the orphan insert is accepted. *)
     expect_ok db "INSERT INTO cf VALUES (404, 0)";
@@ -340,7 +344,7 @@ let drop_is_refused_inside_an_explicit_transaction () =
 let fk_added_by_add_column_is_also_protected () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
-    exec db "CREATE TABLE pa (id INTEGER PRIMARY KEY)";
+    exec db "CREATE TABLE pa (id INTEGER PRIMARY KEY, filler INTEGER)";
     exec db "CREATE TABLE ca (junk INTEGER)";
     exec db "ALTER TABLE ca ADD COLUMN pid INTEGER REFERENCES pa(id)";
     expect_drop_refused db "ALTER TABLE ca DROP COLUMN pid";

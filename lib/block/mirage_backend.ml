@@ -8,10 +8,10 @@ let default_page_size = 4096
    refusal a caller sees at open time and the error a stray [sync] would return
    say the same thing, and so a test can pin the wording in one place. *)
 let no_barrier_reason =
-  "mirage_backend: Mirage_block.S exposes only get_info/read/write/disconnect \
-   and has no flush or barrier operation, so this adapter cannot make a write \
-   durable. Supply Mirage_backend.connect's ~barrier argument with a \
-   platform-specific flush, or run with PRAGMA synchronous = off"
+  "mirage_backend: Mirage_block.S exposes only get_info/read/write/disconnect and has no \
+   flush or barrier operation, so this adapter cannot make a write durable. Supply \
+   Mirage_backend.connect's ~barrier argument with a platform-specific flush, or run \
+   with PRAGMA synchronous = off"
 ;;
 
 module Make (B : Mirage_block.S) = struct
@@ -39,8 +39,7 @@ module Make (B : Mirage_block.S) = struct
       let capacity =
         Int64.div info.Mirage_block.size_sectors (Int64.of_int sectors_per_page)
       in
-      Lwt.return
-        { dev; page_size; sectors_per_page; capacity; n_pages = 0L; barrier })
+      Lwt.return { dev; page_size; sectors_per_page; capacity; n_pages = 0L; barrier })
   ;;
 
   let n_pages t = t.n_pages

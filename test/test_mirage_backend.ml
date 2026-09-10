@@ -148,10 +148,11 @@ let () =
         ; test_case "out_of_capacity" `Quick test_out_of_capacity
         ; test_case "resize_within_capacity" `Quick test_resize_within_capacity
         ; test_case "resize_beyond_capacity" `Quick test_resize_beyond_capacity
-        ; test_case "sync_refuses_without_barrier" `Quick
+        ; test_case
+            "sync_refuses_without_barrier"
+            `Quick
             test_sync_refuses_without_barrier
-        ; test_case "sync_uses_supplied_barrier" `Quick
-            test_sync_uses_supplied_barrier
+        ; test_case "sync_uses_supplied_barrier" `Quick test_sync_uses_supplied_barrier
         ] )
     ]
 ;;

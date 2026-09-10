@@ -1191,8 +1191,8 @@ let test_rolled_back_unregister_restores_the_first_hooks_fire_position () =
     exec db "ROLLBACK";
     exec db "INSERT INTO t VALUES (1)";
     Alcotest.(check (list string))
-      "the rolled-back unregister restores A to its original position: A was \
-       registered before B, so it fires before B (#769)"
+      "the rolled-back unregister restores A to its original position: A was registered \
+       before B, so it fires before B (#769)"
       [ "a"; "b" ]
       (List.rev !order))
 ;;
@@ -1263,9 +1263,9 @@ let test_row_hook_depth_attribution_survives_the_vacuum_store_swap () =
     7
     !inside;
   Alcotest.(check int)
-    "the store-wide counter reads 0 at carry-over time, so copying it across the \
-     swap would have carried nothing -- the registry lineage, not the counter, is \
-     what makes the deferred continuation's scope resolvable again (#774)"
+    "the store-wide counter reads 0 at carry-over time, so copying it across the swap \
+     would have carried nothing -- the registry lineage, not the counter, is what makes \
+     the deferred continuation's scope resolvable again (#774)"
     0
     !counter_at_swap;
   Alcotest.(check int)

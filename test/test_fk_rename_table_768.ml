@@ -146,9 +146,7 @@ let rename_child_table_with_pending_fk_is_refused () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
     exec db "CREATE TABLE p (id INTEGER PRIMARY KEY)";
-    exec
-      db
-      "CREATE TABLE c (pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)";
+    exec db "CREATE TABLE c (pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)";
     exec db "BEGIN";
     exec db "INSERT INTO c VALUES (999)";
     let msg =
@@ -190,10 +188,7 @@ let rename_parent_table_with_pending_fk_is_refused () =
       true
       (contains ~needle:"is referenced by a FOREIGN KEY on 'c3'" msg);
     exec db "ROLLBACK";
-    expect_absent
-      ~what:"p4 must not exist: the rename was refused"
-      db
-      "SELECT id FROM p4")
+    expect_absent ~what:"p4 must not exist: the rename was refused" db "SELECT id FROM p4")
 ;;
 
 (* The control for both repros: with NO rename attempted, the very same
@@ -346,9 +341,7 @@ let rename_after_rollback_of_the_pending_transaction_succeeds () =
     (match exec_result db "ALTER TABLE c13 RENAME TO c13b" with
      | Ok () -> ()
      | Error msg ->
-       Alcotest.failf
-         "the queue is empty after ROLLBACK; rename must succeed, got %S"
-         msg);
+       Alcotest.failf "the queue is empty after ROLLBACK; rename must succeed, got %S" msg);
     (match exec_result db "COMMIT" with
      | Ok () -> ()
      | Error msg -> Alcotest.failf "COMMIT should have succeeded, got %S" msg);
@@ -400,11 +393,10 @@ let drop_parent_table_is_unguarded_in_and_out_of_a_transaction () =
     exec db "INSERT INTO cb VALUES (999)";
     (match exec_result db "DROP TABLE cb" with
      | Ok () -> ()
-     | Error msg ->
-       Alcotest.failf "DROP TABLE of the child must stay allowed, got %S" msg);
-    (match exec_result db "COMMIT" with
-     | Ok () -> ()
-     | Error msg -> Alcotest.failf "COMMIT should have succeeded, got %S" msg))
+     | Error msg -> Alcotest.failf "DROP TABLE of the child must stay allowed, got %S" msg);
+    match exec_result db "COMMIT" with
+    | Ok () -> ()
+    | Error msg -> Alcotest.failf "COMMIT should have succeeded, got %S" msg)
 ;;
 
 let () =

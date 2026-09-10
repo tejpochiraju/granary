@@ -424,8 +424,6 @@ val in_row_hook_for : t -> bool
     it. *)
 val row_hook_ambient_undo_target : t -> ((unit -> unit) -> unit) option
 
-(** Errors from the persistent (B+-tree) backend.  The in-memory backend
-    never returns errors. *)
 (** #772: whether the backing device can make a write durable.
 
     [Mirage_block.S] has exactly four operations — [get_info], [read], [write],
@@ -468,6 +466,8 @@ type durability =
       }
   | Off
 
+(** Errors from the persistent (B+-tree) backend.  The in-memory backend
+    never returns errors. *)
 type error =
   | Block_error of string
   | Corruption of string
@@ -983,7 +983,6 @@ val clear_checkpoint_error : t -> unit
 (** The durability mode type is declared earlier in this interface (just after
     {!barrier}) because {!open_block} takes it; see there for the full
     contract. *)
-
 
 (** (#772) The backing device's durability capability, as declared at open.
     [`Available] on the in-memory backend and on every file backend.  When

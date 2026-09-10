@@ -3968,8 +3968,8 @@ let fk_column_dependents t ~table ~column =
    to recreate the table. *)
 let fk_dependents_error ~what ~deps =
   Printf.sprintf
-    "cannot %s: it participates in %s; there is no ALTER TABLE DROP CONSTRAINT to \
-     remove the constraint, so recreate the affected table%s without it first"
+    "cannot %s: it participates in %s; there is no ALTER TABLE DROP CONSTRAINT to remove \
+     the constraint, so recreate the affected table%s without it first"
     what
     (String.concat ", " deps)
     (match deps with

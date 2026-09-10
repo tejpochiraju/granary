@@ -911,8 +911,9 @@ val view_callback_generation : view_callback -> int
     step names an explicit generation: no step ever asks for "whatever is live
     now", which is the TOCTOU itself.
 
+    In it, [h] was obtained earlier from this same [db].
+
     {[
-      (* [h] was obtained earlier from this same [db]. *)
       let rewire db h cb =
         let name = Db.view_callback_view h in
         let rec attach_at g =
@@ -921,17 +922,20 @@ val view_callback_generation : view_callback -> int
           with
           | Ok (h', (_ : int)) -> Ok h'
           | Error (`Unknown_view v) -> Error (`Unknown_view v)
-          (* A FURTHER recreate landed in between; [g'] is the one that is
-             live as of this failure, so retry against exactly that. *)
           | Error (`Stale_generation g') -> attach_at g'
         in
         match Db.unregister_view_callback db h with
-        (* Same incarnation: [h] was current, nothing to re-register. *)
         | `Removed | `Not_registered -> Ok h
         | `Unknown_view v -> Error (`Unknown_view v)
         | `Stale_generation g -> attach_at g
       ;;
     ]}
+
+    Two arms carry the whole argument. [`Removed] and [`Not_registered] both
+    mean [h] named the incarnation that is still live, so there is nothing to
+    re-register. A [`Stale_generation g'] from the registration itself means a
+    FURTHER recreate landed in between, and [g'] is the incarnation live as of
+    that failure, so the retry chases exactly that one.
 
     {b It terminates in practice} because generations for one name in one store
     are strictly increasing (see {!reactive_view_generation}), so every

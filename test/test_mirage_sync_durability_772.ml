@@ -253,11 +253,14 @@ let test_off_opens_and_works () =
           | Error e -> Alcotest.failf "INSERT: %a" Db.pp_error e
           | Ok () -> ());
          let* qr = Db.query db "SELECT v FROM t WHERE id = 1" in
-         (match qr with
-          | Error e -> Alcotest.failf "SELECT: %a" Db.pp_error e
-          | Ok stream ->
-            let* rows = Lwt_stream.to_list stream in
-            Alcotest.(check int) "one row back" 1 (List.length rows));
+         let* () =
+           match qr with
+           | Error e -> Alcotest.failf "SELECT: %a" Db.pp_error e
+           | Ok stream ->
+             let* rows = Lwt_stream.to_list stream in
+             Alcotest.(check int) "one row back" 1 (List.length rows);
+             Lwt.return_unit
+         in
          Db.close db))
 ;;
 
@@ -318,14 +321,16 @@ let test_pragma_synchronous_refuses () =
           | Error e -> Alcotest.failf "PRAGMA synchronous = off: %a" Db.pp_error e
           | Ok () -> ());
          let* qr = Db.query db "PRAGMA synchronous" in
-         (match qr with
-          | Error e -> Alcotest.failf "PRAGMA synchronous read: %a" Db.pp_error e
-          | Ok stream ->
-            let* rows = Lwt_stream.to_list stream in
-            (match rows with
-             | [ [| Db.V_text s |] ] ->
-               Alcotest.(check string) "reads back off" "off" s
-             | _ -> Alcotest.fail "PRAGMA synchronous returned an unexpected shape"));
+         let* () =
+           match qr with
+           | Error e -> Alcotest.failf "PRAGMA synchronous read: %a" Db.pp_error e
+           | Ok stream ->
+             let* rows = Lwt_stream.to_list stream in
+             (match rows with
+              | [ [| Db.V_text s |] ] -> Alcotest.(check string) "reads back off" "off" s
+              | _ -> Alcotest.fail "PRAGMA synchronous returned an unexpected shape");
+             Lwt.return_unit
+         in
          Db.close db))
 ;;
 
@@ -385,7 +390,9 @@ let test_unix_file_unchanged () =
   Fun.protect
     ~finally:(fun () ->
       List.iter
-        (fun p -> try Unix.unlink p with Unix.Unix_error _ -> ())
+        (fun p ->
+           try Unix.unlink p with
+           | Unix.Unix_error _ -> ())
         [ path; path ^ "-wal"; path ^ ".aslog" ])
     (fun () ->
        run
@@ -417,11 +424,14 @@ let test_unix_file_unchanged () =
             let* () = expect_ok "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)" in
             let* () = expect_ok "INSERT INTO t VALUES (1, 'a')" in
             let* qr = Db.query db "SELECT v FROM t WHERE id = 1" in
-            (match qr with
-             | Error e -> Alcotest.failf "SELECT: %a" Db.pp_error e
-             | Ok stream ->
-               let* rows = Lwt_stream.to_list stream in
-               Alcotest.(check int) "one row back" 1 (List.length rows));
+            let* () =
+              match qr with
+              | Error e -> Alcotest.failf "SELECT: %a" Db.pp_error e
+              | Ok stream ->
+                let* rows = Lwt_stream.to_list stream in
+                Alcotest.(check int) "one row back" 1 (List.length rows);
+                Lwt.return_unit
+            in
             Db.close db))
 ;;
 
@@ -430,10 +440,14 @@ let () =
   run
     "mirage_sync_durability_772"
     [ ( "adapter"
-      , [ test_case "sync refuses without a barrier" `Quick
+      , [ test_case
+            "sync refuses without a barrier"
+            `Quick
             test_sync_refuses_without_barrier
         ; test_case "supplied barrier is used" `Quick test_sync_uses_supplied_barrier
-        ; test_case "supplied barrier's error propagates" `Quick
+        ; test_case
+            "supplied barrier's error propagates"
+            `Quick
             test_supplied_barrier_error_propagates
         ] )
     ; ( "open"
@@ -443,12 +457,15 @@ let () =
         ; test_case "off opens and works" `Quick test_off_opens_and_works
         ] )
     ; ( "after open"
-      , [ test_case "set_durability keeps refusing" `Quick
+      , [ test_case
+            "set_durability keeps refusing"
+            `Quick
             test_set_durability_refuses_after_open
-        ; test_case "PRAGMA synchronous refuses full/batched" `Quick
+        ; test_case
+            "PRAGMA synchronous refuses full/batched"
+            `Quick
             test_pragma_synchronous_refuses
-        ; test_case "a replication commit-sink is refused" `Quick
-            test_commit_sink_refused
+        ; test_case "a replication commit-sink is refused" `Quick test_commit_sink_refused
         ] )
     ; "unix_file", [ test_case "unaffected" `Quick test_unix_file_unchanged ]
     ]

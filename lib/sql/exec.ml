@@ -229,9 +229,7 @@ let run_row_hook ~ctx hook ~tx ~new_row ~old_row : unit Lwt.t =
 ;;
 
 (* The [ctx] prefix for a hook fired by an FK cascade step on [table]. *)
-let fk_cascade_hook_ctx table =
-  Printf.sprintf "FOREIGN KEY cascade on '%s': " table
-;;
+let fk_cascade_hook_ctx table = Printf.sprintf "FOREIGN KEY cascade on '%s': " table
 
 (* Drain to the public shape: user tables only, deduplicated, sorted. *)
 let dirty_elements ({ names; _ } : dirty_tables_acc) : string list =
@@ -10217,9 +10215,9 @@ let execute_with_count
     then
       failwith
         (Printf.sprintf
-           "PRAGMA synchronous: '%s' needs a write barrier this backend cannot \
-            issue, so commits could not be made durable however they were acked: \
-            %s. Only 'off' is honest on this backend."
+           "PRAGMA synchronous: '%s' needs a write barrier this backend cannot issue, so \
+            commits could not be made durable however they were acked: %s. Only 'off' is \
+            honest on this backend."
            mode
            (Option.get barrier_reason))
     else if mode <> "full" && S.commit_callback_active store

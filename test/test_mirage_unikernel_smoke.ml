@@ -149,9 +149,13 @@ let () =
   run
     "mirage_unikernel_smoke"
     [ ( "wiring"
-      , [ test_case "unikernel shape: no barrier, synchronous=off" `Quick
+      , [ test_case
+            "unikernel shape: no barrier, synchronous=off"
+            `Quick
             test_unikernel_shape
-        ; test_case "barrier shape: platform fsync, synchronous=full" `Quick
+        ; test_case
+            "barrier shape: platform fsync, synchronous=full"
+            `Quick
             test_barrier_shape
         ] )
     ]

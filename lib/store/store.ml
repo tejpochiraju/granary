@@ -1817,7 +1817,7 @@ let resolve_barrier
       ~(barrier : barrier)
       ~(durability : durability)
       ~(sync : unit -> (unit, string) result Lwt.t)
-  : ((unit -> (unit, string) result Lwt.t), error) result
+  : (unit -> (unit, string) result Lwt.t, error) result
   =
   match barrier with
   | `Available -> Ok sync
@@ -1830,10 +1830,9 @@ let resolve_barrier
             (Printf.sprintf
                "durability '%s' needs a write barrier this backend cannot issue, so \
                 every commit would be acked durable while the data is still in a \
-                volatile cache. Backend reports: %s. Either supply a backend that \
-                can flush, or open with ~durability:Granary_store.Store.Off (and \
-                PRAGMA synchronous = off) to accept that nothing survives a power \
-                loss."
+                volatile cache. Backend reports: %s. Either supply a backend that can \
+                flush, or open with ~durability:Granary_store.Store.Off (and PRAGMA \
+                synchronous = off) to accept that nothing survives a power loss."
                (match durability with
                 | Full -> "full"
                 | Batched _ -> "batched"
@@ -1873,78 +1872,78 @@ let open_block
         | Some f -> f
         | None -> fun () -> 0L
       in
-      match
-        let ( let* ) = Result.bind in
-        let* cipher = build_cipher key in
-        let* () = ensure_rng_seeded cipher in
-        let* geom = geom_for_cipher cipher geom in
-        Ok (cipher, geom)
-      with
-      | Error e -> Lwt.return_error e
-      | Ok (cipher, geom) ->
-        let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
-        let pager =
-          Pager.create
-            ~read_page
-            ~write_page
-            ~sync
-            ~resize
-            ~n_pages
-            ~freelist:Freelist.empty
-        in
-        (* Adopt the file's real geometry (peeked for an existing file, [geom] for a
+      (match
+         let ( let* ) = Result.bind in
+         let* cipher = build_cipher key in
+         let* () = ensure_rng_seeded cipher in
+         let* geom = geom_for_cipher cipher geom in
+         Ok (cipher, geom)
+       with
+       | Error e -> Lwt.return_error e
+       | Ok (cipher, geom) ->
+         let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
+         let pager =
+           Pager.create
+             ~read_page
+             ~write_page
+             ~sync
+             ~resize
+             ~n_pages
+             ~freelist:Freelist.empty
+         in
+         (* Adopt the file's real geometry (peeked for an existing file, [geom] for a
          fresh one) before any header read so buffers are sized correctly (#95). *)
-        let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
-        Pager.set_geom pager eff_geom;
-        let%lwt hr = Header.read_live pager in
-        (match hr with
-         | Error Header.Both_headers_corrupt when init_if_corrupt ->
-           (* Fresh device — initialise headers.  Disabled via [~init_if_corrupt:false]
+         let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+         Pager.set_geom pager eff_geom;
+         let%lwt hr = Header.read_live pager in
+         (match hr with
+          | Error Header.Both_headers_corrupt when init_if_corrupt ->
+            (* Fresh device — initialise headers.  Disabled via [~init_if_corrupt:false]
             so an existing-but-corrupt device surfaces [Header_error] instead of
             being silently re-initialised (a Unix-file open must not clobber). *)
-           let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
-           (match ir with
-            | Error e -> Lwt.return_error (map_header_err e)
-            | Ok () ->
-              Pager.set_n_pages pager 2L;
-              let%lwt hr2 = Header.read_live pager in
-              (match hr2 with
-               | Error e -> Lwt.return_error (map_header_err e)
-               | Ok h ->
-                 let meta = Btree.create pager ~root_page:0L in
-                 Lwt.return_ok
-                   (make_btree_store
-                      ~cipher
-                      ~history
-                      ~history_now
-                      ~barrier
-                      ~durability
-                      ~close_fn:close
-                      ~pager
-                      ~meta
-                      ~h
-                      ())))
-         | Error e -> Lwt.return_error (map_header_err e)
-         | Ok h ->
-           (match check_key h cipher with
-            | Error e -> Lwt.return_error e
-            | Ok () ->
-              Pager.set_n_pages pager h.n_pages_total;
-              let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
-              Pager.set_freelist pager fl;
-              let meta = Btree.create pager ~root_page:h.root_page in
-              Lwt.return_ok
-                (make_btree_store
-                   ~cipher
-                   ~history
-                   ~history_now
-                   ~barrier
-                   ~durability
-                   ~close_fn:close
-                   ~pager
-                   ~meta
-                   ~h
-                   ()))))
+            let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
+            (match ir with
+             | Error e -> Lwt.return_error (map_header_err e)
+             | Ok () ->
+               Pager.set_n_pages pager 2L;
+               let%lwt hr2 = Header.read_live pager in
+               (match hr2 with
+                | Error e -> Lwt.return_error (map_header_err e)
+                | Ok h ->
+                  let meta = Btree.create pager ~root_page:0L in
+                  Lwt.return_ok
+                    (make_btree_store
+                       ~cipher
+                       ~history
+                       ~history_now
+                       ~barrier
+                       ~durability
+                       ~close_fn:close
+                       ~pager
+                       ~meta
+                       ~h
+                       ())))
+          | Error e -> Lwt.return_error (map_header_err e)
+          | Ok h ->
+            (match check_key h cipher with
+             | Error e -> Lwt.return_error e
+             | Ok () ->
+               Pager.set_n_pages pager h.n_pages_total;
+               let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
+               Pager.set_freelist pager fl;
+               let meta = Btree.create pager ~root_page:h.root_page in
+               Lwt.return_ok
+                 (make_btree_store
+                    ~cipher
+                    ~history
+                    ~history_now
+                    ~barrier
+                    ~durability
+                    ~close_fn:close
+                    ~pager
+                    ~meta
+                    ~h
+                    ())))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -2081,78 +2080,79 @@ let open_block_wal
         | Some f -> f
         | None -> fun () -> 0L
       in
-      match
-        let ( let* ) = Result.bind in
-        let* cipher = build_cipher key in
-        let* () = ensure_rng_seeded cipher in
-        let* geom = geom_for_cipher cipher geom in
-        Ok (cipher, geom)
-      with
-      | Error e -> Lwt.return_error e
-      | Ok (cipher, geom) ->
-        let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
-        let pager =
-          Pager.create
-            ~read_page
-            ~write_page
-            ~sync
-            ~resize
-            ~n_pages
-            ~freelist:Freelist.empty
-        in
-        (* Adopt the file's real geometry before any header read or WAL open so the
+      (match
+         let ( let* ) = Result.bind in
+         let* cipher = build_cipher key in
+         let* () = ensure_rng_seeded cipher in
+         let* geom = geom_for_cipher cipher geom in
+         Ok (cipher, geom)
+       with
+       | Error e -> Lwt.return_error e
+       | Ok (cipher, geom) ->
+         let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
+         let pager =
+           Pager.create
+             ~read_page
+             ~write_page
+             ~sync
+             ~resize
+             ~n_pages
+             ~freelist:Freelist.empty
+         in
+         (* Adopt the file's real geometry before any header read or WAL open so the
          main-DB buffers and the WAL frame size both match it (#95). *)
-        let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
-        Pager.set_geom pager eff_geom;
-        (* Step 1: read the main-DB header (or initialise if fresh). The WAL
+         let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+         Pager.set_geom pager eff_geom;
+         (* Step 1: read the main-DB header (or initialise if fresh). The WAL
          hook is NOT installed yet, so writes go directly to the main DB.
          [was_fresh] flag preserves the post-init n_pages override below. *)
-        let%lwt hr = Header.read_live pager in
-        let%lwt init_result =
-          match hr with
-          | Error Header.Both_headers_corrupt ->
-            let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
-            (match ir with
-             | Error e -> Lwt.return_error (map_header_err e)
-             | Ok () ->
-               Pager.set_n_pages pager 2L;
-               Lwt.return_ok true)
-          | Error e -> Lwt.return_error (map_header_err e)
-          | Ok _ -> Lwt.return_ok false
-        in
-        (match init_result with
-         | Error e -> Lwt.return_error e
-         | Ok was_fresh ->
-           (* Step 2: open the WAL and recover its index. *)
-           let%lwt wr =
-             Wal.open_
-               ~cipher
-               ~page_size:(Pager.page_size pager)
-               ?resize:wal_resize
-               ~read_at:wal_read_at
-               ~write_at:wal_write_at
-               ~sync:wal_sync
-               ~size_bytes:wal_size_bytes
-               ()
-           in
-           (match wr with
-            | Error e ->
-              Lwt.return_error (Block_error (Format.asprintf "wal open: %a" Wal.pp_error e))
-            | Ok wal ->
-              (* Step 3: install the hook so subsequent reads consult the WAL. *)
-              install_wal_hook pager wal;
-              (* Step 4: re-read the header (now WAL-aware) and build the store. *)
-              finish_wal_open
+         let%lwt hr = Header.read_live pager in
+         let%lwt init_result =
+           match hr with
+           | Error Header.Both_headers_corrupt ->
+             let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
+             (match ir with
+              | Error e -> Lwt.return_error (map_header_err e)
+              | Ok () ->
+                Pager.set_n_pages pager 2L;
+                Lwt.return_ok true)
+           | Error e -> Lwt.return_error (map_header_err e)
+           | Ok _ -> Lwt.return_ok false
+         in
+         (match init_result with
+          | Error e -> Lwt.return_error e
+          | Ok was_fresh ->
+            (* Step 2: open the WAL and recover its index. *)
+            let%lwt wr =
+              Wal.open_
                 ~cipher
-                ~history
-                ~history_now
-                ~barrier
-                ~durability
-                ~close
-                ~wal_close
-                ~pager
-                ~wal
-                ~was_fresh)))
+                ~page_size:(Pager.page_size pager)
+                ?resize:wal_resize
+                ~read_at:wal_read_at
+                ~write_at:wal_write_at
+                ~sync:wal_sync
+                ~size_bytes:wal_size_bytes
+                ()
+            in
+            (match wr with
+             | Error e ->
+               Lwt.return_error
+                 (Block_error (Format.asprintf "wal open: %a" Wal.pp_error e))
+             | Ok wal ->
+               (* Step 3: install the hook so subsequent reads consult the WAL. *)
+               install_wal_hook pager wal;
+               (* Step 4: re-read the header (now WAL-aware) and build the store. *)
+               finish_wal_open
+                 ~cipher
+                 ~history
+                 ~history_now
+                 ~barrier
+                 ~durability
+                 ~close
+                 ~wal_close
+                 ~pager
+                 ~wal
+                 ~was_fresh))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3774,8 +3774,8 @@ let set_durability (t : t) (d : durability) : unit =
      | `Unavailable reason, (Full | Batched _) ->
        failwith
          (Printf.sprintf
-            "Store.set_durability: '%s' needs a write barrier this backend cannot \
-             issue: %s"
+            "Store.set_durability: '%s' needs a write barrier this backend cannot issue: \
+             %s"
             (string_of_durability d)
             reason)
      | (`Available | `Unavailable _), _ -> ());
@@ -5042,8 +5042,7 @@ let set_commit_callback
        Lwt.fail_with
          (Printf.sprintf
             "Store.set_commit_callback: a replication commit-sink requires \
-             synchronous=full, which needs a write barrier this backend cannot \
-             issue: %s"
+             synchronous=full, which needs a write barrier this backend cannot issue: %s"
             (match st.barrier with
              | `Unavailable r -> r
              | `Available -> ""))
