@@ -703,10 +703,36 @@ val clear_pk_flags
   -> cols:string list
   -> (unit, string) result Lwt.t
 
+(** [fk_column_dependents t ~table ~column] lists, as human-readable
+    descriptions, every FOREIGN KEY constraint in the catalog that names
+    [table].[column] — either as the LOCAL side of one of [table]'s own
+    constraints, or as the PARENT side of any table's constraint pointing at
+    [table] (self-references included). Empty means no constraint would be
+    stranded by removing the column.
+
+    #767: [drop_column] rebuilds a table's columns but cannot rewrite
+    [fk_constraints] coherently, so this is the gate that refuses instead.
+    Reads structured catalog metadata rather than stored SQL text, so unlike
+    {!column_dependents_tx}'s lexical scan it is exact in both directions. The
+    result is sorted and de-duplicated, so the refusal message is
+    deterministic. *)
+val fk_column_dependents : t -> table:string -> column:string -> string list
+
+(** [fk_dependents_error ~what ~deps] renders the refusal message for a
+    mutation [what] blocked by the FK constraints [deps] (as returned by
+    {!fk_column_dependents}). Names every constraint, because this engine has
+    no [ALTER TABLE ... DROP CONSTRAINT] with which to clear one. *)
+val fk_dependents_error : what:string -> deps:string list -> string
+
 (** Remove a column from an existing table.
     Re-keys all column entries with ordinal > drop_idx (shift down by 1).
     Does NOT migrate existing row data — caller (the executor) is responsible.
     Returns [Error msg] if the table or column does not exist.
+
+    #767: also returns [Error msg] — {!fk_dependents_error} — when the column
+    participates in any FOREIGN KEY constraint ({!fk_column_dependents}), since
+    this function carries [fk_constraints] through unchanged and would
+    otherwise leave a dangling column name in them forever.
 
     [?txn] (#282): as for [add_column]. *)
 val drop_column

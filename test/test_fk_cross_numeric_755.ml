@@ -511,26 +511,36 @@ let alter_table_refuses_drop_that_would_precede_a_same_name_readd () =
 (* path, rather than a bare find_col_idx_by_name "column not found".      *)
 (*                                                                        *)
 (* Round 3's own structural refusal (above) prevents this from arising   *)
-(* via a mid-transaction race, but it is still reachable through #767's  *)
-(* standalone, non-transactional Cat.drop_column corruption: an autocommit *)
-(* DROP COLUMN with NO deferred check pending succeeds (out of scope to   *)
-(* prevent here -- that is #767's own remit), and a LATER, separate       *)
-(* UPDATE/DELETE against the now-corrupted constraint must not crash with *)
-(* an internal-looking message. *)
+(* via a mid-transaction race, and #767 has since closed the route these *)
+(* six tests originally used to reach it: an autocommit DROP COLUMN of a *)
+(* column any FOREIGN KEY names is now REFUSED outright, so the SQL      *)
+(* sequence they used ("DROP COLUMN pid", then UPDATE/DELETE the parent) *)
+(* no longer produces a corrupted constraint at all.                     *)
+(*                                                                        *)
+(* The condition itself is still reachable, so these tests still pin     *)
+(* real behaviour -- they just reach it a different way. CREATE TABLE    *)
+(* does not validate that a table-level FOREIGN KEY's LOCAL columns      *)
+(* exist (Sema.extract_fk_constraints checks the parent table's          *)
+(* existence and columnar-ness and nothing else), so a constraint can be *)
+(* born naming a column its own table does not have: byte-for-byte the   *)
+(* state DROP COLUMN used to leave behind, and the state any database    *)
+(* file written before #767 can still be opened in. That unvalidated     *)
+(* CREATE TABLE is a separate gap, named in docs/DECISIONS.md's #767     *)
+(* entry rather than closed there. *)
 (* ------------------------------------------------------------------ *)
 
 let precheck_update_fk_fails_loudly_not_with_bare_column_not_found () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
     exec db "CREATE TABLE p12 (id INTEGER PRIMARY KEY)";
-    exec db "CREATE TABLE c12 (pid INTEGER REFERENCES p12(id), junk INTEGER)";
+    (* c12 has no [pid] column: the constraint is unresolvable from birth,
+       which is exactly the state a pre-#767 DROP COLUMN left behind. Reached
+       deliberately so this test pins the SEPARATE fix (item 2 -- a loud,
+       FK-specific message from the immediate precheck) rather than round 3's
+       refusal (which only fires while an obligation is actually pending) or
+       #767's (which only fires on the DROP itself). *)
+    exec db "CREATE TABLE c12 (junk INTEGER, FOREIGN KEY (pid) REFERENCES p12(id))";
     exec db "INSERT INTO p12 VALUES (1)";
-    exec db "INSERT INTO c12 VALUES (1, 0)";
-    (* No pending deferred check here (autocommit, no BEGIN) -- #767's
-       corruption, reached deliberately so this test can pin the SEPARATE
-       fix (item 2) rather than round 3's refusal (which only fires while
-       an obligation is actually pending). *)
-    expect_ok db "ALTER TABLE c12 DROP COLUMN pid";
     match exec_result db "UPDATE p12 SET id = 2 WHERE id = 1" with
     | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
     | Error msg ->
@@ -546,10 +556,8 @@ let precheck_delete_fk_fails_loudly_not_with_bare_column_not_found () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
     exec db "CREATE TABLE p13 (id INTEGER PRIMARY KEY)";
-    exec db "CREATE TABLE c13 (pid INTEGER REFERENCES p13(id), junk INTEGER)";
+    exec db "CREATE TABLE c13 (junk INTEGER, FOREIGN KEY (pid) REFERENCES p13(id))";
     exec db "INSERT INTO p13 VALUES (1)";
-    exec db "INSERT INTO c13 VALUES (1, 0)";
-    expect_ok db "ALTER TABLE c13 DROP COLUMN pid";
     match exec_result db "DELETE FROM p13 WHERE id = 1" with
     | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
     | Error msg ->
@@ -566,9 +574,10 @@ let precheck_delete_fk_fails_loudly_not_with_bare_column_not_found () =
 (* resolved FK columns with the raw find_col_idx_by_name{,_opt} instead   *)
 (* of resolve_fk_col_idxs, and disagreed with each other and with the     *)
 (* RESTRICT paths on failure mode for the identical corrupted-column      *)
-(* condition (#767's standalone Cat.drop_column corruption, reached here  *)
-(* the same way as round 3's item 2 tests -- an autocommit DROP COLUMN    *)
-(* with no pending check, so nothing refuses the drop itself):            *)
+(* condition (reached here the same way as round 3's item 2 tests above  *)
+(* -- a table-level FOREIGN KEY naming a local column its own table does *)
+(* not have, which CREATE TABLE does not validate; see that section's    *)
+(* header for why this replaced the DROP COLUMN route #767 closed):       *)
 (*   - cascade_delete_fk: find_col_idx_by_name_opt, SILENT Lwt.return_unit *)
 (*     (the cascade action never runs, nothing raised -- worse than       *)
 (*     RESTRICT's own loud refusal for the identical condition)           *)
@@ -589,10 +598,9 @@ let apply_delete_cascade_fk_fails_loudly () =
     exec db "CREATE TABLE p14 (id INTEGER PRIMARY KEY)";
     exec
       db
-      "CREATE TABLE c14 (pid INTEGER REFERENCES p14(id) ON DELETE SET NULL, junk INTEGER)";
+      "CREATE TABLE c14 (junk INTEGER, FOREIGN KEY (pid) REFERENCES p14(id) ON DELETE \
+       SET NULL)";
     exec db "INSERT INTO p14 VALUES (1)";
-    exec db "INSERT INTO c14 VALUES (1, 0)";
-    expect_ok db "ALTER TABLE c14 DROP COLUMN pid";
     match exec_result db "DELETE FROM p14 WHERE id = 1" with
     | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
     | Error msg ->
@@ -610,10 +618,9 @@ let apply_update_cascade_fk_fails_loudly () =
     exec db "CREATE TABLE p15 (id INTEGER PRIMARY KEY)";
     exec
       db
-      "CREATE TABLE c15 (pid INTEGER REFERENCES p15(id) ON UPDATE CASCADE, junk INTEGER)";
+      "CREATE TABLE c15 (junk INTEGER, FOREIGN KEY (pid) REFERENCES p15(id) ON UPDATE \
+       CASCADE)";
     exec db "INSERT INTO p15 VALUES (1)";
-    exec db "INSERT INTO c15 VALUES (1, 0)";
-    expect_ok db "ALTER TABLE c15 DROP COLUMN pid";
     match exec_result db "UPDATE p15 SET id = 2 WHERE id = 1" with
     | Ok () -> Alcotest.fail "expected an error: the FK constraint is now unresolvable"
     | Error msg ->
@@ -641,11 +648,10 @@ let cascade_delete_fk_fails_loudly_not_silently () =
        DELETE CASCADE)";
     exec
       db
-      "CREATE TABLE c16 (mid INTEGER REFERENCES m16(id) ON DELETE SET NULL, junk INTEGER)";
+      "CREATE TABLE c16 (junk INTEGER, FOREIGN KEY (mid) REFERENCES m16(id) ON DELETE \
+       SET NULL)";
     exec db "INSERT INTO p16 VALUES (1)";
     exec db "INSERT INTO m16 VALUES (10, 1)";
-    exec db "INSERT INTO c16 VALUES (10, 0)";
-    expect_ok db "ALTER TABLE c16 DROP COLUMN mid";
     (match exec_result db "DELETE FROM p16 WHERE id = 1" with
      | Ok () -> Alcotest.fail "expected an error: c16's FK constraint is unresolvable"
      | Error msg ->
@@ -675,11 +681,10 @@ let cascade_update_fk_fails_loudly () =
        UPDATE CASCADE, UNIQUE (pid))";
     exec
       db
-      "CREATE TABLE c17 (mid INTEGER REFERENCES m17(pid) ON UPDATE CASCADE, junk INTEGER)";
+      "CREATE TABLE c17 (junk INTEGER, FOREIGN KEY (mid) REFERENCES m17(pid) ON UPDATE \
+       CASCADE)";
     exec db "INSERT INTO p17 VALUES (1)";
     exec db "INSERT INTO m17 VALUES (10, 1)";
-    exec db "INSERT INTO c17 VALUES (1, 0)";
-    expect_ok db "ALTER TABLE c17 DROP COLUMN mid";
     match exec_result db "UPDATE p17 SET id = 2 WHERE id = 1" with
     | Ok () -> Alcotest.fail "expected an error: c17's FK constraint is unresolvable"
     | Error msg ->

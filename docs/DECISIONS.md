@@ -774,6 +774,145 @@ useful reading order — search for the issue number instead.
   (#768) — no new action follows; it stays the same already-filed,
   already-scoped-out gap, just no longer hypothetical.
 
+- **`ALTER TABLE ... DROP COLUMN` is refused when the column participates in
+  any FOREIGN KEY constraint, on either side (#767, decided 2026-09-10).**
+  `Cat.drop_column` rebuilds `table_meta` as `{ meta with columns =
+  List.filteri ... }` and carries `fk_constraints` through **completely
+  unchanged**. `Exec.alter_drop_column` compensates for two of the column's
+  other dependents — its indexes (`Cat.drop_index`) and its now-unbacked
+  PRIMARY KEY flags (`Cat.clear_pk_flags`, #533) — but has no equivalent for
+  FK metadata, and no equivalent of `rename_column`'s `column_dependents_tx`
+  gate either. Contrast `Cat.rename_column`, which rewrites `fk_local_cols`
+  via `rename_col_in_fk` *and* walks every other table's constraints via
+  `rewrite_child_fks_tx` (#553): RENAME keeps FK metadata coherent, DROP
+  COLUMN never touched it at all.
+
+  So a `DROP COLUMN` on a column any FOREIGN KEY names — the child's own
+  local column, or the parent column some other table's FK references —
+  succeeded and left a **permanently dangling column name** behind. The
+  issue's repro: after `ALTER TABLE c DROP COLUMN pid`, every `INSERT INTO c`
+  fails ("some local columns not found in table 'c'"), and every
+  `DELETE`/`UPDATE` of the parent key that must check or cascade fails with
+  it. There is no `ALTER TABLE ... DROP CONSTRAINT` in this engine, so
+  nothing can repair the catalog short of dropping and recreating the table.
+
+  **Refusal, not repair, and the reasoning is what makes it a decision.**
+  The issue sketched both directions. Rewriting `fk_constraints` in place —
+  dropping the whole constraint when its local side loses a column, and
+  dropping or refusing constraints on OTHER tables whose parent side
+  references it — is more permissive, and it is what SQLite effectively
+  does (it orphans the constraint silently, which is the behaviour this
+  issue exists to NOT copy). It was rejected for three reasons, in
+  increasing order of weight:
+
+  1. It would silently **weaken a declared integrity guarantee nobody asked
+     to weaken**. A user who wrote `REFERENCES p(id)` and later drops an
+     unrelated-looking column would find the constraint gone, with the
+     database quietly accepting orphans from then on. A refusal is loud and
+     recoverable; a dropped constraint is silent and, once rows have been
+     written against it, not recoverable at all.
+  2. The parent-side case would let a statement about ONE table **silently
+     mutate another table's schema**. `ALTER TABLE p DROP COLUMN code`
+     removing a constraint from `c` is a surprise no amount of error-message
+     design fixes, and it opens its own design question (report it? log it?
+     discard it?) that the issue itself flagged as needing separate care.
+  3. It is not what this project does. The established answer to a mutation
+     the engine cannot make coherent is conservative refusal: `ALTER TABLE
+     ... RENAME` refusing when a view or trigger depends on the table
+     (#673/#645, where the stored SQL text cannot be rewritten scoped), and
+     #765 round 3's `Exec.fk_obligation_conflict` refusing a RENAME/DROP
+     COLUMN with a deferred FK obligation pending. This is the same shape
+     with the same justification: refusing a mutation that might have been
+     harmless is cheaper than performing one that silently corrupts.
+
+  The over-refusal relative to SQLite is real and accepted. Recreating the
+  table is the escape hatch, and it is the same escape hatch #673/#645
+  leaves for a view-dependent RENAME.
+
+  **Mechanism.** `Cat.fk_column_dependents t ~table ~column` walks every
+  table in the schema cache and returns a rendered description of each FK
+  constraint that names the column on either side: the LOCAL side of
+  `table`'s own constraints, and the PARENT side of ANY table's constraint
+  whose `fk_parent_table` is `table`. The walk covers every table rather
+  than "every table but this one" (which is what `Cat.child_tables_of`
+  does) precisely so a **self-referential** FK — `e (id INTEGER PRIMARY
+  KEY, mgr INTEGER REFERENCES e(id))` — is found on its parent side too.
+  It reads structured catalog metadata, not stored SQL text, so unlike
+  `column_dependents_tx`'s deliberately over-approximate lexical scan
+  (#609) it is exact in both directions: no false refusal from an
+  unrelated table that happens to have a column of the same name, and no
+  false pass from a definition that never spells the name. The result is
+  sorted and de-duplicated, because the walk is a `Hashtbl` fold with no
+  stable order and the error message must not vary between runs.
+
+  `Exec.fk_drop_column_conflict` turns a non-empty list into
+  `Cat.fk_dependents_error`'s message, and `Exec.drop_column_refusal`
+  chains it **after** `fk_obligation_conflict`. The order matters in one
+  direction only: a column with a deferred FK obligation pending is
+  necessarily a column some constraint still names, so the new check would
+  refuse every case the old one does — reporting the generic "there is no
+  ALTER TABLE DROP CONSTRAINT" where the specific and more actionable "a
+  deferred check on this very constraint is still pending in this
+  transaction" is available. The narrower message wins; the new one is the
+  catch-all behind it.
+
+  `Cat.drop_column` repeats the check and returns the same `Error`. That
+  branch is unreachable through SQL — the executor's gate fires first, and
+  before any row migration — and it is kept anyway because `drop_column` is
+  the function that would actually do the corrupting: a future caller that
+  does not come through `execute_alter_table` should not be able to
+  reintroduce #767 by skipping a gate that lives somewhere else.
+
+  **Not gated on `PRAGMA foreign_keys`, deliberately.** That pragma decides
+  whether a constraint is ENFORCED, not whether it is DECLARED. The catalog
+  damage is identical either way, and permanent either way — a database
+  dropped-through with enforcement off is still broken when enforcement is
+  turned back on, which is exactly when it will hurt. Every other FK site in
+  the executor consults the pragma because they are *enforcement*; this is
+  *DDL coherence*, which is a different thing.
+
+  **Two accepted consequences, named rather than left implicit.**
+
+  - The refusal is raised from inside `with_ddl_txn`, like every other DDL
+    refusal in this engine, so inside an explicit transaction it poisons the
+    txn (#286) and `ROLLBACK` becomes the only exit, even though nothing was
+    applied. Hoisting the check above `with_ddl_txn` would avoid that for
+    this one refusal while `fk_obligation_conflict` and `Cat.rename_table`'s
+    view/trigger gate kept the old behaviour — a local improvement bought
+    with an inconsistency, and the inconsistency is worse. If this is worth
+    changing it is worth changing for all of them at once, which is a
+    different change.
+  - Six cases in `test/test_fk_cross_numeric_755.ml` reached the
+    corrupted-constraint state **through** this bug on purpose, to pin #765
+    round 3's and round 4's loud-failure fixes (`resolve_fk_col_idxs`, the
+    four cascade-dispatch functions). Closing the DROP COLUMN route means
+    those tests needed a different way in, and there is one: **CREATE TABLE
+    does not validate that a table-level `FOREIGN KEY`'s LOCAL columns
+    exist.** `Sema.extract_fk_constraints` checks the parent table's
+    existence and columnar-ness and nothing else, so `CREATE TABLE c (junk
+    INTEGER, FOREIGN KEY (pid) REFERENCES p(id))` on a table with no `pid`
+    is accepted and produces byte-for-byte the state DROP COLUMN used to
+    leave behind — which is also the state any database file written before
+    this fix can still be opened in, so those tests continue to pin behaviour
+    that genuinely matters. That unvalidated CREATE TABLE is a real, separate
+    gap; it is named here rather than closed, because refusing it is its own
+    behaviour change with its own compatibility question (what happens to an
+    existing file that already contains one), and because it is the only
+    remaining way to construct the state #765's loud-failure paths exist to
+    handle.
+
+  Pinned by `test/test_drop_column_fk_767.ml`: the issue's own repro (refused,
+  and then all three DML shapes the issue reported as broken still work), the
+  parent-side case, the exact refusal text naming the referencing table's
+  constraint, a composite FK refused on all four of its columns, a
+  self-referential FK refused on both sides, an FK created by `ALTER TABLE ...
+  ADD COLUMN` (appended at the end of `fk_constraints`, per `Exec.fk_ordinal`'s
+  note) protected the same way, refusal under `PRAGMA foreign_keys = 0`,
+  refusal inside `BEGIN` with the schema intact afterwards, and two
+  no-over-refusal cases: an unrelated column still drops with the FK still
+  enforcing afterwards, and a same-named column on a table with no FK at all
+  still drops.
+
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does
   for UNIQUE. `OR IGNORE` skips the offending row — consistent with the UNIQUE

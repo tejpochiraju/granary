@@ -9478,6 +9478,58 @@ let mark_alter_dirty ~(table_meta : Cat.table_meta) = function
    that txn (no nested [rw_begin], which previously self-deadlocked inside
    [BEGIN…COMMIT]) and registers a schema-cache undo so a [ROLLBACK] reverts the
    in-memory catalog along with the store. *)
+(* #767: [ALTER TABLE ... DROP COLUMN] on a column a FOREIGN KEY names — the
+   local side of this table's own constraint, or the parent side of some other
+   table's — is refused outright.  [Cat.drop_column] rebuilds the column list but
+   carries [fk_constraints] through unchanged, and there is no [ALTER TABLE ...
+   DROP CONSTRAINT] with which to clean up afterwards, so letting the drop
+   through leaves a dangling column name in the catalog for the rest of the
+   table's life: every subsequent INSERT into the child fails, and every
+   UPDATE/DELETE of the parent that would have to check or cascade fails with
+   it.  See docs/DECISIONS.md for why this refuses rather than rewriting.
+
+   Deliberately NOT gated on [PRAGMA foreign_keys]: that pragma decides whether
+   the constraint is ENFORCED, not whether it is DECLARED, and the catalog
+   damage is identical (and permanent) either way — turning enforcement back on
+   later would find a table whose declared constraint can no longer be
+   evaluated.  {!fk_child_has_ref_multi} and friends consult the pragma because
+   they are enforcement; this is DDL coherence.
+
+   Runs AFTER {!fk_obligation_conflict} on the same statement, and the order
+   matters in one direction only: a column with a deferred FK obligation
+   pending is necessarily a column some constraint still names, so this check
+   would refuse every case that one does — reporting "there is no ALTER TABLE
+   DROP CONSTRAINT" where the specific and more actionable answer is "a
+   deferred check on this very constraint is still pending in this
+   transaction".  The narrower message wins; this is the catch-all behind it.
+
+   Refused from inside [with_ddl_txn], like every other DDL refusal in this
+   engine, so inside an explicit transaction it poisons the txn (#286) even
+   though nothing was applied.  That is consistent with the sibling refusals
+   ({!fk_obligation_conflict}, [Cat.rename_table]'s view/trigger gate) rather
+   than a property of this one; see docs/DECISIONS.md.  [Cat.drop_column]
+   repeats the check as defence in depth, for a caller that does not come
+   through here. *)
+let fk_drop_column_conflict (cat : Cat.t) ~table_name ~col_name : string option =
+  match Cat.fk_column_dependents cat ~table:table_name ~column:col_name with
+  | [] -> None
+  | deps ->
+    Some
+      (Cat.fk_dependents_error
+         ~what:(Printf.sprintf "drop column %s.%s" table_name col_name)
+         ~deps)
+;;
+
+(* Both reasons a [DROP COLUMN] is refused, narrower first — see the two
+   functions above.  One function rather than two nested matches at the call
+   site, which keeps the [AA_drop_column] branch as flat as its siblings. *)
+let drop_column_refusal (cat : Cat.t) ~table_name ~col_name : string option =
+  match fk_obligation_conflict cat ~table_name ~col_name with
+  | Some conflict ->
+    Some (Printf.sprintf "cannot drop column %s.%s: %s" table_name col_name conflict)
+  | None -> fk_drop_column_conflict cat ~table_name ~col_name
+;;
+
 let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta) action
   : int Lwt.t
   =
@@ -9533,14 +9585,8 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
               clear_table_expr_caches table_meta.Cat.name;
               Lwt.return 0))
       | Ast.AA_drop_column col_name ->
-        (match fk_obligation_conflict cat ~table_name:table_meta.Cat.name ~col_name with
-         | Some conflict ->
-           Lwt.fail_with
-             (Printf.sprintf
-                "cannot drop column %s.%s: %s"
-                table_meta.Cat.name
-                col_name
-                conflict)
+        (match drop_column_refusal cat ~table_name:table_meta.Cat.name ~col_name with
+         | Some msg -> Lwt.fail_with msg
          | None -> alter_drop_column tx cat ~table_meta col_name))
   in
   mark_alter_dirty ~table_meta action;

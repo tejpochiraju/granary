@@ -2244,6 +2244,18 @@
  (modules test_fk_cross_numeric_755)
  (libraries granary alcotest qcheck-core qcheck-alcotest lwt.unix))
 
+; #767: ALTER TABLE ... DROP COLUMN carried fk_constraints through unchanged,
+; so dropping a column a FOREIGN KEY names -- as the child's own local column
+; or as the parent column another table's FK references -- left a permanently
+; dangling column name behind, with no ALTER TABLE DROP CONSTRAINT to repair
+; it.  Now refused outright, on both sides, regardless of PRAGMA foreign_keys.
+; In-memory: pure catalog/DDL behaviour.
+
+(test
+ (name test_drop_column_fk_767)
+ (modules test_drop_column_fk_767)
+ (libraries granary alcotest lwt lwt.unix))
+
 ; #416: the RO tree-root memo must never serve a root from a different
 ; committed generation (commits, DDL, rollback, as-of/live alternation), and
 ; the Op_project fusion into a rowid point lookup must project exactly what

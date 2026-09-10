@@ -3919,6 +3919,64 @@ let dependents_error ~what ~deps =
      | _ -> "them")
 ;;
 
+(* #767: one FOREIGN KEY constraint, rendered for an error message.  [owner] is
+   the table the constraint is declared on, which is not always the table the
+   refusal is about — a parent-side hit names some OTHER table's constraint. *)
+let describe_fk ~owner (fk : fk_constraint) =
+  Printf.sprintf
+    "FOREIGN KEY (%s) REFERENCES %s (%s) on table '%s'"
+    (String.concat ", " fk.fk_local_cols)
+    fk.fk_parent_table
+    (String.concat ", " fk.fk_parent_cols)
+    owner
+;;
+
+(* #767: every FK constraint in the whole catalog that names [table].[column] —
+   the two sides a [DROP COLUMN] would strand:
+
+   - the LOCAL side of one of [table]'s own constraints ([fk_local_cols]); and
+   - the PARENT side of ANY table's constraint that points at [table]
+     ([fk_parent_table = table] && [column] in [fk_parent_cols]) — including
+     [table]'s own self-referential constraints, which is why the walk covers
+     every table rather than "every table but this one" the way
+     {!child_tables_of} does.
+
+   Unlike {!column_dependents_tx}, this reads structured catalog metadata rather
+   than stored SQL text, so it is exact in both directions: no false positive
+   from an unrelated table that happens to use the same column name, and no
+   false negative from a definition that never spells the name.
+
+   Sorted and de-duplicated so the refusal message is deterministic — the walk
+   itself is a [Hashtbl] fold and has no stable order. *)
+let fk_column_dependents t ~table ~column =
+  all_tables t
+  |> List.concat_map (fun (m : table_meta) ->
+    List.filter_map
+      (fun (fk : fk_constraint) ->
+         let local_hit = String.equal m.name table && List.mem column fk.fk_local_cols in
+         let parent_hit =
+           String.equal fk.fk_parent_table table && List.mem column fk.fk_parent_cols
+         in
+         if local_hit || parent_hit then Some (describe_fk ~owner:m.name fk) else None)
+      m.fk_constraints)
+  |> List.sort_uniq String.compare
+;;
+
+(* #767: the refusal message for the above.  Names every constraint, because —
+   unlike the view/trigger case {!dependents_error} covers — there is no [ALTER
+   TABLE ... DROP CONSTRAINT] in this engine, so the only way forward really is
+   to recreate the table. *)
+let fk_dependents_error ~what ~deps =
+  Printf.sprintf
+    "cannot %s: it participates in %s; there is no ALTER TABLE DROP CONSTRAINT to \
+     remove the constraint, so recreate the affected table%s without it first"
+    what
+    (String.concat ", " deps)
+    (match deps with
+     | [ _ ] -> ""
+     | _ -> "s")
+;;
+
 (* An index with [old_col] renamed to [new_col]: a plain column matches by name,
    an expression column and the partial WHERE by the lexical rewrite above. *)
 let rename_col_in_index ~old_col ~new_col (info : index_info) =
@@ -4384,8 +4442,23 @@ let drop_column ?txn t ~table_name ~col_name =
       | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
       | _ :: rest -> find_idx (i + 1) rest
     in
+    let fk_deps = fk_column_dependents t ~table:table_name ~column:col_name in
     (match find_idx 0 meta.columns with
      | None -> Lwt.return (Error (Printf.sprintf "column not found: %s" col_name))
+     | Some _ when fk_deps <> [] ->
+       (* #767: this function rebuilds [columns] but carries [fk_constraints]
+          through untouched, so dropping a column that either side of a FOREIGN
+          KEY names would leave a dangling column name behind forever — with no
+          [ALTER TABLE ... DROP CONSTRAINT] to repair it.  Refused rather than
+          rewritten; see [Exec.execute_alter_table], which makes the same refusal
+          BEFORE any row migration runs, and docs/DECISIONS.md.  Kept here too
+          because this is the function that would do the corrupting, so a future
+          caller cannot reintroduce it by skipping the executor's gate. *)
+       Lwt.return
+         (Error
+            (fk_dependents_error
+               ~what:(Printf.sprintf "drop column %s.%s" table_name col_name)
+               ~deps:fk_deps))
      | Some drop_idx ->
        let n_cols = List.length meta.columns in
        let new_columns = List.filteri (fun i _ -> i <> drop_idx) meta.columns in

@@ -483,6 +483,19 @@ things that were tried and rejected) is usually the point.
   including the residual this does NOT close (`RENAME TABLE`/`DROP TABLE`
   can still desync a pending check by table name, tracked as #768) — in
   `docs/DECISIONS.md`.
+- **`ALTER TABLE ... DROP COLUMN` is refused when the column participates in
+  any FOREIGN KEY, on either side (#767).** `Cat.drop_column` rebuilt
+  `columns` but carried `fk_constraints` through unchanged, so the drop left
+  a permanently dangling column name with no `ALTER TABLE DROP CONSTRAINT`
+  to repair it. `Cat.fk_column_dependents` walks the whole catalog (local
+  side, parent side, self-references) and `Exec.drop_column_refusal` refuses
+  behind #765's narrower pending-obligation message; refusal is independent
+  of `PRAGMA foreign_keys`, which governs enforcement rather than
+  declaration. Rewriting the constraint away was rejected: it would silently
+  weaken a declared guarantee and let one table's ALTER mutate another
+  table's schema. The residual it does NOT close — `CREATE TABLE` never
+  validating that a table-level `FOREIGN KEY`'s local columns exist — is
+  named in `docs/DECISIONS.md`.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.
