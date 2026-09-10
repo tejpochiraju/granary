@@ -319,8 +319,23 @@ val row_hook_depth_decr : row_hooks -> unit
 
     [~depth] is the recursion depth this particular invocation is running
     at (#752 review round 8, item 2) — see {!row_hook_effective_depth},
-    which is how a later, causally-descended firing recovers it. *)
-val run_in_row_hook_scope : t -> depth:int -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+    which is how a later, causally-descended firing recovers it.
+
+    [~register_undo] (#752 review round 9, finding 2) pushes a #269
+    schema-undo closure onto the #269 undo log owned by the [Cat.t] of the
+    [Db.t] statement that is ACTUALLY firing this hook — [Db]'s sole caller,
+    {!Db.fire_ocaml_row_hook}, passes [Cat.register_schema_undo] partially
+    applied to its own handle's catalog. A plain function rather than a
+    [Cat.t] field, since [Store] sits below [Catalog] in the dependency
+    graph. See {!row_hook_ambient_undo_target}, which is how
+    [Db.register_row_hook]/[Db.unregister_row_hook] recover it instead of
+    reaching for their own (possibly wrong, cross-handle) catalog. *)
+val run_in_row_hook_scope
+  :  t
+  -> depth:int
+  -> register_undo:((unit -> unit) -> unit)
+  -> (unit -> 'a Lwt.t)
+  -> 'a Lwt.t
 
 (** #752 (review round 8, item 2): the recursion depth to attribute a NEW row
     hook firing for [t] against, given [t]'s [row_hooks]. [Db]'s
@@ -371,6 +386,25 @@ val row_hook_effective_depth : t -> row_hooks -> int
     the log to be wrongly replayed by whatever unrelated rollback happens
     next. *)
 val in_row_hook_for : t -> bool
+
+(** The schema-undo target to push a row-hook registry mutation onto, when
+    the currently-running continuation is a causal descendant of a row hook
+    callback firing for [t] and still within that hook invocation's genuine
+    dynamic extent — the same condition {!in_row_hook_for} tests. [None]
+    exactly when {!in_row_hook_for} would answer [false].
+
+    #752 (review round 9, finding 2): [Db.register_row_hook]/
+    [Db.unregister_row_hook] consult this INSTEAD OF their own handle's
+    [Cat.t] whenever it returns [Some] — the round-8 gate
+    ([Option.is_some t.explicit_txn || in_row_hook_for t.store]) pushed onto
+    the CALLING handle's catalog unconditionally, which is wrong when a hook
+    body running as part of a DIFFERENT sibling [Db.t]'s statement (multiple
+    handles can share one [Store.t] via {!Db.create_worker_handle},
+    #589/#633/#632) calls [register_row_hook]/[unregister_row_hook] on this
+    handle: the undo must land on the FIRING statement's own catalog, not the
+    target handle's, or neither handle's rollback/commit will ever resolve
+    it. *)
+val row_hook_ambient_undo_target : t -> ((unit -> unit) -> unit) option
 
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)

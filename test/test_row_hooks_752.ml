@@ -1367,6 +1367,244 @@ let test_autocommit_registry_mutation_rolls_back_on_same_statement_failure () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* Silent-skip schema-undo resolution (review round 9, finding 1)          *)
+(* ------------------------------------------------------------------ *)
+
+(* Round 8 fixed the RAISING/VETOING half of "a [`Before] hook self-mutates
+   the registry mid-statement" — [execute_insert]'s own [Lwt.catch] exception
+   handler runs [Cat.rollback_schema_changes] when a LATER hook raises or
+   vetoes. Round 9 found the other half: [execute_insert_write]'s silent-skip
+   arms ([Iw_skip] from a secondary UNIQUE/NOT NULL [OR IGNORE], and the
+   alias-PK [CA_ignore] arm) are a SUCCESS outcome, not an exception, so they
+   never reach that handler either — and, before this round's
+   [rollback_skip] fix, never called [release_txn]'s [Cat.commit_schema_changes]
+   path (the OTHER thing that resolves the log) since they return a plain
+   [false] without going through it. A [`Before] hook's self-mutation before
+   such a skip was therefore left permanently stranded on [cat.sc.undo]:
+   neither committed nor rolled back by this statement.
+
+   That stranding is invisible immediately after the skip -- the STORE-level
+   mutation ([S.row_hook_unregister]) is unconditional and already took
+   effect regardless of the bug. The bug only shows up on the NEXT thing that
+   consults [cat.sc.undo]: an UNRELATED LATER statement on the same [Db.t]
+   that actually RAISES (not skips) runs [Cat.rollback_schema_changes], which
+   -- before this fix -- would wrongly REPLAY the stranded entry, undoing the
+   unregister and resurrecting the hook the skip had nothing to do with. Each
+   test below therefore checks not just the immediate effect, but that a
+   later unrelated failure leaves it alone. *)
+
+(* [Iw_skip] via a secondary (non-alias) UNIQUE index conflict resolved by
+   [OR IGNORE] -- [check_insert_unique] returns [Ic_skip], converted to
+   [Iw_skip]. *)
+let test_before_hook_self_unregister_sticks_across_a_secondary_unique_ignore_skip () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    exec db "CREATE UNIQUE INDEX t_v ON t (v)";
+    exec db "INSERT INTO t VALUES (1, 100)";
+    let h0_fired = ref 0 in
+    let h0 =
+      attach
+        db
+        ~table:"t"
+        ~timing:`Before
+        ~event:`Insert
+        (ok_hook (fun _ -> incr h0_fired))
+    in
+    let _h1 =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        Db.unregister_row_hook db h0;
+        Lwt.return (Ok ()))
+    in
+    (* v=100 collides with row 1's secondary UNIQUE index entry -- [OR IGNORE]
+       resolves it via [Iw_skip], a silent, non-exceptional skip, not a
+       veto. [h0] fires once (its own primary effect) before [h1]
+       unregisters it. *)
+    exec db "INSERT OR IGNORE INTO t VALUES (2, 100)";
+    Alcotest.(check (list string))
+      "the OR IGNORE row was not inserted"
+      [ "1|100" ]
+      (texts db "SELECT * FROM t");
+    Alcotest.(check int)
+      "h0 fired once, during the skipped statement's before phase"
+      1
+      !h0_fired;
+    (* The discriminating step: an UNRELATED statement that actually RAISES
+       (a plain INSERT, no OR IGNORE) exercises [execute_insert]'s exception
+       handler and its [Cat.rollback_schema_changes]. Before this round's
+       fix, the skip above left h1's unregister-undo stranded, so this
+       unrelated failure would wrongly replay it and resurrect h0. *)
+    exec_error db ~needle:"UNIQUE constraint failed" "INSERT INTO t VALUES (3, 100)";
+    exec db "INSERT INTO t VALUES (4, 400)";
+    Alcotest.(check int)
+      "h0's unregistration must stick: an unrelated later statement's own \
+       exception-driven rollback must not resurrect it via a stranded undo entry"
+      1
+      !h0_fired)
+;;
+
+(* [Iw_skip] via the plain (no [ON CONFLICT] clause) NOT NULL [OR IGNORE]
+   check in [execute_insert] itself (T1) -- a different SQL shape from the
+   secondary-index case above, converging on the same [Iw_skip] arm and the
+   same [rollback_skip] fix. *)
+let test_before_hook_self_unregister_sticks_across_a_not_null_ignore_skip () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)";
+    (* Baseline row, inserted BEFORE any hook is attached (so it does not
+       itself fire h0), reused below as the discriminating failure's
+       alias-PK conflict -- deliberately with NO successful write in
+       between, since an intervening successful [INSERT] would itself
+       discard the undo log via [release_txn]'s pre-existing (round 8)
+       [Cat.commit_schema_changes] and mask the bug this test targets. *)
+    exec db "INSERT INTO t VALUES (1, 100)";
+    let h0_fired = ref 0 in
+    let h0 =
+      attach
+        db
+        ~table:"t"
+        ~timing:`Before
+        ~event:`Insert
+        (ok_hook (fun _ -> incr h0_fired))
+    in
+    let _h1 =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        Db.unregister_row_hook db h0;
+        Lwt.return (Ok ()))
+    in
+    exec db "INSERT OR IGNORE INTO t VALUES (2, NULL)";
+    Alcotest.(check (list string))
+      "the OR IGNORE row was not inserted"
+      [ "1|100" ]
+      (texts db "SELECT * FROM t");
+    Alcotest.(check int)
+      "h0 fired once, during the skipped statement's before phase"
+      1
+      !h0_fired;
+    (* The discriminating unrelated failure, immediately following the skip
+       with no intervening successful write: a plain (no OR IGNORE) alias-PK
+       conflict against the baseline row, which raises through the ordinary
+       runtime path and exercises [execute_insert]'s exception handler --
+       unlike a literal NULL against a NOT NULL column, which this engine
+       catches at bind time instead. *)
+    exec_error db ~needle:"UNIQUE constraint failed" "INSERT INTO t VALUES (1, 999)";
+    exec db "INSERT INTO t VALUES (3, 300)";
+    Alcotest.(check int)
+      "h0's unregistration must stick across an unrelated later NOT NULL failure too"
+      1
+      !h0_fired)
+;;
+
+(* The alias-PK [CA_ignore] arm -- an explicit rowid-alias conflict detected
+   by [S.put_x], resolved by [OR IGNORE] with no [ON CONFLICT ... DO UPDATE]
+   clause naming that column, so it never reaches [execute_upsert_update]. *)
+let test_before_hook_self_unregister_sticks_across_an_alias_pk_ignore_skip () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    exec db "INSERT INTO t VALUES (1, 100)";
+    let h0_fired = ref 0 in
+    let h0 =
+      attach
+        db
+        ~table:"t"
+        ~timing:`Before
+        ~event:`Insert
+        (ok_hook (fun _ -> incr h0_fired))
+    in
+    let _h1 =
+      attach db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        Db.unregister_row_hook db h0;
+        Lwt.return (Ok ()))
+    in
+    (* id=1 collides with the existing row's rowid-alias PK -- [put_x] detects
+       it and [OR IGNORE] resolves via the alias-PK [CA_ignore] arm. *)
+    exec db "INSERT OR IGNORE INTO t VALUES (1, 999)";
+    Alcotest.(check (list string))
+      "the OR IGNORE row did not overwrite the existing one"
+      [ "1|100" ]
+      (texts db "SELECT * FROM t");
+    Alcotest.(check int)
+      "h0 fired once, during the skipped statement's before phase"
+      1
+      !h0_fired;
+    exec_error db ~needle:"UNIQUE constraint failed" "INSERT INTO t VALUES (1, 500)";
+    exec db "INSERT INTO t VALUES (2, 200)";
+    Alcotest.(check int)
+      "h0's unregistration must stick across an unrelated later alias-PK conflict too"
+      1
+      !h0_fired)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Cross-handle undo scoping (review round 9, finding 2)                    *)
+(* ------------------------------------------------------------------ *)
+
+(* Round 8's gate ([Option.is_some t.explicit_txn || Store.in_row_hook_for
+   t.store]) is keyed on the shared [Store.t], but the undo itself used to
+   land on the CALLING handle's own [Cat.t] regardless of which handle's
+   statement was actually firing the hook. [b_db] (a {!Db.create_worker_handle}
+   sibling of [a_db], sharing one [Store.t] per #589/#633/#632) fires a
+   [`Before] chain on its own INSERT: [h1] (registered on [b_db]) calls
+   [Db.unregister_row_hook] on [a_db] -- a DIFFERENT handle -- to detach [h0]
+   (registered on [a_db], but firing store-wide regardless of which handle
+   registered it), and [h2] (also on [b_db]) then vetoes, failing the whole
+   statement.
+
+   Before this round's fix, the undo for [h1]'s cross-handle unregister
+   landed on [a_db.catalog] (the OLD, wrong behaviour: [t.catalog] where [t]
+   is whichever handle's [register_row_hook]/[unregister_row_hook] was
+   literally called on). Only [b_db]'s own exception handler ever runs
+   [Cat.rollback_schema_changes b_db.catalog] when [b_db]'s statement fails
+   -- [a_db.catalog]'s stranded entry is never touched by it, so [h0] would
+   stay wrongly unregistered forever (until, if ever, [a_db] itself opened
+   and rolled back some unrelated explicit transaction of its own -- which
+   this test deliberately never does, per the round-9 spec: "given H1 didn't
+   independently commit/rollback anything").
+
+   After the fix, {!Store.row_hook_ambient_undo_target} routes the undo onto
+   [b_db.catalog] instead -- the catalog of whichever handle is ACTUALLY
+   firing the hook -- so [b_db]'s own failure correctly replays it and
+   restores [h0], immediately, with no help from [a_db]. *)
+let test_cross_handle_hook_mutation_resolves_against_the_firing_handles_catalog () =
+  with_db (fun a_db ->
+    exec a_db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+    let b_db = run (Db.create_worker_handle a_db) in
+    let h0_fired = ref 0 in
+    let h0 =
+      attach
+        a_db
+        ~table:"t"
+        ~timing:`After
+        ~event:`Insert
+        (ok_hook (fun _ -> incr h0_fired))
+    in
+    let h1 =
+      attach b_db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        (* Cross-handle: b_db's firing hook mutates a_db's registration. *)
+        Db.unregister_row_hook a_db h0;
+        Lwt.return (Ok ()))
+    in
+    let h2 =
+      attach b_db ~table:"t" ~timing:`Before ~event:`Insert (fun _ ->
+        Lwt.return (Error "veto"))
+    in
+    (* h1 fires first (registration order), unregistering h0 via a_db; h2
+       fires next and vetoes, failing b_db's whole autocommit statement. a_db
+       never opens an explicit transaction of its own anywhere in this test. *)
+    exec_error b_db ~needle:"veto" "INSERT INTO t VALUES (1, 10)";
+    (* Detach h1/h2 (both `Before`, store-wide) before probing, or they would
+       re-fire (and h1 would re-unregister h0 again) on the very insert used
+       to check whether h0 survived. *)
+    Db.unregister_row_hook b_db h1;
+    Db.unregister_row_hook b_db h2;
+    exec a_db "INSERT INTO t VALUES (2, 20)";
+    Alcotest.(check int)
+      "h0 must be restored: b_db's own failed statement is the correct scope for the \
+       cross-handle unregister its hook chain performed, even though the mutation was \
+       made through a_db"
+      1
+      !h0_fired)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* QCheck: registered/unregistered set matches what fires               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1637,6 +1875,26 @@ let () =
             "a mid-statement registry mutation rolls back on the same statement's failure"
             `Quick
             test_autocommit_registry_mutation_rolls_back_on_same_statement_failure
+        ] )
+    ; ( "silent-skip schema-undo resolution (review round 9, finding 1)"
+      , [ Alcotest.test_case
+            "a self-unregister sticks across a secondary-UNIQUE OR IGNORE skip"
+            `Quick
+            test_before_hook_self_unregister_sticks_across_a_secondary_unique_ignore_skip
+        ; Alcotest.test_case
+            "a self-unregister sticks across a NOT NULL OR IGNORE skip"
+            `Quick
+            test_before_hook_self_unregister_sticks_across_a_not_null_ignore_skip
+        ; Alcotest.test_case
+            "a self-unregister sticks across an alias-PK OR IGNORE skip"
+            `Quick
+            test_before_hook_self_unregister_sticks_across_an_alias_pk_ignore_skip
+        ] )
+    ; ( "cross-handle undo scoping (review round 9, finding 2)"
+      , [ Alcotest.test_case
+            "a cross-handle hook mutation resolves against the firing handle's catalog"
+            `Quick
+            test_cross_handle_hook_mutation_resolves_against_the_firing_handles_catalog
         ] )
     ; "qcheck", [ QCheck_alcotest.to_alcotest prop_fired_matches_registered ]
     ]

@@ -3274,6 +3274,40 @@ let release_txn ?cat tx owned =
   else Lwt.return_unit
 ;;
 
+(* #752 (review round 9, finding 1): [execute_insert_write]'s silent-skip
+   arms ([Iw_skip], its own internal NOT NULL [OR IGNORE] check, and the
+   alias-PK [CA_ignore] arm) each roll [tx] back directly, without going
+   through [release_txn] — a skip is a SUCCESS outcome (a deliberate
+   [OR IGNORE], not a raised exception), so it never reaches
+   [execute_insert]'s [Lwt.catch] exception handler either. Neither of the
+   two places that (since round 8) resolve [cat]'s #269 schema-undo log —
+   [release_txn]'s [owned] commit branch, and the exception handler's
+   [Cat.rollback_schema_changes] — ever ran for a skip, so a [`Before] hook
+   that self-mutated the registry (the documented nested-hook-mutation
+   pattern) before the skip was decided left its undo entry permanently
+   stranded on [cat.sc.undo]: neither committed nor rolled back by THIS
+   statement, to be wrongly replayed by whatever unrelated future statement
+   next rolls back on this same [Db.t].
+
+   The correct resolution is COMMIT, not rollback: a skip means "this row's
+   write didn't happen," not "this statement failed." [S.rollback tx] here
+   undoes only the STORE-level attempt at the row write (the B-tree
+   descents made so far, harmless to discard since nothing else could have
+   been written for a row that never got past its own uniqueness/NOT NULL
+   check) — it does not mean the surrounding statement raised or was
+   vetoed. The hook registry mutation is a real, intentional side effect
+   independent of whether this particular row made it in, exactly as
+   [release_txn]'s write-succeeded path already treats it. Guarded on
+   [owned] for the same reason [release_txn] is: when the transaction is
+   borrowed ([not owned]), the outer explicit transaction is the schema-undo
+   scope, and its own eventual COMMIT/ROLLBACK — not this statement — is
+   what must resolve the entry. *)
+let rollback_skip ~(cat : Cat.t) tx ~owned : unit Lwt.t =
+  let* () = if owned then S.rollback tx else Lwt.return_unit in
+  if owned then Cat.commit_schema_changes cat;
+  Lwt.return_unit
+;;
+
 (** Extract the in-memory columnar store from a table_meta.  Asserts [Row]
     cannot happen at call sites guarded by [Cat.is_columnar]. *)
 let col_store_of_meta (m : Cat.table_meta) : Granary_columnar.Col_store.t =
@@ -4900,8 +4934,14 @@ let execute_insert_write
        [on_conflict = CA_ignore] means [check_insert_unique] returned
        [Ic_skip] without ever producing [Ic_replace], so the write path below
        (including [delete_replace_conflicts]) is unreachable — no hooks have
-       fired and no B-tree deletes have been made, so [S.rollback] is safe. *)
-    let* () = if owned then S.rollback tx else Lwt.return_unit in
+       fired and no B-tree deletes have been made, so [S.rollback] is safe.
+
+       #752 (review round 9, finding 1): [rollback_skip] additionally
+       resolves [cat]'s #269 schema-undo log via [Cat.commit_schema_changes]
+       when [owned] — see its doc comment for why this is a SUCCESS
+       (commit), not a failure (rollback), for a [`Before] hook's own
+       registry self-mutation. *)
+    let* () = rollback_skip ~cat tx ~owned in
     Lwt.return false
   | Iw_plain | Iw_replace _ ->
     (* #567: the rowid-alias column has just been written back by
@@ -4919,8 +4959,9 @@ let execute_insert_write
     let null_skip = not_null_skip_or_fail ~clock ~params table_meta row ~on_conflict in
     if null_skip
     then
-      (* Decided before any write, same as the [Iw_skip] arm above. *)
-      let* () = if owned then S.rollback tx else Lwt.return_unit in
+      (* Decided before any write, same as the [Iw_skip] arm above — see its
+         [rollback_skip] comment (#752 review round 9, finding 1). *)
+      let* () = rollback_skip ~cat tx ~owned in
       Lwt.return false
     else
       let* displaced_rows =
@@ -5021,7 +5062,10 @@ let execute_insert_write
               ~on_upsert_update_before
               ~on_upsert_update
           | Some Ast.CA_ignore, _ ->
-            let* () = if owned then S.rollback tx else Lwt.return_unit in
+            (* #752 (review round 9, finding 1): same [rollback_skip] fix as
+               the [Iw_skip] arm above — an alias-PK [OR IGNORE] skip is a
+               success outcome too. *)
+            let* () = rollback_skip ~cat tx ~owned in
             Lwt.return false
           | Some Ast.CA_replace, _ ->
             let* old_bytes_opt =

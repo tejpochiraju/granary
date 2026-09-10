@@ -636,7 +636,22 @@ things that were tried and rejected) is usually the point.
   survives past the point the reentrancy guard's own `rhs_active` flag flips to
   `false`. A statement-level `unregister_row_hook` still has no effect on the
   REST of that same statement's already-snapshotted fire list, tracked as
-  #771. Full detail in `docs/DECISIONS.md`.
+  #771. **Round 9 found round 8's schema-undo fix only closed the
+  exception-raising half of what it targeted.** A silent skip (`OR IGNORE`
+  on a secondary UNIQUE/NOT NULL conflict, or an alias-PK conflict) is a
+  SUCCESS outcome, not a raised exception, so it never reached either place
+  round 8 taught to resolve the log — fixed by `rollback_skip`, which
+  resolves via `Cat.commit_schema_changes` (not rollback) on a skip, since a
+  skip means "this row's write didn't happen," not "this statement failed."
+  Separately, a hook mutation made across `create_worker_handle` siblings
+  landed on the CALLING handle's catalog rather than the FIRING statement's
+  — fixed by threading a `(unit -> unit) -> unit` undo-target closure through
+  the ambient row-hook scope itself (`Store.row_hook_ambient_undo_target`),
+  captured by whichever handle is actually firing the hook. FK
+  `CASCADE`/`SET NULL`/`SET DEFAULT` bypassing OCaml row hooks entirely is
+  tracked as #773 (not fixed); `row_hooks_carry_over` omitting
+  `row_hook_depth` across a VACUUM store-swap is tracked as #774 (not
+  fixed). Full detail in `docs/DECISIONS.md`.
 
 ## Repository structure
 

@@ -889,6 +889,40 @@ type row_hook_scope =
             let a chain of such hooks re-enter unboundedly -- the exact gap
             {!max_row_hook_depth} exists to close. See
             {!row_hook_effective_depth}. *)
+  ; rhs_register_undo : (unit -> unit) -> unit
+    (** #752 (review round 9, finding 2): pushes a #269 schema-undo closure
+            onto the #269 undo log OWNED BY THE STATEMENT THAT IS ACTUALLY
+            FIRING THIS HOOK -- i.e. [Cat.register_schema_undo] partially
+            applied to that statement's own [Cat.t], captured by
+            {!Db.fire_ocaml_row_hook} at scope-creation time, when it alone
+            knows which [Db.t] is running.  Deliberately a closure rather
+            than a [Cat.t] field: [Store] sits below [Catalog] in the
+            dependency graph ([Catalog] opens [Store], never the reverse), so
+            embedding [Cat.t] here would be circular.  A closure captured
+            by the one caller who already has both types in scope avoids
+            that with no new dependency at all.
+
+            This is the fix for a real bug: the round-8 gate
+            ([Option.is_some t.explicit_txn || in_row_hook_for t.store]) is
+            keyed on the SHARED [Store.t] -- true for ANY sibling [Db.t]
+            currently inside a hook callback anywhere on that store
+            (multiple handles can share one [Store.t] via
+            {!Db.create_worker_handle}, #589/#633/#632) -- but the undo
+            itself used to be pushed onto the CALLING handle's OWN
+            [Cat.t] regardless of whose statement was actually firing.  If a
+            hook body running as part of handle H2's statement calls
+            [Db.register_row_hook]/[Db.unregister_row_hook] on a DIFFERENT
+            handle H1 sharing the same store, the undo landed on
+            [H1.catalog], but only H2's exception handler
+            ([Cat.rollback_schema_changes] on [H2.catalog]) ever runs when
+            H2's statement later fails -- H1's stranded undo was never
+            replayed on the failure it was meant to guard, and was silently
+            dropped whenever H1 itself next committed
+            ([Schema_cache.commit] unconditionally clears [t.undo]).
+
+            {!row_hook_ambient_undo_target} is what a caller consults instead
+            of reaching for its own [Cat.t] directly whenever an ambient row
+            hook scope for its store is active. *)
   }
 
 let in_row_hook_key : row_hook_scope Lwt.key = Lwt.new_key ()
@@ -912,8 +946,20 @@ let in_row_hook_key : row_hook_scope Lwt.key = Lwt.new_key ()
    [Some scope], because the snapshot reinstated at that bind site is this
    very (now-mutated) record. [rhs_depth] stays put through that same flip,
    which is exactly what lets {!row_hook_effective_depth} still see it. *)
-let run_in_row_hook_scope (t : t) ~depth (f : unit -> 'a Lwt.t) : 'a Lwt.t =
-  let scope = { rhs_store = t; rhs_active = true; rhs_depth = depth } in
+let run_in_row_hook_scope
+      (t : t)
+      ~depth
+      ~(register_undo : (unit -> unit) -> unit)
+      (f : unit -> 'a Lwt.t)
+  : 'a Lwt.t
+  =
+  let scope =
+    { rhs_store = t
+    ; rhs_active = true
+    ; rhs_depth = depth
+    ; rhs_register_undo = register_undo
+    }
+  in
   Lwt.finalize
     (fun () -> Lwt.with_value in_row_hook_key (Some scope) f)
     (fun () ->
@@ -936,6 +982,26 @@ let in_row_hook_for (t : t) =
   match Lwt.get in_row_hook_key with
   | Some scope -> scope.rhs_active && scope.rhs_store == t
   | None -> false
+;;
+
+(* #752 (review round 9, finding 2): the schema-undo target to push a row-hook
+   registry mutation onto, when the currently-running continuation is a
+   causal descendant of a row hook callback firing for [t] and still within
+   that hook invocation's genuine dynamic extent (the same test
+   {!in_row_hook_for} makes -- deliberately duplicated rather than expressed
+   in terms of it, since this needs the [scope] itself, not just its
+   [bool]). [None] when there is no such ambient scope, exactly the case
+   {!in_row_hook_for} answers [false] for.
+
+   [Db.register_row_hook]/[Db.unregister_row_hook] consult this INSTEAD OF
+   reaching for their own handle's [Cat.t] whenever it returns [Some] -- see
+   {!row_hook_scope}'s [rhs_register_undo] field doc comment for the
+   cross-handle bug this closes. *)
+let row_hook_ambient_undo_target (t : t) : ((unit -> unit) -> unit) option =
+  match Lwt.get in_row_hook_key with
+  | Some scope when scope.rhs_active && scope.rhs_store == t ->
+    Some scope.rhs_register_undo
+  | _ -> None
 ;;
 
 (* #752 (review round 8, item 2): the recursion depth to attribute a NEW row

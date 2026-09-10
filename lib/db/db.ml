@@ -1852,24 +1852,28 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
             synchronous, or resumed from a deferred [Lwt.async] continuation
             — recovers it via [Store.row_hook_effective_depth] regardless of
             what the store-wide counter has done in the meantime. *)
-         S.run_in_row_hook_scope t.store ~depth:(depth + 1) (fun () ->
-           Lwt.catch
-             (fun () ->
-                let* r = fn mutation in
-                match r with
-                | Ok () -> Lwt.return_unit
-                | Error msg ->
-                  Lwt.fail_with
-                    (Printf.sprintf "%s row hook on '%s': %s" label table_name msg))
-             (function
-               | Failure _ as exn -> Lwt.fail exn
-               | exn ->
-                 Lwt.fail_with
-                   (Printf.sprintf
-                      "%s row hook on '%s' raised: %s"
-                      label
-                      table_name
-                      (Printexc.to_string exn)))))
+         S.run_in_row_hook_scope
+           t.store
+           ~depth:(depth + 1)
+           ~register_undo:(fun f -> Cat.register_schema_undo t.catalog f)
+           (fun () ->
+              Lwt.catch
+                (fun () ->
+                   let* r = fn mutation in
+                   match r with
+                   | Ok () -> Lwt.return_unit
+                   | Error msg ->
+                     Lwt.fail_with
+                       (Printf.sprintf "%s row hook on '%s': %s" label table_name msg))
+                (function
+                  | Failure _ as exn -> Lwt.fail exn
+                  | exn ->
+                    Lwt.fail_with
+                      (Printf.sprintf
+                         "%s row hook on '%s' raised: %s"
+                         label
+                         table_name
+                         (Printexc.to_string exn)))))
       (fun () ->
          S.row_hook_depth_decr reg;
          Lwt.return_unit))
@@ -4995,6 +4999,49 @@ let unregister_view_callback top h =
 
 let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
 
+(* #752 (review round 9, finding 2): push [f] onto whichever schema-undo log
+   is the REAL scope for a row-hook registry mutation made on [t] — shared by
+   {!register_row_hook} and {!unregister_row_hook} below, which used to each
+   inline [Cat.register_schema_undo t.catalog ...] unconditionally once the
+   round-8 gate passed.
+
+   That gate — [Option.is_some t.explicit_txn || Store.in_row_hook_for
+   t.store] — is keyed on the SHARED [Store.t] (multiple [Db.t] handles can
+   share one via {!create_worker_handle}, #589/#633/#632), so it answers
+   [true] for ANY sibling handle currently inside a hook callback anywhere on
+   that store, not just [t] itself. Pushing onto [t.catalog] regardless of
+   WHICH handle's statement is actually firing was the bug: if a hook body
+   running as part of a DIFFERENT handle H2's statement calls
+   {!register_row_hook}/{!unregister_row_hook} on THIS handle [t] (= H1),
+   the undo needs to land on H2's catalog — H2's own exception handler is
+   the only thing that will ever replay or discard it — not on
+   [t.catalog], which neither H1 nor H2's rollback/commit machinery will
+   ever consult for this entry.
+
+   Two scopes are considered, in priority order:
+   - [t.explicit_txn] open on [t] ITSELF: this is [t]'s own, present scope
+     regardless of what else is happening on the shared store, so it wins
+     even if an ambient hook scope also happens to be active.
+   - failing that, {!Store.row_hook_ambient_undo_target}: the firing
+     statement's own catalog, captured by {!fire_ocaml_row_hook} at the
+     point it knows which [Db.t] is actually running the hook body — this is
+     what corrects the cross-handle case above, and degrades to exactly the
+     round-8 behaviour when the firing handle and [t] are the same one.
+
+   [None] (neither scope) is the ordinary-top-level-call case: nothing will
+   ever replay or discard the entry, so it must not be pushed anywhere, or it
+   would linger on some unrelated log forever. *)
+let push_row_hook_undo t (f : unit -> unit) : unit =
+  let register_undo =
+    if Option.is_some t.explicit_txn
+    then Some (fun g -> Cat.register_schema_undo t.catalog g)
+    else S.row_hook_ambient_undo_target t.store
+  in
+  match register_undo with
+  | None -> ()
+  | Some register -> register f
+;;
+
 let register_row_hook t ~table ~timing ~event fn =
   (* #752 (review round 5, item 1): [S.is_closing] catches a VACUUM race
      window a bare [is_stale t] check cannot — [Db.vacuum] closes [t.store]
@@ -5070,14 +5117,18 @@ let register_row_hook t ~table ~timing ~event fn =
        unrelated ROLLBACK or failed autocommit statement happens next on this
        [t.catalog] — corrupting a completely unrelated statement's rollback.
        [in_row_hook_for] is exactly the causal-descendant test that tells
-       those two cases apart. *)
-      if Option.is_some t.explicit_txn || S.in_row_hook_for t.store
-      then
-        Cat.register_schema_undo t.catalog (fun () ->
-          (* Discards the returned re-undo closure: once this fires the
+       those two cases apart.
+
+       #752 (review round 9, finding 2): routed through {!push_row_hook_undo}
+       rather than pushing onto [t.catalog] directly — see its doc comment
+       for why the target catalog is not always [t]'s own when the ambient
+       hook scope belongs to a different sibling handle sharing this
+       store. *)
+      push_row_hook_undo t (fun () ->
+        (* Discards the returned re-undo closure: once this fires the
            enclosing scope is already being rolled back, so there is nothing
            further to protect this removal against. *)
-          ignore (S.row_hook_unregister (S.row_hooks t.store) id : unit -> unit));
+        ignore (S.row_hook_unregister (S.row_hooks t.store) id : unit -> unit));
       Ok { rh_table = table; rh_timing = timing; rh_event = event; rh_id = id })
 ;;
 
@@ -5123,9 +5174,12 @@ let unregister_row_hook t h =
      replay it in, matching {!register_row_hook}'s identical round-8 fix —
      see its comment for why this needs BOTH the pre-existing
      [t.explicit_txn] check AND {!Store.in_row_hook_for}, and why neither
-     alone, nor an unconditional push, is correct. *)
-  if Option.is_some t.explicit_txn || S.in_row_hook_for t.store
-  then Cat.register_schema_undo t.catalog undo
+     alone, nor an unconditional push, is correct.
+
+     #752 (review round 9, finding 2): routed through {!push_row_hook_undo},
+     same as {!register_row_hook} — see its doc comment for the cross-handle
+     scoping fix. *)
+  push_row_hook_undo t undo
 ;;
 
 let pp_row_hook fmt h =

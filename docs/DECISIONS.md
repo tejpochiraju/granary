@@ -3698,3 +3698,84 @@ handling row N of a multi-row statement) still has H2 fire for every
 remaining row of that statement; the detach only takes effect starting with
 the next statement. Tracked as #771.
 
+**Round 9 found that round 8's schema-undo fix only closed the
+EXCEPTION-RAISING half of what it targeted, in two shapes round 8's own test
+did not cover — the same "torn down or snapshotted at the wrong time" family
+again, one level further out each time.**
+
+- **A silent SKIP left the same schema-undo entry stranded that round 8 fixed
+  for a raise/veto.** `execute_insert_write`'s three silent-skip arms —
+  `Iw_skip` (a secondary-index UNIQUE or plain NOT NULL `OR IGNORE`), the
+  function's own internal NOT NULL `OR IGNORE` check, and the alias-PK
+  `CA_ignore` arm — each called `S.rollback tx` directly and returned `false`
+  without going through EITHER of the two places round 8 taught to resolve
+  the log: `release_txn`'s `owned` success branch (never reached — a skip
+  returns before it) and `execute_insert`'s exception handler (never reached
+  either — a skip is a SUCCESS outcome, not a raised exception). A `` `Before
+  `` hook that self-mutates the registry (round 8's own documented pattern)
+  followed by an `OR IGNORE` skip on that same statement therefore left the
+  mutation's undo entry permanently on `cat.sc.undo` — neither committed nor
+  rolled back — to be wrongly replayed by whatever UNRELATED statement next
+  rolled back on that same `Db.t`. The fix, `rollback_skip`, resolves via
+  `Cat.commit_schema_changes` (not rollback) when `owned`: a skip means "this
+  row's write didn't happen," not "this statement failed," so the hook
+  registry mutation — a real, intentional side effect independent of whether
+  this particular row made it in — must stick, exactly as it already does on
+  `release_txn`'s write-succeeded path. Confirmed via the same
+  revert-and-confirm-failure methodology, with a discriminating twist specific
+  to this bug: the immediate effect of a stranded (vs. resolved) undo entry is
+  IDENTICAL right after the skip, since the store-level `S.row_hook_unregister`
+  mutation is unconditional either way — the bug is only observable via a
+  SECOND, unrelated, later statement that actually raises and wrongly replays
+  the stranded entry. Each new test therefore asserts against that second
+  statement's outcome, not the first, and (having tripped over it once while
+  writing the tests) deliberately inserts no successful write in between,
+  since an intervening successful statement would itself discard the log via
+  `release_txn`'s pre-existing round-8 fix and mask the bug being tested.
+- **A row-hook mutation made across sibling `create_worker_handle` handles
+  landed on the wrong handle's catalog.** Round 8's gate —
+  `Option.is_some t.explicit_txn || Store.in_row_hook_for t.store` — is keyed
+  on the SHARED `Store.t` (multiple `Db.t` handles can share one via
+  `create_worker_handle`, #589/#633/#632), so it answers `true` for ANY
+  sibling handle currently inside a hook callback anywhere on that store —
+  but the undo was still pushed onto `t.catalog`, the CALLING handle's own,
+  regardless of which handle's statement was actually firing. If a hook body
+  running as part of handle H2's statement called
+  `register_row_hook`/`unregister_row_hook` on a DIFFERENT handle H1 sharing
+  the same store, the undo landed on `H1.catalog`, but only H2's own exception
+  handler (`Cat.rollback_schema_changes` on `H2.catalog`) ever ran when H2's
+  statement later failed — H1's stranded entry was never replayed by the
+  failure it was meant to guard, and was silently dropped whenever H1 itself
+  next committed (`Schema_cache.commit` unconditionally clears `t.undo`).
+  Fixed by threading the FIRING statement's own undo target through the
+  ambient row-hook scope itself: `Store.row_hook_scope` gained a new
+  `rhs_register_undo` field — a plain `(unit -> unit) -> unit` closure rather
+  than a `Cat.t` (`Store` sits below `Catalog` in the dependency graph, so
+  embedding `Cat.t` would be circular; a closure captured by
+  `Db.fire_ocaml_row_hook`, the one caller who already has both types in
+  scope, avoids that with no new dependency) — and a new
+  `Store.row_hook_ambient_undo_target` that `register_row_hook`/
+  `unregister_row_hook` now consult INSTEAD OF reaching for their own handle's
+  `Cat.t`, falling back to it only when the calling handle has its own
+  explicit transaction open (a real, present, more specific scope that wins
+  regardless of what else is happening on the shared store) or when there is
+  no ambient scope at all (the ordinary top-level-call case, unaffected).
+  Confirmed via a two-handle test exercising the exact cross-handle shape:
+  H2's hook chain unregisters H0's hook via H1 (a `create_worker_handle`
+  sibling of H2 sharing one store), H2's statement then vetoes, and H1 itself
+  never opens or resolves any transaction of its own — the registration must
+  still be restored, immediately, with no help from H1.
+
+**Deliberately not fixed in round 9** (both filed as new issues rather than
+fixed, per instruction): FK `ON DELETE`/`ON UPDATE` `CASCADE`/`SET NULL`/
+`SET DEFAULT` bypass OCaml row hooks entirely, since
+`cascade_delete_row_in_tx`/`cascade_update_col_in_tx` route through
+`delete_row_in_tx`/`update_col_in_tx` without ever building the
+`before_hook`/`after_hook` closures the direct DELETE/UPDATE paths construct —
+tracked as #773. Separately, `row_hooks_carry_over` does not copy
+`row_hook_depth` across a VACUUM store-swap, so `row_hook_effective_depth`'s
+store-wide-counter fallback silently resets to 0 for an `Lwt.async`-deferred
+continuation whose causal chain no longer matches the new store object,
+widening (not eliminating) `max_row_hook_depth`'s recursion ceiling across a
+VACUUM that happens to land mid-chain — tracked as #774.
+
