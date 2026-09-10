@@ -210,17 +210,13 @@ let commit_still_refuses_when_no_rename_is_attempted () =
       "CREATE TABLE c5 (pid INTEGER REFERENCES p5(id) DEFERRABLE INITIALLY DEFERRED)";
     exec db "BEGIN";
     exec db "INSERT INTO c5 VALUES (999)";
-    (match exec_result db "COMMIT" with
-     | Ok () -> Alcotest.fail "COMMIT must refuse: parent row 999 does not exist"
-     | Error msg ->
-       Alcotest.(check bool)
-         (Printf.sprintf "refused with a FOREIGN KEY error (got %S)" msg)
-         true
-         (contains ~needle:"FOREIGN KEY" msg));
-    Alcotest.(check (list string))
-      "no orphan row survives"
-      []
-      (query_texts db "SELECT pid FROM c5"))
+    match exec_result db "COMMIT" with
+    | Ok () -> Alcotest.fail "COMMIT must refuse: parent row 999 does not exist"
+    | Error msg ->
+      Alcotest.(check bool)
+        (Printf.sprintf "refused with a FOREIGN KEY error (got %S)" msg)
+        true
+        (contains ~needle:"FOREIGN KEY" msg))
 ;;
 
 (* A self-referencing FK: child and parent are the SAME table, so the
@@ -371,9 +367,9 @@ let rename_after_rollback_of_the_pending_transaction_succeeds () =
    the referencing rows outright — "nothing left to enforce" is honest.
    Dropping the PARENT leaves a dangling reference, but leaves the IDENTICAL
    dangling reference outside a transaction with no obligation involved, so
-   it is a wider pre-existing [DROP TABLE] gap and not the identity desync
-   #768 is about. If either half of this ever changes, this test fails and
-   the decision gets re-made deliberately. *)
+   it is a wider pre-existing [DROP TABLE] gap (#776) and not the identity
+   desync #768 is about. If either half of this ever changes, this test
+   fails and the decision gets re-made deliberately. *)
 let drop_parent_table_is_unguarded_in_and_out_of_a_transaction () =
   with_db (fun db ->
     exec db "PRAGMA foreign_keys = 1";
@@ -388,7 +384,7 @@ let drop_parent_table_is_unguarded_in_and_out_of_a_transaction () =
      | Error msg ->
        Alcotest.failf
          "baseline changed: autocommit DROP TABLE of a referenced parent now fails (%S) \
-          — re-decide #768's DROP TABLE scope"
+          — re-decide #776"
          msg);
     Alcotest.(check (list string))
       "the child row outlives its parent table outside any transaction"

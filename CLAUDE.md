@@ -481,8 +481,25 @@ things that were tried and rejected) is usually the point.
   `Exec.child_index_key_types` is now exposed in `exec.mli` so a test can
   confirm the fast-path/full-scan decision directly. Full write-up —
   including the residual this does NOT close (`RENAME TABLE`/`DROP TABLE`
-  can still desync a pending check by table name, tracked as #768) — in
-  `docs/DECISIONS.md`.
+  can still desync a pending check by table name — `RENAME TABLE` closed by
+  #768 below, `DROP TABLE` still open as #776) — in `docs/DECISIONS.md`.
+- **`ALTER TABLE ... RENAME TO` is refused while a deferred FK obligation
+  still names the table on either side (#768).** `Exec.make_fk_recheck`
+  captures the child's and the parent's TABLE NAMES at enqueue time and
+  treats a `Cat.find_table_cached` miss at COMMIT as "not violated", so
+  renaming either side mid-transaction made COMMIT silently accept a genuine
+  violation and leave a permanent orphan. Closed the way #765 round 3 closed
+  `RENAME COLUMN`/`DROP COLUMN` — new `Exec.fk_obligation_table_conflict`,
+  consulted by the `Ast.AA_rename_table` arm before the rename runs — because
+  the recheck only ever sees the schema AFTER the mutation and so can never
+  get ahead of the next mutation shape. Conservative in one direction (a
+  resolved-but-still-queued obligation still refuses) and poisons a borrowed
+  transaction like every other failing in-txn DDL. `DROP TABLE` is
+  deliberately NOT guarded: the child-side drop removes the rows, and the
+  parent-side drop leaves the identical dangling reference with no
+  transaction involved because `Exec.execute_drop_table` does no FK checking
+  at all — a wider pre-existing gap, filed as **#776 (open)** and pinned by a
+  test so the decision gets re-made rather than drifting.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.
