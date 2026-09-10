@@ -98,6 +98,19 @@ let with_file_db path f =
   | Ok db -> Lwt.finalize (fun () -> f db) (fun () -> DB.close db)
 ;;
 
+(* #772: [Mirage_block.S] has no flush operation, so [Mirage_backend] declares
+   no barrier unless the platform supplies one -- and a store told it has no
+   barrier refuses every durability level above [off].  These tests run over a
+   real file and want the ordinary [full] durability, so they hand the adapter a
+   genuine [fsync].  That is also precisely the seam a barrier-capable Solo5
+   block backend would fill.  [fsync] is per-inode, so a second descriptor on
+   the same path flushes the writes [Block] issued through its own. *)
+let fsync_barrier path () : (unit, string) result Lwt.t =
+  let fd = Unix.openfile path [ Unix.O_WRONLY ] 0o644 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd);
+  Lwt.return (Ok ())
+;;
+
 (* #753/#763: [init_if_corrupt] defaults to [true] here because every
    caller except [test_mirage_reopen_persists]'s second call opens a fresh,
    zeroed [tmp_file ()] that has never had a header written to it -- the
@@ -110,7 +123,7 @@ let with_file_db path f =
    rather than raising -- exactly the failure mode #753 closes. *)
 let with_mirage_db ?(init_if_corrupt = true) path f =
   let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-  let* adapter = MB.connect dev in
+  let* adapter = MB.connect ~barrier:(fsync_barrier path) dev in
   let* r =
     DB.open_block
       ~init_if_corrupt

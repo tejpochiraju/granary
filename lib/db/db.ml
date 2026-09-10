@@ -599,6 +599,7 @@ let open_block
       ?geom
       ?clock
       ?durability
+      ?barrier
       ~read_page
       ~write_page
       ~sync
@@ -611,6 +612,8 @@ let open_block
   let* result =
     S.open_block
       ?geom
+      ?barrier
+      ?durability
       ~init_if_corrupt
       ~read_page
       ~write_page

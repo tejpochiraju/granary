@@ -83,7 +83,20 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
 
     [clock] and [durability] are open-options forwarded to [of_store]:
     [durability] sets the database-wide durability knob (full/batched/off)
-    before the catalog is loaded.
+    before the catalog is loaded.  [durability] is {e also} forwarded to
+    {!Granary_store.Store.open_block}, where the #772 [barrier] check consults
+    it (see below).
+
+    {b #772: [barrier].}  Declares whether the backing device can make a write
+    durable, defaulting to [`Available] so file backends and every existing
+    caller are unchanged.  A [Mirage_block.S] device has no flush operation at
+    all: pass
+    [~barrier:(Granary_mirage_block.Mirage_backend.Make(B).durability_barrier
+    adapter)] and the open is refused — with [Error (Runtime msg)] naming the
+    backend and the missing capability — unless [~durability] is
+    {!Granary_store.Store.Off}.  Before #772 such a database acked every commit
+    as durable under the default [full] while the bytes were still in a volatile
+    cache.
 
     {b #753: [init_if_corrupt] defaults to [false].}  It is forwarded
     verbatim to {!Granary_store.Store.open_block}, whose header check cannot
@@ -121,6 +134,7 @@ val open_block
   -> ?geom:Granary_storage.Geometry.t
   -> ?clock:(unit -> float)
   -> ?durability:Granary_store.Store.durability
+  -> ?barrier:Granary_store.Store.barrier
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)

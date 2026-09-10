@@ -331,6 +331,20 @@
   unix))
 
 (test
+ (name test_mirage_sync_durability_772)
+ (modules test_mirage_sync_durability_772)
+ (libraries
+  granary
+  granary.store
+  granary.sample
+  granary.unix
+  granary.mirage_block
+  mirage-block-unix
+  alcotest
+  lwt.unix
+  unix))
+
+(test
  (name test_prepared)
  (modules test_prepared)
  (libraries granary alcotest lwt.unix))
