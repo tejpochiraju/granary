@@ -99,7 +99,10 @@ let user_drop_inside_a_refresh_window_is_refused () =
          Lwt.return_unit)
      with
      | Ok ((_ : Db.view_callback), (_ : int)) -> ()
-     | Error (`Unknown_view v) -> Alcotest.failf "register_view_callback: unknown %s" v);
+     | Error (`Unknown_view v) -> Alcotest.failf "register_view_callback: unknown %s" v
+     | Error (`Stale_generation g) ->
+       (* #766: unreachable without [?expected_generation]. *)
+       Alcotest.failf "register_view_callback: unexpected `Stale_generation %d" g);
     exec db "INSERT INTO t VALUES (1, 'a')";
     (match !seen with
      | None ->

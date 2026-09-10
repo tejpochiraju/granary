@@ -248,9 +248,13 @@ let tmp_path () =
    [view_callback * int] pair (handle, generation); the generation is
    likewise discarded here since these assertions only care about liveness. *)
 let attach db ~view_name cb =
-  Result.map
-    (fun ((_ : Db.view_callback), (_ : int)) -> ())
-    (Db.register_view_callback db ~view_name cb)
+  match Db.register_view_callback db ~view_name cb with
+  | Ok ((_ : Db.view_callback), (_ : int)) -> Ok ()
+  | Error (`Unknown_view n) -> Error (`Unknown_view n)
+  | Error (`Stale_generation g) ->
+    (* #766 widened the error type, but [`Stale_generation] is only reachable
+       when [?expected_generation] is supplied, which this file never does. *)
+    Alcotest.failf "unexpected `Stale_generation %d from a plain registration" g
 ;;
 
 (* Prints the actual error on failure, unlike comparing against [= Ok ()]. *)

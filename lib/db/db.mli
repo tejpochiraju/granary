@@ -780,12 +780,39 @@ val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
     It carries the view it was registered against, so there is no view-name
     argument to get wrong at removal time, and it is minted from a
     process-global counter, so a handle presented to a different {!t} over the
-    same store matches nothing rather than removing an unrelated callback. *)
+    same store matches nothing rather than removing an unrelated callback.
+
+    {b #766: it also carries the view's generation as of registration} — the
+    same number {!register_view_callback} returns alongside it and
+    {!reactive_view_generation} reports for a live name.  That is what lets
+    {!unregister_view_callback} distinguish "already removed" from "the view
+    I attached to was dropped and a different one recreated under the same
+    name" without the caller maintaining its own side table of
+    (handle, generation) pairs.  {!view_callback_view} and
+    {!view_callback_generation} read both fields back, so a caller never has
+    to reconstruct what it already handed over. *)
 type view_callback
 
-(** Render a handle as [view#id].  For logging and test failure messages; the
-    id is an opaque serial number with no meaning beyond identity. *)
+(** Render a handle as [view#id@generation].  For logging and test failure
+    messages; the id is an opaque serial number with no meaning beyond
+    identity, and the generation is the one described on {!view_callback} (#766
+    added it to this rendering — a log line naming only [view#id] could not
+    show which incarnation of [view] the handle belonged to). *)
 val pp_view_callback : Format.formatter -> view_callback -> unit
+
+(** #766: the view name [h] was registered against — the same [view_name] that
+    was passed to {!register_view_callback}. *)
+val view_callback_view : view_callback -> string
+
+(** #766: the generation of the view incarnation [h] was registered against,
+    i.e. exactly what {!register_view_callback} returned alongside [h].
+
+    Comparing it against a fresh {!reactive_view_generation} for
+    {!view_callback_view} is the caller-side liveness check; the
+    {!unregister_view_callback} and [?expected_generation] paths do that
+    comparison internally, so an ordinary caller needs this accessor only for
+    logging or for its own bookkeeping. *)
+val view_callback_generation : view_callback -> int
 
 (** #427: register [cb] to fire after every commit that changes reactive view
     [view_name]'s materialisation.  [cb] receives the native {!row_change} diffs
@@ -843,31 +870,125 @@ val pp_view_callback : Format.formatter -> view_callback -> unit
     See {!reactive_view_generation} for the monotonicity guarantee this
     depends on.
 
-    {b #766 (open, deliberately not closed here): a TOCTOU gap in that
-    re-registration pattern.} Nothing stops a SECOND drop-and-recreate landing
-    between a caller's generation comparison and its re-registration call, so
-    the re-registration can itself land against an incarnation that is
-    already stale by the time this function returns. Closing it needs an
-    atomic check-and-register (an optional expected-generation argument that
-    fails on mismatch rather than silently registering), which is a further
-    signature change beyond this one; tracked rather than rushed. *)
+    {b #766: [?expected_generation] closes the TOCTOU gap in that
+    re-registration pattern.} Without it, nothing stops a SECOND
+    drop-and-recreate landing between a caller's generation comparison and its
+    re-registration call, so the re-registration can itself land against an
+    incarnation that is already stale by the time this function returns, with
+    no way to notice. Supplied, this becomes an atomic check-and-register: if
+    [view_name] is live but at a generation other than [expected_generation],
+    NOTHING is attached and [Error (`Stale_generation g)] reports the live
+    generation [g], which is what the caller's next attempt should ask for.
+    Omitted, the behaviour is exactly as before — attach to whatever is live.
+
+    {b Why that is genuinely atomic and not merely a narrower window.} This
+    function is synchronous: there is no [Lwt] bind, and no other yield point,
+    between reading the registry entry for [view_name] and prepending to its
+    callback list. Under the cooperative scheduler a fiber runs to its next
+    yield, and both [CREATE REACTIVE VIEW] and [DROP REACTIVE VIEW] go through
+    the [Lwt]-bound statement path, so neither can interleave between the
+    generation comparison and the attach. That property — not the argument's
+    mere existence — is what makes the check meaningful; a future change that
+    introduces a yield into this path invalidates it and must redo the check
+    under whatever exclusion the new path needs.
+
+    {b The race-free re-registration recipe} (#766), which a caller holding a
+    handle [h] should follow verbatim rather than re-deriving. Note that every
+    step names an explicit generation: no step ever asks for "whatever is live
+    now", which is the TOCTOU itself.
+
+    {[
+      (* [h] was obtained earlier from this same [db]. *)
+      let rewire db h cb =
+        let name = Db.view_callback_view h in
+        let rec attach_at g =
+          match
+            Db.register_view_callback db ~expected_generation:g ~view_name:name cb
+          with
+          | Ok (h', (_ : int)) -> Ok h'
+          | Error (`Unknown_view v) -> Error (`Unknown_view v)
+          (* A FURTHER recreate landed in between; [g'] is the one that is
+             live as of this failure, so retry against exactly that. *)
+          | Error (`Stale_generation g') -> attach_at g'
+        in
+        match Db.unregister_view_callback db h with
+        (* Same incarnation: [h] was current, nothing to re-register. *)
+        | `Removed | `Not_registered -> Ok h
+        | `Unknown_view v -> Error (`Unknown_view v)
+        | `Stale_generation g -> attach_at g
+      ;;
+    ]}
+
+    {b It terminates in practice} because generations for one name in one store
+    are strictly increasing (see {!reactive_view_generation}), so every
+    iteration chases a strictly newer incarnation and can never revisit one:
+    [attach_at] can only spin for as long as something keeps recreating the
+    view, which is a live-lock the application controls rather than a cycle in
+    this API.
+
+    {b Limit, stated plainly (#766).} [`Stale_generation] detects a
+    drop-and-recreate {e this handle knows about}. It is decided against
+    [t]'s own registry, and a SIBLING handle's drop-and-recreate is not
+    visible there under the per-handle DDL-visibility caveat
+    {!create_worker_handle} documents (#589/#633/#634). Do not read this as a
+    cross-handle recreate detector: if a sibling recreates [view_name], this
+    handle keeps reporting the generation it last learned, [`Stale_generation]
+    never fires, and a callback registered here attaches to this handle's own
+    (now historical) entry. Observing a sibling's recreate still requires
+    re-deriving this handle's view of the store, exactly as it does for the
+    sibling's other DDL.
+
+    {b A durable subscription that survives a recreate was considered and
+    rejected} (#766). It would remove the caller's bookkeeping entirely, but a
+    recreate can change the view's DEFINITION, and therefore the shape of the
+    {!row_change} diffs a callback receives — silently reattaching would
+    deliver deltas the caller never agreed to. The explicit re-register loop
+    above stays, with [?expected_generation] making each step of it exact. *)
 val register_view_callback
   :  t
+  -> ?expected_generation:int
   -> view_name:string
   -> (row_change list -> unit Lwt.t)
-  -> (view_callback * int, [ `Unknown_view of string ]) result
+  -> (view_callback * int, [ `Unknown_view of string | `Stale_generation of int ]) result
 
-(** #746: detach the callback [h] names.  Returns [true] if it was still
-    registered and has now been removed, [false] if it was not — because it was
-    already unregistered, because its view was dropped (which discards every
-    callback on it), or because [h] came from a different {!t}.  Idempotent:
-    unregistering twice is not an error, it just answers [false] the second
-    time.
+(** #746: detach the callback [h] names.  #766: answers a closed polymorphic
+    variant rather than a [bool], because a caller's next action genuinely
+    differs across the four cases the old [false] conflated:
 
-    {b Mid-flush semantics (#746).}  The set of callbacks a notification fires
-    is snapshotted when that view's notification batch begins.  So a callback
-    that unregisters itself — or another callback on the same view — from
-    inside its own invocation:
+    - [`Removed] — [h] was still attached to the live incarnation of its view
+      and is now detached.  Nothing further to do.
+    - [`Not_registered] — the view is live {e at [h]'s own generation}, but
+      [h] is not in its callback list.  That is the ordinary "I already
+      unregistered this" case, and also the case where [h] came from a
+      different {!t} (its id, minted from a process-global counter, matches
+      nothing here).  Nothing further to do either — but, unlike
+      [`Stale_generation], the caller's mental model of which incarnation is
+      live was correct.
+    - [`Stale_generation g] — the name is still live, but at a DIFFERENT
+      incarnation than [h] was registered against ([DROP REACTIVE VIEW v;
+      CREATE REACTIVE VIEW v AS ...] in between).  [g] is the generation that
+      is live {e now}, so a caller that wants to follow the view can
+      re-register with [~expected_generation:g] and needs no second, racy
+      lookup to find it.  See the recipe on {!register_view_callback}.
+    - [`Unknown_view v] — [v] is not a live reactive view in this handle's
+      registry at all: it was dropped and not recreated, or never existed
+      here.  Spelled exactly as {!register_view_callback}'s own error case so
+      a caller can share one match arm across the two.
+
+    All four are non-exceptional: removal is always accepted and this never
+    raises.  Idempotence is unchanged — unregistering twice answers
+    [`Not_registered] the second time.
+
+    {b Why all four are defined now.} Adding a case to a closed polymorphic
+    variant later breaks every exhaustive match a caller wrote, which is the
+    same argument {!register_view_callback}'s doc comment makes against
+    widening the module-wide {!error} type.  The set is therefore fixed up
+    front rather than grown when the next distinction is wanted.
+
+    {b Mid-flush semantics (#746), unchanged.}  The set of callbacks a
+    notification fires is snapshotted when that view's notification batch
+    begins.  So a callback that unregisters itself — or another callback on the
+    same view — from inside its own invocation:
 
     - always completes the invocation it is in;
     - does not affect who else is invoked in {e that} batch: a callback removed
@@ -880,16 +1001,23 @@ val register_view_callback
     next batch.  A registration made from inside a callback behaves the same
     way — it starts firing from the next batch.
 
-    {b #766 (open, deliberately not closed here): [false] is also returned
-    when [h]'s view was dropped and a DIFFERENT incarnation recreated under
-    the same name} — the lookup is by view name, so a stale [h] finds the
-    new incarnation's (unrelated) callback list, fails to find [h]'s id in
-    it, and this reports [false] exactly as it would for "already
-    unregistered". A caller that needs to tell the two apart can compare
-    {!reactive_view_generation} itself; making this function do so natively
-    would need a 3-way result and is tracked, not rushed, in the same
-    follow-up as the TOCTOU note on {!register_view_callback}. *)
-val unregister_view_callback : t -> view_callback -> bool
+    {b Limit, stated plainly (#766).}  The generation this compares against is
+    the one {e this handle} knows for the name.  A SIBLING handle's
+    drop-and-recreate is not visible in this handle's registry under the
+    per-handle DDL-visibility caveat {!create_worker_handle} documents
+    (#589/#633/#634), so [`Stale_generation] is not a cross-handle recreate
+    detector: after a sibling recreates the view, this call still answers
+    [`Removed] or [`Not_registered] against this handle's own (now
+    historical) entry.  See {!reactive_view_generation} for the same caveat on
+    the underlying signal. *)
+val unregister_view_callback
+  :  t
+  -> view_callback
+  -> [ `Removed
+     | `Not_registered
+     | `Stale_generation of int
+     | `Unknown_view of string
+     ]
 
 (** #437: the names of the live reactive views, sorted.  Read from the in-memory
     registry, so — unlike probing the catalog for [_rv_<name>] — a user table
@@ -982,7 +1110,20 @@ val is_reactive_view : t -> string -> bool
     the handle (equal) or to treat it as stale and re-register (different, or
     [None] if the name isn't even live any more on this handle). This is the
     identity signal #746's handle-and-liveness pair could not provide on its
-    own. *)
+    own.
+
+    {b #766: a caller no longer has to keep that record itself, and should not
+    compare-then-register by hand.} The {!view_callback} handle now carries
+    its own generation ({!view_callback_generation}),
+    {!unregister_view_callback} reports [`Stale_generation g] rather than a
+    bare [false] when the name was recreated, and
+    {!register_view_callback}'s [?expected_generation] makes the
+    re-registration an atomic check-and-register. The compare-then-register
+    sequence this paragraph describes has a TOCTOU window that those close;
+    use the recipe on {!register_view_callback}. What none of them change is
+    the cross-handle limit above: every one of them is decided against
+    {e this} handle's registry, so none is a detector for a SIBLING handle's
+    drop-and-recreate. *)
 val reactive_view_generation : t -> string -> int option
 
 (** #752: one row-mutation delivered to a {!register_row_hook} callback,
@@ -1315,7 +1456,7 @@ val register_row_hook
     from. Idempotent and never raises: calling it a second time, on a hook
     that is no longer registered anywhere, or on a handle minted over a
     DIFFERENT store, is simply a no-op — unlike {!unregister_view_callback}
-    this reports no [bool], since a row hook has no analogous "mid-flush"
+    this reports no outcome, since a row hook has no analogous "mid-flush"
     caller who needs to know whether its own removal request was the one
     that mattered.
 
