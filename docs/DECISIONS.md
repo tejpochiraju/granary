@@ -771,8 +771,113 @@ useful reading order — search for the issue number instead.
   #767-corrupted on-disk state should read this as the compatibility note
   it is, not a new defect it introduces. Round 6 also produced a concrete
   repro for the `RENAME TABLE`/`DROP TABLE` residual round 3 named above
-  (#768) — no new action follows; it stays the same already-filed,
-  already-scoped-out gap, just no longer hypothetical.
+  (#768) — no new action followed at the time; it stayed the same
+  already-filed, already-scoped-out gap, just no longer hypothetical.
+  **#768's `RENAME TABLE` half is now closed** — see the next entry; its
+  `DROP TABLE` half is deliberately still open, as #776.
+
+- **`ALTER TABLE ... RENAME TO` is refused while a deferred FK obligation
+  still names the table on either side (#768, decided 2026-09-10).**
+  The table-level completion of #765 round 3, and the same structural
+  argument one scope wider.
+
+  `Exec.make_fk_recheck` identifies BOTH sides of a queued deferred FK
+  obligation by TABLE NAME — `child_name` and `parent_name` are plain
+  strings closed over at enqueue time — and at COMMIT resolves them with
+  `Cat.find_table_cached`, treating `None` as "not violated":
+
+  ```ocaml
+  match find_table_cached cat ~name:child_name,
+        find_table_cached cat ~name:parent_name with
+  | None, _ | _, None -> Lwt.return false
+  ```
+
+  `ALTER TABLE ... RENAME TO` rewrites a table's catalog name with nothing
+  keeping those captured strings in sync. Rename either side of a pending
+  obligation, mid-transaction, and the recheck looks up a name that no
+  longer exists, answers "not violated", and COMMIT accepts a genuine
+  violation. The child row survives under the new name as a permanent
+  orphan with no FK error ever raised — the issue's two repros, verified
+  2026-09-05:
+
+  ```sql
+  BEGIN;
+  INSERT INTO c VALUES (999);   -- parent 999 does not exist; deferred check queued
+  ALTER TABLE c RENAME TO c2;   -- (or: ALTER TABLE p RENAME TO p2)
+  COMMIT;                       -- succeeded; SELECT pid FROM c2 returns 999
+  ```
+
+  **Fixed on the mutation side, not the recheck side, for the reason round 3
+  already established.** New `Exec.fk_obligation_table_conflict` is the
+  table-level twin of round 3's `Exec.fk_obligation_conflict`: it walks
+  `Cat.peek_pending_fk_checks`, resolves each entry's constraint FRESH via
+  `pfk_child_table` + `pfk_fk_ordinal` (exactly as the recheck does at
+  COMMIT, so a `RENAME COLUMN` earlier in the same transaction is already
+  reflected in the constraint's column lists), and returns a conflict when
+  the ALTER's target table is that constraint's child table or its parent
+  table. The `Ast.AA_rename_table` arm of `Exec.execute_alter_table`
+  consults it BEFORE `alter_rename_table` runs, so a refusal leaves the
+  catalog, the #752 row-hook migration and the #405 dirty-name marks all
+  untouched. Rounds 1, 2 and 3 of #765 are three consecutive demonstrations
+  of why the recheck side cannot win this: the recheck only ever sees the
+  schema AFTER the mutation, so each fix closes exactly the shape that
+  prompted it and the next shape walks straight through.
+  `make_fk_recheck`'s by-ordinal resolution and loud failure stay in place
+  as defence in depth — they are also the home of #765's own reasoning
+  about why ordinal beats name.
+
+  The negative-index guard round 4 of #765 had to reopen in
+  `fk_obligation_conflict` is carried over deliberately: `pfk_fk_ordinal =
+  -1` is the "constraint could not be located at enqueue time" sentinel,
+  and `List.nth_opt` raises `Invalid_argument` on a negative index rather
+  than answering `None`, so an entry that can never be resolved must
+  contribute "no conflict" instead of crashing an unrelated ALTER that
+  merely shares a transaction with it.
+
+  **Conservative in one direction, deliberately.** The pending queue only
+  grows until COMMIT drains it or ROLLBACK clears it
+  (`Cat.queue_pending_fk_check` / `drain_pending_fk_checks` /
+  `clear_pending_fk_checks`), so an obligation whose violation has since
+  been RESOLVED — the missing parent row inserted later in the same
+  transaction — is still queued and still refuses the rename. That is an
+  over-refusal, not a wrong answer; pruning the queue on resolution would
+  mean running every recheck at every ALTER, and the cheap escape is to
+  rename after COMMIT. The refusal also poisons a borrowed transaction the
+  same way every other failing in-txn DDL does (`with_ddl_txn`'s `In_txn`
+  arm, #286), so ROLLBACK is the exit — identical to round 3's `RENAME
+  COLUMN` / `DROP COLUMN` refusals, not a new behaviour.
+
+  **`DROP TABLE` is NOT given the same guard, and that is a decision.** The
+  issue names it as part of the same residual class; it is not the same
+  bug. Dropping the CHILD removes the referencing rows outright, so
+  "nothing left to enforce" is the honest answer and a refusal would be
+  pure over-refusal. Dropping the PARENT does leave a dangling reference —
+  but `Exec.execute_drop_table` performs no FK checking at all, so it
+  leaves the IDENTICAL dangling reference with no transaction and no
+  pending obligation involved. Guarding only the pending-obligation case
+  would make the transactional path stricter than the autocommit one for
+  the same end state, which is incoherent rather than safer. That is a
+  wider, pre-existing gap in `DROP TABLE` itself (SQLite treats `DROP TABLE
+  parent` as an implicit `DELETE FROM parent` and fires FK actions; granary
+  does not), filed as **#776** and pinned meanwhile by
+  `drop_parent_table_is_unguarded_in_and_out_of_a_transaction` so whichever
+  way it is decided the test fails loudly and the decision gets re-made
+  rather than drifting.
+
+  Pinned by `test/test_fk_rename_table_768.ml`: the issue's two repros
+  (child-side and parent-side rename, each asserting the refusal message
+  names the right two tables and that the new name never came into
+  existence), a self-referencing FK where child and parent are the same
+  table (the two branches of the guard are an if/else-if — a guard checking
+  only one side still passes one repro), a control showing the very same
+  transaction is refused at COMMIT when NO rename is attempted (which is
+  what makes the repros evidence of a silenced check rather than of a
+  violation that was never queued), and four no-over-refusal cases: an
+  unrelated table renamed inside the same transaction, a rename with no
+  pending obligation at all (the reference was satisfied, so
+  `enforce_insert_fk` queued nothing), an autocommit rename of an
+  FK-bearing table, and a rename in a later transaction after the pending
+  one was rolled back.
 
 - **`ALTER TABLE ... DROP COLUMN` is refused when the column participates in
   any FOREIGN KEY constraint, on either side (#767, decided 2026-09-10).**
