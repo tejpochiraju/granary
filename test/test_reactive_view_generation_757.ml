@@ -108,6 +108,10 @@ let attach db ~view_name cb =
   match Db.register_view_callback db ~view_name cb with
   | Ok (h, g) -> h, g
   | Error (`Unknown_view v) -> Alcotest.failf "expected %S to be a live view" v
+  | Error (`Stale_generation g) ->
+    (* #766 widened the error type; [`Stale_generation] needs
+       [?expected_generation], which this helper never passes. *)
+    Alcotest.failf "unexpected `Stale_generation %d from a plain registration" g
 ;;
 
 (* ------------------------------------------------------------------ *)

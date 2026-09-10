@@ -24,10 +24,19 @@ type rv_mode =
 (* #746: the opaque handle {!register_view_callback} returns and
    {!unregister_view_callback} consumes.  It carries the view it was registered
    against, so a caller cannot present a handle together with the wrong view
-   name — there is no view-name argument to get wrong. *)
+   name — there is no view-name argument to get wrong.
+
+   #766: it also carries the view's GENERATION as of registration, copied from
+   the registry entry's [rv_generation].  That is what lets
+   {!unregister_view_callback} tell "this handle was already removed" from "the
+   view this handle attached to was dropped and a different one recreated under
+   the same name" without the CALLER keeping a side table of
+   (handle, generation) pairs — the side table being precisely where a
+   downstream consumer would otherwise have to get the races right. *)
 type view_callback =
   { vcb_view : string
   ; vcb_id : int
+  ; vcb_generation : int
   }
 
 (* #752 (review round 3): re-exported from {!Store}, which now owns the whole
@@ -4963,21 +4972,56 @@ let reactive_view_generation top name =
    rather than removing an unrelated callback. *)
 let rv_cb_seq = ref 0
 
-let register_view_callback top ~view_name cb =
+(* #766: [?expected_generation] makes registration an ATOMIC check-and-register
+   rather than the caller's own compare-then-register, which had a TOCTOU
+   window: nothing stopped a SECOND drop-and-recreate landing between a
+   caller's {!reactive_view_generation} read and its re-registration call, so
+   the re-registration could itself attach to an incarnation that was already
+   stale by the time it returned.
+
+   The atomicity is structural, not merely narrower: this function is
+   SYNCHRONOUS — there is no [let*], no [Lwt] bind, and no other yield point
+   between reading [top.reactive_views] and assigning [e.rv_callbacks].  Under
+   the cooperative scheduler a fiber runs to its next yield, so no
+   [CREATE]/[DROP REACTIVE VIEW] (both of which go through the Lwt-bound
+   statement path) can interleave between the generation comparison and the
+   prepend.  If a yield point is ever introduced into this path, this argument
+   becomes a fig leaf and the check has to be redone under whatever exclusion
+   the new path needs. *)
+let register_view_callback top ?expected_generation ~view_name cb =
   match Hashtbl.find_opt top.reactive_views view_name with
   | Some e ->
-    incr rv_cb_seq;
-    let id = !rv_cb_seq in
-    (* O(1): prepend.  The firing site reverses, so registration order is
-       preserved — see {!rv_apply_and_notify}. *)
-    e.rv_callbacks <- (id, cb) :: e.rv_callbacks;
-    Ok ({ vcb_view = view_name; vcb_id = id }, e.rv_generation)
+    (match expected_generation with
+     | Some g when g <> e.rv_generation ->
+       (* Attach NOTHING: the caller asked for a specific incarnation and this
+          is not it.  The live generation travels with the error so the
+          caller's retry needs no second (racy) lookup. *)
+       Error (`Stale_generation e.rv_generation)
+     | _ ->
+       incr rv_cb_seq;
+       let id = !rv_cb_seq in
+       (* O(1): prepend.  The firing site reverses, so registration order is
+          preserved — see {!rv_apply_and_notify}. *)
+       e.rv_callbacks <- (id, cb) :: e.rv_callbacks;
+       Ok
+         ( { vcb_view = view_name; vcb_id = id; vcb_generation = e.rv_generation }
+         , e.rv_generation ))
   | None -> Error (`Unknown_view view_name)
 ;;
 
+(* #766: four outcomes, not a [bool].  The generation comparison comes FIRST
+   and is not merely an optimisation: a stale handle's id can never appear in
+   the new incarnation's list anyway (ids are process-global and each is
+   attached to exactly one entry), so checking it first loses no removal and
+   turns what used to be an indistinguishable [false] into a signal.
+
+   Removal is still always accepted and never raises, and the mid-flush
+   snapshot rule is untouched — [List.filter] builds a NEW list, so an
+   in-flight notification keeps iterating the old one. *)
 let unregister_view_callback top h =
   match Hashtbl.find_opt top.reactive_views h.vcb_view with
-  | None -> false
+  | None -> `Unknown_view h.vcb_view
+  | Some e when e.rv_generation <> h.vcb_generation -> `Stale_generation e.rv_generation
   | Some e ->
     let removed = ref false in
     (* [List.filter] builds a NEW list; any snapshot an in-flight notification
@@ -4994,10 +5038,16 @@ let unregister_view_callback top h =
         e.rv_callbacks
     in
     if !removed then e.rv_callbacks <- kept;
-    !removed
+    if !removed then `Removed else `Not_registered
 ;;
 
-let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
+let view_callback_view h = h.vcb_view
+let view_callback_generation h = h.vcb_generation
+
+let pp_view_callback fmt h =
+  (* [@@] is Format's escape for a literal [@]. *)
+  Format.fprintf fmt "%s#%d@@%d" h.vcb_view h.vcb_id h.vcb_generation
+;;
 
 (* #752 (review round 9, finding 2): push [f] onto whichever schema-undo log
    is the REAL scope for a row-hook registry mutation made on [t] — shared by

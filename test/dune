@@ -2164,6 +2164,19 @@
  (modules test_view_callback_746)
  (libraries granary alcotest lwt.unix))
 
+; #766: the two identity gaps the #757 review left open — a four-way
+; unregister_view_callback result (Removed / Not_registered / Stale_generation
+; / Unknown_view) in place of a bool, and an atomic check-and-register via
+; register_view_callback's ?expected_generation. Also pins the documented
+; per-handle limit: a SIBLING handle's drop-and-recreate does NOT surface as
+; Stale_generation (#589/#633/#634), which needs create_worker_handle.
+; In-memory is enough: registry and generation state are process state.
+
+(test
+ (name test_view_callback_identity_766)
+ (modules test_view_callback_identity_766)
+ (libraries granary alcotest lwt.unix))
+
 ; #752: OCaml-side before/after row-mutation hooks (Db.register_row_hook /
 ; Db.unregister_row_hook), the seam camel#75 needs for typed veto/observe
 ; hooks without a SQL CREATE TRIGGER. In-memory is enough: registration is
