@@ -396,6 +396,58 @@ type rowid_counters = (tree_id, int64) Hashtbl.t
    instead of rowid allocation. *)
 type rv_generations = (string, int) Hashtbl.t
 
+(* #752 (review round 3): see the [.mli] doc comment on [row_hooks] for the
+   full rationale. [key] is (table, timing, event); entries are held
+   newest-first per key (O(1) registration), reversed at the firing site by
+   [row_hook_fire_list] to restore registration order — the same shape [Db]'s
+   #746 view-callback registry uses. *)
+type row_hook_timing =
+  [ `Before
+  | `After
+  ]
+
+type row_hook_event =
+  [ `Insert
+  | `Update
+  | `Delete
+  ]
+
+type row_mutation =
+  { table : string
+  ; new_row : Granary_encoding.Row.t option
+  ; old_row : Granary_encoding.Row.t option
+  }
+
+type row_hook_id = int
+type row_hook_key = string * row_hook_timing * row_hook_event
+type row_hook_fn = row_mutation -> (unit, string) result Lwt.t
+
+type row_hooks =
+  { row_hook_tbl : (row_hook_key, (row_hook_id * row_hook_fn) list) Hashtbl.t
+  ; row_hook_index : (row_hook_id, row_hook_key) Hashtbl.t
+    (** #752 (review round 4): the CURRENT (table, timing, event) key for
+        every live id, maintained alongside [row_hook_tbl] by every function
+        that inserts, removes, or moves an entry.  Without this,
+        [Db.unregister_row_hook] would have to trust a [row_hook] handle's
+        table name as captured AT REGISTRATION TIME — which
+        [row_hooks_migrate_table] can silently invalidate by moving the entry
+        to a new key, leaving the handle's captured name stale and the
+        unregister call finding nothing to remove under it (a [`Before] hook
+        with veto power that a caller can no longer detach). Resolving by
+        [row_hook_id] alone through this index instead means a rename can
+        never desynchronise a handle from the registry entry it names. *)
+  ; mutable row_hook_next_id : int
+  ; mutable row_hook_depth : int
+    (** #752 (review round 4): nested row-hook-firing depth, shared by every
+        [Db.t] over this store — same rationale as everything else on
+        [row_hooks]. It must live here rather than on [Db.t]: a hook's nested
+        DML re-entering the hook path through a DIFFERENT handle sharing this
+        store ({!Db.create_worker_handle}, #589/#633) still nests the SAME
+        logical recursion, and a per-handle counter would let a chain that
+        alternates handles nest past the cap before either handle's own
+        counter noticed. *)
+  }
+
 type t =
   { backend : backend
   ; rowid_counters : rowid_counters
@@ -403,6 +455,7 @@ type t =
   ; mutable rv_gen_next : int
     (** #757: the next value {!rv_next_generation} will hand out.  Never
         reset, never decremented — see the [.mli] doc comment. *)
+  ; row_hooks : row_hooks (** #752 (review round 3): see the [.mli] doc comment. *)
   ; lock : Rwlock.t
   ; (* #718: wait/hold accounting for [lock], attributed by acquisition site.
        Lives on [t] rather than on [bt_state] because [lock] does: the Mem
@@ -507,6 +560,22 @@ let geometry t =
   | Btree st -> Pager.geom st.pager
 ;;
 
+(* #338/#752 (review round 5): [true] once {!close} has signalled teardown on
+   this store object — set at the very start of [close] (before any of its
+   own awaits) and never cleared, since a closed store is never reused.
+   [rw_begin]/[ro_begin] already refuse once this is set (see their own
+   comments); exposing it publicly lets a caller outside this module apply
+   the identical "this exact store object is being torn down" check without
+   opening a transaction just to provoke that refusal — e.g. [Db]'s row-hook
+   registry accessors, which touch [row_hooks] directly and never go through
+   [rw_begin]/[ro_begin] at all. Always [false] for [Mem], which has no
+   teardown state. *)
+let is_closing t =
+  match t.backend with
+  | Mem _ -> false
+  | Btree st -> st.closing
+;;
+
 (* #633: the one accessor.  Handing the table out rather than wrapping it keeps
    the catalog's [patch]/[publish] hot path a plain [Hashtbl] lookup. *)
 let rowid_counters t = t.rowid_counters
@@ -525,6 +594,444 @@ let rv_carry_over_generations ~from ~to_ =
     (fun name g -> Hashtbl.replace to_.rv_generations name g)
     from.rv_generations;
   if from.rv_gen_next > to_.rv_gen_next then to_.rv_gen_next <- from.rv_gen_next
+;;
+
+(* #752 (review round 3): see the [.mli] doc comments for the rationale.
+   [row_hooks] is opaque, so every mutation goes through the functions below
+   rather than a caller re-deriving composite-key/insert-order logic against
+   a raw [Hashtbl] — the "hardened primitive" the round-3 review asked for. *)
+let row_hooks t = t.row_hooks
+
+(* Record [id]'s current key in the reverse index for every entry in [lst]. *)
+let index_entries (reg : row_hooks) key lst =
+  List.iter (fun (id, _) -> Hashtbl.replace reg.row_hook_index id key) lst
+;;
+
+let row_hook_register (reg : row_hooks) ~table ~timing ~event fn =
+  reg.row_hook_next_id <- reg.row_hook_next_id + 1;
+  let id = reg.row_hook_next_id in
+  let key = table, timing, event in
+  let existing = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+  Hashtbl.replace reg.row_hook_tbl key ((id, fn) :: existing);
+  Hashtbl.replace reg.row_hook_index id key;
+  id
+;;
+
+(* #752 (review round 4): resolves by [id] alone through {!row_hook_index}
+   rather than trusting a caller-supplied (table, timing, event) — the round-3
+   design took the key as an argument, which a [Db.row_hook] handle captured
+   at registration time and {!row_hooks_migrate_table} could silently
+   invalidate by moving the entry to a new key, leaving
+   [Db.unregister_row_hook] unable to find (and therefore detach) a hook it
+   still holds a handle for. *)
+let row_hook_unregister (reg : row_hooks) id =
+  match Hashtbl.find_opt reg.row_hook_index id with
+  | None -> fun () -> ()
+  | Some key ->
+    Hashtbl.remove reg.row_hook_index id;
+    let current = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+    (* #752 (review round 5, item 2): capture the ONE removed entry, not the
+       whole prior list at [key] — a blind snapshot-and-replace undo would
+       silently discard a hook a DIFFERENT caller registers on this exact key
+       between this removal and a later ROLLBACK replaying the undo below
+       (that registration's [row_hook_index] entry would survive, pointing at
+       a list entry the blind replace had just erased). Merging the removed
+       entry back into whatever is CURRENT at undo-time, instead of replacing
+       outright, cannot lose a concurrent registration. *)
+    let removed_fn = List.assoc_opt id current in
+    (match List.filter (fun (i, _) -> i <> id) current with
+     | [] -> Hashtbl.remove reg.row_hook_tbl key
+     | kept -> Hashtbl.replace reg.row_hook_tbl key kept);
+    fun () ->
+      (match removed_fn with
+       | None -> ()
+       | Some fn ->
+         (* Idempotent per-id: if [id] is already present (a second replay, or
+           because some other path already restored it), re-adding it is a
+           no-op rather than a duplicate entry.
+
+           #769: append, not prepend — [move_row_hook_key]'s [current_new @
+           to_add] and [row_hooks_purge_table]'s [current @ to_restore] both
+           put whatever is CURRENT at undo-time first and the restored
+           entry(ies) after, so a hook registered on this key while [id] was
+           unregistered fires BEFORE the restored one once the undo replays.
+           Prepending here was the odd one out among the three siblings: it
+           put the restored (older) registration first, ahead of a
+           registration made later in wall-clock time. *)
+         let now = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+         if not (List.mem_assoc id now)
+         then (
+           Hashtbl.replace reg.row_hook_tbl key (now @ [ id, fn ]);
+           Hashtbl.replace reg.row_hook_index id key))
+;;
+
+let row_hook_fire_list (reg : row_hooks) ~table ~timing ~event =
+  match Hashtbl.find_opt reg.row_hook_tbl (table, timing, event) with
+  | None -> []
+  | Some lst -> List.rev lst
+;;
+
+let row_hooks_is_empty (reg : row_hooks) = Hashtbl.length reg.row_hook_tbl = 0
+
+(* Every (timing, event) pair a row hook can be registered under -- the
+   cartesian product {!row_hooks_purge_table}/{!row_hooks_migrate_table} sweep
+   for one table name, factored out so neither nests two [List.iter]s to
+   cover it by hand. *)
+let all_row_hook_timings_events : (row_hook_timing * row_hook_event) list =
+  List.concat_map
+    (fun timing -> List.map (fun event -> timing, event) [ `Insert; `Update; `Delete ])
+    [ `Before; `After ]
+;;
+
+let row_hooks_purge_table (reg : row_hooks) name =
+  let removed =
+    List.filter_map
+      (fun (timing, event) ->
+         let key = name, timing, event in
+         Option.map (fun entries -> key, entries) (Hashtbl.find_opt reg.row_hook_tbl key))
+      all_row_hook_timings_events
+  in
+  List.iter
+    (fun (key, entries) ->
+       Hashtbl.remove reg.row_hook_tbl key;
+       List.iter (fun (id, _) -> Hashtbl.remove reg.row_hook_index id) entries)
+    removed;
+  (* #752 (review round 5, item 2): merge the removed entries back into
+     whatever is CURRENTLY at each key, rather than replacing it outright —
+     the same fix as {!row_hook_unregister}, for the same reason. A table
+     this purge dropped can be re-created (with the same name) and get a
+     fresh registration before a later ROLLBACK undoes the DROP; a blind
+     snapshot-replace here would silently erase that fresh registration's
+     list entry while leaving its [row_hook_index] entry dangling. Newer
+     (current) entries sort before the restored (older) ones, matching
+     [row_hook_fire_list]'s newest-first storage order. *)
+  fun () ->
+    List.iter
+      (fun (key, entries) ->
+         let current = Option.value (Hashtbl.find_opt reg.row_hook_tbl key) ~default:[] in
+         let to_restore =
+           List.filter (fun (id, _) -> not (List.mem_assoc id current)) entries
+         in
+         (match current @ to_restore with
+          | [] -> Hashtbl.remove reg.row_hook_tbl key
+          | merged -> Hashtbl.replace reg.row_hook_tbl key merged);
+         index_entries reg key entries)
+      removed
+;;
+
+(* #752 (review round 6, item 1): move entries at [old_name]'s composite key
+   over to [new_name]'s -- merging with, never replacing, whatever the
+   destination key already holds. The same fix round 5 applied to
+   {!row_hook_unregister} and {!row_hooks_purge_table}, left open in this
+   third sibling function until now.
+
+   [~only]: [None] (the initial, forward call {!row_hooks_migrate_table}
+   makes) moves every entry currently at [old_name]'s key, as before.
+   [Some ids] moves only the entries in [ids] that are STILL present at the
+   key, leaving anything else there untouched -- in particular a
+   registration that landed on the key after [ids] was captured.
+   {!row_hooks_migrate_table}'s undo closure always passes [Some ids] with
+   exactly the ids the forward call returned, so a ROLLBACK's reverse move
+   can never sweep up a sibling registration that landed on the renamed
+   table's key in the meantime: the documented DDL-visibility leak
+   (#589/#633) lets a sibling handle see the rename's target name as live
+   before the renaming transaction commits and register directly against
+   it, and "whatever is currently at this key" is not the same set as "what
+   I moved" -- conflating the two is exactly the bug round 5 fixed in the
+   other two functions.
+
+   Returns the ids actually moved, so a caller building an undo can pass
+   them back as [~only] on the reverse call. *)
+let move_row_hook_key ?only (reg : row_hooks) ~old_name ~new_name (timing, event) =
+  let old_key = old_name, timing, event in
+  match Hashtbl.find_opt reg.row_hook_tbl old_key with
+  | None -> []
+  | Some current_old ->
+    let moving, staying =
+      match only with
+      | None -> current_old, []
+      | Some ids -> List.partition (fun (id, _) -> List.mem id ids) current_old
+    in
+    (match staying with
+     | [] -> Hashtbl.remove reg.row_hook_tbl old_key
+     | _ -> Hashtbl.replace reg.row_hook_tbl old_key staying);
+    List.iter (fun (id, _) -> Hashtbl.remove reg.row_hook_index id) moving;
+    let new_key = new_name, timing, event in
+    let current_new =
+      Option.value (Hashtbl.find_opt reg.row_hook_tbl new_key) ~default:[]
+    in
+    let to_add =
+      List.filter (fun (id, _) -> not (List.mem_assoc id current_new)) moving
+    in
+    (match current_new @ to_add with
+     | [] -> Hashtbl.remove reg.row_hook_tbl new_key
+     | merged -> Hashtbl.replace reg.row_hook_tbl new_key merged);
+    index_entries reg new_key moving;
+    List.map fst moving
+;;
+
+let row_hooks_migrate_table (reg : row_hooks) ~old_name ~new_name =
+  if String.equal old_name new_name
+  then fun () -> ()
+  else (
+    let moved =
+      List.map
+        (fun te -> te, move_row_hook_key reg ~old_name ~new_name te)
+        all_row_hook_timings_events
+    in
+    fun () ->
+      List.iter
+        (fun (te, ids) ->
+           ignore
+             (move_row_hook_key reg ~only:ids ~old_name:new_name ~new_name:old_name te
+              : row_hook_id list))
+        moved)
+;;
+
+let row_hooks_carry_over ~from ~to_ =
+  Hashtbl.iter
+    (fun key entries -> Hashtbl.replace to_.row_hooks.row_hook_tbl key entries)
+    from.row_hooks.row_hook_tbl;
+  Hashtbl.iter
+    (fun id key -> Hashtbl.replace to_.row_hooks.row_hook_index id key)
+    from.row_hooks.row_hook_index;
+  if from.row_hooks.row_hook_next_id > to_.row_hooks.row_hook_next_id
+  then to_.row_hooks.row_hook_next_id <- from.row_hooks.row_hook_next_id
+;;
+
+(* #752 (review round 4): see the [.mli] doc comment on [row_hooks]'s
+   [row_hook_depth] field for the rationale (store-wide, not per-[Db.t]). *)
+let row_hook_depth (reg : row_hooks) = reg.row_hook_depth
+let row_hook_depth_incr (reg : row_hooks) = reg.row_hook_depth <- reg.row_hook_depth + 1
+let row_hook_depth_decr (reg : row_hooks) = reg.row_hook_depth <- reg.row_hook_depth - 1
+
+(* #752 (review round 6, item 2): a dynamic-extent marker for "the
+   continuation now running is a synchronous descendant of a row hook
+   callback firing for THIS store's currently-open write transaction" --
+   [Lwt.with_value]'s per-fiber storage, not a plain counter.
+
+   [row_hook_depth] above already counts "how many row hooks are currently
+   firing on this store," but that count is store-WIDE and says nothing
+   about WHICH call chain incremented it. Two logically independent
+   statements can be interleaved by the Lwt scheduler on the same store
+   (sibling handles sharing one [t], #589): one can be legitimately,
+   ordinarily blocked in {!acquire_writer} waiting its turn while a
+   completely unrelated statement on a sibling handle happens to be
+   mid-hook at that instant. A bare "is any hook firing anywhere on this
+   store" check cannot tell that ordinary queued waiter from the one case
+   that is actually a self-deadlock: a hook's OWN nested DML trying to open
+   a SECOND write transaction on the very store whose FIRST transaction --
+   the one that fired the hook -- it is still synchronously running inside
+   of, and can therefore never finish waiting on: the writer lock is
+   released only by that outer transaction's commit/rollback, and the outer
+   transaction cannot reach its commit/rollback until this nested call
+   returns first.
+
+   [Lwt.with_value]'s dynamic extent draws exactly that line: the marker is
+   visible to every synchronous and asynchronous continuation created
+   inside the scope ([Db]'s [fire_ocaml_row_hook] wraps its call to
+   [fn mutation] in it), and invisible to any OTHER, concurrently-scheduled
+   fiber -- including one racing against it on the very same store --
+   because Lwt's sequence-associated storage follows the causal call chain,
+   not global mutable state. The same mechanism [Db] already uses for a
+   transaction's owner token (#585, [txn_scope_key]) and [Sql.Exec]'s
+   per-query mode/stats keys.
+
+   #752 (review round 7, item 3): the marker's VALUE is a mutable record,
+   not [t] directly, and that mutability is load-bearing -- see
+   {!row_hook_scope} and {!run_in_row_hook_scope} below for why a bare
+   [t Lwt.key] (round 6's original shape) spuriously refused the exact
+   deferred-write pattern this module's own [Db.register_row_hook] doc
+   comment recommends. *)
+type row_hook_scope =
+  { rhs_store : t
+  ; mutable rhs_active : bool
+    (** [true] only for the hook invocation's own synchronous dynamic
+            extent -- see {!run_in_row_hook_scope}. Flipped to [false] once
+            [f]'s promise settles, by which point the writer lock the hook
+            fired under has been released (commit or rollback already ran).
+            [Lwt.with_value]'s snapshot mechanism cannot express this by
+            itself: {!Lwt.bind} (and hence [let*]) captures the CURRENT
+            storage at BIND-CONSTRUCTION time and reinstates that exact
+            snapshot whenever the bound continuation actually runs, however
+            much later. A hook body that defers unconditional write work via
+            [Lwt.async (fun () -> let* () = <something that yields> in
+            Db.execute db sql)] constructs that bind synchronously, while
+            still inside the hook's extent -- so the snapshot it captures is
+            [Some scope] with [rhs_active] still [true] at that instant. If
+            the marker's value were immutable (round 6's plain [Some t]),
+            the deferred continuation would see that same frozen answer no
+            matter how long after the hook returned it actually ran,
+            because bind-capture reinstates the OLD snapshot rather than
+            asking "is this dynamic extent still live." A mutable field
+            inside the captured VALUE sidesteps that entirely: the captured
+            reference is the SAME record the still-running
+            {!run_in_row_hook_scope} call is about to flip, so a check made
+            from the deferred continuation observes the CURRENT truth
+            through that shared, mutable cell rather than the stale
+            snapshot the immutable version would have frozen in. *)
+  ; rhs_depth : int
+    (** #752 (review round 8, item 2): the recursion depth THIS hook
+            invocation is running at, captured once at scope creation --
+            immutable, unlike [rhs_active], because a re-entrant firing
+            causally descended from this scope (whether a genuinely
+            synchronous nested call, or one chained off a deferred
+            [Lwt.async] continuation constructed while [rhs_active] was
+            still [true]) must be attributed against THIS number regardless
+            of what the store-wide {!row_hook_depth} counter has done in the
+            meantime. That counter is decremented as soon as [rhs_active]
+            flips to [false] -- i.e. as soon as the hook's own synchronous
+            extent ends -- which for a hook that merely SCHEDULES its
+            recursive step via [Lwt.async] and returns immediately happens
+            long before the scheduled step actually runs. Without this
+            field, {!row_hook_effective_depth} would read the store-wide
+            counter at that point, see it back at its pre-firing value, and
+            let a chain of such hooks re-enter unboundedly -- the exact gap
+            {!max_row_hook_depth} exists to close. See
+            {!row_hook_effective_depth}. *)
+  ; rhs_register_undo : (unit -> unit) -> unit
+    (** #752 (review round 9, finding 2): pushes a #269 schema-undo closure
+            onto the #269 undo log OWNED BY THE STATEMENT THAT IS ACTUALLY
+            FIRING THIS HOOK -- i.e. [Cat.register_schema_undo] partially
+            applied to that statement's own [Cat.t], captured by
+            {!Db.fire_ocaml_row_hook} at scope-creation time, when it alone
+            knows which [Db.t] is running.  Deliberately a closure rather
+            than a [Cat.t] field: [Store] sits below [Catalog] in the
+            dependency graph ([Catalog] opens [Store], never the reverse), so
+            embedding [Cat.t] here would be circular.  A closure captured
+            by the one caller who already has both types in scope avoids
+            that with no new dependency at all.
+
+            This is the fix for a real bug: the round-8 gate
+            ([Option.is_some t.explicit_txn || in_row_hook_for t.store]) is
+            keyed on the SHARED [Store.t] -- true for ANY sibling [Db.t]
+            currently inside a hook callback anywhere on that store
+            (multiple handles can share one [Store.t] via
+            {!Db.create_worker_handle}, #589/#633/#632) -- but the undo
+            itself used to be pushed onto the CALLING handle's OWN
+            [Cat.t] regardless of whose statement was actually firing.  If a
+            hook body running as part of handle H2's statement calls
+            [Db.register_row_hook]/[Db.unregister_row_hook] on a DIFFERENT
+            handle H1 sharing the same store, the undo landed on
+            [H1.catalog], but only H2's exception handler
+            ([Cat.rollback_schema_changes] on [H2.catalog]) ever runs when
+            H2's statement later fails -- H1's stranded undo was never
+            replayed on the failure it was meant to guard, and was silently
+            dropped whenever H1 itself next committed
+            ([Schema_cache.commit] unconditionally clears [t.undo]).
+
+            {!row_hook_ambient_undo_target} is what a caller consults instead
+            of reaching for its own [Cat.t] directly whenever an ambient row
+            hook scope for its store is active. *)
+  }
+
+let in_row_hook_key : row_hook_scope Lwt.key = Lwt.new_key ()
+
+(* Run [f] tagged as "executing inside a row hook callback fired for [t]" --
+   see [in_row_hook_key] and {!row_hook_scope} above. Called once, around the
+   whole hook invocation, by [Db.fire_ocaml_row_hook]. [depth] is the
+   recursion depth this particular invocation is running at (#752 review
+   round 8, item 2) -- see {!row_hook_effective_depth}.
+
+   [rhs_active] starts [true] and is flipped to [false] under [Lwt.finalize]
+   once [f]'s own promise settles -- i.e. once the hook's synchronous
+   dynamic extent (including anything chained directly off [f]'s returned
+   promise) is over, NOT once every fiber it ever spawned finishes. A
+   continuation dispatched via [Lwt.async] from inside [f] and still pending
+   when [f] settles keeps the SAME [scope] record (captured by reference at
+   bind-construction time, per the [rhs_active] doc comment), so when that
+   continuation eventually runs and consults {!in_row_hook_for}, it sees
+   [rhs_active = false] and is correctly treated as no longer inside the
+   hook -- even though [Lwt.get in_row_hook_key] itself still answers
+   [Some scope], because the snapshot reinstated at that bind site is this
+   very (now-mutated) record. [rhs_depth] stays put through that same flip,
+   which is exactly what lets {!row_hook_effective_depth} still see it. *)
+let run_in_row_hook_scope
+      (t : t)
+      ~depth
+      ~(register_undo : (unit -> unit) -> unit)
+      (f : unit -> 'a Lwt.t)
+  : 'a Lwt.t
+  =
+  let scope =
+    { rhs_store = t
+    ; rhs_active = true
+    ; rhs_depth = depth
+    ; rhs_register_undo = register_undo
+    }
+  in
+  Lwt.finalize
+    (fun () -> Lwt.with_value in_row_hook_key (Some scope) f)
+    (fun () ->
+       scope.rhs_active <- false;
+       Lwt.return_unit)
+;;
+
+(* [true] iff the currently-running continuation is BOTH a causal descendant
+   of a row hook callback firing for [t] specifically AND still within that
+   hook invocation's genuine dynamic extent -- see {!row_hook_scope} and
+   {!run_in_row_hook_scope} above for why the second half of that
+   conjunction is necessary. Consulted by [rw_begin] to refuse, rather than
+   hang forever on, a hook's own nested attempt to open a second write
+   transaction on the SAME store while the transaction that fired it is
+   still open (#740's non-reentrant writer lock; #752 review round 6, item
+   2) -- without also, incorrectly, refusing a deferred write dispatched via
+   [Lwt.async] that runs after the firing transaction has already committed
+   or rolled back and released the lock (#752 review round 7, item 3). *)
+let in_row_hook_for (t : t) =
+  match Lwt.get in_row_hook_key with
+  | Some scope -> scope.rhs_active && scope.rhs_store == t
+  | None -> false
+;;
+
+(* #752 (review round 9, finding 2): the schema-undo target to push a row-hook
+   registry mutation onto, when the currently-running continuation is a
+   causal descendant of a row hook callback firing for [t] and still within
+   that hook invocation's genuine dynamic extent (the same test
+   {!in_row_hook_for} makes -- deliberately duplicated rather than expressed
+   in terms of it, since this needs the [scope] itself, not just its
+   [bool]). [None] when there is no such ambient scope, exactly the case
+   {!in_row_hook_for} answers [false] for.
+
+   [Db.register_row_hook]/[Db.unregister_row_hook] consult this INSTEAD OF
+   reaching for their own handle's [Cat.t] whenever it returns [Some] -- see
+   {!row_hook_scope}'s [rhs_register_undo] field doc comment for the
+   cross-handle bug this closes. *)
+let row_hook_ambient_undo_target (t : t) : ((unit -> unit) -> unit) option =
+  match Lwt.get in_row_hook_key with
+  | Some scope when scope.rhs_active && scope.rhs_store == t ->
+    Some scope.rhs_register_undo
+  | _ -> None
+;;
+
+(* #752 (review round 8, item 2): the recursion depth to attribute a NEW row
+   hook firing for [t] against, given [reg] (this store's [row_hooks]).
+
+   Deliberately NOT just [row_hook_depth reg]: that store-wide counter is
+   decremented the instant a hook's own synchronous extent ends (see
+   {!row_hook_scope}'s [rhs_active]), so a hook that fires, unconditionally
+   SCHEDULES its recursive next step via [Lwt.async], and returns
+   immediately has already released its claim on the counter by the time
+   the scheduled step actually runs -- letting a chain of such hooks re-fire
+   this same hook forever without ever appearing to nest.
+
+   When the currently-running continuation is a causal descendant of a row
+   hook scope for THIS store -- whether still synchronously inside it
+   ([rhs_active = true]) or resumed later from a deferred [Lwt.async]
+   continuation constructed while it was ([rhs_active] since flipped to
+   [false], but [rhs_depth] unaffected) -- that scope's [rhs_depth] is the
+   truth: it is the exact depth this new firing is nesting from, regardless
+   of what unrelated firings elsewhere have since done to the store-wide
+   counter. Only when there is no such ambient scope (a fresh top-level
+   statement, or one on a sibling {!Db.t} with no causal Lwt link to any
+   in-flight hook -- {!Db.create_worker_handle}, #589) does the store-wide
+   counter serve as the fallback, which is what keeps recursion attributed
+   correctly across sibling handles for a genuinely synchronous nested chain
+   (round 4). *)
+let row_hook_effective_depth (t : t) (reg : row_hooks) =
+  match Lwt.get in_row_hook_key with
+  | Some scope when scope.rhs_store == t -> scope.rhs_depth
+  | _ -> reg.row_hook_depth
 ;;
 
 type ro_snapshot =
@@ -856,6 +1363,12 @@ let create () : t =
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
+  ; row_hooks =
+      { row_hook_tbl = Hashtbl.create 4
+      ; row_hook_index = Hashtbl.create 4
+      ; row_hook_next_id = 0
+      ; row_hook_depth = 0
+      }
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -942,6 +1455,12 @@ let make_btree_store
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
+  ; row_hooks =
+      { row_hook_tbl = Hashtbl.create 4
+      ; row_hook_index = Hashtbl.create 4
+      ; row_hook_next_id = 0
+      ; row_hook_depth = 0
+      }
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -1727,61 +2246,72 @@ let note_checkpoint_success (st : bt_state) : unit =
    under the write lock). *)
 let active_txn_id (st : bt_state) = Int64.add st.current_header.txn_id 1L
 
+(* #752 (review round 6, item 2): the message for the one refusal below --
+   see [in_row_hook_for]'s doc comment for the full reasoning. *)
+let reentrant_row_hook_write_msg =
+  "Store.rw_begin: refused — a row hook callback attempted to open a new write \
+   transaction on this store while the statement that fired it still holds the writer \
+   lock (#752 review round 6, item 2).  The writer lock is not re-entrant (#740), so \
+   this would deadlock the connection rather than ever completing.  A row hook's own \
+   nested DML must reuse a transaction that was ALREADY open before the statement that \
+   fired the hook ran (BEGIN; the statement; the hook's nested Db.execute then reuses \
+   that transaction) rather than starting a fresh one on an autocommit call — see \
+   Db.register_row_hook's doc comment."
+;;
+
 let rw_begin t =
-  (* #718: [Txn] is released by [commit]/[rollback], not here, so one recorded
-     hold spans the whole transaction — BEGIN through the mid-COMMIT unlock.
-     That span is the critical section a sibling writer queues behind, which is
-     the quantity #716 could not separate from service time. *)
-  let* () = acquire_writer t Lock_stats.Txn in
-  let is_follower =
-    match t.backend with
-    | Btree st -> st.follower
-    | Mem _ -> false
-  in
-  let is_closing =
-    match t.backend with
-    | Btree st -> st.closing
-    | Mem _ -> false
-  in
-  if is_closing
-  then (
-    (* #338 (review r2 #4): fail fast on a write begun after [close] signalled
+  if in_row_hook_for t
+  then Lwt.fail_with reentrant_row_hook_write_msg
+  else
+    (* #718: [Txn] is released by [commit]/[rollback], not here, so one recorded
+       hold spans the whole transaction — BEGIN through the mid-COMMIT unlock.
+       That span is the critical section a sibling writer queues behind, which is
+       the quantity #716 could not separate from service time. *)
+    let* () = acquire_writer t Lock_stats.Txn in
+    let is_follower =
+      match t.backend with
+      | Btree st -> st.follower
+      | Mem _ -> false
+    in
+    if is_closing t
+    then (
+      (* #338 (review r2 #4): fail fast on a write begun after [close] signalled
        teardown, rather than letting the commit surface an obscure EBADF from a
        torn-down fd.  [close] does not take [t.lock], so a write can still race
        in here; this is best-effort, paired with the quiesce-before-close
        contract documented on [close]. *)
-    release_writer t;
-    Lwt.fail_with "Store.rw_begin: store is closing — write transactions are rejected")
-  else if is_follower
-  then (
-    release_writer t;
-    Lwt.fail_with
-      "Store.rw_begin: store is in follower mode — write transactions are rejected while \
-       following")
-  else (
-    (match t.backend with
-     | Mem trees ->
-       let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
-       t.mem_rw_shadow <- Some snap;
-       t.mem_savepoints <- []
-     | Btree st ->
-       let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
-       emit_event st (Store_event.Txn_begin { txn_id = current_rw_txn_id });
-       Pager.set_txn_id st.pager current_rw_txn_id;
-       let min_safe =
-         match min_active_reader_txn st with
-         | None -> current_rw_txn_id
-         | Some m -> Int64.min current_rw_txn_id m
-       in
-       (* #266: cap [min_safe] at the retention floor so pages reachable from
+      release_writer t;
+      Lwt.fail_with "Store.rw_begin: store is closing — write transactions are rejected")
+    else if is_follower
+    then (
+      release_writer t;
+      Lwt.fail_with
+        "Store.rw_begin: store is in follower mode — write transactions are rejected \
+         while following")
+    else (
+      (match t.backend with
+       | Mem trees ->
+         let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+         t.mem_rw_shadow <- Some snap;
+         t.mem_savepoints <- []
+       | Btree st ->
+         let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
+         emit_event st (Store_event.Txn_begin { txn_id = current_rw_txn_id });
+         Pager.set_txn_id st.pager current_rw_txn_id;
+         let min_safe =
+           match min_active_reader_txn st with
+           | None -> current_rw_txn_id
+           | Some m -> Int64.min current_rw_txn_id m
+         in
+         (* #266: cap [min_safe] at the retention floor so pages reachable from
           roots >= the floor are never reused by the allocator. *)
-       let min_safe =
-         match st.history_floor with
-         | None -> min_safe
-         | Some f -> Int64.min min_safe (Int64.add f 1L)
-       in
-       Pager.set_alloc_min_safe st.pager min_safe;
-       (* #297: same-txn page reuse happens via the txn_owned_pool (pages
+         let min_safe =
+           match st.history_floor with
+           | None -> min_safe
+           | Some f -> Int64.min min_safe (Int64.add f 1L)
+         in
+         Pager.set_alloc_min_safe st.pager min_safe;
+         (* #297: same-txn page reuse happens via the txn_owned_pool (pages
           allocated above n_pages_at_rw_begin), NOT the main freelist, so
           alloc_min_safe is unchanged from the pre-#297 baseline.  The
           None branch (no readers) and Some m branch (reader exists) both
@@ -1790,11 +2320,11 @@ let rw_begin t =
           main freelist regardless of reader state.  The txn_owned_pool,
           checked before the main freelist by Pager.alloc, provides
           same-txn reuse independently of the freelist guard. *)
-       Pager.set_n_pages_at_rw_begin st.pager (Pager.n_pages st.pager);
-       (* #297: defensive reset — any leftover from the previous txn is stale. *)
-       Pager.txn_owned_pool_set st.pager [];
-       st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
-    Lwt.return (Rw t))
+         Pager.set_n_pages_at_rw_begin st.pager (Pager.n_pages st.pager);
+         (* #297: defensive reset — any leftover from the previous txn is stale. *)
+         Pager.txn_owned_pool_set st.pager [];
+         st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
+      Lwt.return (Rw t))
 ;;
 
 let ro_end (Ro snap : ro txn) =

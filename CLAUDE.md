@@ -631,6 +631,79 @@ things that were tried and rejected) is usually the point.
   the #674 covering-index MIN/MAX fast path (the index key can no longer
   carry the true sign of a decoded zero, so that path now falls back to
   fetching the row instead of answering `+0.0` for a stored `-0.0` minimum).
+- **OCaml row-mutation hooks (`Db.register_row_hook`) share one registry
+  across every handle over a store, and every rollback-undo in it merges
+  rather than replaces (#752).** `Store.row_hooks` lives on `Store.t`, not
+  `Db.t` (mirrors `rowid_counters`/`rv_generations`, #633/#757), so a hook
+  registered, fired, purged (`DROP TABLE`) or migrated (`RENAME`) is
+  consistent across `create_worker_handle` siblings. `row_hook_unregister`,
+  `row_hooks_purge_table` and `move_row_hook_key` each had the identical
+  blind-snapshot-replace rollback-undo bug, fixed one at a time across two
+  review rounds — a concurrent sibling registration landing on the same key
+  in the DDL-visibility window (#589/#633) must never be lost or misfiled by
+  a later `ROLLBACK`'s undo; `row_hook_unregister`'s undo also prepended
+  where its two siblings append, misordering a restored hook relative to a
+  concurrent registration — fixed, closing #769. A hook's own nested DML
+  with no already-open explicit transaction now fails fast with a clear
+  error instead of deadlocking on the non-reentrant writer lock (#740) —
+  detected via a dynamic-extent marker (`Lwt.with_value` over a *mutable*
+  scope record, not a store-wide counter or a plain `t option`), so an
+  unrelated sibling statement merely queued behind the same lock is not
+  mistaken for the genuine self-deadlock case, and — the mutability is why —
+  a write correctly deferred via `Lwt.async` past the firing transaction's
+  commit is not mistaken for one either, even though `Lwt.with_value`'s own
+  bind-capture semantics reinstate the tag long after the hook's dynamic
+  extent should be considered over. `unregister_row_hook` also had a VACUUM
+  race the opposite way round from `register_row_hook`'s: it could make a
+  hook *survive* detachment during the pre-carry-over window rather than
+  merely fail to attach a new one — fixed by always removing it from the
+  store's registry regardless of `is_closing`, since that removal is a
+  plain, synchronous `Hashtbl` mutation safe to run at any point. A row
+  hook's own nested `BEGIN`/`SAVEPOINT` (as opposed to nested DML through
+  `Db.execute`) still bypasses the `Ok`/`Error` contract and raises instead,
+  tracked as #770. **Round 8 fixed the same recurring shape (a mechanism torn
+  down or snapshotted at the wrong time) one level further out, in two more
+  places.** An autocommit statement's hook-registry mutation — a hook calling
+  `register_row_hook`/`unregister_row_hook` on itself, per the documented
+  nested-hook-mutation pattern — now rolls back correctly when a LATER hook in
+  that same statement raises or vetoes: `register_row_hook`/
+  `unregister_row_hook` push a #269 schema-undo entry whenever
+  `Store.in_row_hook_for` holds (a mutation made from inside a currently-firing
+  row hook's own body), not only when an explicit transaction is open, and
+  `Sql.Exec.release_txn`/`execute_insert`/`execute_update`/`execute_delete`
+  commit or replay that log symmetrically with `with_ddl_txn`'s existing DDL
+  branches. Pushing the undo *unconditionally* was tried and rejected: a plain
+  top-level `register_row_hook` call with no explicit transaction and no hook
+  currently firing has nothing that will ever commit or roll back the entry,
+  so it would leak onto the shared log and get wrongly replayed by an
+  unrelated later rollback. Separately, `max_row_hook_depth` — meant to fail
+  cleanly on runaway recursion — did not bound a chain of hooks that each
+  re-trigger the same hook via a deferred `Lwt.async` write, because the depth
+  counter was released as soon as a hook's own synchronous extent ended, well
+  before its scheduled continuation ran. Fixed by giving the round-7 mutable
+  reentrancy-guard record an additional immutable `rhs_depth` field, read back
+  via a new `Store.row_hook_effective_depth` that prefers the ambient scope's
+  captured depth over the plain store-wide counter whenever the current
+  continuation is a causal descendant of one for this store — which correctly
+  survives past the point the reentrancy guard's own `rhs_active` flag flips to
+  `false`. A statement-level `unregister_row_hook` still has no effect on the
+  REST of that same statement's already-snapshotted fire list, tracked as
+  #771. **Round 9 found round 8's schema-undo fix only closed the
+  exception-raising half of what it targeted.** A silent skip (`OR IGNORE`
+  on a secondary UNIQUE/NOT NULL conflict, or an alias-PK conflict) is a
+  SUCCESS outcome, not a raised exception, so it never reached either place
+  round 8 taught to resolve the log — fixed by `rollback_skip`, which
+  resolves via `Cat.commit_schema_changes` (not rollback) on a skip, since a
+  skip means "this row's write didn't happen," not "this statement failed."
+  Separately, a hook mutation made across `create_worker_handle` siblings
+  landed on the CALLING handle's catalog rather than the FIRING statement's
+  — fixed by threading a `(unit -> unit) -> unit` undo-target closure through
+  the ambient row-hook scope itself (`Store.row_hook_ambient_undo_target`),
+  captured by whichever handle is actually firing the hook. FK
+  `CASCADE`/`SET NULL`/`SET DEFAULT` bypassing OCaml row hooks entirely is
+  tracked as #773 (not fixed); `row_hooks_carry_over` omitting
+  `row_hook_depth` across a VACUUM store-swap is tracked as #774 (not
+  fixed). Full detail in `docs/DECISIONS.md`.
 
 ## Repository structure
 

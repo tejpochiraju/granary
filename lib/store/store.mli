@@ -25,6 +25,23 @@ val pp : Format.formatter -> t -> unit
     chosen at open time.  VACUUM reads this to rebuild at the same page_size. *)
 val geometry : t -> Geometry.t
 
+(** #338/#752 (review round 5): [true] once {!close} has signalled teardown
+    on this exact store object — set at the very start of {!close}, before
+    any of its own awaits, and never cleared, since a closed store is never
+    reused (a VACUUM that swaps in a rebuilt store gives the caller a
+    brand-new {!t}, not a resurrection of this one). {!rw_begin}/{!ro_begin}
+    already refuse once this is set; this is the same check, exposed so a
+    caller that mutates store-level state directly — without opening a
+    transaction — can apply it too.  This is exactly [Db]'s situation for its
+    row-hook registry accessors: a sibling handle whose [t.store] still names
+    a store a concurrent {!Db.vacuum} has already closed (but not yet swapped
+    out on the vacuuming handle — a real window, since {!Db.vacuum} awaits
+    between the two) could otherwise register or unregister a hook against a
+    registry nobody will ever look at again, with no error. Always [false]
+    for the in-memory backend, which has no teardown state and on which
+    {!Db.vacuum} refuses to run at all. *)
+val is_closing : t -> bool
+
 (** Phantom types for transaction modes. *)
 type ro
 
@@ -99,6 +116,295 @@ val rv_next_generation : t -> int
     minted for that name, since nothing mints against [to_] until this
     returns). *)
 val rv_carry_over_generations : from:t -> to_:t -> unit
+
+(** #752: whether an OCaml row hook fires before the row write it observes
+    (able to veto — see [Db.register_row_hook]) or only after (observe-only). *)
+type row_hook_timing =
+  [ `Before
+  | `After
+  ]
+
+(** #752: the DML event an OCaml row hook fires for. *)
+type row_hook_event =
+  [ `Insert
+  | `Update
+  | `Delete
+  ]
+
+(** #752: one row-mutation delivered to a registered row-hook callback,
+    modeled on the [NEW]/[OLD] pair a SQL trigger body sees. INSERT:
+    [old_row = None], [new_row = Some _]. DELETE: the reverse. UPDATE: both
+    [Some _]. *)
+type row_mutation =
+  { table : string
+  ; new_row : Granary_encoding.Row.t option
+  ; old_row : Granary_encoding.Row.t option
+  }
+
+(** #752: id for one registered row hook, minted from a counter shared by
+    every handle over this store (mirrors {!rv_next_generation}), so a handle
+    presented an id minted by a sibling matches nothing rather than removing
+    an unrelated hook. Transparent (like {!tree_id}) rather than abstract —
+    nothing about its representation is meant to be hidden, only its
+    provenance (this counter, not any other) is what gives it meaning. *)
+type row_hook_id = int
+
+(** #752 (review round 3): the table-keyed registry every [Db.t] handle's
+    [register_row_hook] / [unregister_row_hook] and every DROP-TABLE /
+    RENAME-TABLE execution path reads and writes — the ONE hardened
+    primitive this module gives every caller for "a table-keyed registry
+    entry that survives/migrates/purges correctly across RENAME, DROP and
+    ROLLBACK, from any execution path, visible across every sibling handle
+    sharing this store."
+
+    It lives on {!t} rather than on a catalog or a [Db.t] for the same reason
+    {!rowid_counters} and {!rv_generations} do: a hook registered through one
+    handle must be visible to, and fire from, every SIBLING handle's write
+    path over the same store ({!Db.create_worker_handle}, #589/#633), and a
+    DROP/RENAME executed by ANY handle must purge/migrate it for all of them
+    — a per-[Db.t] copy could only give that by remembering to synchronise
+    copies, which is exactly the design {!row_hooks} replaces. It is opaque
+    (unlike {!rowid_counters}/{!rv_generations}'s transparent [Hashtbl]
+    aliases) because its correct manipulation is more than a bare table
+    lookup — composite keys, insert-order-preserving retrieval, and
+    snapshot-based undo — so every caller goes through the functions below
+    instead of each re-deriving that logic against a raw [Hashtbl]. *)
+type row_hooks
+
+(** This store's row-hook registry. Every [Db.t] opened over the same store
+    gets this same table — mirrors {!rowid_counters}/{!rv_generations}. *)
+val row_hooks : t -> row_hooks
+
+(** Register [fn] to fire on every [event] mutation of [table] at [timing].
+    Returns the fresh id. O(1): entries are held newest-first per
+    (table, timing, event) key; {!row_hook_fire_list} reverses at the firing
+    site to restore registration order — the same shape [Db]'s #746 view-
+    callback registry uses for the same reason. *)
+val row_hook_register
+  :  row_hooks
+  -> table:string
+  -> timing:row_hook_timing
+  -> event:row_hook_event
+  -> (row_mutation -> (unit, string) result Lwt.t)
+  -> row_hook_id
+
+(** Detach the hook [id], and return a closure that reverses exactly that
+    detachment — the same "perform, return the undo" shape as
+    {!row_hooks_purge_table}/{!row_hooks_migrate_table}, for the same reason
+    (#752 review round 3, item 3): [Db.unregister_row_hook] needs it so
+    [BEGIN; unregister_row_hook h; ROLLBACK] does not leave [h] permanently
+    detached, and a caller with no transaction to protect against (an
+    unregister that is itself undoing a registration, say) simply discards
+    it.
+
+    {b Resolved by [id] alone (#752 review round 4), not by a caller-supplied
+    (table, timing, event).} A [Db.row_hook] handle's table name is captured
+    at registration time; {!row_hooks_migrate_table} can silently move the
+    entry to a new key afterwards (a RENAME), and a caller unregistering by
+    the handle's now-stale name would find nothing to remove — an
+    undetachable hook, which for a [`Before] hook is an undetachable veto.
+    Looking [id] up through the registry's own reverse index instead means a
+    rename can never desynchronise a handle from the entry it names.
+
+    Idempotent: a second call to either the outer function or its returned
+    closure, or an [id] not currently registered anywhere, is a no-op. Drops
+    the (table, timing, event) key from the registry entirely once its last
+    hook is removed (rather than leaving it mapped to [[]]), so
+    {!row_hooks_is_empty} correctly returns to [true]. *)
+val row_hook_unregister : row_hooks -> row_hook_id -> unit -> unit
+
+(** The hooks registered on (table, timing, event), in registration order.
+    [[]] if none are registered. *)
+val row_hook_fire_list
+  :  row_hooks
+  -> table:string
+  -> timing:row_hook_timing
+  -> event:row_hook_event
+  -> (row_hook_id * (row_mutation -> (unit, string) result Lwt.t)) list
+
+(** [true] iff no row hook is registered anywhere in this store, for any
+    (table, timing, event) — the fast path a write-path caller checks before
+    ever computing a lookup key, so a store nobody has registered a hook on
+    pays for one length check. *)
+val row_hooks_is_empty : row_hooks -> bool
+
+(** Remove every hook registered on [name], for every (timing, event), and
+    return a closure that reverses exactly that removal. Calling the closure
+    twice is a no-op the second time (it replays a fixed snapshot taken
+    before the removal), so it is safe to hand to a schema-undo log that may
+    replay it more than once (e.g. a [ROLLBACK TO] nested inside a wider
+    [ROLLBACK]'s replay). Used by every DROP-TABLE execution path — see
+    [Sql.Exec.execute_drop_table] — to keep the registry consistent with
+    [table_exists] across both directions of that statement's outcome. *)
+val row_hooks_purge_table : row_hooks -> string -> unit -> unit
+
+(** Move every hook registered on [old_name] to [new_name], for every
+    (timing, event), and return a closure that reverses exactly that move.
+    A no-op (returning a no-op closure) if the two names are equal.
+
+    {b The reverse move is restricted to exactly the entries the forward
+    move actually moved, merged into whatever the destination key holds at
+    undo time — never a blind replace (#752 review round 6, item 1).}
+    [ALTER TABLE ... RENAME] refuses a target name that already names a
+    table, so nothing can already be registered at [new_name] when the
+    FORWARD move runs — but a sibling handle can still see [new_name] as
+    live before this transaction commits (the documented DDL-visibility
+    leak, #589/#633) and register a hook directly against it while the
+    rename's transaction is still open. A ROLLBACK then replays this
+    function's returned closure with the names swapped; grabbing "whatever
+    is currently at [new_name]'s key" at that point — as an earlier
+    revision did — would sweep the sibling's brand-new, unrelated
+    registration back onto [old_name] along with the entries that
+    genuinely moved, misfiling it under a table name it never named (full
+    veto power included, for a [`Before] hook). Restricting the reverse to
+    the ids the forward call actually moved, and merging rather than
+    replacing at the destination, is the same fix round 5 applied to
+    {!row_hook_unregister} and {!row_hooks_purge_table} for the identical
+    reason — the reverse move's idempotence still follows from the same
+    fact {!row_hook_unregister} relies on: replaying it a second time finds
+    none of the originally-moved ids left at the source key. Used by every
+    RENAME-TABLE execution path — see [Sql.Exec.execute_alter_table]. *)
+val row_hooks_migrate_table
+  :  row_hooks
+  -> old_name:string
+  -> new_name:string
+  -> unit
+  -> unit
+
+(** #752: carry every registered hook from [from] into [to_] — the VACUUM
+    case, mirroring {!rv_carry_over_generations} exactly: VACUUM builds a
+    wholly new {!t}, so without this call every row hook registered before it
+    would silently vanish across the rebuild, which for a [`Before] hook with
+    veto power is a correctness change, not a cosmetic loss. Call from
+    {!Db.vacuum}'s one call site, before the handle swaps onto the new store —
+    the same point {!rv_carry_over_generations} is called from. *)
+val row_hooks_carry_over : from:t -> to_:t -> unit
+
+(** #752 (review round 4): current nested row-hook-firing depth, shared by
+    every [Db.t] over this store. [Db]'s recursion guard (mirroring its SQL
+    trigger recursion guard) reads this — not a per-handle counter — so that
+    a hook whose nested DML re-enters the hook path through a DIFFERENT
+    handle sharing this store ({!Db.create_worker_handle}) still counts
+    against the SAME budget: the recursion is one logical chain regardless of
+    which handle each frame happens to run through. *)
+val row_hook_depth : row_hooks -> int
+
+(** Increment {!row_hook_depth} by one — call before entering a row hook's
+    body. *)
+val row_hook_depth_incr : row_hooks -> unit
+
+(** Decrement {!row_hook_depth} by one — call (under [Lwt.finalize], so it
+    runs even if the body raised) after a row hook's body returns. *)
+val row_hook_depth_decr : row_hooks -> unit
+
+(** Run [f] tagged, for its whole dynamic extent (every synchronous and
+    asynchronous continuation it creates, via [Lwt.with_value]), as
+    "executing inside a row hook callback fired for [t]" (#752 review round
+    6, item 2). {!rw_begin} consults this tag to refuse — immediately, with a
+    clear error — a hook's own nested attempt to open a SECOND write
+    transaction on the SAME store while the transaction that fired it is
+    still open, which would otherwise deadlock: the writer lock
+    (non-reentrant, #740) is released only by that outer transaction's
+    commit/rollback, and the outer transaction cannot reach its
+    commit/rollback until this nested call returns.
+
+    Deliberately a dynamic-extent tag, not a plain counter like
+    {!row_hook_depth}: two logically independent statements can be
+    interleaved by the Lwt scheduler on the same store (sibling handles,
+    #589), and a bare "is any hook firing anywhere on this store" flag
+    cannot tell an ordinary, unrelated writer legitimately queued behind the
+    writer lock from the one case that is a genuine self-deadlock. [Db]'s
+    [fire_ocaml_row_hook] is the sole caller, wrapping its call to the
+    hook's own [fn].
+
+    [~depth] is the recursion depth this particular invocation is running
+    at (#752 review round 8, item 2) — see {!row_hook_effective_depth},
+    which is how a later, causally-descended firing recovers it.
+
+    [~register_undo] (#752 review round 9, finding 2) pushes a #269
+    schema-undo closure onto the #269 undo log owned by the [Cat.t] of the
+    [Db.t] statement that is ACTUALLY firing this hook — [Db]'s sole caller,
+    {!Db.fire_ocaml_row_hook}, passes [Cat.register_schema_undo] partially
+    applied to its own handle's catalog. A plain function rather than a
+    [Cat.t] field, since [Store] sits below [Catalog] in the dependency
+    graph. See {!row_hook_ambient_undo_target}, which is how
+    [Db.register_row_hook]/[Db.unregister_row_hook] recover it instead of
+    reaching for their own (possibly wrong, cross-handle) catalog. *)
+val run_in_row_hook_scope
+  :  t
+  -> depth:int
+  -> register_undo:((unit -> unit) -> unit)
+  -> (unit -> 'a Lwt.t)
+  -> 'a Lwt.t
+
+(** #752 (review round 8, item 2): the recursion depth to attribute a NEW row
+    hook firing for [t] against, given [t]'s [row_hooks]. [Db]'s
+    [fire_ocaml_row_hook] consults this instead of {!row_hook_depth} directly
+    for its recursion-limit check.
+
+    {!row_hook_depth} is a store-wide counter that is decremented the
+    instant a hook's own synchronous extent ends — including when that
+    extent ends because the hook merely SCHEDULED its recursive next step
+    via [Lwt.async] and returned immediately, well before the scheduled step
+    actually runs. A chain of such hooks — each firing, scheduling its own
+    reinvocation, and returning — would therefore never appear to nest by
+    {!row_hook_depth}'s reading alone, letting {!max_row_hook_depth}'s bound
+    in [Db] go unenforced indefinitely.
+
+    This function instead prefers the depth captured on the row-hook scope
+    (see {!run_in_row_hook_scope}) of the currently-running continuation, if
+    it is a causal descendant of one for THIS store — which remains valid
+    even after that scope's own synchronous extent has ended, exactly
+    covering the deferred-[Lwt.async] case above — and falls back to the
+    plain {!row_hook_depth} counter only when there is no such ambient
+    scope (a fresh top-level statement, or a genuinely synchronous nested
+    chain reached through a sibling {!Db.t} with no causal Lwt link to the
+    firing hook — {!Db.create_worker_handle}, #589 — the case round 4's
+    shared-counter test exercises). *)
+val row_hook_effective_depth : t -> row_hooks -> int
+
+(** [true] iff the currently-running continuation is a causal descendant of a
+    row hook callback firing for [t] AND still within that hook invocation's
+    genuine dynamic extent — i.e. it has not yet returned (synchronously), nor
+    settled via a deferred [Lwt.async] continuation constructed while it was
+    still running. See {!row_hook_scope} and {!run_in_row_hook_scope}'s doc
+    comments for the full mechanism ({!rw_begin} is the original consumer).
+
+    #752 (review round 8, item 1): [Db.register_row_hook]/
+    [Db.unregister_row_hook] consult this to decide whether a registry
+    mutation needs a #269 schema-undo entry — a mutation made from a hook's
+    OWN body (this predicate [true]) is reversible by whatever write is
+    currently in flight (an explicit transaction's ROLLBACK, or — when there
+    is none — the autocommit DML statement that fired the hook, via
+    {!Sql.Exec.execute_insert}/[execute_update]/[execute_delete]'s own
+    [owned]-mode rollback), so it must always be tracked. A mutation made from
+    ordinary top-level application code (this predicate [false], no ambient
+    hook firing) has no such statement or transaction to be undone by unless
+    ONE happens to be explicitly open — {!Db.explicit_txn}'s pre-existing,
+    unchanged check — and must NOT be tracked otherwise: nothing would ever
+    consume (commit or roll back) an undo pushed there, and it would linger on
+    the log to be wrongly replayed by whatever unrelated rollback happens
+    next. *)
+val in_row_hook_for : t -> bool
+
+(** The schema-undo target to push a row-hook registry mutation onto, when
+    the currently-running continuation is a causal descendant of a row hook
+    callback firing for [t] and still within that hook invocation's genuine
+    dynamic extent — the same condition {!in_row_hook_for} tests. [None]
+    exactly when {!in_row_hook_for} would answer [false].
+
+    #752 (review round 9, finding 2): [Db.register_row_hook]/
+    [Db.unregister_row_hook] consult this INSTEAD OF their own handle's
+    [Cat.t] whenever it returns [Some] — the round-8 gate
+    ([Option.is_some t.explicit_txn || in_row_hook_for t.store]) pushed onto
+    the CALLING handle's catalog unconditionally, which is wrong when a hook
+    body running as part of a DIFFERENT sibling [Db.t]'s statement (multiple
+    handles can share one [Store.t] via {!Db.create_worker_handle},
+    #589/#633/#632) calls [register_row_hook]/[unregister_row_hook] on this
+    handle: the undo must land on the FIRING statement's own catalog, not the
+    target handle's, or neither handle's rollback/commit will ever resolve
+    it. *)
+val row_hook_ambient_undo_target : t -> ((unit -> unit) -> unit) option
 
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
@@ -297,7 +603,15 @@ val ro_begin_as_of : t -> History.target -> ro txn Lwt.t
 exception History_error of error
 
 (** Begin a read-write transaction. Only one RW txn may be active at a
-    time; this call blocks until the previous one commits or rolls back. *)
+    time; this call blocks until the previous one commits or rolls back.
+
+    {b Refuses immediately, rather than blocking forever, when called from
+    inside a row hook callback that is itself still running as part of an
+    outer, not-yet-committed write transaction on THIS store (#752 review
+    round 6, item 2).} See {!run_in_row_hook_scope}'s doc comment for why —
+    in short, the outer transaction's own writer-lock release is
+    unreachable until this nested call returns, so blocking on the lock
+    here would never resolve. *)
 val rw_begin : t -> rw txn Lwt.t
 
 (** Commit a read-write transaction, making its mutations durable. *)

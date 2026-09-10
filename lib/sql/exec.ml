@@ -3232,7 +3232,29 @@ let acquire_txn store mode =
    dirtied by nested In_txn DML (e.g. trigger inserts) are persisted, then
    persist any dirty columnar stores before committing.  After commit
    succeeds, clear the dirty flag on the stores that were persisted so the
-   next cycle only flushes new mutations. *)
+   next cycle only flushes new mutations.
+
+   #752 (review round 8, item 1): also discards [cat]'s #269 schema-undo log
+   via [Cat.commit_schema_changes], mirroring [with_ddl_txn]'s [owned]
+   success branch exactly. [owned] means this call opened its own txn with no
+   ambient explicit transaction borrowing it -- i.e. this DML statement IS
+   the schema-undo scope, the same role an [Auto]-mode DDL statement plays
+   for [with_ddl_txn]. [Db.register_row_hook]/[Db.unregister_row_hook], when
+   called from inside a row hook's OWN body with no explicit transaction open
+   ([Store.in_row_hook_for]), push onto that log too (not just inside an
+   explicit transaction, #752 review round 7's gate) so that a hook mutating
+   the row-hook registry from inside another hook's body, mid-statement, is
+   reversible by THIS statement's own rollback (see the paired
+   [Cat.rollback_schema_changes] call in [execute_insert]/[execute_update]/
+   [execute_delete]'s exception handlers) -- which means every successful
+   [owned] statement must equally discard whatever it pushed, or the log
+   would carry a stale, already-applied undo forward into whatever
+   transaction happens to roll back next. Safe to call even when nothing was
+   pushed (DML paths with no [before_hook]/[after_hook], FTS, columnar,
+   PRAGMA repair, ...): the writer lock's exclusivity guarantees nothing else
+   could have pushed onto [cat]'s undo log during this call's dynamic
+   extent, so discarding it here can never drop someone else's pending
+   undo. *)
 let release_txn ?cat tx owned =
   if owned
   then (
@@ -3244,9 +3266,46 @@ let release_txn ?cat tx owned =
         Cat.persist_dirty_columnar_stores c tx
     in
     let* () = S.commit tx in
+    (match cat with
+     | None -> ()
+     | Some c -> Cat.commit_schema_changes c);
     List.iter Granary_columnar.Col_store.mark_clean saved;
     Lwt.return_unit)
   else Lwt.return_unit
+;;
+
+(* #752 (review round 9, finding 1): [execute_insert_write]'s silent-skip
+   arms ([Iw_skip], its own internal NOT NULL [OR IGNORE] check, and the
+   alias-PK [CA_ignore] arm) each roll [tx] back directly, without going
+   through [release_txn] — a skip is a SUCCESS outcome (a deliberate
+   [OR IGNORE], not a raised exception), so it never reaches
+   [execute_insert]'s [Lwt.catch] exception handler either. Neither of the
+   two places that (since round 8) resolve [cat]'s #269 schema-undo log —
+   [release_txn]'s [owned] commit branch, and the exception handler's
+   [Cat.rollback_schema_changes] — ever ran for a skip, so a [`Before] hook
+   that self-mutated the registry (the documented nested-hook-mutation
+   pattern) before the skip was decided left its undo entry permanently
+   stranded on [cat.sc.undo]: neither committed nor rolled back by THIS
+   statement, to be wrongly replayed by whatever unrelated future statement
+   next rolls back on this same [Db.t].
+
+   The correct resolution is COMMIT, not rollback: a skip means "this row's
+   write didn't happen," not "this statement failed." [S.rollback tx] here
+   undoes only the STORE-level attempt at the row write (the B-tree
+   descents made so far, harmless to discard since nothing else could have
+   been written for a row that never got past its own uniqueness/NOT NULL
+   check) — it does not mean the surrounding statement raised or was
+   vetoed. The hook registry mutation is a real, intentional side effect
+   independent of whether this particular row made it in, exactly as
+   [release_txn]'s write-succeeded path already treats it. Guarded on
+   [owned] for the same reason [release_txn] is: when the transaction is
+   borrowed ([not owned]), the outer explicit transaction is the schema-undo
+   scope, and its own eventual COMMIT/ROLLBACK — not this statement — is
+   what must resolve the entry. *)
+let rollback_skip ~(cat : Cat.t) tx ~owned : unit Lwt.t =
+  let* () = if owned then S.rollback tx else Lwt.return_unit in
+  if owned then Cat.commit_schema_changes cat;
+  Lwt.return_unit
 ;;
 
 (** Extract the in-memory columnar store from a table_meta.  Asserts [Row]
@@ -5198,8 +5257,14 @@ let execute_insert_write
        [on_conflict = CA_ignore] means [check_insert_unique] returned
        [Ic_skip] without ever producing [Ic_replace], so the write path below
        (including [delete_replace_conflicts]) is unreachable — no hooks have
-       fired and no B-tree deletes have been made, so [S.rollback] is safe. *)
-    let* () = if owned then S.rollback tx else Lwt.return_unit in
+       fired and no B-tree deletes have been made, so [S.rollback] is safe.
+
+       #752 (review round 9, finding 1): [rollback_skip] additionally
+       resolves [cat]'s #269 schema-undo log via [Cat.commit_schema_changes]
+       when [owned] — see its doc comment for why this is a SUCCESS
+       (commit), not a failure (rollback), for a [`Before] hook's own
+       registry self-mutation. *)
+    let* () = rollback_skip ~cat tx ~owned in
     Lwt.return false
   | Iw_plain | Iw_replace _ ->
     (* #567: the rowid-alias column has just been written back by
@@ -5217,8 +5282,9 @@ let execute_insert_write
     let null_skip = not_null_skip_or_fail ~clock ~params table_meta row ~on_conflict in
     if null_skip
     then
-      (* Decided before any write, same as the [Iw_skip] arm above. *)
-      let* () = if owned then S.rollback tx else Lwt.return_unit in
+      (* Decided before any write, same as the [Iw_skip] arm above — see its
+         [rollback_skip] comment (#752 review round 9, finding 1). *)
+      let* () = rollback_skip ~cat tx ~owned in
       Lwt.return false
     else
       let* displaced_rows =
@@ -5319,7 +5385,10 @@ let execute_insert_write
               ~on_upsert_update_before
               ~on_upsert_update
           | Some Ast.CA_ignore, _ ->
-            let* () = if owned then S.rollback tx else Lwt.return_unit in
+            (* #752 (review round 9, finding 1): same [rollback_skip] fix as
+               the [Iw_skip] arm above — an alias-PK [OR IGNORE] skip is a
+               success outcome too. *)
+            let* () = rollback_skip ~cat tx ~owned in
             Lwt.return false
           | Some Ast.CA_replace, _ ->
             let* old_bytes_opt =
@@ -5754,10 +5823,30 @@ let execute_insert
           owes itself a mark: whatever a raising statement left in the delta
           log is discarded, and the views are rebuilt from the base tables.
           A mark here is still correct and is kept, because it also serves the
-          non-raising SKIP path through [stmt_savepoint_finish]. *)
+          non-raising SKIP path through [stmt_savepoint_finish].
+
+          #752 (review round 8, item 1): also runs [Cat.rollback_schema_changes]
+          alongside [S.rollback] when [owned], mirroring [with_ddl_txn]'s own
+          [owned] failure branch. [before_hook]/[after_hook] above can invoke a
+          row hook whose body itself calls [Db.register_row_hook] /
+          [Db.unregister_row_hook] on this same [t] (the documented nested-
+          hook-mutation pattern) — those push onto [cat]'s #269 schema-undo log
+          whenever [Store.in_row_hook_for] is true, not just inside an
+          explicit transaction. In autocommit ([owned]), THIS statement is
+          that undo log's whole scope
+          — nothing else could reach it, since the writer lock this call holds
+          is exclusive — so if a LATER hook in this same statement then raises
+          or vetoes, the row-hook registry mutation must be undone alongside
+          the row-store rollback below, or it would survive a statement whose
+          primary effect never happened. When [not owned] (a borrowed, ambient
+          explicit transaction), this is deliberately a no-op exactly as
+          before: the pushed undo stays queued for that outer transaction's own
+          eventual COMMIT/ROLLBACK, matching [register_row_hook]'s pre-existing
+          behavior for that case. *)
        let* () = stmt_savepoint_release ~cat tx sp in
        if owned then changes_restore mark;
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       if owned then Cat.rollback_schema_changes cat;
        Lwt.fail exn)
 ;;
 
@@ -7821,6 +7910,15 @@ let execute_update
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       (* #752 (review round 8, item 1): see [execute_insert]'s exception
+          handler for the full rationale — [before_hook]/[after_hook] above can
+          fire a row hook whose body mutates the row-hook registry via
+          [Db.register_row_hook]/[Db.unregister_row_hook], which push onto
+          [cat]'s #269 schema-undo log while [Store.in_row_hook_for] holds; in
+          autocommit ([owned]) this statement is that log's whole scope, so a
+          later hook raising here must undo it alongside the row-store
+          rollback above. *)
+       if owned then Cat.rollback_schema_changes cat;
        Lwt.fail exn)
 ;;
 
@@ -8144,6 +8242,14 @@ let execute_delete
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       (* #752 (review round 8, item 1): see [execute_insert]'s exception
+          handler for the full rationale — [before_hook]/[after_hook] above can
+          fire a row hook whose body mutates the row-hook registry, which
+          pushes onto [cat]'s #269 schema-undo log while
+          [Store.in_row_hook_for] holds; in autocommit ([owned]) this
+          statement is that log's whole scope, so a later hook raising here
+          must undo it alongside the row-store rollback above. *)
+       if owned then Cat.rollback_schema_changes cat;
        Lwt.fail exn)
 ;;
 
@@ -8175,7 +8281,20 @@ let execute_drop_table
       (* #283: [Cat.drop_table] self-registers the cache undo for the table and each
          dependent index (via [Schema_cache.remove_table]/[remove_index]), so no
          external snapshot+undo is needed here. *)
-      Cat.drop_table cat tx ~name)
+      let* () = Cat.drop_table cat tx ~name in
+      (* #752 (review round 3): this is the ONE place a table is ever dropped
+         — every caller of [execute]/[execute_with_count] (top-level DML,
+         prepared statements, and trigger-body nested DML via
+         [Db.run_trigger_op], which all funnel through here) gets the
+         row-hook purge by construction, not by each remembering to call it.
+         [Store.row_hooks] is shared by every [Db.t] over this store
+         (#589/#633), so a sibling handle's registered hook is purged too —
+         self-registers the cache undo exactly like [Cat.drop_table] does
+         just above, so [with_ddl_txn] discards it on commit and replays it
+         on rollback with no special-casing here. *)
+      let undo = S.row_hooks_purge_table (S.row_hooks store) name in
+      Cat.register_schema_undo cat undo;
+      Lwt.return_unit)
   in
   (* #405: the table's rows are gone, so every cached result over [name] is
      stale.  Marked AFTER the drop succeeds: a raising DROP marks nothing, which
@@ -9367,7 +9486,23 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
       match action with
       | Ast.AA_add_column col_def -> alter_add_column ~txn:tx cat ~table_meta col_def
       | Ast.AA_rename_table new_name ->
-        alter_rename_table ~txn:tx cat ~table_meta new_name
+        let* n = alter_rename_table ~txn:tx cat ~table_meta new_name in
+        (* #752 (review round 3): this is the ONE place a table is ever
+           renamed — see the matching comment on the DROP TABLE path above
+           for why routing the row-hook migration through here (rather than
+           each caller of [execute]/[execute_with_count] remembering to call
+           it) closes the trigger-body and cross-handle gaps by construction.
+           Registers its own undo the same way [Cat.rename_table] already
+           does for the catalog row, so [with_ddl_txn] discards or replays it
+           in lockstep with the rest of this statement's schema-cache undo. *)
+        let undo =
+          S.row_hooks_migrate_table
+            (S.row_hooks store)
+            ~old_name:table_meta.Cat.name
+            ~new_name
+        in
+        Cat.register_schema_undo cat undo;
+        Lwt.return n
       | Ast.AA_rename_column (old_col, new_col) ->
         (match
            fk_obligation_conflict cat ~table_name:table_meta.Cat.name ~col_name:old_col

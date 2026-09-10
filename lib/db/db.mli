@@ -985,6 +985,385 @@ val is_reactive_view : t -> string -> bool
     own. *)
 val reactive_view_generation : t -> string -> int option
 
+(** #752: one row-mutation delivered to a {!register_row_hook} callback,
+    modeled on the [NEW]/[OLD] pair a SQL trigger body sees.
+
+    - INSERT: [old_row = None], [new_row = Some _].
+    - DELETE: [old_row = Some _], [new_row = None].
+    - UPDATE: both [Some _].
+
+    [table] is always the table the hook was registered against — a
+    convenience for a callback shared across more than one
+    {!register_row_hook} call, so it need not close over the table name
+    itself to tell which registration fired it. *)
+type row_mutation =
+  { table : string
+  ; new_row : row option
+  ; old_row : row option
+  }
+
+(** #752: an opaque handle for one registered OCaml row-mutation hook,
+    returned by {!register_row_hook} and consumed by {!unregister_row_hook}.
+    Its id is minted from a counter shared by every {!t} over the same store
+    ({!Granary_store.Store.row_hooks}, #752 review round 3), so a handle
+    presented to a {!t} over a DIFFERENT store matches nothing rather than
+    removing an unrelated hook.
+
+    {b Removal resolves by id alone, not by the (table, timing, event) key
+    (#752 review round 4).} An earlier revision of this feature had
+    {!unregister_row_hook} re-derive that key from the handle's fields to
+    look the hook up — which a RENAME could silently invalidate: the
+    handle's captured table name would no longer match where the entry
+    actually lives, and the unregister call would find nothing to remove
+    (an undetachable hook, which for a [`Before] hook is an undetachable
+    veto). The handle's [table]/[timing]/[event] are kept only for
+    {!pp_row_hook}'s display; after a RENAME they describe where the hook
+    was {e registered}, not necessarily where it fires now. *)
+type row_hook
+
+(** Render a handle as [table:timing:event#id] (e.g. [orders:before:insert#3]),
+    using the fields captured at registration time. For logging and test
+    failure messages; the id is an opaque serial number with no meaning
+    beyond identity, and — per {!row_hook}'s doc comment — is what removal
+    actually uses, not the displayed table/timing/event. *)
+val pp_row_hook : Format.formatter -> row_hook -> unit
+
+(** #752: register [fn] to run on every [event] mutation of [table] at
+    [timing], as an OCaml closure rather than a SQL [CREATE TRIGGER] body —
+    the seam camel#75 needs for a GADT-certified program's [before:]/[after:]
+    hooks, which are typed OCaml, not SQL, by design (camel#1).
+
+    Returns [Error (`Unknown_table table)] — registering nothing — when
+    [table] does not exist at the instant of the call, mirroring
+    {!register_view_callback}'s [`Unknown_view] (#437): a caller wiring hooks
+    from config can tell a typo from a successful registration. The error is a
+    closed polymorphic variant rather than the module-wide {!error} for the
+    same reason #437 gives — this is {!register_row_hook}'s only failure
+    class, and widening {!error} would add a case no other function returning
+    [(_, error) result] can produce.
+
+    {b Returns [Error (`Columnstore_unsupported table)] for a [USING
+    COLUMNSTORE] table (#752 review).} The columnar write path calls
+    [Col_store.insert_rows] directly for INSERT, bypassing [before_hook]/
+    [after_hook] entirely, and refuses UPDATE/DELETE outright — so a hook
+    registered on a columnstore table could never fire, for any [timing] or
+    [event]. Refusing at registration matches the precedent set by a
+    GENERATED column on a [USING COLUMNSTORE] table being refused at DDL
+    (#660) rather than silently accepted and then never honoured.
+
+    {b Returns [Error `Store_closing] during a narrow VACUUM race window on a
+    SIBLING handle (#752 review round 5).} [row_hooks] lives on the store
+    (see below) and this call never opens a transaction, so it is not
+    naturally refused the way ordinary DML is once a store starts closing.
+    {!vacuum} closes the old store, carries its row-hook registry over to the
+    new one, and only THEN swaps [t.store] to the new store and marks sibling
+    handles stale — with Lwt-yielding work (re-opening the catalog) in
+    between. A sibling whose [t.store] still names that already-closed store
+    during this window would otherwise register a hook into a registry
+    {!Granary_store.Store.row_hooks_carry_over} has already finished copying
+    out of (silently never firing). Detected via
+    {!Granary_store.Store.is_closing} — the same check {!Granary_store.Store.rw_begin}
+    already applies to ordinary writes — rather than the VACUUM-staleness
+    check every ordinary statement is refused with, which this window
+    predates (the shared cohort generation bumps only after the swap, so a
+    part-way-failed VACUUM leaves it untouched). Retry is not meaningful: by
+    the time this returns, the caller's handle is doomed the same way #634
+    already documents for any other operation racing a sibling's VACUUM —
+    obtain a fresh handle via {!create_worker_handle} on the handle that ran
+    it.
+
+    {b A hook is tied to the table it was registered against, not to the
+    name — DROP TABLE purges it; RENAME migrates it, from ANY execution path
+    and for EVERY handle sharing this store (#752 review round 3).} The
+    registry backing this is {!Granary_store.Store.row_hooks}, not a table on
+    [t] — the same move #757 made for reactive-view generation identity, and
+    for the identical reason: a table-keyed registry entry must stay correct
+    no matter which of possibly several {!t} handles sharing one store
+    ({!create_worker_handle}, #589/#633) performs the DROP/RENAME, or fires
+    the hook, or (for {!unregister_row_hook}) removes it. The purge/migrate
+    itself lives inside the ONE function each statement shape funnels through
+    ([Sql.Exec.execute_drop_table] / [execute_alter_table]) — reached alike
+    by a one-shot {!execute}, a {!prepare}d statement, and a trigger body's
+    nested DML (which a Db.ml-only mechanism checked in an earlier revision
+    of this feature missed) — so no future DDL-executing path can bypass it
+    by construction, not by remembering to call a bookkeeping function.
+    Applied once the DDL statement that names [table] actually {e succeeds}
+    (a failed or rolled-back DROP/RENAME leaves the registry as if it never
+    ran — see the ROLLBACK paragraph below):
+    - [DROP TABLE table] removes every hook registered on it, for every
+      [timing]/[event]. Without this, [DROP TABLE t; CREATE TABLE t (...)]
+      with a different shape would silently reattach a stale hook to the new
+      table — and since a [`Before] hook can veto, a misattached one is a
+      correctness/security gap, not just a leak.
+    - [ALTER TABLE table RENAME TO new_name] re-keys every hook registered
+      on it to fire under [new_name] instead — {e not} a refusal, unlike
+      #609's view/trigger dependency check. #609 refuses because a view or
+      trigger is stored as raw, unparsed SQL text with no name to rewrite in
+      place; that is a technical necessity, not a chosen policy. A row hook
+      is a structured in-memory registration keyed by name, so re-keying it
+      is exact and lossless, and a [row_mutation] fired after the rename
+      reports [table = new_name] — refusing here would only strand a
+      caller's hook (and camel's [reject!] veto with it) for no correctness
+      reason.
+    - VACUUM rebuilds the store's data into a wholly new
+      {!Granary_store.Store.t}; without a dedicated carry-over (mirroring
+      {!Granary_store.Store.rv_carry_over_generations}, called from the same
+      site) every registered hook would silently vanish across the rebuild.
+      {!create_worker_handle}'s existing VACUUM-invalidation caveat still
+      applies to everything else about a sibling handle's view of the store.
+
+    {b Registering is undone by a rollback of whatever write is currently in
+    flight, when there is one to be undone by (#752 review, revised round
+    8).} [register_row_hook] is an OCaml call, not a SQL statement, so it
+    does not automatically share in a rollback the way DDL run through
+    {!execute} does. Without special handling,
+    [BEGIN; CREATE TABLE t(...); (* register_row_hook here *); ROLLBACK]
+    would leave the hook attached even though [t] never really existed — and
+    a {e later, unrelated} [CREATE TABLE t] would silently reattach it. Via
+    the same #269 schema-undo mechanism the view/trigger caches use, two
+    cases are protected:
+    - {b Called with an explicit transaction open} (from anywhere, including
+      top-level application code): its ROLLBACK undoes the registration
+      (including a [ROLLBACK TO] that unwinds past the point of
+      registration).
+    - {b Called from inside a row hook's OWN body — [`Before]/[`After],
+      firing for either this same [t] or a {!create_worker_handle} sibling
+      sharing this store — with no explicit transaction open (#752 review
+      round 8).} This is the nested-hook-mutation pattern documented below: a
+      hook mutates the registry as part of handling one row, and the
+      mutation must be undone alongside whatever else the {e firing
+      statement} — not the hook itself — rolls back, since that statement is
+      the only scope protecting it. If a {e later} hook firing for the
+      {e same} statement then vetoes or raises, this registration is undone
+      together with the row-store write, even in autocommit with no [BEGIN]
+      anywhere; if the statement instead succeeds, the undo is discarded
+      exactly as DDL discards its own at [Auto]-mode COMMIT, so a hook that
+      never mutates the registry mid-statement, or does so only in a
+      statement that always succeeds, pays nothing for this. Before round 8
+      this case was missed entirely: the registration survived a statement
+      whose own primary effect never happened, because nothing recorded how
+      to undo a mutation made outside an explicit transaction.
+
+    {b Called from plain top-level application code with neither of the
+    above true is genuinely unaffected} — there is no rollback of anything to
+    protect the registration against, so nothing is recorded (an
+    unconditional recording here, tried and rejected during round 8, would
+    instead leak: nothing would ever consume it, so it would sit on the
+    shared log to be wrongly replayed by whatever unrelated ROLLBACK, or
+    failed autocommit statement, happens next on this store).
+
+    {b Veto ([`Before] only).}  [fn] returns [(unit, string) result Lwt.t].
+    [Ok ()] lets the write proceed (or, for [`After], simply completes).
+    [Error msg] is a {b veto} for a [`Before] hook: the write this statement
+    was about to make never happens and [msg] surfaces to the statement's
+    caller as a {!Runtime} error — {e exactly} the path a failing
+    [BEFORE INSERT] trigger body already takes today, because a [`Before] veto
+    is implemented as the identical [Lwt.fail]: the write path's
+    [before_hook]/[after_hook] pair does not distinguish a hook that raised
+    from a hook that returned [Error]; both unwind the same way.
+
+    {b What "unwind" gets you, precisely — this is narrower than #631's
+    OR-IGNORE guarantee and deliberately not widened here.}  In autocommit,
+    a veto rolls back the statement's own transaction outright: the primary
+    write, and anything the vetoing hook itself wrote via nested DML on this
+    [t], are both gone. Inside an explicit transaction the caller opened,
+    only the {e primary} write is prevented — a [`Before] hook's own nested
+    DML, if it performed any before returning [Error], is {b not} specially
+    unwound, for the same reason a raising [BEFORE INSERT] trigger's own
+    nested DML is not: #631's statement-level savepoint exists only for the
+    non-raising [OR IGNORE]/NOT NULL {e skip} path ([execute_insert] takes it
+    exactly when [on_conflict = Some Ast.CA_ignore]), not for a raise, and a
+    raise's partial effects surviving a borrowed transaction is a pre-existing,
+    documented property of that path (see [execute_insert]'s exception
+    handler) — not a new gap this feature introduces, and not one this issue
+    closes. A hook wanting true no-residue nested DML on veto should perform
+    it, if at all, only after every other [`Before] hook and check has
+    already had a chance to veto — or avoid nested DML from a vetoing path
+    entirely.
+
+    {b The common case is unaffected by that caveat.}  A [`Before] hook that
+    coexists with a SQL [BEFORE] trigger on the same table vetoes {e before}
+    the trigger ever runs (see Ordering, below) — the trigger's body,
+    including any nested DML it would have performed, simply never executes,
+    which is a stronger and simpler guarantee than rolling it back.
+
+    {b [`After] hook errors also abort the statement}, deliberately the same
+    as [`Before]'s veto rather than a log-and-continue: an [`After] hook runs
+    inside the same not-yet-committed write transaction a [`Before] hook and a
+    SQL [AFTER] trigger body run in (all three are threaded through the one
+    [before_hook]/[after_hook] pair {!make_trigger_hook} already built for SQL
+    triggers), so there is no "the write is already durable" case that would
+    make swallowing the error meaningful — an [AFTER] trigger's body failing
+    aborts the statement today for the identical reason, and giving [`After]
+    row hooks quieter failure semantics than that would be a surprising
+    asymmetry with no upside. A hook that truly wants log-and-continue
+    semantics can catch its own errors and always return [Ok ()].
+
+    {b Ordering against SQL [CREATE TRIGGER]s (design decision, #752).} OCaml
+    row hooks and SQL triggers on the same (table, timing, event) are
+    sandwiched, not interleaved by a shared registration order: at [`Before]
+    every registered row hook runs {b before} any matching SQL [BEFORE]
+    trigger; at [`After] every matching SQL [AFTER] trigger runs {b before}
+    the row hooks. Row hooks are therefore always the outer gate — a
+    [`Before] veto pre-empts a SQL trigger's nested DML for that statement
+    entirely, and an [`After] hook always observes the row after every SQL
+    [AFTER] trigger this statement fired has already applied its own writes.
+
+    {b Multiple hooks on the same (table, timing, event) fire in registration
+    order}, sequentially — the firing site awaits each in turn — matching
+    {!register_view_callback}'s #746 contract for view callbacks.
+
+    {b Not persisted, but SHARED across handles over one store (#752 review
+    round 3 — revised from an earlier revision of this feature).} Unlike a
+    SQL trigger, a row hook is an in-memory OCaml closure: it does not
+    survive closing and reopening the database. Unlike that earlier
+    revision, though, it is {e not} private to the {!t} that registered it —
+    a sibling handle from {!create_worker_handle} sees it, fires it, and can
+    purge/migrate it via its own DROP/RENAME, because the registry lives on
+    the shared {!Granary_store.Store.t} (see the paragraph above). This is a
+    deliberate divergence from {!register_view_callback}, whose callbacks
+    stay private per handle — a reactive-view callback is a per-subscriber
+    observation, where a row hook (especially a [`Before] veto) is closer to
+    a table-level invariant that should hold no matter which handle is
+    writing.
+
+    {b A row hook's own nested DML re-entering this same hook is bounded,
+    like SQL trigger recursion (#752 review round 3, item 4).} If [fn] itself
+    performs DML (via {!execute}/{!execute_change_count} on this same [t], OR
+    on a {!create_worker_handle} sibling sharing this store — see below) that
+    re-triggers the same or another row hook, the nesting is capped at the
+    same depth {!Db}'s SQL-trigger recursion guard uses, on an independent
+    counter — so a self-recursing hook fails cleanly with a bounded
+    "recursion limit exceeded" message instead of exhausting the OCaml call
+    stack. A row hook and a SQL trigger nesting into each other in one call
+    chain each get their own full budget rather than sharing one. {b The
+    counter is store-wide, not per-handle (#752 review round 4)}: nested DML
+    that re-enters the hook path through a DIFFERENT handle over the same
+    store is still counted as the same recursion, so a chain that alternates
+    handles cannot nest past the cap by splitting its frames across them.
+
+    {b Nested DML that would need a FRESH write transaction on this store
+    fails immediately, rather than hanging, and the fix is what this
+    paragraph exists to spell out (#752 review round 6, item 2).} [fn]
+    running is itself part of the write transaction that fired it, still
+    open (not yet committed) and still holding this store's writer lock —
+    the same lock any DML on this store must acquire. If [fn] calls
+    {!execute}/{!execute_change_count}/{!query} — on this [t], or on a
+    {!create_worker_handle} sibling sharing this store — WITHOUT an explicit
+    transaction already open on that handle, the call computes autocommit
+    mode and tries to open a brand-new write transaction, which needs the
+    very lock the still-running outer statement already holds. Because that
+    lock is deliberately not re-entrant (#740), and because the outer
+    transaction cannot reach its own commit/rollback (which is what would
+    release the lock) until this nested call returns, that nested call would
+    block forever with no way to ever unblock — a genuine, guaranteed
+    self-deadlock, not a timing-dependent one. [Store.rw_begin] now detects
+    this specific shape and refuses immediately with a descriptive
+    [Failure] (surfacing as a {!Runtime} error) instead of hanging.
+
+    {b The safe pattern: open the transaction BEFORE the statement that
+    fires the hook, so the hook's nested DML reuses it.} [BEGIN]; the
+    statement that will fire the hook; inside the hook body, further
+    {!execute} calls on the SAME already-open handle (or a sibling sharing
+    that same explicit transaction) join that transaction instead of trying
+    to start a new one, and are safe — this is the documented recursion
+    path just above, and how every nested-DML test in this feature's test
+    suite is written. A hook that always needs a transaction of its own,
+    with no ambient one to join, cannot safely perform autocommit nested DML
+    from inside its own firing and must be restructured — e.g. deferring
+    that work until after the firing statement's transaction has
+    committed — rather than attempting a fresh [BEGIN] or an autocommit
+    write from inside the callback.
+
+    {b A hook that raises is treated exactly like one that returns [Error]
+    (#752 review).} [fn]'s documented failure path is [Error msg], but a hook
+    that raises an OCaml exception instead ([Not_found], a failed pattern
+    match, ...) gets the identical treatment rather than escaping the
+    [(_, error) result] contract every other failure in this library upholds:
+    the exception is caught and re-raised as [Failure], the one exception
+    class {!execute}/{!execute_change_count} already turn into
+    [Error (Runtime _)]. The resulting message is prefixed with the timing,
+    event and table (e.g. ["before row hook on 't': <msg>"], or
+    ["... raised: <exn>"] for a genuine exception) rather than given its own
+    {!error} variant — deliberately: this fires from deep inside the write
+    path rather than at a single call boundary, and adding a case to the
+    small, closed {!error} type would force every existing exhaustive match
+    on it to grow an arm only this one feature can produce, which is exactly
+    what #437/#746 chose closed polymorphic variants over for
+    {!register_view_callback}. A caller that needs to tell a hook's veto from
+    an unrelated internal error can match the [Runtime] message text. *)
+val register_row_hook
+  :  t
+  -> table:string
+  -> timing:[ `Before | `After ]
+  -> event:[ `Insert | `Update | `Delete ]
+  -> (row_mutation -> (unit, string) result Lwt.t)
+  -> ( row_hook
+       , [ `Unknown_table of string
+         | `Columnstore_unsupported of string
+         | `Store_closing
+         ] )
+       result
+
+(** #752: detach the row hook [h] names — for every handle sharing [h]'s
+    store (#752 review round 3): the removal acts on
+    {!Granary_store.Store.row_hooks}, so a sibling handle stops seeing [h]
+    fire too, {b and stays correct across a RENAME of the table [h] was
+    registered on} (#752 review round 4) — resolved by [h]'s id through the
+    registry's own reverse index rather than by re-deriving the table name
+    [h] captured at registration, which a RENAME can move the entry away
+    from. Idempotent and never raises: calling it a second time, on a hook
+    that is no longer registered anywhere, or on a handle minted over a
+    DIFFERENT store, is simply a no-op — unlike {!unregister_view_callback}
+    this reports no [bool], since a row hook has no analogous "mid-flush"
+    caller who needs to know whether its own removal request was the one
+    that mattered.
+
+    {b Undone by a rollback of whatever write is currently in flight, when
+    there is one, symmetrically with {!register_row_hook} (#752 review round
+    3, item 3; revised round 8).} Calling this inside an explicit transaction
+    that later rolls back re-attaches [h] exactly as it was — otherwise
+    [BEGIN; unregister_row_hook h; ROLLBACK] would leave [h] permanently
+    detached even though nothing else about the transaction survived. {b The
+    same is true when this is called from inside a row hook's OWN body, with
+    no explicit transaction open (#752 review round 8):} if a hook's body
+    calls [unregister_row_hook] on its own handle (or a
+    {!create_worker_handle} sibling's) and a {e later} hook firing for the
+    {e same} statement then vetoes or raises, [h] is re-attached alongside
+    whatever else that autocommit statement rolls back, even though no
+    [BEGIN] was ever issued — see {!register_row_hook}'s doc comment for the
+    full mechanism, why round 3-7's "outside an explicit transaction is
+    unaffected" claim was incomplete, and why a plain top-level call with
+    neither condition true remains genuinely unaffected.
+
+    {b Always acts on the store's registry directly, including during the
+    VACUUM race window {!register_row_hook} refuses with [`Store_closing]
+    (#752 review round 7, item 1 — revised from round 5).} Unlike
+    registration, unregistration has no error channel to report the race
+    through, and — unlike round 5's short-circuit, which treated
+    [`Granary_store.Store.is_closing`] as reason to no-op unconditionally —
+    silently skipping the removal is only ever safe on ONE side of that
+    window. {!vacuum} flips [is_closing] on the old store well before it
+    calls {!Granary_store.Store.row_hooks_carry_over} (several Lwt-yielding
+    steps later: tmp-file rename, reopen, catalog reload); a sibling handle
+    whose [t] still names that closing-but-not-yet-carried-over store can
+    call this function inside that window, and [h]'s hook — including a
+    [`Before] veto — is still fully present in the OLD store's registry,
+    not yet copied anywhere. A no-op there left it in place for
+    [row_hooks_carry_over] to copy verbatim into the new store, so the
+    caller's successful-looking (always [unit]) detach request left the
+    hook attached and firing regardless. This call now always resolves [h]
+    through {!Granary_store.Store.row_hook_unregister} — a plain,
+    synchronous [Hashtbl] mutation with no transaction and no yield of its
+    own, so doing so unconditionally is correct on the other side of the
+    window too: once a sibling's VACUUM has already completed and carried
+    the registry over, this store is a permanently abandoned husk and [h]'s
+    entry (if still present) is removed from a table nobody consults again
+    — a genuine no-op, as it always was. The hook itself lives only in the
+    new store from that point on, unreachable from this handle without a
+    fresh one (#634) — that part of round 5's reasoning is unchanged. *)
+val unregister_row_hook : t -> row_hook -> unit
+
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
     a best-effort name per result column: a SELECT alias or bare column name
