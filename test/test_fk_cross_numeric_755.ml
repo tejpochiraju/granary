@@ -525,8 +525,8 @@ let alter_table_refuses_drop_that_would_precede_a_same_name_readd () =
 (* born naming a column its own table does not have: byte-for-byte the   *)
 (* state DROP COLUMN used to leave behind, and the state any database    *)
 (* file written before #767 can still be opened in. That unvalidated     *)
-(* CREATE TABLE is a separate gap, named in docs/DECISIONS.md's #767     *)
-(* entry rather than closed there. *)
+(* CREATE TABLE is a separate gap, filed as #781 rather than closed in   *)
+(* #767; see docs/DECISIONS.md's #767 entry. *)
 (* ------------------------------------------------------------------ *)
 
 let precheck_update_fk_fails_loudly_not_with_bare_column_not_found () =

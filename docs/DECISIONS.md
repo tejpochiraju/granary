@@ -895,11 +895,11 @@ useful reading order — search for the issue number instead.
     leave behind — which is also the state any database file written before
     this fix can still be opened in, so those tests continue to pin behaviour
     that genuinely matters. That unvalidated CREATE TABLE is a real, separate
-    gap; it is named here rather than closed, because refusing it is its own
-    behaviour change with its own compatibility question (what happens to an
-    existing file that already contains one), and because it is the only
-    remaining way to construct the state #765's loud-failure paths exist to
-    handle.
+    gap; it is **filed as #781** rather than closed here, because refusing it
+    is its own behaviour change with its own compatibility question (what
+    happens to an existing file that already contains one), and because it is
+    the only remaining way to construct the state #765's loud-failure paths
+    exist to handle.
 
   Pinned by `test/test_drop_column_fk_767.ml`: the issue's own repro (refused,
   and then all three DML shapes the issue reported as broken still work), the

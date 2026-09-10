@@ -495,7 +495,7 @@ things that were tried and rejected) is usually the point.
   weaken a declared guarantee and let one table's ALTER mutate another
   table's schema. The residual it does NOT close — `CREATE TABLE` never
   validating that a table-level `FOREIGN KEY`'s local columns exist — is
-  named in `docs/DECISIONS.md`.
+  filed as #781 and detailed in `docs/DECISIONS.md`.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.
