@@ -277,7 +277,17 @@ val row_hooks_migrate_table
     would silently vanish across the rebuild, which for a [`Before] hook with
     veto power is a correctness change, not a cosmetic loss. Call from
     {!Db.vacuum}'s one call site, before the handle swaps onto the new store —
-    the same point {!rv_carry_over_generations} is called from. *)
+    the same point {!rv_carry_over_generations} is called from.
+
+    #774: [to_] also joins [from]'s registry LINEAGE, which is what keeps
+    {!row_hook_effective_depth} attributing a pre-VACUUM hook's deferred
+    [Lwt.async] continuation against the depth it actually nests from once
+    that continuation resumes and writes through the post-VACUUM store. The
+    one thing NOT carried is {!row_hook_depth} itself: it counts invocations
+    that are currently firing, each of whose matching {!row_hook_depth_decr}
+    is closed over [from]'s record, so a copied non-zero count would be a
+    claim on [to_] that nothing ever releases. See the implementation comment
+    for why copying it would also not have fixed #774. *)
 val row_hooks_carry_over : from:t -> to_:t -> unit
 
 (** #752 (review round 4): current nested row-hook-firing depth, shared by
@@ -360,7 +370,15 @@ val run_in_row_hook_scope
     scope (a fresh top-level statement, or a genuinely synchronous nested
     chain reached through a sibling {!Db.t} with no causal Lwt link to the
     firing hook — {!Db.create_worker_handle}, #589 — the case round 4's
-    shared-counter test exercises). *)
+    shared-counter test exercises).
+
+    #774: "for THIS store" means "for a store in the same row-hook registry
+    lineage", not "for this exact store object". {!Db.vacuum} swaps a wholly
+    new {!t} in under the handle and moves the registry across with
+    {!row_hooks_carry_over}; a scope captured before that swap names the old
+    object, and testing physical identity would drop back to the fresh
+    store's zeroed counter — handing a chain that had already nested deep a
+    full [max_row_hook_depth] budget again. *)
 val row_hook_effective_depth : t -> row_hooks -> int
 
 (** [true] iff the currently-running continuation is a causal descendant of a

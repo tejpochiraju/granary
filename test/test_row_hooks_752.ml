@@ -1164,6 +1164,117 @@ let test_unregister_rollback_undo_restores_the_hooks_original_chronological_posi
     (List.map fst fired)
 ;;
 
+(* The issue's own four-step reproduction, end to end through [Db] rather
+   than against the Store primitive the sibling above drives directly:
+   register A, register B on the SAME (table, timing, event) key, then
+   BEGIN / unregister A / ROLLBACK and INSERT. The rollback replays A's
+   undo, and A -- registered first -- must fire first again.
+
+   This is a DIFFERENT shape from
+   [test_unregister_rollback_undo_restores_the_hooks_original_chronological_position]
+   above, and both are needed: that one exercises the merge case (a
+   concurrent registration lands on the key while A is unregistered, so the
+   undo has something to merge PAST), where this one has nothing concurrent
+   at all -- B was already there before the unregister, and the undo must put
+   A back AHEAD of it. The prepend bug #769 reported failed this shape: it
+   put A at the head of the raw newest-first list, which
+   [Store.row_hook_fire_list]'s reversal turns into firing LAST. *)
+let test_rolled_back_unregister_restores_the_first_hooks_fire_position () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    let order = ref [] in
+    let note name _ = order := name :: !order in
+    let a = attach db ~table:"t" ~timing:`After ~event:`Insert (ok_hook (note "a")) in
+    let _b = attach db ~table:"t" ~timing:`After ~event:`Insert (ok_hook (note "b")) in
+    exec db "BEGIN";
+    Db.unregister_row_hook db a;
+    exec db "ROLLBACK";
+    exec db "INSERT INTO t VALUES (1)";
+    Alcotest.(check (list string))
+      "the rolled-back unregister restores A to its original position: A was \
+       registered before B, so it fires before B (#769)"
+      [ "a"; "b" ]
+      (List.rev !order))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Depth attribution across VACUUM's store swap (#774)                   *)
+(* ------------------------------------------------------------------ *)
+
+(* The deferred continuation #774 is about: constructed inside a row hook's
+   dynamic extent (the [Lwt.async]-after-a-yield shape [Db.register_row_hook]'s
+   own doc comment recommends), it resumes only after that extent has ended
+   AND after a VACUUM has swapped a wholly new [Store.t] in under the handle.
+   Its captured row-hook scope still names the PRE-VACUUM store, so the depth
+   it must be attributed against is reachable only if
+   [Store.row_hook_effective_depth] recognises the post-VACUUM store as the
+   same registry. Top-level (like [deferred_insert_after_pause] above) so the
+   test body itself stays flat. *)
+let vacuum_swap_depth_probe ~gate ~observed ~wake store () =
+  let open Lwt.Syntax in
+  let* () = gate in
+  observed := Store.row_hook_effective_depth store (Store.row_hooks store);
+  Lwt.wakeup wake ();
+  Lwt.return_unit
+;;
+
+(* Reconstructs [Db.vacuum]'s store swap at the Store level, deterministically
+   and with no interleaving -- the same approach the "vacuum race window"
+   tests above take, and for the same reason (no test in this codebase races
+   real fibers against [Db.vacuum]'s exact internal timing). The only two
+   steps that bear on which depth a hook firing on the new store is
+   attributed against are [Store.row_hooks_carry_over ~from:t.store
+   ~to_:new_store] and the [t.store <- new_store] swap right after it;
+   everything else VACUUM does (file rebuild, catalog reopen) is irrelevant
+   here.
+
+   Without the fix the last check reads 0: the probe's scope names
+   [old_store], the physical [==] test against [new_store] fails, and
+   [row_hook_effective_depth] falls back to the fresh registry's own counter
+   -- handing a chain that had already nested to depth 7 a full
+   [max_row_hook_depth] budget again. The middle check is why copying
+   [row_hook_depth] in [row_hooks_carry_over] (the issue's suggested fix)
+   would NOT have closed this: by carry-over time the hook's synchronous
+   extent is over, its [Lwt.finalize] has already decremented the counter,
+   and a copy therefore carries a zero. *)
+let test_row_hook_depth_attribution_survives_the_vacuum_store_swap () =
+  let old_store = Store.create () in
+  let new_store = Store.create () in
+  let inside = ref (-1) in
+  let observed = ref (-1) in
+  let counter_at_swap = ref (-1) in
+  let gate, open_gate = Lwt.wait () in
+  let settled, settle = Lwt.wait () in
+  let no_undo _ = () in
+  let hook_body () =
+    inside := Store.row_hook_effective_depth old_store (Store.row_hooks old_store);
+    Lwt.async (vacuum_swap_depth_probe ~gate ~observed ~wake:settle new_store);
+    Lwt.return_unit
+  in
+  run (Store.run_in_row_hook_scope old_store ~depth:7 ~register_undo:no_undo hook_body);
+  (* [Db.vacuum] reaches its carry-over here: the hook's own synchronous
+     extent is over, but the continuation it scheduled has not run yet. *)
+  counter_at_swap := Store.row_hook_depth (Store.row_hooks old_store);
+  Store.row_hooks_carry_over ~from:old_store ~to_:new_store;
+  Lwt.wakeup open_gate ();
+  run settled;
+  Alcotest.(check int)
+    "inside the hook's own extent, the scope's own depth is what is attributed"
+    7
+    !inside;
+  Alcotest.(check int)
+    "the store-wide counter reads 0 at carry-over time, so copying it across the \
+     swap would have carried nothing -- the registry lineage, not the counter, is \
+     what makes the deferred continuation's scope resolvable again (#774)"
+    0
+    !counter_at_swap;
+  Alcotest.(check int)
+    "after the store swap the deferred continuation is still attributed against the \
+     depth it actually nests from, not restarted at 0 (#774)"
+    7
+    !observed
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Reentrant-write guard (review round 6, item 2)                        *)
 (* ------------------------------------------------------------------ *)
@@ -1855,6 +1966,17 @@ let () =
              position (#769)"
             `Quick
             test_unregister_rollback_undo_restores_the_hooks_original_chronological_position
+        ; Alcotest.test_case
+            "a rolled-back unregister of the FIRST of two hooks still fires it first \
+             (#769, the issue's own reproduction)"
+            `Quick
+            test_rolled_back_unregister_restores_the_first_hooks_fire_position
+        ] )
+    ; ( "vacuum store swap (#774)"
+      , [ Alcotest.test_case
+            "a deferred continuation's recursion depth survives VACUUM's store swap"
+            `Quick
+            test_row_hook_depth_attribution_survives_the_vacuum_store_swap
         ] )
     ; ( "reentrant write guard (round 6, item 2 / round 7, item 3)"
       , [ Alcotest.test_case

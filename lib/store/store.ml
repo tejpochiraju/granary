@@ -437,6 +437,20 @@ type row_hooks =
         [row_hook_id] alone through this index instead means a rename can
         never desynchronise a handle from the registry entry it names. *)
   ; mutable row_hook_next_id : int
+  ; mutable row_hook_lineage : int
+    (** #774: identity of the registry LINEAGE this record belongs to,
+        minted fresh for every new [row_hooks] record and copied verbatim by
+        {!row_hooks_carry_over}.  [Db.vacuum] rebuilds the database into a
+        brand-new [Store.t] and swaps it in under the handle, so the pre- and
+        post-VACUUM stores are different objects holding different [row_hooks]
+        records — but they are the SAME logical registry, because the carry-over
+        moves every entry across.  {!row_hook_effective_depth} needs exactly
+        that "same logical registry" test rather than the physical [==] on
+        [t]: a hook's deferred [Lwt.async] continuation, whose captured
+        {!row_hook_scope} still names the PRE-VACUUM store, must keep being
+        attributed against its own [rhs_depth] once it resumes and writes
+        through the post-VACUUM store, or [Db]'s [max_row_hook_depth] guard
+        silently restarts from zero for it.  See {!row_hook_effective_depth}. *)
   ; mutable row_hook_depth : int
     (** #752 (review round 4): nested row-hook-firing depth, shared by every
         [Db.t] over this store — same rationale as everything else on
@@ -601,6 +615,26 @@ let rv_carry_over_generations ~from ~to_ =
    rather than a caller re-deriving composite-key/insert-order logic against
    a raw [Hashtbl] — the "hardened primitive" the round-3 review asked for. *)
 let row_hooks t = t.row_hooks
+
+(* #774: source of {!row_hooks}' [row_hook_lineage] values.  A plain global
+   counter: the only property required of a lineage id is that two registries
+   compare equal iff {!row_hooks_carry_over} put them in the same lineage, and
+   a monotonically increasing counter gives that with no bookkeeping.  Never
+   reset — mirroring [rv_gen_next]'s (#757) reasoning one level up. *)
+let row_hook_lineage_next = ref 0
+
+(* The one place a [row_hooks] record is built, so a new field can never be
+   added to one construction site and forgotten at the other ([create] and
+   [make_btree_store] both call this). *)
+let fresh_row_hooks () =
+  incr row_hook_lineage_next;
+  { row_hook_tbl = Hashtbl.create 4
+  ; row_hook_index = Hashtbl.create 4
+  ; row_hook_next_id = 0
+  ; row_hook_lineage = !row_hook_lineage_next
+  ; row_hook_depth = 0
+  }
+;;
 
 (* Record [id]'s current key in the reverse index for every entry in [lst]. *)
 let index_entries (reg : row_hooks) key lst =
@@ -796,7 +830,26 @@ let row_hooks_carry_over ~from ~to_ =
     (fun id key -> Hashtbl.replace to_.row_hooks.row_hook_index id key)
     from.row_hooks.row_hook_index;
   if from.row_hooks.row_hook_next_id > to_.row_hooks.row_hook_next_id
-  then to_.row_hooks.row_hook_next_id <- from.row_hooks.row_hook_next_id
+  then to_.row_hooks.row_hook_next_id <- from.row_hooks.row_hook_next_id;
+  (* #774: the destination joins the source's registry lineage, so an
+     in-flight {!row_hook_scope} captured against [from] still resolves
+     against [to_] in {!row_hook_effective_depth}.  See that function and the
+     [row_hook_lineage] field's own doc comment.
+
+     [row_hook_depth] is deliberately NOT copied, which is the one field of
+     [row_hooks] this function leaves alone.  It counts hook invocations that
+     are CURRENTLY firing, and each one's matching {!row_hook_depth_decr} runs
+     under an [Lwt.finalize] closed over the [row_hooks] record it
+     incremented — [from]'s.  Copying a non-zero count
+     onto [to_] would therefore hand the new store a claim that nothing will
+     ever release, permanently shrinking [Db]'s [max_row_hook_depth] budget on
+     the post-VACUUM store.  Copying it is also not what #774 needed: the
+     deferred continuation that motivated the issue resumes AFTER its hook's
+     synchronous extent ended, i.e. after the decrement, so [from]'s counter
+     reads 0 at carry-over time and a copy would carry nothing.  The depth
+     that matters for that continuation is its scope's [rhs_depth], which is
+     what the lineage carried above lets {!row_hook_effective_depth} reach. *)
+  to_.row_hooks.row_hook_lineage <- from.row_hooks.row_hook_lineage
 ;;
 
 (* #752 (review round 4): see the [.mli] doc comment on [row_hooks]'s
@@ -1004,6 +1057,16 @@ let row_hook_ambient_undo_target (t : t) : ((unit -> unit) -> unit) option =
   | _ -> None
 ;;
 
+(* #774: [a] and [b] hold the same logical row-hook registry -- either
+   literally the same store, or two stores {!row_hooks_carry_over} has put in
+   one lineage (VACUUM's rebuild). See {!row_hook_effective_depth} just below,
+   its only caller, for why that is the right question there and the wrong one
+   for {!in_row_hook_for}. The physical test comes first: it answers the
+   overwhelmingly common no-VACUUM case without touching either registry. *)
+let same_row_hook_lineage (a : t) (b : t) =
+  a == b || a.row_hooks.row_hook_lineage = b.row_hooks.row_hook_lineage
+;;
+
 (* #752 (review round 8, item 2): the recursion depth to attribute a NEW row
    hook firing for [t] against, given [reg] (this store's [row_hooks]).
 
@@ -1027,10 +1090,32 @@ let row_hook_ambient_undo_target (t : t) : ((unit -> unit) -> unit) option =
    in-flight hook -- {!Db.create_worker_handle}, #589) does the store-wide
    counter serve as the fallback, which is what keeps recursion attributed
    correctly across sibling handles for a genuinely synchronous nested chain
-   (round 4). *)
+   (round 4).
+
+   #774: the scope is matched against [t] by registry LINEAGE, not by
+   physical store identity. [Db.vacuum] rebuilds the database into a brand-new
+   [Store.t], carries the row-hook registry across
+   ({!row_hooks_carry_over}) and swaps the new store in under the handle, so a
+   deferred continuation constructed inside a pre-VACUUM hook's extent holds a
+   scope naming a store object that is no longer the handle's. A plain [==]
+   test fails there and falls through to the store-wide counter on the FRESH
+   registry — which reads 0, restarting [Db]'s [max_row_hook_depth] budget for
+   a chain that had already nested arbitrarily deep, in exactly the case this
+   function exists to catch. Comparing lineages instead makes the carry-over,
+   rather than object identity, decide what "this store's registry" means; two
+   genuinely unrelated stores never share a lineage, since one is only ever
+   copied by {!row_hooks_carry_over}. The [==] fast path is kept ahead of it
+   purely to answer the overwhelmingly common no-VACUUM case without touching
+   the registries.
+
+   {!in_row_hook_for} and {!row_hook_ambient_undo_target} deliberately keep the
+   physical [==] test: they ask about the writer lock of one specific store
+   object (#740) and about a [Cat.t] captured for one specific statement, and
+   VACUUM genuinely replaces both — a pre-VACUUM answer would be wrong there,
+   where here it is the only right one. *)
 let row_hook_effective_depth (t : t) (reg : row_hooks) =
   match Lwt.get in_row_hook_key with
-  | Some scope when scope.rhs_store == t -> scope.rhs_depth
+  | Some scope when same_row_hook_lineage scope.rhs_store t -> scope.rhs_depth
   | _ -> reg.row_hook_depth
 ;;
 
@@ -1363,12 +1448,7 @@ let create () : t =
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
-  ; row_hooks =
-      { row_hook_tbl = Hashtbl.create 4
-      ; row_hook_index = Hashtbl.create 4
-      ; row_hook_next_id = 0
-      ; row_hook_depth = 0
-      }
+  ; row_hooks = fresh_row_hooks ()
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -1455,12 +1535,7 @@ let make_btree_store
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
-  ; row_hooks =
-      { row_hook_tbl = Hashtbl.create 4
-      ; row_hook_index = Hashtbl.create 4
-      ; row_hook_next_id = 0
-      ; row_hook_depth = 0
-      }
+  ; row_hooks = fresh_row_hooks ()
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None

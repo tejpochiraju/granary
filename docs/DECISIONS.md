@@ -4433,10 +4433,54 @@ fixed, per instruction): FK `ON DELETE`/`ON UPDATE` `CASCADE`/`SET NULL`/
 `cascade_delete_row_in_tx`/`cascade_update_col_in_tx` route through
 `delete_row_in_tx`/`update_col_in_tx` without ever building the
 `before_hook`/`after_hook` closures the direct DELETE/UPDATE paths construct —
-tracked as #773. Separately, `row_hooks_carry_over` does not copy
-`row_hook_depth` across a VACUUM store-swap, so `row_hook_effective_depth`'s
-store-wide-counter fallback silently resets to 0 for an `Lwt.async`-deferred
-continuation whose causal chain no longer matches the new store object,
-widening (not eliminating) `max_row_hook_depth`'s recursion ceiling across a
-VACUUM that happens to land mid-chain — tracked as #774.
+tracked as #773. Separately, `row_hooks_carry_over` did not carry a row hook's
+recursion depth across a VACUUM store-swap — filed as #774 and **fixed
+separately (below)**.
+
+**#774: a row hook's recursion depth now survives `Db.vacuum`'s store swap,
+and the issue's own suggested fix — copying `row_hook_depth` — was neither
+sufficient nor safe.** `Db.vacuum` rebuilds the database into a wholly new
+`Store.t`, carries the row-hook registry across with
+`Store.row_hooks_carry_over`, and swaps the new store in under the handle. A
+deferred `Lwt.async` continuation constructed inside a pre-VACUUM hook's
+extent therefore holds a `row_hook_scope` naming a store object that is no
+longer the handle's, and `row_hook_effective_depth`'s `scope.rhs_store == t`
+test failed, dropping to the store-wide counter on the *fresh* registry — 0 —
+so `Db`'s `max_row_hook_depth` guard restarted from scratch for a chain that
+had already nested arbitrarily deep. Copying `row_hook_depth` (#774's stated
+fix direction) does not close that: the deferred continuation resumes *after*
+its hook's synchronous extent, i.e. after `Lwt.finalize` has already
+decremented the counter, so the source counter reads 0 at carry-over time and
+a copy carries nothing — pinned as an explicit assertion in the regression
+test, so the point cannot be lost. Copying it is also unsafe in the one
+window where it *would* be non-zero: each increment's matching
+`row_hook_depth_decr` runs under an `Lwt.finalize` closed over the `row_hooks`
+record it incremented (the *old* one), so a copied non-zero count is a claim
+on the new store that nothing ever releases — permanently shrinking the
+post-VACUUM recursion budget instead of widening it. The fix is instead a
+registry **lineage** id (`row_hooks.row_hook_lineage`, minted per record from
+a global counter and copied verbatim by `row_hooks_carry_over`):
+`row_hook_effective_depth` matches an ambient scope against `t` by lineage,
+keeping the `==` fast path ahead of it for the overwhelmingly common
+no-VACUUM case. `in_row_hook_for` and `row_hook_ambient_undo_target`
+deliberately keep the physical `==` test — they ask about one specific store
+object's writer lock (#740) and one specific statement's `Cat.t`, both of
+which VACUUM genuinely replaces, so a pre-VACUUM answer would be wrong there
+where here it is the only right one. `row_hook_depth` is now the one field of
+`row_hooks` that carry-over deliberately leaves alone, and both `.mli` and
+implementation say why. Pinned by a Store-level test that reconstructs the
+swap deterministically (the same approach the round-5/7 "vacuum race window"
+tests take — no test in this codebase races real fibers against `Db.vacuum`'s
+internal timing).
+
+**#769 was already closed by round 7's append fix; verified and closed.** The
+round-7 one-line change (`now @ [ id, fn ]`) is correct for the issue's own
+four-step reproduction as well as the concurrent-registration shape the
+round-7 test pinned, and a second, end-to-end `Db`-level test now covers that
+reproduction directly (register A, register B on the same key, `BEGIN`,
+unregister A, `ROLLBACK`, INSERT — A fires first). The two shapes are
+complements: round 7's exercises the *merge* case, where the undo must place
+the restored entry past a registration made while it was detached; the new
+one has nothing concurrent at all, so it pins that the restored entry goes
+back *ahead* of an entry that was already there.
 
