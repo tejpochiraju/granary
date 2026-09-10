@@ -2244,6 +2244,16 @@
  (modules test_fk_cross_numeric_755)
  (libraries granary alcotest qcheck-core qcheck-alcotest lwt.unix))
 
+; #768: ALTER TABLE ... RENAME TO must be refused while a deferred FK
+; obligation still names the table on either side — the table-level twin of
+; #765 round 3's RENAME COLUMN / DROP COLUMN refusal. In-memory: catalog and
+; deferred-check-queue behaviour only.
+
+(test
+ (name test_fk_rename_table_768)
+ (modules test_fk_rename_table_768)
+ (libraries granary alcotest lwt.unix))
+
 ; #416: the RO tree-root memo must never serve a root from a different
 ; committed generation (commits, DDL, rollback, as-of/live alternation), and
 ; the Op_project fusion into a rowid point lookup must project exactly what

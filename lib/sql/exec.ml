@@ -9390,15 +9390,13 @@ let alter_rename_table ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) new_nam
     pre-existing and separately-filed gap this function does not attempt to
     close.
 
-    Residual NOT closed by this check, named explicitly rather than left
-    implicit: [ALTER TABLE ... RENAME TO] (renaming the WHOLE table) and
-    [DROP TABLE] can still desync a pending check by table name the same
-    way — [make_fk_recheck]'s [Cat.find_table_cached] returning [None]
-    reports "not violated", the same silent-wrong-answer shape the review's
-    RENAME COLUMN finding had for a column. Out of round 3's stated scope
-    (RENAME COLUMN / DROP COLUMN / ADD COLUMN); worth a future issue if it
-    proves reachable — filing it is simpler than a new mid-flight guard, and
-    matches how #767 was itself scoped out of this same PR. *)
+    The table-level half of the same class — [ALTER TABLE ... RENAME TO]
+    desyncing a pending check by TABLE name, which round 3 named as its own
+    open residual — was filed as #768 and is closed by this function's
+    sibling {!fk_obligation_table_conflict}, which the [RENAME TO] arm
+    consults exactly as the two column arms consult this one. [DROP TABLE]
+    is deliberately still not guarded; see that function's own comment for
+    why it is a different (and wider) question rather than the same bug. *)
 let fk_obligation_conflict (cat : Cat.t) ~table_name ~col_name : string option =
   let check_conflict (chk : Cat.pending_fk_check) =
     if chk.Cat.pfk_fk_ordinal < 0
@@ -9447,6 +9445,99 @@ let fk_obligation_conflict (cat : Cat.t) ~table_name ~col_name : string option =
   List.find_map check_conflict (Cat.peek_pending_fk_checks cat)
 ;;
 
+(** #768: the table-level sibling of {!fk_obligation_conflict}, and the same
+    structural argument one scope wider.
+
+    {!make_fk_recheck} identifies BOTH sides of a pending deferred FK
+    obligation by TABLE NAME — [child_name] and [parent_name] are plain
+    strings closed over at enqueue time — and at COMMIT resolves them with
+    [Cat.find_table_cached], treating [None] as "not violated".
+    [ALTER TABLE ... RENAME TO] rewrites a table's catalog name with nothing
+    keeping those captured strings in sync, so renaming either side of a
+    pending obligation mid-transaction made COMMIT silently accept a genuine
+    violation and leave a permanent orphan behind (#768's two repros: rename
+    the child, or rename the parent).
+
+    That is exactly the shape round 3 of #765 closed for [RENAME COLUMN] /
+    [DROP COLUMN], and it is closed the same way rather than on the recheck
+    side: the recheck only ever sees the schema AFTER the mutation, so
+    teaching it to chase one more mutation shape can never get ahead of the
+    next one. Refusing the mutation WHILE the obligation is live removes the
+    race instead of predicting its shape.
+
+    [table_name] is the ALTER's own target (the OLD name). Returns
+    [Some conflict_message] when some pending check's FK constraint —
+    resolved FRESH right now via {!Cat.peek_pending_fk_checks} and its
+    [pfk_fk_ordinal], exactly as {!make_fk_recheck} resolves it at COMMIT —
+    still names [table_name] as its CHILD table or as its PARENT table;
+    [None] when the table is free to rename.
+
+    Deliberately narrow, in two directions:
+
+    - Only [RENAME TO] calls this. The three column-level ALTER forms have
+      their own, finer check ({!fk_obligation_conflict}); an unrelated table
+      renamed inside the same transaction is not touched, because the check
+      is keyed on the tables the pending obligation actually names, not on
+      "any DDL in a transaction that has any pending check".
+    - [DROP TABLE] is deliberately NOT guarded, and that is a decision, not
+      an omission. Dropping the CHILD removes the referencing rows outright,
+      so "nothing left to enforce" is the honest answer and a refusal here
+      would be a pure over-refusal. Dropping the PARENT does leave a dangling
+      reference — but it leaves the identical dangling reference with NO
+      pending obligation and NO transaction at all (this engine does not
+      check a parent table's incoming references at [DROP TABLE] time), so
+      guarding only the pending-obligation case would make the transactional
+      path stricter than the autocommit one for the same end state. That is
+      a wider, pre-existing gap in [DROP TABLE] itself rather than an
+      identity-desync bug, and it is tracked separately as #776.
+
+    Conservative in one direction, deliberately: the pending queue only
+    grows until COMMIT drains it or ROLLBACK clears it
+    ([Cat.queue_pending_fk_check] / [Cat.drain_pending_fk_checks] /
+    [Cat.clear_pending_fk_checks]), so an obligation whose violation has
+    since been RESOLVED — the missing parent row inserted later in the same
+    transaction — is still in the queue and still refuses the rename. That
+    is an over-refusal, not a wrong answer, and pruning the queue on
+    resolution would mean running every recheck at every ALTER; the cheap,
+    correct escape is to rename after COMMIT. *)
+let fk_obligation_table_conflict (cat : Cat.t) ~table_name : string option =
+  let check_conflict (chk : Cat.pending_fk_check) =
+    if chk.Cat.pfk_fk_ordinal < 0
+    then
+      (* Same [List.nth_opt]-on-a-negative-index guard as
+         {!fk_obligation_conflict}: the [-1] sentinel means the constraint
+         could not be located at enqueue time, so this entry can never be
+         resolved either — treat it as "no conflict from this entry" rather
+         than raising [Invalid_argument] out of an unrelated ALTER. *)
+      None
+    else (
+      match Cat.find_table_cached cat ~name:chk.Cat.pfk_child_table with
+      | None -> None
+      | Some child_now ->
+        (match List.nth_opt child_now.Cat.fk_constraints chk.Cat.pfk_fk_ordinal with
+         | None -> None
+         | Some fk_now ->
+           if String.equal chk.Cat.pfk_child_table table_name
+           then
+             Some
+               (Printf.sprintf
+                  "table '%s' is the child side of a FOREIGN KEY referencing '%s' with a \
+                   deferred check still pending in this transaction"
+                  table_name
+                  fk_now.Cat.fk_parent_table)
+           else if String.equal fk_now.Cat.fk_parent_table table_name
+           then
+             Some
+               (Printf.sprintf
+                  "table '%s' is referenced by a FOREIGN KEY on '%s' with a deferred \
+                   check still pending in this transaction"
+                  table_name
+                  chk.Cat.pfk_child_table)
+           else None))
+  in
+  List.find_map check_conflict (Cat.peek_pending_fk_checks cat)
+;;
+
 (* #405: which user table names an ALTER makes stale for a name-keyed external
    read cache.  Every ALTER form this engine has changes the table's OBSERVABLE
    contents, so all four mark:
@@ -9486,23 +9577,40 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
       match action with
       | Ast.AA_add_column col_def -> alter_add_column ~txn:tx cat ~table_meta col_def
       | Ast.AA_rename_table new_name ->
-        let* n = alter_rename_table ~txn:tx cat ~table_meta new_name in
-        (* #752 (review round 3): this is the ONE place a table is ever
-           renamed — see the matching comment on the DROP TABLE path above
-           for why routing the row-hook migration through here (rather than
-           each caller of [execute]/[execute_with_count] remembering to call
-           it) closes the trigger-body and cross-handle gaps by construction.
-           Registers its own undo the same way [Cat.rename_table] already
-           does for the catalog row, so [with_ddl_txn] discards or replays it
-           in lockstep with the rest of this statement's schema-cache undo. *)
-        let undo =
-          S.row_hooks_migrate_table
-            (S.row_hooks store)
-            ~old_name:table_meta.Cat.name
-            ~new_name
-        in
-        Cat.register_schema_undo cat undo;
-        Lwt.return n
+        (* #768: refuse the rename outright while a deferred FK obligation
+           still names this table on either side -- the table-level twin of
+           the [RENAME COLUMN] / [DROP COLUMN] refusal below, and closed the
+           same structural way for the same reason (see
+           {!fk_obligation_table_conflict}). Checked BEFORE
+           [alter_rename_table] runs, so a refusal leaves the catalog, the
+           row-hook registry and the dirty-name marks all untouched. *)
+        (match fk_obligation_table_conflict cat ~table_name:table_meta.Cat.name with
+         | Some conflict ->
+           Lwt.fail_with
+             (Printf.sprintf
+                "cannot rename table %s to %s: %s"
+                table_meta.Cat.name
+                new_name
+                conflict)
+         | None ->
+           let* n = alter_rename_table ~txn:tx cat ~table_meta new_name in
+           (* #752 (review round 3): this is the ONE place a table is ever
+              renamed — see the matching comment on the DROP TABLE path above
+              for why routing the row-hook migration through here (rather than
+              each caller of [execute]/[execute_with_count] remembering to
+              call it) closes the trigger-body and cross-handle gaps by
+              construction. Registers its own undo the same way
+              [Cat.rename_table] already does for the catalog row, so
+              [with_ddl_txn] discards or replays it in lockstep with the rest
+              of this statement's schema-cache undo. *)
+           let undo =
+             S.row_hooks_migrate_table
+               (S.row_hooks store)
+               ~old_name:table_meta.Cat.name
+               ~new_name
+           in
+           Cat.register_schema_undo cat undo;
+           Lwt.return n)
       | Ast.AA_rename_column (old_col, new_col) ->
         (match
            fk_obligation_conflict cat ~table_name:table_meta.Cat.name ~col_name:old_col
