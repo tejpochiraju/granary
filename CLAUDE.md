@@ -573,6 +573,26 @@ things that were tried and rejected) is usually the point.
   (#746).** `Db.register_view_callback` returns a handle;
   `Db.unregister_view_callback` removes it. Callback order is now contractual
   (registration order) and mid-flush removal is a per-batch snapshot.
+- **A view-callback handle carries its own generation, and re-registering is
+  atomic (#766).** One deliberate breaking API change closing both identity
+  gaps #757's review left open. `Db.unregister_view_callback` answers
+  `` `Removed | `Not_registered | `Stale_generation of int | `Unknown_view of
+  string `` instead of a `bool` — all four defined up front, because widening a
+  closed variant later breaks every exhaustive match — and
+  `Db.register_view_callback` takes `?expected_generation:int`, attaching
+  nothing and reporting the live generation on a mismatch. That check is
+  genuinely atomic rather than merely narrower because the function is
+  synchronous: no Lwt bind between reading the registry and prepending to the
+  callback list, while CREATE/DROP REACTIVE VIEW go through the Lwt-bound
+  statement path — a future yield introduced there invalidates the argument.
+  `Db.view_callback_view` / `Db.view_callback_generation` remove the caller's
+  (handle, generation) side table. **It is not a cross-handle recreate
+  detector**: every signal is decided against *this* handle's registry, so a
+  sibling's drop-and-recreate stays invisible under the per-handle
+  DDL-visibility caveat (#589/#633/#634), and a test pins that absence. A
+  durable auto-resubscribing callback was rejected — a recreate can change the
+  view's definition, so reattaching silently would deliver `row_change` diffs
+  the caller never agreed to.
 - **The writer lock is measured per acquisition site, and every acquire/release
   must go through the measured door (#718).** `Store.lock_stats`; a bypassing
   site would corrupt the wait attribution, not just go unmeasured.

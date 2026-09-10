@@ -2575,6 +2575,153 @@ a flat 13 words per registration, i.e. exactly 2.00x. That is the gate in
 because the ceiling is backed by a measurement rather than predicted; verified
 by mutation, where restoring the `@` append reports slope 7.98 and fails.
 
+### A view callback's handle carries its own identity, and re-registering is atomic (#766)
+
+`Db.view_callback` now carries the view's **generation** as of registration
+(`vcb_generation`, copied from the registry entry's `rv_generation`), readable
+back through `Db.view_callback_view` and `Db.view_callback_generation`.
+`Db.unregister_view_callback` answers a closed four-way polymorphic variant in
+place of a `bool`, and `Db.register_view_callback` takes an optional
+`?expected_generation:int`. Both halves are one deliberate breaking change to a
+public API, shipped together on purpose: the consumer is a downstream project
+(camel), and two signature changes three months apart cost it more than one
+change now.
+
+**The gap this closes is identity, not liveness — #757's distinction, one level
+down.** #757 gave a *name* an incarnation number so a caller could tell
+`DROP REACTIVE VIEW v; CREATE REACTIVE VIEW v AS ...` from "nothing happened",
+because every liveness query keeps answering "`v` is live" straight through a
+recreate. What it left the caller holding was the bookkeeping: record the
+generation alongside the handle, compare it against a later
+`reactive_view_generation`, re-register if they differ. That side table is
+exactly where the races live, and #766's review found two of them.
+
+**Item 3: `unregister_view_callback` conflated four situations into one
+`false`.** A handle registered against the OLD incarnation looked the new entry
+up by name, failed to find its id in the new (empty) callback list, and answered
+`false` — indistinguishable from the ordinary "I already unregistered this".
+The four outcomes now, chosen because a caller's next action genuinely differs
+in each:
+
+| outcome | means | next action |
+|---|---|---|
+| `` `Removed `` | still attached to the live incarnation, now detached | nothing |
+| `` `Not_registered `` | the view is live *at this handle's generation*, but the handle is not in its list | nothing — and the caller's model of which incarnation is live was right |
+| `` `Stale_generation g `` | the name is live at a DIFFERENT incarnation; `g` is the live one | re-register with `~expected_generation:g` |
+| `` `Unknown_view v `` | `v` is not a live reactive view in this handle's registry at all | give up, or wait for a create |
+
+**The generation comparison runs FIRST, and that costs no removal.** A stale
+handle's id can never appear in the new incarnation's callback list anyway —
+ids come from one process-global counter and each is attached to exactly one
+entry — so ordering the check ahead of the `List.filter` turns an
+indistinguishable `false` into a signal without ever declining to remove
+something that was there. The handle-from-a-different-`Db.t` case therefore
+reports `` `Not_registered ``, not `` `Stale_generation ``: two stores each mint
+their first view generation 1, so the generations agree and only the id
+misses.
+
+**All four are defined up front, and that is the decision rather than an
+accident of what was needed.** Adding a case to a closed polymorphic variant
+later breaks every exhaustive match a consumer wrote — the same argument
+`register_view_callback`'s own doc comment already makes against widening the
+module-wide `error` type. `` `Unknown_view of string `` reuses
+`register_view_callback`'s spelling so a caller can share one match arm across
+the two functions.
+
+**Item 4: the documented re-registration pattern had a TOCTOU window, and
+`?expected_generation` closes it — structurally, not statistically.** Nothing
+stopped a SECOND drop-and-recreate landing between a caller's generation
+comparison and its re-registration call, so the re-registration could itself
+attach to an incarnation that was already stale by the time it returned, with
+no way to notice. Supplied and mismatched, the argument now attaches **nothing**
+and reports `Error (`Stale_generation live)`.
+
+The reason that is a fix and not a fig leaf is worth stating explicitly,
+because an optional argument that merely narrows a window would look identical
+at the call site: **`register_view_callback` is synchronous.** There is no
+`let*`, no `Lwt` bind, and no other yield point between reading
+`top.reactive_views` and assigning `e.rv_callbacks`, while both
+`CREATE REACTIVE VIEW` and `DROP REACTIVE VIEW` go through the Lwt-bound
+statement path. Under the cooperative scheduler a fiber runs to its next yield,
+so nothing can interleave between the check and the attach. That property is
+recorded in the `.mli` next to the argument rather than only in a commit
+message, because a future change that introduces a yield into this path
+invalidates the argument and must redo the check under whatever exclusion the
+new path needs. It is also why there is no test of the interleaving: there is
+no interleaving to construct. What the test suite pins instead is the
+observable consequence — a mismatch attaches nothing *at all*, rather than
+attaching and reporting the mismatch afterwards, which is the failure mode an
+error-code-only assertion would have missed.
+
+**Precedence: `` `Unknown_view `` beats `` `Stale_generation ``.** An expected
+generation supplied for a name that is not live reports `` `Unknown_view ``.
+`` `Stale_generation `` means "live, but a different incarnation" and would be
+actively misleading here — there is no incarnation for the caller to retry
+against.
+
+**The limit, stated plainly, because it matters to the consumer more than the
+feature does.** Every one of these signals is decided against **this handle's**
+registry. A SIBLING handle's drop-and-recreate is not visible there, under the
+per-handle DDL-visibility caveat `create_worker_handle` already documents for
+tables, views and triggers (#589/#633/#634). So `` `Stale_generation `` detects
+a recreate *this handle knows about*, and is **not** a cross-handle recreate
+detector: after a sibling recreates the view, this handle still believes its own
+entry is current and `unregister_view_callback` answers `` `Removed ``.
+Observing a sibling's recreate still requires re-deriving this handle's view of
+the store — a fresh `create_worker_handle`, or reopening. That is pinned by
+`a_siblings_recreate_is_not_visible_as_stale`, which asserts the *absence* of
+the signal, so the doc comment's promise cannot quietly become untrue in either
+direction.
+
+**Rejected: a durable subscription that auto-survives a drop-and-recreate.** It
+would remove the caller's bookkeeping entirely, which is the strongest argument
+for it. It was rejected because a recreate can change the view's DEFINITION, and
+therefore the shape of the `row_change` diffs a callback receives — silently
+reattaching would deliver deltas the caller never agreed to, which is worse than
+making it re-register, and worse in a way that is hard to notice. The explicit
+re-register loop stays; `?expected_generation` is what makes each step of it
+exact. In its place the race-free recipe is written into
+`register_view_callback`'s doc comment as a copyable sequence, and transcribed
+verbatim into `recipe_reattaches_across_a_drop_and_recreate` so the two cannot
+drift apart without a test noticing.
+
+The recipe is "detach the old, attach the new, always against a *named*
+generation": unregister; on `` `Removed ``/`` `Not_registered `` re-attach at
+the handle's own generation (both outcomes prove the view is live at it); on
+`` `Stale_generation g `` re-attach at `g`; and if *that* reports a newer
+generation, retry against the one it named. **It terminates in practice**
+because generations for one name in one store are strictly increasing (#757),
+so every iteration chases a strictly newer incarnation and can never revisit
+one — the loop can only spin for as long as something keeps recreating the
+view, which is a live-lock the application controls rather than a cycle in the
+API.
+
+**The #746 mid-flush snapshot rule is untouched by all of this**, and is
+re-pinned against the new surface rather than assumed: `unregister` still
+builds a new list with `List.filter`, so an in-flight notification keeps
+iterating the old one; a callback that removes itself still completes the
+invocation it is in and reports `` `Removed ``; a registration made from inside
+a firing callback — with `~expected_generation` or without — still starts firing
+from the next batch.
+
+`pp_view_callback` renders `view#id@generation` now. It has no caller in `lib/`
+outside its own module and exists for merlint's abstract-`type t`-needs-a-`pp`
+rule (`docs/DEAD_CODE.md` exempts `pp` from dead-code triage), but a log line
+naming only `view#id` could not say which incarnation a handle belonged to,
+which is the very distinction this issue is about; `pp_renders_the_generation`
+gives it a consumer.
+
+Pinned by `test/test_view_callback_identity_766.ml` (all four unregister arms
+hit deliberately; `?expected_generation` matching, mismatching, and omitted;
+the `` `Unknown_view ``-beats-`` `Stale_generation `` precedence; the handle
+accessors; both mid-flush directions; the recipe across a real
+drop-and-recreate and its give-up arm; and the sibling-handle limit), plus the
+updated `test_view_callback_746.ml`, whose `GRANARY_MEM_MAX_CALLBACK_SLOPE`
+allocation gate is unaffected: `vcb_generation` adds one word to a record
+allocated once per registration, where the gate measures the *slope* of total
+allocation against `n`, and a constant per-registration cost moves neither the
+2.00x linear figure nor the 4.00x quadratic one it discriminates against.
+
 ### The writer lock is measured, and every acquisition goes through one door (#718)
 
 `Store.lock_stats` reports the writer lock's wait and hold time per acquisition
