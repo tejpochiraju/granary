@@ -1878,6 +1878,56 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
          S.row_hook_depth_decr reg;
          Lwt.return_unit))
 
+(** #773/#775: resolve the OCaml row hooks for an arbitrary (table, timing,
+    event) at the moment a write happens, for the write paths that cannot be
+    handed a {!make_combined_hook} up front — an FK cascade's child tables
+    (discovered a level at a time as the fan-out runs) and [PRAGMA
+    not_null_repair]'s per-table victim deletes.  Installed around every
+    [Sql.Exec] call this module makes, via [Sql.Exec.with_row_hooks].
+
+    {b OCaml hooks only, deliberately — no SQL triggers.}  {!make_combined_hook}
+    layers OCaml hooks over {!make_trigger_hook}; this does not, so a cascaded
+    child write fires [Db.register_row_hook] callbacks and does NOT fire a SQL
+    [CREATE TRIGGER] body on the child table.  That is SQLite's own default
+    (FK actions fire triggers only under [PRAGMA recursive_triggers], which is
+    off by default), it is the pre-#773 behaviour for triggers, and widening it
+    would be a separate, larger behaviour change with its own recursion story —
+    #773 is about the veto guarantee [register_row_hook]'s doc comment makes,
+    which SQL triggers never made.
+
+    Every guard {!fire_ocaml_row_hook} installs applies unchanged, because this
+    goes through it: [max_row_hook_depth] (via
+    [Store.row_hook_effective_depth], so a cascade-fired hook that defers work
+    with [Lwt.async] is still bounded — #752 round 8), the reentrancy scope
+    that turns a hook's own fresh-transaction nested DML into a clean error
+    rather than a writer-lock deadlock (#740/#752 round 6-7), and the ambient
+    undo target a registry mutation made from inside the hook lands on (#752
+    round 9). *)
+and make_row_hook_lookup t : Sql.Exec.row_hook_lookup =
+  fun ~table ~timing ~event ->
+  let reg = S.row_hooks t.store in
+  (* Mirrors {!make_combined_hook}'s own fast path: a store with no row hooks
+     registered anywhere pays one length check per cascaded row. *)
+  if S.row_hooks_is_empty reg
+  then None
+  else (
+    match S.row_hook_fire_list reg ~table ~timing ~event with
+    | [] -> None
+    | hooks ->
+      Some
+        (fun ~tx:_ ~new_row ~old_row ->
+          (* [~tx] is unused: an OCaml row hook receives the {!row_mutation}
+             record, never the transaction — its own nested DML goes back
+             through [Db.execute] and joins the ambient explicit transaction
+             (or is refused, per the reentrancy guard).  The parameter is kept
+             so this closure has the identical shape to the [before_hook]/
+             [after_hook] the direct write path threads, which is what lets a
+             future SQL-trigger-on-cascade decision reuse it unchanged. *)
+          let mutation = { table; new_row; old_row } in
+          Lwt_list.iter_s
+            (fun entry -> fire_ocaml_row_hook t ~timing ~table_name:table entry mutation)
+            hooks))
+
 and make_combined_hook t table_meta ~timing ~event =
   let sql_hook = make_trigger_hook t table_meta ~timing ~event in
   let reg = S.row_hooks t.store in
@@ -2029,18 +2079,21 @@ and run_trigger_op t ~tx b =
       insert_replace_upsert_hooks t op
     | _ -> None, None, None, None
   in
-  Sql.Exec.execute
-    ~before_hook
-    ~after_hook
-    ~on_replace_delete_before
-    ~on_replace_delete
-    ~on_upsert_update_before
-    ~on_upsert_update
-    ~mode
-    ~clock:t.clock
-    t.store
-    t.catalog
-    op
+  (* #773/#775: nested trigger-body DML cascades and repairs like any other
+     statement, so it gets the same row-hook lookup installed. *)
+  Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+    Sql.Exec.execute
+      ~before_hook
+      ~after_hook
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~on_upsert_update_before
+      ~on_upsert_update
+      ~mode
+      ~clock:t.clock
+      t.store
+      t.catalog
+      op)
 ;;
 
 (** Extract column names from a view query's projection, in order.
@@ -2757,18 +2810,23 @@ let run_dml t op ~on_ok =
     dml_hooks t op
   in
   match
-    Sql.Exec.execute_with_count
-      ~mode
-      ~clock:t.clock
-      ~before_hook
-      ~after_hook
-      ~on_replace_delete_before
-      ~on_replace_delete
-      ~on_upsert_update_before
-      ~on_upsert_update
-      t.store
-      t.catalog
-      op
+    (* #773/#775: the row-hook lookup the FK-cascade and [PRAGMA
+       not_null_repair] write paths resolve child-table hooks through.
+       [Lwt.with_value] is entered synchronously, so a plan that raises during
+       construction still lands in the [exception Failure] arm below. *)
+    Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+      Sql.Exec.execute_with_count
+        ~mode
+        ~clock:t.clock
+        ~before_hook
+        ~after_hook
+        ~on_replace_delete_before
+        ~on_replace_delete
+        ~on_upsert_update_before
+        ~on_upsert_update
+        t.store
+        t.catalog
+        op)
   with
   | exception Failure msg ->
     (* Discard any pending deferred FK checks queued by the failed
@@ -3152,7 +3210,15 @@ let query_impl ?stats ?mode ?on top sql =
        exceptions still propagate unchanged. *)
     Lwt.catch
       (fun () ->
-         let* stream = Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op in
+         (* #775: [PRAGMA not_null_repair] is reachable from the QUERY path too
+            (#588 gave it both entry points), and its deletes happen eagerly
+            while the stream is being constructed — inside this extent, not
+            when the caller drains it — so installing the lookup here is what
+            makes a [`Before `Delete] veto bind on that spelling as well. *)
+         let* stream =
+           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+             Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op)
+         in
          Lwt.return (Ok stream))
       (function
         | Failure msg -> Lwt.return (Error (Runtime msg))
@@ -3440,19 +3506,22 @@ let run_core st ~params =
     Lwt.catch
       (fun () ->
          let* n =
-           Sql.Exec.execute_with_count
-             ~mode
-             ~clock:t.clock
-             ~params:params_arr
-             ~before_hook
-             ~after_hook
-             ~on_replace_delete_before
-             ~on_replace_delete
-             ~on_upsert_update_before
-             ~on_upsert_update
-             t.store
-             t.catalog
-             st.plan
+           (* #773/#775: as in {!run_dml} — a prepared write cascades and
+              repairs identically. *)
+           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+             Sql.Exec.execute_with_count
+               ~mode
+               ~clock:t.clock
+               ~params:params_arr
+               ~before_hook
+               ~after_hook
+               ~on_replace_delete_before
+               ~on_replace_delete
+               ~on_upsert_update_before
+               ~on_upsert_update
+               t.store
+               t.catalog
+               st.plan)
          in
          t.last_changes <- n;
          t.total_changes <- t.total_changes + n;
@@ -3517,14 +3586,17 @@ let iter_impl ?stats st ~params =
     Lwt.catch
       (fun () ->
          let* stream =
-           Sql.Exec.query
-             ~mode
-             ~clock:t.clock
-             ~params:params_arr
-             ?stats
-             t.store
-             t.catalog
-             st.plan
+           (* #775: as in {!query_impl} — a prepared [PRAGMA not_null_repair]
+              writes during stream construction. *)
+           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+             Sql.Exec.query
+               ~mode
+               ~clock:t.clock
+               ~params:params_arr
+               ?stats
+               t.store
+               t.catalog
+               st.plan)
          in
          Lwt.return (Ok stream))
       (function
