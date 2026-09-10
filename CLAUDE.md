@@ -557,6 +557,19 @@ things that were tried and rejected) is usually the point.
   contents — `DROP TABLE` and every `ALTER TABLE` form (#405).** DDL that
   doesn't change existing rows (`CREATE TABLE`/`INDEX`, `VACUUM`, ...) is
   deliberately not marked.
+- **A backend that cannot issue a write barrier refuses the durability level it
+  cannot honour (#772).** `Mirage_backend.sync` was `Lwt.return (Ok ())` —
+  `Mirage_block.S` has no flush operation at all, so under the default
+  `synchronous = full` every commit was acked durable while the data sat in the
+  host page cache. It now returns `Error`, and `Store.open_block{,_wal}` /
+  `Db.open_block` take a `?barrier` (`` `Available `` by default) that makes
+  `full` **and `batched`** a refusal at open — `batched` too, because it
+  promises a deferred barrier rather than none. `Off` is the only truthful level
+  and is therefore the escape hatch, deliberately instead of a boolean opt-in
+  that would let `full` keep lying. `Mirage_backend.connect`'s `?barrier` is the
+  seam a flush-aware Solo5 or `mirage-block-unix` backend fills; the upstream
+  Solo5 hypercall work is out of scope. Behaviour break for `mirage/`, which now
+  opts in explicitly. `Unix_file` is unaffected.
 - **A failing autocheckpoint is recorded and surfaced, never raised to the
   triggering commit's caller (#638).** `Store_event.Checkpoint_failed`,
   `Store.checkpoint_health`, and `PRAGMA checkpoint_status`.

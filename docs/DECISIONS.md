@@ -4196,3 +4196,108 @@ continuation whose causal chain no longer matches the new store object,
 widening (not eliminating) `max_row_hook_depth`'s recursion ceiling across a
 VACUUM that happens to land mid-chain — tracked as #774.
 
+
+- **A backend that cannot issue a write barrier refuses the durability level it
+  cannot honour, rather than acking commits as durable (#772, decided
+  2026-09-10).** `lib/block/mirage_backend.ml:70` was
+  `let sync _t () = Lwt.return (Ok ())`. That is not a local slip that can be
+  fixed inside the adapter: `Mirage_block.S` has exactly four operations —
+  `get_info`, `read`, `write`, `disconnect` — and no flush or barrier of any
+  kind, so there is genuinely nothing for `sync` to call. Stock Solo5 exposes no
+  block-flush hypercall either, and the `hvt` tender's `pwrite` lands in the
+  host's page cache. But an adapter that cannot provide a barrier should say so,
+  not return `Ok`: under `PRAGMA synchronous = full` — the default, and the mode
+  the README documents as "no loss" on an OS or power crash — every commit was
+  acked durable while the data was still volatile, and crash recovery had
+  nothing to recover to. The `mirage/` sample unikernel (#403), and the aarch64
+  audit that cross-built it (#402), were therefore both measuring a
+  configuration that does not survive power loss.
+
+  **The contract chosen, and the two alternatives rejected.**
+
+  - `Mirage_backend.connect` gains `?barrier:(unit -> (unit, string) result
+    Lwt.t)` — the issue's option 2, "carry the barrier through this library's
+    own signature". Supplied, it *is* `sync` and
+    `Mirage_backend.durability_barrier` reports `` `Available ``; omitted,
+    `sync` returns `Error Mirage_backend.no_barrier_reason` and the adapter
+    reports `` `Unavailable `` with the same string. `Mirage_block.S` never
+    changes, and a `mirage-block-unix` deployment (an `fsync`) or a flush-aware
+    Solo5 build (a hypercall stub) fills the seam without touching this
+    repository. The upstream Solo5 work the issue describes — the `hvt`
+    `HVT_ABI_VERSION` 2→3 bump and the `spt` `fdatasync` — is deliberately
+    **out of scope**; this is the hole it would plug into.
+  - `Store.open_block` and `Store.open_block_wal` gain `?barrier:barrier` and
+    `?durability:durability`. `barrier` is a *structural* polymorphic variant
+    (`[ `Available | `Unavailable of string ]`) rather than a nominal type
+    precisely so `granary.mirage_block` can produce the value without acquiring
+    a dependency on `granary.store`; the adapter's `durability_barrier` result
+    is passed straight through with no conversion. The check runs before any
+    device operation, alongside the #266 `as_of_history` guard, so a refused
+    open leaks no fd.
+  - **`Off` is the only truthful level with no barrier, and it is the escape
+    hatch.** `Full` promises an fsync per group-commit; `Batched` promises one
+    per batch plus one at every checkpoint and at `close`. Neither promise can
+    be kept, so **both** are refused by name — refusing `Batched` too is the
+    part that is easy to get wrong, and the reason is that `Batched` is a
+    *deferred* barrier, not the absence of one. `Off` already means "commits are
+    not made durable on commit", which is exactly the state of affairs, so
+    selecting it is choosing the accurate description rather than waiving a
+    check. That is also why the escape hatch is **not** a boolean opt-in such as
+    `~allow_unsafe_durability:true`: a flag like that would let `Full` keep
+    lying — `PRAGMA synchronous` would go on reporting `full` while nothing was
+    durable, which is the original bug wearing a permission slip. And it cannot
+    be hit by accident: the default is `Full`, `Full` is refused, and the only
+    way through is to type the word `Off`.
+  - The refusal outlives the open, because the level can be re-requested later:
+    `Store.set_durability` raises `Failure` for `Full`/`Batched`;
+    `PRAGMA synchronous = full|batched` raises with its own wording naming the
+    PRAGMA (the SQL-facing half, mirroring the pre-existing
+    `commit_callback_active` guard beside it); and `Store.set_commit_callback`
+    refuses a *registration*, because registering a replication sink pins `Full`
+    (#298/#336) and that pin would re-establish the false claim behind the
+    caller's back. Unregistering (`None`) is always allowed.
+
+  **The one place the store still passes `Ok ()`, and why it is not the same
+  lie.** With no barrier the store also must not *call* `sync`. The main-DB
+  `sync` callback is reached unconditionally by `Pager.flush_sync_main` at every
+  checkpoint and by `Pager.flush` on the non-WAL commit path, and the adapter is
+  now required to return `Error` — so letting that `Error` through would leave
+  `Off` unable to check point or commit at all, turning the escape hatch into a
+  different bug rather than a fix for this one. `Store.resolve_barrier`
+  therefore substitutes a no-op `sync` in exactly the `` `Unavailable ``-plus-
+  `Off` case. That is not the `Ok ()` this issue objects to: the original one
+  survived to a caller who had been promised `Full`, whereas this one runs only
+  after every mode that promises anything has been refused, so there is no
+  outstanding durability claim for it to falsify. `Store.barrier` keeps the
+  capability readable so nothing is hidden, and `PRAGMA synchronous` keeps
+  reporting `off`.
+
+  **Behaviour break.** `mirage/unikernel.ml` opened in WAL mode over a
+  `Mirage_block` device with the default `full`; it would now be refused, so it
+  opts in explicitly with `~durability:Store.Off` and logs a warning naming the
+  missing capability. Any downstream unikernel doing the same must either pass a
+  `~barrier` or lower its level. Camel's M11 plan (camel #335, #316) — a
+  block-backed runtime on solo5 `hvt`/`spt`, on an unattended edge appliance
+  with no BBU — is exactly the shape this protects.
+
+  **`Unix_file` is untouched.** It has a real `fsync`, so it reports
+  `` `Available `` by default and every durability level behaves exactly as
+  before. `test_mirage_sync_durability_772.ml`'s `unix_file` case pins that.
+
+  **Measurement note.** The issue records, from
+  `experiments/sqlite-mirage-experiments` at `b3587d7`, that a real barrier
+  costs about 1.5x on `spt` (72.6 → 48.0 commits/sec) and nothing measurable on
+  `hvt` (13.8 → 14.4, where a VM exit per 512-byte block already dominates).
+  Durability there is cheap; having none of it was the expensive outcome. The
+  amd64 baseline and aarch64 audit numbers in `mirage/README.md` are annotated
+  rather than deleted — they were taken against a non-durable configuration and
+  are not comparable to anything durable.
+
+  Pinned by `test/test_mirage_sync_durability_772.ml` (adapter refusal, the
+  supplied-barrier seam in both directions, the open-time refusal of `Full` and
+  `Batched` and of the default path, `Off` opening *and working*, the
+  after-open refusals, and `Unix_file` unchanged) and by
+  `test/test_mirage_unikernel_smoke.ml`, which now runs the wiring in both
+  shapes: the unikernel's own barrier-less `Off` (asserting zero commit fsyncs,
+  where it used to assert two that never reached the device) and a
+  platform-`fsync` `full` that still pins the exact commit-fsync count.
