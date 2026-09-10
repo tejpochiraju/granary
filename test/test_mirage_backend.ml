@@ -88,7 +88,12 @@ let test_resize_beyond_capacity () =
           MB.close adapter))
 ;;
 
-let test_sync_always_ok () =
+(* #772: this test used to be [test_sync_always_ok], asserting [Ok ()].  That
+   [Ok] was the bug: [Mirage_block.S] has no flush operation, so the adapter had
+   nothing to call and reported success anyway, which made every commit look
+   durable under the default [synchronous = full] while the bytes were still in
+   the host page cache.  With no [~barrier] the adapter now refuses. *)
+let test_sync_refuses_without_barrier () =
   let path = tmp_file () in
   Fun.protect
     ~finally:(fun () -> Unix.unlink path)
@@ -97,7 +102,39 @@ let test_sync_always_ok () =
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
           let* adapter = MB.connect dev in
           let* sr = MB.sync adapter () in
+          Alcotest.(check (result unit string))
+            "sync reports the missing barrier instead of success"
+            (Error Granary_mirage_block.Mirage_backend.no_barrier_reason)
+            sr;
+          MB.close adapter))
+;;
+
+(* #772: the seam.  A platform that CAN flush supplies it here, and then the
+   adapter reports a barrier and [sync] is that function. *)
+let test_sync_uses_supplied_barrier () =
+  let path = tmp_file () in
+  Fun.protect
+    ~finally:(fun () -> Unix.unlink path)
+    (fun () ->
+       Lwt_main.run
+         (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+          let calls = ref 0 in
+          let* adapter =
+            MB.connect
+              ~barrier:(fun () ->
+                incr calls;
+                Lwt.return (Ok ()))
+              dev
+          in
+          Alcotest.(check bool)
+            "a supplied barrier is reported available"
+            true
+            (match MB.durability_barrier adapter with
+             | `Available -> true
+             | `Unavailable _ -> false);
+          let* sr = MB.sync adapter () in
           Alcotest.(check (result unit string)) "sync ok" (Ok ()) sr;
+          Alcotest.(check int) "the supplied barrier ran" 1 !calls;
           MB.close adapter))
 ;;
 
@@ -111,7 +148,10 @@ let () =
         ; test_case "out_of_capacity" `Quick test_out_of_capacity
         ; test_case "resize_within_capacity" `Quick test_resize_within_capacity
         ; test_case "resize_beyond_capacity" `Quick test_resize_beyond_capacity
-        ; test_case "sync_always_ok" `Quick test_sync_always_ok
+        ; test_case "sync_refuses_without_barrier" `Quick
+            test_sync_refuses_without_barrier
+        ; test_case "sync_uses_supplied_barrier" `Quick
+            test_sync_uses_supplied_barrier
         ] )
     ]
 ;;

@@ -426,6 +426,48 @@ val row_hook_ambient_undo_target : t -> ((unit -> unit) -> unit) option
 
 (** Errors from the persistent (B+-tree) backend.  The in-memory backend
     never returns errors. *)
+(** #772: whether the backing device can make a write durable.
+
+    [Mirage_block.S] has exactly four operations — [get_info], [read], [write],
+    [disconnect] — and no flush or barrier, so an adapter over it reports
+    [`Unavailable] carrying a reason that names the backend and the missing
+    capability.  {!open_block} and {!open_block_wal} then refuse every
+    durability level that would promise a barrier they cannot issue, instead of
+    acking commits as durable while the bytes sit in a volatile cache.
+
+    A structural polymorphic variant rather than a nominal type on purpose:
+    [granary.mirage_block] produces this value (see
+    [Granary_mirage_block.Mirage_backend.Make.durability_barrier]) without
+    depending on [granary.store]. *)
+type barrier =
+  [ `Available
+  | `Unavailable of string
+  ]
+
+(** #298: per-deployment durability mode (analogue of SQLite [synchronous]).
+    [Full] fsyncs the WAL on every group-commit before acking (the default,
+    unchanged behaviour).  [Batched] acks immediately and defers the fsync
+    until [commits] un-synced commits accumulate OR [interval_ms] have elapsed
+    since the last sync (whichever first; the time bound needs a clock — see
+    {!set_clock} — otherwise only the commit count triggers).  [Off] never
+    fsyncs on commit.  Checkpoint and {!close} are always full-sync anchors,
+    so [Batched]/[Off] data is made durable there.  The setting is
+    DATABASE-WIDE (the commit queue is shared across connections), not
+    per-connection.  No-op on the in-memory backend.
+
+    {b Crash safety:} an app-process crash is safe in every mode — unsynced
+    WAL frames live in the OS page cache, which survives process death, and
+    recovery replays them.  An OS or power crash with [Batched]/[Off] loses
+    acked commits in the un-synced window; recovery converges to a prefix of
+    acked commits (never torn state), but those commits may be gone. *)
+type durability =
+  | Full
+  | Batched of
+      { commits : int
+      ; interval_ms : int
+      }
+  | Off
+
 type error =
   | Block_error of string
   | Corruption of string
@@ -442,6 +484,11 @@ type error =
   | History_unavailable (** as-of API used on a store opened without the feature *)
   | History_pruned (** as-of target is older than the retained floor *)
   | History_misconfigured (** [as_of_history:true] but no history sink supplied *)
+  | Durability_unavailable of string
+  (** (#772) the requested durability level needs a write barrier the backend
+      cannot issue.  Carries the whole refusal text — the level asked for, the
+      backend's own reason, and the way out — so {!pp_error} prints it
+      verbatim. *)
 
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
@@ -473,6 +520,20 @@ val create : unit -> t
     supplied for a plaintext DB) or [Encryption_rng_unseeded] (a key was given
     but the RNG was never seeded).
 
+    (#772) [barrier] declares whether the backing device can make a write
+    durable; it defaults to [`Available], so every existing caller (and every
+    real file backend, which has [fsync]) is unchanged.  When it is
+    [`Unavailable], the only durability level that can be honoured is [Off], and
+    any other — including the [Full] default — is refused with
+    [Durability_unavailable] before a single device operation is issued.  The
+    escape hatch is therefore the honest [~durability:Off], not a flag that
+    would let [Full] keep lying; see {!barrier}.
+
+    (#772) [durability] sets the durability level at open (default [Full]),
+    ahead of the [barrier] check.  Equivalent to a {!set_durability} straight
+    after the open, except that this is the only spelling the [barrier] check
+    can consult.
+
     (#266) When [as_of_history] is [true], a [history] sink MUST be supplied
     (else [History_misconfigured]); each commit is recorded for as-of reads.
     [now] supplies the wall-clock (ms since epoch) stamped onto each record.
@@ -483,6 +544,8 @@ val open_block
   -> ?now:(unit -> int64)
   -> ?key:string
   -> ?geom:Granary_storage.Geometry.t
+  -> ?barrier:barrier
+  -> ?durability:durability
   -> init_if_corrupt:bool
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -507,13 +570,19 @@ val open_block
     (#266) When [as_of_history] is [true], a [history] sink MUST be supplied
     (else [History_misconfigured]); each commit is recorded for as-of reads.
     [now] supplies the wall-clock (ms since epoch) stamped onto each record.
-    Default [false] — feature off, zero overhead. *)
+    Default [false] — feature off, zero overhead.
+
+    [barrier] and [durability] (#772) behave exactly as in {!open_block}: with
+    [`Unavailable] every level but [Off] is refused up front, because a WAL
+    group-commit's whole durability claim rests on the barrier. *)
 val open_block_wal
   :  ?as_of_history:bool
   -> ?history:History.sink
   -> ?now:(unit -> int64)
   -> ?key:string
   -> ?geom:Granary_storage.Geometry.t
+  -> ?barrier:barrier
+  -> ?durability:durability
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
@@ -911,29 +980,18 @@ val wal_replay_check : t -> wal_replay_check
     who has acknowledged the condition.  No-op on the in-memory backend. *)
 val clear_checkpoint_error : t -> unit
 
-(** #298: per-deployment durability mode (analogue of SQLite [synchronous]).
-    [Full] fsyncs the WAL on every group-commit before acking (the default,
-    unchanged behaviour).  [Batched] acks immediately and defers the fsync
-    until [commits] un-synced commits accumulate OR [interval_ms] have elapsed
-    since the last sync (whichever first; the time bound needs a clock — see
-    {!set_clock} — otherwise only the commit count triggers).  [Off] never
-    fsyncs on commit.  Checkpoint and {!close} are always full-sync anchors,
-    so [Batched]/[Off] data is made durable there.  The setting is
-    DATABASE-WIDE (the commit queue is shared across connections), not
-    per-connection.  No-op on the in-memory backend.
+(** The durability mode type is declared earlier in this interface (just after
+    {!barrier}) because {!open_block} takes it; see there for the full
+    contract. *)
 
-    {b Crash safety:} an app-process crash is safe in every mode — unsynced
-    WAL frames live in the OS page cache, which survives process death, and
-    recovery replays them.  An OS or power crash with [Batched]/[Off] loses
-    acked commits in the un-synced window; recovery converges to a prefix of
-    acked commits (never torn state), but those commits may be gone. *)
-type durability =
-  | Full
-  | Batched of
-      { commits : int
-      ; interval_ms : int
-      }
-  | Off
+
+(** (#772) The backing device's durability capability, as declared at open.
+    [`Available] on the in-memory backend and on every file backend.  When
+    [`Unavailable], the store is pinned to [Off] — {!open_block} refused
+    anything else and {!set_durability} keeps refusing — and no barrier is
+    issued at commit, checkpoint or {!close}, because there is none to issue and
+    no durability claim outstanding for one to satisfy. *)
+val barrier : t -> barrier
 
 (** Current durability mode. Returns [Full] on the in-memory backend. *)
 val durability : t -> durability
@@ -955,7 +1013,14 @@ val durability : t -> durability
     request: an embedder driving the store directly opts into the "configure
     now, apply on sink removal" ergonomics, whereas an interactive SQL user
     expects an explicit error.  Use {!commit_callback_active} to check before
-    calling if you need a signal. *)
+    calling if you need a signal.
+
+    Contract on a barrier-less backend (#772): raises [Failure] when [d] is
+    [Full] or [Batched] and {!barrier} is [`Unavailable].  Deliberately louder
+    than the replication-sink arm above — that one defers a legal setting until
+    the sink goes away, whereas this is a level the device can never reach, so
+    there is nothing to defer and silence would reinstate the false durability
+    ack this guard exists to remove. *)
 val set_durability : t -> durability -> unit
 
 (** Batched commit-count threshold N (default 256). Independent of the active
@@ -1259,7 +1324,12 @@ val capture_frames_since
     frames (#336): a store opened [off]/[batched] may have acked commits still
     in the OS page cache, and registration pins [Full] going forward but ships
     only NEW frames — so those historical frames are fsynced now rather than
-    left crash-exposed.  This is why registration returns an [Lwt.t]. *)
+    left crash-exposed.  This is why registration returns an [Lwt.t].
+
+    (#772) Because registration pins [Full], registering a sink on a backend
+    whose {!barrier} is [`Unavailable] fails with [Failure] rather than letting
+    the pin re-establish a durability claim the device cannot meet.
+    Unregistering ([None]) is always allowed. *)
 val set_commit_callback
   :  t
   -> (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option

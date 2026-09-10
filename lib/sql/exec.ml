@@ -10204,7 +10204,25 @@ let execute_with_count
     S.set_wal_autocheckpoint store (Int64.to_int n);
     Lwt.return 0
   | Plan.Op_pragma_set_synchronous { mode } ->
-    if mode <> "full" && S.commit_callback_active store
+    (* #772: a level that needs a write barrier the backend cannot issue is
+       refused here, by name, rather than accepted and silently not honoured.
+       This is the SQL-facing half of [Store.set_durability]'s guard; it runs
+       first so the message names the PRAGMA and the mode the user typed. *)
+    let barrier_reason =
+      match S.barrier store with
+      | `Available -> None
+      | `Unavailable r -> Some r
+    in
+    if (mode = "full" || mode = "batched") && Option.is_some barrier_reason
+    then
+      failwith
+        (Printf.sprintf
+           "PRAGMA synchronous: '%s' needs a write barrier this backend cannot \
+            issue, so commits could not be made durable however they were acked: \
+            %s. Only 'off' is honest on this backend."
+           mode
+           (Option.get barrier_reason))
+    else if mode <> "full" && S.commit_callback_active store
     then
       failwith
         "PRAGMA synchronous: durability cannot be relaxed while a replication \

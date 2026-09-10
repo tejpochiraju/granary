@@ -86,6 +86,7 @@ nothing says so.
 | Symbol | Why it must stay |
 |---|---|
 | `Granary_encoding.Sql_ident.sql_keywords`, `.is_sql_keyword`, `.ident_needs_quoting` | The handle the `lexer.mll` drift guard in `test/test_ident_quoting_572.ml` holds. That guard re-derives the keyword table from `lexer.mll` and fails when it and `sql_keywords` have drifted apart — the only thing binding the two now that they live in different libraries. Delete them and the next reserved word added to the lexer corrupts stored SQL again (#577, #572, #619). |
+| `Granary_mirage_block.Mirage_backend.no_barrier_reason`, `Make.durability_barrier` | #772's durability capability. Nothing in `lib/` calls either: the engine reaches `Mirage_backend` only through the `read_page`/`write_page`/`sync` callbacks a caller wires into `Store.open_block`. Their consumers are `mirage/unikernel.ml` (which `dune build` does not compile — the unikernel builds under the separate `mirage` CLI) and `test/test_mirage_sync_durability_772.ml` / `test_mirage_backend.ml`. Delete them and the adapter silently loses its only way to tell a store it cannot flush, so `Store.open_block`'s barrier check goes back to defaulting to `` `Available `` for a `Mirage_block` device — the #772 bug restored, with nothing red to say so (#772). |
 
 Before triaging a finding on this list, read the `(** ... *)` note at the top
 of the owning `.mli`. Anything added here owes itself the same note next to the

@@ -60,6 +60,19 @@ let with_fresh_db ~f =
        Lwt.return_unit)
 ;;
 
+(* #772: [Mirage_block.S] has no flush operation, so [Mirage_backend] declares
+   no barrier unless the platform supplies one -- and a store told it has no
+   barrier refuses every durability level above [off].  These tests run over a
+   real file and want the ordinary [full] durability, so they hand the adapter a
+   genuine [fsync].  That is also precisely the seam a barrier-capable Solo5
+   block backend would fill.  [fsync] is per-inode, so a second descriptor on
+   the same path flushes the writes [Block] issued through its own. *)
+let fsync_barrier path () : (unit, string) result Lwt.t =
+  let fd = Unix.openfile path [ Unix.O_WRONLY ] 0o644 in
+  Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> Unix.fsync fd);
+  Lwt.return (Ok ())
+;;
+
 let tmp_block_file size_mb =
   let path = Filename.temp_file "granary_ob_test" ".raw" in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
@@ -71,7 +84,7 @@ let tmp_block_file size_mb =
 let with_block_store path f =
   run
     (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-     let* adapter = MB.connect dev in
+     let* adapter = MB.connect ~barrier:(fsync_barrier path) dev in
      let* result =
        S.open_block
          ~init_if_corrupt:true

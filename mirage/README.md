@@ -19,7 +19,33 @@ BEGIN; INSERT × 3; COMMIT;        -- drives the WAL fsync / commit path
 SELECT id, name FROM kv ORDER BY id;
 ```
 
-It logs e.g. `granary demo OK: read back 3 rows; WAL fsyncs=2`.
+It logs e.g. `granary demo OK: read back 3 rows; WAL fsyncs=0 (commit path
+exercised, durability=off)`.
+
+> **Durability — this sample is NOT durable, and since #772 it says so.**
+> `Mirage_block.S` has exactly four operations — `get_info`, `read`, `write`,
+> `disconnect` — and no flush or barrier of any kind, and stock Solo5 exposes no
+> block-flush hypercall either, so a guest `pwrite` lands in the host's page
+> cache and stays there. `Mirage_backend.sync` used to return `Ok ()` anyway,
+> which under the default `PRAGMA synchronous = full` acked every commit as
+> durable while the data was still volatile. It now returns `Error`, and the
+> store **refuses any durability level above `off`** on a backend that declares
+> no barrier. This unikernel therefore opens with
+> `~barrier:(MB.durability_barrier adapter)` and `~durability:Store.Off`
+> explicitly, and logs a warning at boot. `WAL fsyncs` is consequently `0`,
+> where it used to read `2` — two fsyncs that never reached the device.
+>
+> **To get real durability here**, supply `Mirage_backend.connect`'s `?barrier`
+> with a platform flush and drop the `~durability` argument:
+>
+> ```ocaml
+> let* adapter = MB.connect ~barrier:my_platform_flush block in
+> ```
+>
+> On `-t unix` that flush can be an `fsync`; on Solo5 it needs the block-flush
+> hypercall that stock `hvt`/`spt` do not yet have (see #772 for the upstream
+> patch, which is out of scope for this repo). `Mirage_block.S` itself never has
+> to change.
 
 The exact same `Mirage_backend ↔ Store.open_block_wal` wiring and workload run as
 a host unit test — [`test/test_mirage_unikernel_smoke.ml`](../test/test_mirage_unikernel_smoke.ml)
@@ -32,7 +58,10 @@ without needing the mirage toolchain.
 > in-memory, lazily-grown buffer. The commit path (frame serialization +
 > `wal_sync`) is still fully exercised — only WAL durability across reboots is
 > out of scope for the sample. Putting the WAL on a second block device via a
-> byte-over-sector shim is a possible follow-up.
+> byte-over-sector shim is a possible follow-up. (#772: the `~barrier` declared
+> at open describes the weakest device backing the store. Here both are
+> non-durable — the block device has no flush, and the WAL is a RAM buffer — so
+> one `` `Unavailable `` covers them.)
 
 ## Build toolchain
 
@@ -115,6 +144,12 @@ podman run --rm --platform=linux/arm64 -v "$PWD:/workspace:z" -w /workspace \
 - `-t unix`: builds (native aarch64 ELF) and **runs** —
   `read back 3 rows; WAL fsyncs=2`. This clears the #157 risk note: the
   `mirage-block-unix` WAL fsync syscalls are arch-neutral on arm64.
+  **(#772: that run, and the amd64 baseline it was compared against, used the
+  pre-#772 no-op `Mirage_backend.sync`, so the configuration measured did not
+  survive power loss and its numbers are not comparable to anything durable.
+  Kept as recorded rather than deleted — it remains valid evidence for what it
+  was actually testing, which is toolchain and byte-order portability, not
+  durability. The demo now logs `WAL fsyncs=0` for the same workload.)**
 - `-t hvt`: the `ocaml-solo5` aarch64 cross toolchain installs and cross-compiles
   cleanly; `dist/granary-demo.hvt` is a valid Solo5 image
   (ELF `e_machine = 0xB7` = `EM_AARCH64`). Running it needs an arm64
@@ -127,7 +162,11 @@ podman run --rm --platform=linux/arm64 -v "$PWD:/workspace:z" -w /workspace \
 
 ## CI
 
-- The host smoke test runs in the normal `dune test` gate (`ci.yml`).
+- The host smoke test runs in the normal `dune test` gate (`ci.yml`). Since #772
+  it runs the wiring in **both** shapes: this unikernel's barrier-less
+  `synchronous=off`, and a variant that supplies a real `fsync` through
+  `Mirage_backend.connect`'s `~barrier` and keeps `synchronous=full` — so the
+  seam a barrier-capable backend would fill is guarded too.
 - [`.forgejo/workflows/mirage.yml`](../.forgejo/workflows/mirage.yml) runs
   `mirage configure -t unix && make depends && make build` (and runs the unix
   unikernel) on a schedule / on demand, so the unikernel target does not
