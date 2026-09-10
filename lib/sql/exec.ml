@@ -9925,7 +9925,7 @@ let execute_with_count
       | `Available -> None
       | `Unavailable r -> Some r
     in
-    if mode <> "off" && Option.is_some barrier_reason
+    if (mode = "full" || mode = "batched") && Option.is_some barrier_reason
     then
       failwith
         (Printf.sprintf

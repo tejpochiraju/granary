@@ -49,7 +49,7 @@ let tmp_file () =
 
 let with_tmp f =
   let path = tmp_file () in
-  Fun.protect ~finally:(fun () -> try Unix.unlink path with _ -> ()) (fun () -> f path)
+  Fun.protect ~finally:(fun () -> Unix.unlink path) (fun () -> f path)
 ;;
 
 (* The seam: a platform-supplied flush.  On Unix that is [fsync]; on a
@@ -140,20 +140,30 @@ let test_supplied_barrier_error_propagates () =
 (* 3 + 4: the open-time refusal, and the escape hatch                   *)
 (* ------------------------------------------------------------------ *)
 
+(* On a refusal [Store.open_block] never wires [close] into a store record (there
+   is no store), so the adapter is ours to release -- the same contract
+   #753/#763 gave [Db.open_block]. *)
 let open_mirage path ~durability =
   let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
   let* adapter = MB.connect dev in
-  Store.open_block
-    ~barrier:(MB.durability_barrier adapter)
-    ~durability
-    ~init_if_corrupt:true
-    ~read_page:(MB.read_page adapter)
-    ~write_page:(MB.write_page adapter)
-    ~sync:(MB.sync adapter)
-    ~resize:(MB.resize adapter)
-    ~n_pages:(MB.n_pages adapter)
-    ~close:(fun () -> MB.close adapter)
-    ()
+  let* r =
+    Store.open_block
+      ~barrier:(MB.durability_barrier adapter)
+      ~durability
+      ~init_if_corrupt:true
+      ~read_page:(MB.read_page adapter)
+      ~write_page:(MB.write_page adapter)
+      ~sync:(MB.sync adapter)
+      ~resize:(MB.resize adapter)
+      ~n_pages:(MB.n_pages adapter)
+      ~close:(fun () -> MB.close adapter)
+      ()
+  in
+  match r with
+  | Error _ ->
+    let* () = MB.close adapter in
+    Lwt.return r
+  | Ok _ -> Lwt.return r
 ;;
 
 let expect_refusal ~what result =
@@ -375,7 +385,7 @@ let test_unix_file_unchanged () =
   Fun.protect
     ~finally:(fun () ->
       List.iter
-        (fun p -> try Unix.unlink p with _ -> ())
+        (fun p -> try Unix.unlink p with Unix.Unix_error _ -> ())
         [ path; path ^ "-wal"; path ^ ".aslog" ])
     (fun () ->
        run
