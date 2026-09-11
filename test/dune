@@ -331,6 +331,20 @@
   unix))
 
 (test
+ (name test_mirage_sync_durability_772)
+ (modules test_mirage_sync_durability_772)
+ (libraries
+  granary
+  granary.store
+  granary.sample
+  granary.unix
+  granary.mirage_block
+  mirage-block-unix
+  alcotest
+  lwt.unix
+  unix))
+
+(test
  (name test_prepared)
  (modules test_prepared)
  (libraries granary alcotest lwt.unix))
@@ -2164,6 +2178,19 @@
  (modules test_view_callback_746)
  (libraries granary alcotest lwt.unix))
 
+; #766: the two identity gaps the #757 review left open — a four-way
+; unregister_view_callback result (Removed / Not_registered / Stale_generation
+; / Unknown_view) in place of a bool, and an atomic check-and-register via
+; register_view_callback's ?expected_generation. Also pins the documented
+; per-handle limit: a SIBLING handle's drop-and-recreate does NOT surface as
+; Stale_generation (#589/#633/#634), which needs create_worker_handle.
+; In-memory is enough: registry and generation state are process state.
+
+(test
+ (name test_view_callback_identity_766)
+ (modules test_view_callback_identity_766)
+ (libraries granary alcotest lwt.unix))
+
 ; #752: OCaml-side before/after row-mutation hooks (Db.register_row_hook /
 ; Db.unregister_row_hook), the seam camel#75 needs for typed veto/observe
 ; hooks without a SQL CREATE TRIGGER. In-memory is enough: registration is
@@ -2180,6 +2207,26 @@
   qcheck-core
   qcheck-alcotest
   lwt.unix))
+
+; #773/#775: an FK cascade's child writes and PRAGMA not_null_repair's victim
+; deletes both fire the OCaml row hooks the equivalent direct DELETE/UPDATE
+; fires, and both honour a `Before veto by failing the whole statement. Needs
+; a FILE-backed store for the #775 half: the only route to a stored NULL in a
+; NOT NULL column is the pre-#530 legacy-file fixture #567 established, which
+; reopens the catalog to re-derive the constraint.
+
+(test
+ (name test_cascade_row_hooks_773)
+ (modules test_cascade_row_hooks_773)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  lwt.unix
+  unix))
 
 ; #750: a compound-root CREATE REACTIVE VIEW is refused. base_tables_of
 ; answered [] for an S_compound root, so the view registered with no base
@@ -2243,6 +2290,28 @@
  (name test_fk_cross_numeric_755)
  (modules test_fk_cross_numeric_755)
  (libraries granary alcotest qcheck-core qcheck-alcotest lwt.unix))
+
+; #767: ALTER TABLE ... DROP COLUMN carried fk_constraints through unchanged,
+; so dropping a column a FOREIGN KEY names -- as the child's own local column
+; or as the parent column another table's FK references -- left a permanently
+; dangling column name behind, with no ALTER TABLE DROP CONSTRAINT to repair
+; it.  Now refused outright, on both sides, regardless of PRAGMA foreign_keys.
+; In-memory: pure catalog/DDL behaviour.
+
+(test
+ (name test_drop_column_fk_767)
+ (modules test_drop_column_fk_767)
+ (libraries granary alcotest lwt lwt.unix))
+
+; #768: ALTER TABLE ... RENAME TO must be refused while a deferred FK
+; obligation still names the table on either side — the table-level twin of
+; #765 round 3's RENAME COLUMN / DROP COLUMN refusal. In-memory: catalog and
+; deferred-check-queue behaviour only.
+
+(test
+ (name test_fk_rename_table_768)
+ (modules test_fk_rename_table_768)
+ (libraries granary alcotest lwt.unix))
 
 ; #416: the RO tree-root memo must never serve a root from a different
 ; committed generation (commits, DDL, rollback, as-of/live alternation), and

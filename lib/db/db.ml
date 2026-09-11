@@ -24,10 +24,19 @@ type rv_mode =
 (* #746: the opaque handle {!register_view_callback} returns and
    {!unregister_view_callback} consumes.  It carries the view it was registered
    against, so a caller cannot present a handle together with the wrong view
-   name — there is no view-name argument to get wrong. *)
+   name — there is no view-name argument to get wrong.
+
+   #766: it also carries the view's GENERATION as of registration, copied from
+   the registry entry's [rv_generation].  That is what lets
+   {!unregister_view_callback} tell "this handle was already removed" from "the
+   view this handle attached to was dropped and a different one recreated under
+   the same name" without the CALLER keeping a side table of
+   (handle, generation) pairs — the side table being precisely where a
+   downstream consumer would otherwise have to get the races right. *)
 type view_callback =
   { vcb_view : string
   ; vcb_id : int
+  ; vcb_generation : int
   }
 
 (* #752 (review round 3): re-exported from {!Store}, which now owns the whole
@@ -599,6 +608,7 @@ let open_block
       ?geom
       ?clock
       ?durability
+      ?barrier
       ~read_page
       ~write_page
       ~sync
@@ -611,6 +621,8 @@ let open_block
   let* result =
     S.open_block
       ?geom
+      ?barrier
+      ?durability
       ~init_if_corrupt
       ~read_page
       ~write_page
@@ -1878,6 +1890,56 @@ and fire_ocaml_row_hook t ~(timing : [ `Before | `After ]) ~table_name (_id, fn)
          S.row_hook_depth_decr reg;
          Lwt.return_unit))
 
+(** #773/#775: resolve the OCaml row hooks for an arbitrary (table, timing,
+    event) at the moment a write happens, for the write paths that cannot be
+    handed a {!make_combined_hook} up front — an FK cascade's child tables
+    (discovered a level at a time as the fan-out runs) and [PRAGMA
+    not_null_repair]'s per-table victim deletes.  Installed around every
+    [Sql.Exec] call this module makes, via [Sql.Exec.with_row_hooks].
+
+    {b OCaml hooks only, deliberately — no SQL triggers.}  {!make_combined_hook}
+    layers OCaml hooks over {!make_trigger_hook}; this does not, so a cascaded
+    child write fires [Db.register_row_hook] callbacks and does NOT fire a SQL
+    [CREATE TRIGGER] body on the child table.  That is SQLite's own default
+    (FK actions fire triggers only under [PRAGMA recursive_triggers], which is
+    off by default), it is the pre-#773 behaviour for triggers, and widening it
+    would be a separate, larger behaviour change with its own recursion story —
+    #773 is about the veto guarantee [register_row_hook]'s doc comment makes,
+    which SQL triggers never made.
+
+    Every guard {!fire_ocaml_row_hook} installs applies unchanged, because this
+    goes through it: [max_row_hook_depth] (via
+    [Store.row_hook_effective_depth], so a cascade-fired hook that defers work
+    with [Lwt.async] is still bounded — #752 round 8), the reentrancy scope
+    that turns a hook's own fresh-transaction nested DML into a clean error
+    rather than a writer-lock deadlock (#740/#752 round 6-7), and the ambient
+    undo target a registry mutation made from inside the hook lands on (#752
+    round 9). *)
+and make_row_hook_lookup t : Sql.Exec.row_hook_lookup =
+  fun ~table ~timing ~event ->
+  let reg = S.row_hooks t.store in
+  (* Mirrors {!make_combined_hook}'s own fast path: a store with no row hooks
+     registered anywhere pays one length check per cascaded row. *)
+  if S.row_hooks_is_empty reg
+  then None
+  else (
+    match S.row_hook_fire_list reg ~table ~timing ~event with
+    | [] -> None
+    | hooks ->
+      Some
+        (fun ~tx:_ ~new_row ~old_row ->
+          (* [~tx] is unused: an OCaml row hook receives the {!row_mutation}
+             record, never the transaction — its own nested DML goes back
+             through [Db.execute] and joins the ambient explicit transaction
+             (or is refused, per the reentrancy guard).  The parameter is kept
+             so this closure has the identical shape to the [before_hook]/
+             [after_hook] the direct write path threads, which is what lets a
+             future SQL-trigger-on-cascade decision reuse it unchanged. *)
+          let mutation = { table; new_row; old_row } in
+          Lwt_list.iter_s
+            (fun entry -> fire_ocaml_row_hook t ~timing ~table_name:table entry mutation)
+            hooks))
+
 and make_combined_hook t table_meta ~timing ~event =
   let sql_hook = make_trigger_hook t table_meta ~timing ~event in
   let reg = S.row_hooks t.store in
@@ -2029,18 +2091,21 @@ and run_trigger_op t ~tx b =
       insert_replace_upsert_hooks t op
     | _ -> None, None, None, None
   in
-  Sql.Exec.execute
-    ~before_hook
-    ~after_hook
-    ~on_replace_delete_before
-    ~on_replace_delete
-    ~on_upsert_update_before
-    ~on_upsert_update
-    ~mode
-    ~clock:t.clock
-    t.store
-    t.catalog
-    op
+  (* #773/#775: nested trigger-body DML cascades and repairs like any other
+     statement, so it gets the same row-hook lookup installed. *)
+  Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+    Sql.Exec.execute
+      ~before_hook
+      ~after_hook
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~on_upsert_update_before
+      ~on_upsert_update
+      ~mode
+      ~clock:t.clock
+      t.store
+      t.catalog
+      op)
 ;;
 
 (** Extract column names from a view query's projection, in order.
@@ -2757,18 +2822,23 @@ let run_dml t op ~on_ok =
     dml_hooks t op
   in
   match
-    Sql.Exec.execute_with_count
-      ~mode
-      ~clock:t.clock
-      ~before_hook
-      ~after_hook
-      ~on_replace_delete_before
-      ~on_replace_delete
-      ~on_upsert_update_before
-      ~on_upsert_update
-      t.store
-      t.catalog
-      op
+    (* #773/#775: the row-hook lookup the FK-cascade and [PRAGMA
+       not_null_repair] write paths resolve child-table hooks through.
+       [Lwt.with_value] is entered synchronously, so a plan that raises during
+       construction still lands in the [exception Failure] arm below. *)
+    Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+      Sql.Exec.execute_with_count
+        ~mode
+        ~clock:t.clock
+        ~before_hook
+        ~after_hook
+        ~on_replace_delete_before
+        ~on_replace_delete
+        ~on_upsert_update_before
+        ~on_upsert_update
+        t.store
+        t.catalog
+        op)
   with
   | exception Failure msg ->
     (* Discard any pending deferred FK checks queued by the failed
@@ -3152,7 +3222,15 @@ let query_impl ?stats ?mode ?on top sql =
        exceptions still propagate unchanged. *)
     Lwt.catch
       (fun () ->
-         let* stream = Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op in
+         (* #775: [PRAGMA not_null_repair] is reachable from the QUERY path too
+            (#588 gave it both entry points), and its deletes happen eagerly
+            while the stream is being constructed — inside this extent, not
+            when the caller drains it — so installing the lookup here is what
+            makes a [`Before `Delete] veto bind on that spelling as well. *)
+         let* stream =
+           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+             Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op)
+         in
          Lwt.return (Ok stream))
       (function
         | Failure msg -> Lwt.return (Error (Runtime msg))
@@ -3440,19 +3518,22 @@ let run_core st ~params =
     Lwt.catch
       (fun () ->
          let* n =
-           Sql.Exec.execute_with_count
-             ~mode
-             ~clock:t.clock
-             ~params:params_arr
-             ~before_hook
-             ~after_hook
-             ~on_replace_delete_before
-             ~on_replace_delete
-             ~on_upsert_update_before
-             ~on_upsert_update
-             t.store
-             t.catalog
-             st.plan
+           (* #773/#775: as in {!run_dml} — a prepared write cascades and
+              repairs identically. *)
+           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+             Sql.Exec.execute_with_count
+               ~mode
+               ~clock:t.clock
+               ~params:params_arr
+               ~before_hook
+               ~after_hook
+               ~on_replace_delete_before
+               ~on_replace_delete
+               ~on_upsert_update_before
+               ~on_upsert_update
+               t.store
+               t.catalog
+               st.plan)
          in
          t.last_changes <- n;
          t.total_changes <- t.total_changes + n;
@@ -3517,14 +3598,17 @@ let iter_impl ?stats st ~params =
     Lwt.catch
       (fun () ->
          let* stream =
-           Sql.Exec.query
-             ~mode
-             ~clock:t.clock
-             ~params:params_arr
-             ?stats
-             t.store
-             t.catalog
-             st.plan
+           (* #775: as in {!query_impl} — a prepared [PRAGMA not_null_repair]
+              writes during stream construction. *)
+           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+             Sql.Exec.query
+               ~mode
+               ~clock:t.clock
+               ~params:params_arr
+               ?stats
+               t.store
+               t.catalog
+               st.plan)
          in
          Lwt.return (Ok stream))
       (function
@@ -4963,21 +5047,56 @@ let reactive_view_generation top name =
    rather than removing an unrelated callback. *)
 let rv_cb_seq = ref 0
 
-let register_view_callback top ~view_name cb =
+(* #766: [?expected_generation] makes registration an ATOMIC check-and-register
+   rather than the caller's own compare-then-register, which had a TOCTOU
+   window: nothing stopped a SECOND drop-and-recreate landing between a
+   caller's {!reactive_view_generation} read and its re-registration call, so
+   the re-registration could itself attach to an incarnation that was already
+   stale by the time it returned.
+
+   The atomicity is structural, not merely narrower: this function is
+   SYNCHRONOUS — there is no [let*], no [Lwt] bind, and no other yield point
+   between reading [top.reactive_views] and assigning [e.rv_callbacks].  Under
+   the cooperative scheduler a fiber runs to its next yield, so no
+   [CREATE]/[DROP REACTIVE VIEW] (both of which go through the Lwt-bound
+   statement path) can interleave between the generation comparison and the
+   prepend.  If a yield point is ever introduced into this path, this argument
+   becomes a fig leaf and the check has to be redone under whatever exclusion
+   the new path needs. *)
+let register_view_callback top ?expected_generation ~view_name cb =
   match Hashtbl.find_opt top.reactive_views view_name with
   | Some e ->
-    incr rv_cb_seq;
-    let id = !rv_cb_seq in
-    (* O(1): prepend.  The firing site reverses, so registration order is
-       preserved — see {!rv_apply_and_notify}. *)
-    e.rv_callbacks <- (id, cb) :: e.rv_callbacks;
-    Ok ({ vcb_view = view_name; vcb_id = id }, e.rv_generation)
+    (match expected_generation with
+     | Some g when g <> e.rv_generation ->
+       (* Attach NOTHING: the caller asked for a specific incarnation and this
+          is not it.  The live generation travels with the error so the
+          caller's retry needs no second (racy) lookup. *)
+       Error (`Stale_generation e.rv_generation)
+     | _ ->
+       incr rv_cb_seq;
+       let id = !rv_cb_seq in
+       (* O(1): prepend.  The firing site reverses, so registration order is
+          preserved — see {!rv_apply_and_notify}. *)
+       e.rv_callbacks <- (id, cb) :: e.rv_callbacks;
+       Ok
+         ( { vcb_view = view_name; vcb_id = id; vcb_generation = e.rv_generation }
+         , e.rv_generation ))
   | None -> Error (`Unknown_view view_name)
 ;;
 
+(* #766: four outcomes, not a [bool].  The generation comparison comes FIRST
+   and is not merely an optimisation: a stale handle's id can never appear in
+   the new incarnation's list anyway (ids are process-global and each is
+   attached to exactly one entry), so checking it first loses no removal and
+   turns what used to be an indistinguishable [false] into a signal.
+
+   Removal is still always accepted and never raises, and the mid-flush
+   snapshot rule is untouched — [List.filter] builds a NEW list, so an
+   in-flight notification keeps iterating the old one. *)
 let unregister_view_callback top h =
   match Hashtbl.find_opt top.reactive_views h.vcb_view with
-  | None -> false
+  | None -> `Unknown_view h.vcb_view
+  | Some e when e.rv_generation <> h.vcb_generation -> `Stale_generation e.rv_generation
   | Some e ->
     let removed = ref false in
     (* [List.filter] builds a NEW list; any snapshot an in-flight notification
@@ -4994,10 +5113,16 @@ let unregister_view_callback top h =
         e.rv_callbacks
     in
     if !removed then e.rv_callbacks <- kept;
-    !removed
+    if !removed then `Removed else `Not_registered
 ;;
 
-let pp_view_callback fmt h = Format.fprintf fmt "%s#%d" h.vcb_view h.vcb_id
+let view_callback_view h = h.vcb_view
+let view_callback_generation h = h.vcb_generation
+
+let pp_view_callback fmt h =
+  (* [@@] is Format's escape for a literal [@]. *)
+  Format.fprintf fmt "%s#%d@@%d" h.vcb_view h.vcb_id h.vcb_generation
+;;
 
 (* #752 (review round 9, finding 2): push [f] onto whichever schema-undo log
    is the REAL scope for a row-hook registry mutation made on [t] — shared by

@@ -13,8 +13,12 @@
 
     - the handle round-trip: register, fire, unregister, stop firing, and the
       other callbacks on the same view keep firing;
-    - [unregister_view_callback] is idempotent and answers [false] for a handle
-      whose view was dropped or that came from another [Db.t];
+    - [unregister_view_callback] is idempotent and, since #766, names WHICH of
+      the non-removal cases it hit: [`Unknown_view] for a handle whose view was
+      dropped, [`Not_registered] for one already removed or minted on another
+      [Db.t]. (The fourth case, [`Stale_generation], and the
+      [?expected_generation] registration argument are pinned in
+      [test_view_callback_identity_766.ml].)
     - callbacks fire in {e registration order} — contractual since #746, and
       the thing the O(1) prepend must not quietly reverse;
     - the mid-flush semantics: the callback set is snapshotted per notification
@@ -56,6 +60,22 @@ let attach db ~view_name cb =
   match Db.register_view_callback db ~view_name cb with
   | Ok (h, (_ : int)) -> h
   | Error (`Unknown_view v) -> Alcotest.failf "expected %S to be a live view" v
+  | Error (`Stale_generation g) ->
+    (* #766 widened the error type, but [`Stale_generation] is reachable only
+       when [?expected_generation] is supplied, which this file never does. *)
+    Alcotest.failf "unexpected `Stale_generation %d from a plain registration" g
+;;
+
+(* #766: [unregister_view_callback] answers a four-way variant rather than a
+   [bool].  Rendering it keeps the failure messages informative — [check bool]
+   could only ever say "expected true, got false", which is exactly the
+   conflation #766 removed. *)
+let unreg db h =
+  match Db.unregister_view_callback db h with
+  | `Removed -> "`Removed"
+  | `Not_registered -> "`Not_registered"
+  | `Stale_generation g -> Printf.sprintf "`Stale_generation %d" g
+  | `Unknown_view v -> Printf.sprintf "`Unknown_view %S" v
 ;;
 
 (* A one-column-group COUNT view over [t]: every INSERT moves it, so every
@@ -84,10 +104,10 @@ let test_unregister_detaches_one_callback () =
     let _hb = attach db ~view_name:"cnt" cb_b in
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check (pair int int)) "both fire while registered" (1, 1) (!a, !b);
-    Alcotest.(check bool)
+    Alcotest.(check string)
       "unregistering a live callback reports it was removed"
-      true
-      (Db.unregister_view_callback db ha);
+      "`Removed"
+      (unreg db ha);
     exec db "INSERT INTO t VALUES (2, 'b', 20)";
     Alcotest.(check (pair int int))
       "the detached one is silent; its sibling is untouched"
@@ -100,11 +120,11 @@ let test_unregister_is_idempotent () =
     setup db;
     let _, cb = counter () in
     let h = attach db ~view_name:"cnt" cb in
-    Alcotest.(check bool) "first removal" true (Db.unregister_view_callback db h);
-    Alcotest.(check bool)
-      "second removal answers false rather than raising"
-      false
-      (Db.unregister_view_callback db h))
+    Alcotest.(check string) "first removal" "`Removed" (unreg db h);
+    Alcotest.(check string)
+      "second removal answers `Not_registered rather than raising"
+      "`Not_registered"
+      (unreg db h))
 ;;
 
 let test_unregister_after_drop_and_across_handles () =
@@ -113,10 +133,10 @@ let test_unregister_after_drop_and_across_handles () =
     let n, cb = counter () in
     let h = attach db ~view_name:"cnt" cb in
     exec db "DROP REACTIVE VIEW cnt";
-    Alcotest.(check bool)
+    Alcotest.(check string)
       "a dropped view took its callbacks with it (#469), so there is nothing to remove"
-      false
-      (Db.unregister_view_callback db h);
+      "`Unknown_view \"cnt\""
+      (unreg db h);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "and it does not fire" 0 !n);
   (* A handle minted on one [Db.t] and presented to another matches nothing:
@@ -130,10 +150,15 @@ let test_unregister_after_drop_and_across_handles () =
       setup db2;
       let n2, cb2 = counter () in
       let _ = attach db2 ~view_name:"cnt" cb2 in
-      Alcotest.(check bool)
+      (* #766: [`Not_registered], not [`Unknown_view] — [cnt] IS live on [db2],
+         and [db2]'s own store minted it the same generation [db1]'s did (each
+         counter starts fresh per store), so the handle is not stale either.  It
+         is simply not in this registry's list, because ids are process-global
+         and [h1]'s belongs to [db1]. *)
+      Alcotest.(check string)
         "a foreign handle removes nothing"
-        false
-        (Db.unregister_view_callback db2 h1);
+        "`Not_registered"
+        (unreg db2 h1);
       exec db2 "INSERT INTO t VALUES (1, 'a', 10)";
       Alcotest.(check int) "db2's own callback still fires" 1 !n2);
     exec db1 "INSERT INTO t VALUES (1, 'a', 10)";
@@ -171,16 +196,16 @@ let test_self_unregister_mid_flush () =
     let cb _ =
       incr fired;
       (match !slot with
-       | Some h -> removed := Some (Db.unregister_view_callback db h)
+       | Some h -> removed := Some (unreg db h)
        | None -> Alcotest.fail "handle not stored before the first fire");
       Lwt.return_unit
     in
     slot := Some (attach db ~view_name:"cnt" cb);
     exec db "INSERT INTO t VALUES (1, 'a', 10)";
     Alcotest.(check int) "the callback ran the invocation it was in" 1 !fired;
-    Alcotest.(check (option bool))
+    Alcotest.(check (option string))
       "removing itself from inside its own invocation is accepted"
-      (Some true)
+      (Some "`Removed")
       !removed;
     exec db "INSERT INTO t VALUES (2, 'b', 20)";
     Alcotest.(check int) "and it is silent from the next batch on" 1 !fired)

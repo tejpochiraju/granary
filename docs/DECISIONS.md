@@ -771,8 +771,284 @@ useful reading order — search for the issue number instead.
   #767-corrupted on-disk state should read this as the compatibility note
   it is, not a new defect it introduces. Round 6 also produced a concrete
   repro for the `RENAME TABLE`/`DROP TABLE` residual round 3 named above
-  (#768) — no new action follows; it stays the same already-filed,
-  already-scoped-out gap, just no longer hypothetical.
+  (#768) — no new action followed at the time; it stayed the same
+  already-filed, already-scoped-out gap, just no longer hypothetical.
+  **#768's `RENAME TABLE` half is now closed** — see the next entry; its
+  `DROP TABLE` half is deliberately still open, as #776.
+
+- **`ALTER TABLE ... RENAME TO` is refused while a deferred FK obligation
+  still names the table on either side (#768, decided 2026-09-10).**
+  The table-level completion of #765 round 3, and the same structural
+  argument one scope wider.
+
+  `Exec.make_fk_recheck` identifies BOTH sides of a queued deferred FK
+  obligation by TABLE NAME — `child_name` and `parent_name` are plain
+  strings closed over at enqueue time — and at COMMIT resolves them with
+  `Cat.find_table_cached`, treating `None` as "not violated":
+
+  ```ocaml
+  match find_table_cached cat ~name:child_name,
+        find_table_cached cat ~name:parent_name with
+  | None, _ | _, None -> Lwt.return false
+  ```
+
+  `ALTER TABLE ... RENAME TO` rewrites a table's catalog name with nothing
+  keeping those captured strings in sync. Rename either side of a pending
+  obligation, mid-transaction, and the recheck looks up a name that no
+  longer exists, answers "not violated", and COMMIT accepts a genuine
+  violation. The child row survives under the new name as a permanent
+  orphan with no FK error ever raised — the issue's two repros, verified
+  2026-09-05:
+
+  ```sql
+  BEGIN;
+  INSERT INTO c VALUES (999);   -- parent 999 does not exist; deferred check queued
+  ALTER TABLE c RENAME TO c2;   -- (or: ALTER TABLE p RENAME TO p2)
+  COMMIT;                       -- succeeded; SELECT pid FROM c2 returns 999
+  ```
+
+  **Fixed on the mutation side, not the recheck side, for the reason round 3
+  already established.** New `Exec.fk_obligation_table_conflict` is the
+  table-level twin of round 3's `Exec.fk_obligation_conflict`: it walks
+  `Cat.peek_pending_fk_checks`, resolves each entry's constraint FRESH via
+  `pfk_child_table` + `pfk_fk_ordinal` (exactly as the recheck does at
+  COMMIT, so a `RENAME COLUMN` earlier in the same transaction is already
+  reflected in the constraint's column lists), and returns a conflict when
+  the ALTER's target table is that constraint's child table or its parent
+  table. The `Ast.AA_rename_table` arm of `Exec.execute_alter_table`
+  consults it BEFORE `alter_rename_table` runs, so a refusal leaves the
+  catalog, the #752 row-hook migration and the #405 dirty-name marks all
+  untouched. Rounds 1, 2 and 3 of #765 are three consecutive demonstrations
+  of why the recheck side cannot win this: the recheck only ever sees the
+  schema AFTER the mutation, so each fix closes exactly the shape that
+  prompted it and the next shape walks straight through.
+  `make_fk_recheck`'s by-ordinal resolution and loud failure stay in place
+  as defence in depth — they are also the home of #765's own reasoning
+  about why ordinal beats name.
+
+  The negative-index guard round 4 of #765 had to reopen in
+  `fk_obligation_conflict` is carried over deliberately: `pfk_fk_ordinal =
+  -1` is the "constraint could not be located at enqueue time" sentinel,
+  and `List.nth_opt` raises `Invalid_argument` on a negative index rather
+  than answering `None`, so an entry that can never be resolved must
+  contribute "no conflict" instead of crashing an unrelated ALTER that
+  merely shares a transaction with it.
+
+  **Conservative in one direction, deliberately.** The pending queue only
+  grows until COMMIT drains it or ROLLBACK clears it
+  (`Cat.queue_pending_fk_check` / `drain_pending_fk_checks` /
+  `clear_pending_fk_checks`), so an obligation whose violation has since
+  been RESOLVED — the missing parent row inserted later in the same
+  transaction — is still queued and still refuses the rename. That is an
+  over-refusal, not a wrong answer; pruning the queue on resolution would
+  mean running every recheck at every ALTER, and the cheap escape is to
+  rename after COMMIT. The refusal also poisons a borrowed transaction the
+  same way every other failing in-txn DDL does (`with_ddl_txn`'s `In_txn`
+  arm, #286), so ROLLBACK is the exit — identical to round 3's `RENAME
+  COLUMN` / `DROP COLUMN` refusals, not a new behaviour.
+
+  **The queue this guard reasons about is not the durable record the refusal
+  is written as if it were — #789, found in this PR's review and filed
+  rather than fixed (2026-09-11).** The paragraph above says the queue
+  "only grows until COMMIT drains it or ROLLBACK clears it". That is
+  incomplete: `Cat.clear_pending_fk_checks` is `t.pending_fk_checks <- []`,
+  the WHOLE queue, and `lib/db/db.ml` calls it from every statement-failure
+  path (`run_dml`'s two `Failure` arms and the prepared-statement
+  `run_core`'s) under a comment claiming it discards "any pending deferred
+  FK checks queued by the failed statement". It discards every *other*
+  statement's obligations too. So inside one explicit transaction —
+  `INSERT` queueing a deferred obligation, an unrelated second statement
+  failing, then `ALTER TABLE ... RENAME TO` —
+  `fk_obligation_table_conflict` walks an empty queue, finds nothing, and
+  lets the rename through. (A failing DML does not poison the
+  transaction; only a failing in-txn DDL does, #286, which is why the
+  sequence is reachable at all.)
+
+  **That is not a hole this guard opened, and the distinction is the
+  reason it is documented rather than patched here.** The same `clear`
+  already threw the *obligation itself* away, so that COMMIT accepts the
+  violation with or without any rename — the loss is upstream of the
+  rename, in `Db`, and is #789's to fix. What it does mean is that this
+  refusal's coverage is exactly as good as the queue's accuracy, and the
+  queue is currently not accurate across a failed sibling statement: read
+  the guard as "refuses whenever the obligation is still queued", not as
+  "refuses whenever an obligation exists". Adding a pinning test for the
+  shape was considered and rejected both ways round — one asserting
+  today's outcome would have to be deleted by #789's fix, and one
+  asserting the intended outcome fails now for a reason this PR does not
+  own. When #789 lands (a per-statement tag on `pending_fk_check`, or a
+  savepoint-scoped queue), this paragraph should shrink to a sentence.
+
+  **`DROP TABLE` is NOT given the same guard, and that is a decision.** The
+  issue names it as part of the same residual class; it is not the same
+  bug. Dropping the CHILD removes the referencing rows outright, so
+  "nothing left to enforce" is the honest answer and a refusal would be
+  pure over-refusal. Dropping the PARENT does leave a dangling reference —
+  but `Exec.execute_drop_table` performs no FK checking at all, so it
+  leaves the IDENTICAL dangling reference with no transaction and no
+  pending obligation involved. Guarding only the pending-obligation case
+  would make the transactional path stricter than the autocommit one for
+  the same end state, which is incoherent rather than safer. That is a
+  wider, pre-existing gap in `DROP TABLE` itself (SQLite treats `DROP TABLE
+  parent` as an implicit `DELETE FROM parent` and fires FK actions; granary
+  does not), filed as **#776** and pinned meanwhile by
+  `drop_parent_table_is_unguarded_in_and_out_of_a_transaction` so whichever
+  way it is decided the test fails loudly and the decision gets re-made
+  rather than drifting.
+
+  Pinned by `test/test_fk_rename_table_768.ml`: the issue's two repros
+  (child-side and parent-side rename, each asserting the refusal message
+  names the right two tables and that the new name never came into
+  existence), a self-referencing FK where child and parent are the same
+  table (the two branches of the guard are an if/else-if — a guard checking
+  only one side still passes one repro), a control showing the very same
+  transaction is refused at COMMIT when NO rename is attempted (which is
+  what makes the repros evidence of a silenced check rather than of a
+  violation that was never queued), and four no-over-refusal cases: an
+  unrelated table renamed inside the same transaction, a rename with no
+  pending obligation at all (the reference was satisfied, so
+  `enforce_insert_fk` queued nothing), an autocommit rename of an
+  FK-bearing table, and a rename in a later transaction after the pending
+  one was rolled back.
+
+- **`ALTER TABLE ... DROP COLUMN` is refused when the column participates in
+  any FOREIGN KEY constraint, on either side (#767, decided 2026-09-10).**
+  `Cat.drop_column` rebuilds `table_meta` as `{ meta with columns =
+  List.filteri ... }` and carries `fk_constraints` through **completely
+  unchanged**. `Exec.alter_drop_column` compensates for two of the column's
+  other dependents — its indexes (`Cat.drop_index`) and its now-unbacked
+  PRIMARY KEY flags (`Cat.clear_pk_flags`, #533) — but has no equivalent for
+  FK metadata, and no equivalent of `rename_column`'s `column_dependents_tx`
+  gate either. Contrast `Cat.rename_column`, which rewrites `fk_local_cols`
+  via `rename_col_in_fk` *and* walks every other table's constraints via
+  `rewrite_child_fks_tx` (#553): RENAME keeps FK metadata coherent, DROP
+  COLUMN never touched it at all.
+
+  So a `DROP COLUMN` on a column any FOREIGN KEY names — the child's own
+  local column, or the parent column some other table's FK references —
+  succeeded and left a **permanently dangling column name** behind. The
+  issue's repro: after `ALTER TABLE c DROP COLUMN pid`, every `INSERT INTO c`
+  fails ("some local columns not found in table 'c'"), and every
+  `DELETE`/`UPDATE` of the parent key that must check or cascade fails with
+  it. There is no `ALTER TABLE ... DROP CONSTRAINT` in this engine, so
+  nothing can repair the catalog short of dropping and recreating the table.
+
+  **Refusal, not repair, and the reasoning is what makes it a decision.**
+  The issue sketched both directions. Rewriting `fk_constraints` in place —
+  dropping the whole constraint when its local side loses a column, and
+  dropping or refusing constraints on OTHER tables whose parent side
+  references it — is more permissive, and it is what SQLite effectively
+  does (it orphans the constraint silently, which is the behaviour this
+  issue exists to NOT copy). It was rejected for three reasons, in
+  increasing order of weight:
+
+  1. It would silently **weaken a declared integrity guarantee nobody asked
+     to weaken**. A user who wrote `REFERENCES p(id)` and later drops an
+     unrelated-looking column would find the constraint gone, with the
+     database quietly accepting orphans from then on. A refusal is loud and
+     recoverable; a dropped constraint is silent and, once rows have been
+     written against it, not recoverable at all.
+  2. The parent-side case would let a statement about ONE table **silently
+     mutate another table's schema**. `ALTER TABLE p DROP COLUMN code`
+     removing a constraint from `c` is a surprise no amount of error-message
+     design fixes, and it opens its own design question (report it? log it?
+     discard it?) that the issue itself flagged as needing separate care.
+  3. It is not what this project does. The established answer to a mutation
+     the engine cannot make coherent is conservative refusal: `ALTER TABLE
+     ... RENAME` refusing when a view or trigger depends on the table
+     (#673/#645, where the stored SQL text cannot be rewritten scoped), and
+     #765 round 3's `Exec.fk_obligation_conflict` refusing a RENAME/DROP
+     COLUMN with a deferred FK obligation pending. This is the same shape
+     with the same justification: refusing a mutation that might have been
+     harmless is cheaper than performing one that silently corrupts.
+
+  The over-refusal relative to SQLite is real and accepted. Recreating the
+  table is the escape hatch, and it is the same escape hatch #673/#645
+  leaves for a view-dependent RENAME.
+
+  **Mechanism.** `Cat.fk_column_dependents t ~table ~column` walks every
+  table in the schema cache and returns a rendered description of each FK
+  constraint that names the column on either side: the LOCAL side of
+  `table`'s own constraints, and the PARENT side of ANY table's constraint
+  whose `fk_parent_table` is `table`. The walk covers every table rather
+  than "every table but this one" (which is what `Cat.child_tables_of`
+  does) precisely so a **self-referential** FK — `e (id INTEGER PRIMARY
+  KEY, mgr INTEGER REFERENCES e(id))` — is found on its parent side too.
+  It reads structured catalog metadata, not stored SQL text, so unlike
+  `column_dependents_tx`'s deliberately over-approximate lexical scan
+  (#609) it is exact in both directions: no false refusal from an
+  unrelated table that happens to have a column of the same name, and no
+  false pass from a definition that never spells the name. The result is
+  sorted and de-duplicated, because the walk is a `Hashtbl` fold with no
+  stable order and the error message must not vary between runs.
+
+  `Exec.fk_drop_column_conflict` turns a non-empty list into
+  `Cat.fk_dependents_error`'s message, and `Exec.drop_column_refusal`
+  chains it **after** `fk_obligation_conflict`. The order matters in one
+  direction only: a column with a deferred FK obligation pending is
+  necessarily a column some constraint still names, so the new check would
+  refuse every case the old one does — reporting the generic "there is no
+  ALTER TABLE DROP CONSTRAINT" where the specific and more actionable "a
+  deferred check on this very constraint is still pending in this
+  transaction" is available. The narrower message wins; the new one is the
+  catch-all behind it.
+
+  `Cat.drop_column` repeats the check and returns the same `Error`. That
+  branch is unreachable through SQL — the executor's gate fires first, and
+  before any row migration — and it is kept anyway because `drop_column` is
+  the function that would actually do the corrupting: a future caller that
+  does not come through `execute_alter_table` should not be able to
+  reintroduce #767 by skipping a gate that lives somewhere else.
+
+  **Not gated on `PRAGMA foreign_keys`, deliberately.** That pragma decides
+  whether a constraint is ENFORCED, not whether it is DECLARED. The catalog
+  damage is identical either way, and permanent either way — a database
+  dropped-through with enforcement off is still broken when enforcement is
+  turned back on, which is exactly when it will hurt. Every other FK site in
+  the executor consults the pragma because they are *enforcement*; this is
+  *DDL coherence*, which is a different thing.
+
+  **Two accepted consequences, named rather than left implicit.**
+
+  - The refusal is raised from inside `with_ddl_txn`, like every other DDL
+    refusal in this engine, so inside an explicit transaction it poisons the
+    txn (#286) and `ROLLBACK` becomes the only exit, even though nothing was
+    applied. Hoisting the check above `with_ddl_txn` would avoid that for
+    this one refusal while `fk_obligation_conflict` and `Cat.rename_table`'s
+    view/trigger gate kept the old behaviour — a local improvement bought
+    with an inconsistency, and the inconsistency is worse. If this is worth
+    changing it is worth changing for all of them at once, which is a
+    different change.
+  - Six cases in `test/test_fk_cross_numeric_755.ml` reached the
+    corrupted-constraint state **through** this bug on purpose, to pin #765
+    round 3's and round 4's loud-failure fixes (`resolve_fk_col_idxs`, the
+    four cascade-dispatch functions). Closing the DROP COLUMN route means
+    those tests needed a different way in, and there is one: **CREATE TABLE
+    does not validate that a table-level `FOREIGN KEY`'s LOCAL columns
+    exist.** `Sema.extract_fk_constraints` checks the parent table's
+    existence and columnar-ness and nothing else, so `CREATE TABLE c (junk
+    INTEGER, FOREIGN KEY (pid) REFERENCES p(id))` on a table with no `pid`
+    is accepted and produces byte-for-byte the state DROP COLUMN used to
+    leave behind — which is also the state any database file written before
+    this fix can still be opened in, so those tests continue to pin behaviour
+    that genuinely matters. That unvalidated CREATE TABLE is a real, separate
+    gap; it is **filed as #781** rather than closed here, because refusing it
+    is its own behaviour change with its own compatibility question (what
+    happens to an existing file that already contains one), and because it is
+    the only remaining way to construct the state #765's loud-failure paths
+    exist to handle.
+
+  Pinned by `test/test_drop_column_fk_767.ml`: the issue's own repro (refused,
+  and then all three DML shapes the issue reported as broken still work), the
+  parent-side case, the exact refusal text naming the referencing table's
+  constraint, a composite FK refused on all four of its columns, a
+  self-referential FK refused on both sides, an FK created by `ALTER TABLE ...
+  ADD COLUMN` (appended at the end of `fk_constraints`, per `Exec.fk_ordinal`'s
+  note) protected the same way, refusal under `PRAGMA foreign_keys = 0`,
+  refusal inside `BEGIN` with the schema intact afterwards, and two
+  no-over-refusal cases: an unrelated column still drops with the FK still
+  enforcing afterwards, and a same-named column on a table with no FK at all
+  still drops.
 
 - **`OR IGNORE` skips a NOT NULL violation; `OR REPLACE` raises on one (#599, decided 2026-08-02).**
   A conflict-resolution modifier means the same thing for NOT NULL as it does
@@ -2575,6 +2851,153 @@ a flat 13 words per registration, i.e. exactly 2.00x. That is the gate in
 because the ceiling is backed by a measurement rather than predicted; verified
 by mutation, where restoring the `@` append reports slope 7.98 and fails.
 
+### A view callback's handle carries its own identity, and re-registering is atomic (#766)
+
+`Db.view_callback` now carries the view's **generation** as of registration
+(`vcb_generation`, copied from the registry entry's `rv_generation`), readable
+back through `Db.view_callback_view` and `Db.view_callback_generation`.
+`Db.unregister_view_callback` answers a closed four-way polymorphic variant in
+place of a `bool`, and `Db.register_view_callback` takes an optional
+`?expected_generation:int`. Both halves are one deliberate breaking change to a
+public API, shipped together on purpose: the consumer is a downstream project
+(camel), and two signature changes three months apart cost it more than one
+change now.
+
+**The gap this closes is identity, not liveness — #757's distinction, one level
+down.** #757 gave a *name* an incarnation number so a caller could tell
+`DROP REACTIVE VIEW v; CREATE REACTIVE VIEW v AS ...` from "nothing happened",
+because every liveness query keeps answering "`v` is live" straight through a
+recreate. What it left the caller holding was the bookkeeping: record the
+generation alongside the handle, compare it against a later
+`reactive_view_generation`, re-register if they differ. That side table is
+exactly where the races live, and #766's review found two of them.
+
+**Item 3: `unregister_view_callback` conflated four situations into one
+`false`.** A handle registered against the OLD incarnation looked the new entry
+up by name, failed to find its id in the new (empty) callback list, and answered
+`false` — indistinguishable from the ordinary "I already unregistered this".
+The four outcomes now, chosen because a caller's next action genuinely differs
+in each:
+
+| outcome | means | next action |
+|---|---|---|
+| `` `Removed `` | still attached to the live incarnation, now detached | nothing |
+| `` `Not_registered `` | the view is live *at this handle's generation*, but the handle is not in its list | nothing — and the caller's model of which incarnation is live was right |
+| `` `Stale_generation g `` | the name is live at a DIFFERENT incarnation; `g` is the live one | re-register with `~expected_generation:g` |
+| `` `Unknown_view v `` | `v` is not a live reactive view in this handle's registry at all | give up, or wait for a create |
+
+**The generation comparison runs FIRST, and that costs no removal.** A stale
+handle's id can never appear in the new incarnation's callback list anyway —
+ids come from one process-global counter and each is attached to exactly one
+entry — so ordering the check ahead of the `List.filter` turns an
+indistinguishable `false` into a signal without ever declining to remove
+something that was there. The handle-from-a-different-`Db.t` case therefore
+reports `` `Not_registered ``, not `` `Stale_generation ``: two stores each mint
+their first view generation 1, so the generations agree and only the id
+misses.
+
+**All four are defined up front, and that is the decision rather than an
+accident of what was needed.** Adding a case to a closed polymorphic variant
+later breaks every exhaustive match a consumer wrote — the same argument
+`register_view_callback`'s own doc comment already makes against widening the
+module-wide `error` type. `` `Unknown_view of string `` reuses
+`register_view_callback`'s spelling so a caller can share one match arm across
+the two functions.
+
+**Item 4: the documented re-registration pattern had a TOCTOU window, and
+`?expected_generation` closes it — structurally, not statistically.** Nothing
+stopped a SECOND drop-and-recreate landing between a caller's generation
+comparison and its re-registration call, so the re-registration could itself
+attach to an incarnation that was already stale by the time it returned, with
+no way to notice. Supplied and mismatched, the argument now attaches **nothing**
+and reports `Error (`Stale_generation live)`.
+
+The reason that is a fix and not a fig leaf is worth stating explicitly,
+because an optional argument that merely narrows a window would look identical
+at the call site: **`register_view_callback` is synchronous.** There is no
+`let*`, no `Lwt` bind, and no other yield point between reading
+`top.reactive_views` and assigning `e.rv_callbacks`, while both
+`CREATE REACTIVE VIEW` and `DROP REACTIVE VIEW` go through the Lwt-bound
+statement path. Under the cooperative scheduler a fiber runs to its next yield,
+so nothing can interleave between the check and the attach. That property is
+recorded in the `.mli` next to the argument rather than only in a commit
+message, because a future change that introduces a yield into this path
+invalidates the argument and must redo the check under whatever exclusion the
+new path needs. It is also why there is no test of the interleaving: there is
+no interleaving to construct. What the test suite pins instead is the
+observable consequence — a mismatch attaches nothing *at all*, rather than
+attaching and reporting the mismatch afterwards, which is the failure mode an
+error-code-only assertion would have missed.
+
+**Precedence: `` `Unknown_view `` beats `` `Stale_generation ``.** An expected
+generation supplied for a name that is not live reports `` `Unknown_view ``.
+`` `Stale_generation `` means "live, but a different incarnation" and would be
+actively misleading here — there is no incarnation for the caller to retry
+against.
+
+**The limit, stated plainly, because it matters to the consumer more than the
+feature does.** Every one of these signals is decided against **this handle's**
+registry. A SIBLING handle's drop-and-recreate is not visible there, under the
+per-handle DDL-visibility caveat `create_worker_handle` already documents for
+tables, views and triggers (#589/#633/#634). So `` `Stale_generation `` detects
+a recreate *this handle knows about*, and is **not** a cross-handle recreate
+detector: after a sibling recreates the view, this handle still believes its own
+entry is current and `unregister_view_callback` answers `` `Removed ``.
+Observing a sibling's recreate still requires re-deriving this handle's view of
+the store — a fresh `create_worker_handle`, or reopening. That is pinned by
+`a_siblings_recreate_is_not_visible_as_stale`, which asserts the *absence* of
+the signal, so the doc comment's promise cannot quietly become untrue in either
+direction.
+
+**Rejected: a durable subscription that auto-survives a drop-and-recreate.** It
+would remove the caller's bookkeeping entirely, which is the strongest argument
+for it. It was rejected because a recreate can change the view's DEFINITION, and
+therefore the shape of the `row_change` diffs a callback receives — silently
+reattaching would deliver deltas the caller never agreed to, which is worse than
+making it re-register, and worse in a way that is hard to notice. The explicit
+re-register loop stays; `?expected_generation` is what makes each step of it
+exact. In its place the race-free recipe is written into
+`register_view_callback`'s doc comment as a copyable sequence, and transcribed
+verbatim into `recipe_reattaches_across_a_drop_and_recreate` so the two cannot
+drift apart without a test noticing.
+
+The recipe is "detach the old, attach the new, always against a *named*
+generation": unregister; on `` `Removed ``/`` `Not_registered `` re-attach at
+the handle's own generation (both outcomes prove the view is live at it); on
+`` `Stale_generation g `` re-attach at `g`; and if *that* reports a newer
+generation, retry against the one it named. **It terminates in practice**
+because generations for one name in one store are strictly increasing (#757),
+so every iteration chases a strictly newer incarnation and can never revisit
+one — the loop can only spin for as long as something keeps recreating the
+view, which is a live-lock the application controls rather than a cycle in the
+API.
+
+**The #746 mid-flush snapshot rule is untouched by all of this**, and is
+re-pinned against the new surface rather than assumed: `unregister` still
+builds a new list with `List.filter`, so an in-flight notification keeps
+iterating the old one; a callback that removes itself still completes the
+invocation it is in and reports `` `Removed ``; a registration made from inside
+a firing callback — with `~expected_generation` or without — still starts firing
+from the next batch.
+
+`pp_view_callback` renders `view#id@generation` now. It has no caller in `lib/`
+outside its own module and exists for merlint's abstract-`type t`-needs-a-`pp`
+rule (`docs/DEAD_CODE.md` exempts `pp` from dead-code triage), but a log line
+naming only `view#id` could not say which incarnation a handle belonged to,
+which is the very distinction this issue is about; `pp_renders_the_generation`
+gives it a consumer.
+
+Pinned by `test/test_view_callback_identity_766.ml` (all four unregister arms
+hit deliberately; `?expected_generation` matching, mismatching, and omitted;
+the `` `Unknown_view ``-beats-`` `Stale_generation `` precedence; the handle
+accessors; both mid-flush directions; the recipe across a real
+drop-and-recreate and its give-up arm; and the sibling-handle limit), plus the
+updated `test_view_callback_746.ml`, whose `GRANARY_MEM_MAX_CALLBACK_SLOPE`
+allocation gate is unaffected: `vcb_generation` adds one word to a record
+allocated once per registration, where the gate measures the *slope* of total
+allocation against `n`, and a constant per-registration cost moves neither the
+2.00x linear figure nor the 4.00x quadratic one it discriminates against.
+
 ### The writer lock is measured, and every acquisition goes through one door (#718)
 
 `Store.lock_stats` reports the writer lock's wait and hold time per acquisition
@@ -4189,10 +4612,601 @@ fixed, per instruction): FK `ON DELETE`/`ON UPDATE` `CASCADE`/`SET NULL`/
 `cascade_delete_row_in_tx`/`cascade_update_col_in_tx` route through
 `delete_row_in_tx`/`update_col_in_tx` without ever building the
 `before_hook`/`after_hook` closures the direct DELETE/UPDATE paths construct —
-tracked as #773. Separately, `row_hooks_carry_over` does not copy
-`row_hook_depth` across a VACUUM store-swap, so `row_hook_effective_depth`'s
-store-wide-counter fallback silently resets to 0 for an `Lwt.async`-deferred
-continuation whose causal chain no longer matches the new store object,
-widening (not eliminating) `max_row_hook_depth`'s recursion ceiling across a
-VACUUM that happens to land mid-chain — tracked as #774.
+tracked as #773 (fixed since — see its own entry below). Separately, `row_hooks_carry_over` did not carry a row hook's
+recursion depth across a VACUUM store-swap — filed as #774 and **fixed
+separately (below)**.
 
+**#774: a row hook's recursion depth now survives `Db.vacuum`'s store swap,
+and the issue's own suggested fix — copying `row_hook_depth` — was neither
+sufficient nor safe.** `Db.vacuum` rebuilds the database into a wholly new
+`Store.t`, carries the row-hook registry across with
+`Store.row_hooks_carry_over`, and swaps the new store in under the handle. A
+deferred `Lwt.async` continuation constructed inside a pre-VACUUM hook's
+extent therefore holds a `row_hook_scope` naming a store object that is no
+longer the handle's, and `row_hook_effective_depth`'s `scope.rhs_store == t`
+test failed, dropping to the store-wide counter on the *fresh* registry — 0 —
+so `Db`'s `max_row_hook_depth` guard restarted from scratch for a chain that
+had already nested arbitrarily deep. Copying `row_hook_depth` (#774's stated
+fix direction) does not close that: the deferred continuation resumes *after*
+its hook's synchronous extent, i.e. after `Lwt.finalize` has already
+decremented the counter, so the source counter reads 0 at carry-over time and
+a copy carries nothing — pinned as an explicit assertion in the regression
+test, so the point cannot be lost. Copying it is also unsafe in the one
+window where it *would* be non-zero: each increment's matching
+`row_hook_depth_decr` runs under an `Lwt.finalize` closed over the `row_hooks`
+record it incremented (the *old* one), so a copied non-zero count is a claim
+on the new store that nothing ever releases — permanently shrinking the
+post-VACUUM recursion budget instead of widening it. The fix is instead a
+registry **lineage** id (`row_hooks.row_hook_lineage`, minted per record from
+a global counter and copied verbatim by `row_hooks_carry_over`):
+`row_hook_effective_depth` matches an ambient scope against `t` by lineage,
+keeping the `==` fast path ahead of it for the overwhelmingly common
+no-VACUUM case. `in_row_hook_for` and `row_hook_ambient_undo_target`
+deliberately keep the physical `==` test — they ask about one specific store
+object's writer lock (#740) and one specific statement's `Cat.t`, both of
+which VACUUM genuinely replaces, so a pre-VACUUM answer would be wrong there
+where here it is the only right one. `row_hook_depth` is now the one field of
+`row_hooks` that carry-over deliberately leaves alone, and both `.mli` and
+implementation say why. Pinned by a Store-level test that reconstructs the
+swap deterministically (the same approach the round-5/7 "vacuum race window"
+tests take — no test in this codebase races real fibers against `Db.vacuum`'s
+internal timing).
+
+**#769 was already closed by round 7's append fix; verified and closed.** The
+round-7 one-line change (`now @ [ id, fn ]`) is correct for the issue's own
+four-step reproduction as well as the concurrent-registration shape the
+round-7 test pinned, and a second, end-to-end `Db`-level test now covers that
+reproduction directly (register A, register B on the same key, `BEGIN`,
+unregister A, `ROLLBACK`, INSERT — A fires first). The two shapes are
+complements: round 7's exercises the *merge* case, where the undo must place
+the restored entry past a registration made while it was detached; the new
+one has nothing concurrent at all, so it pins that the restored entry goes
+back *ahead* of an entry that was already there.
+
+
+### An FK cascade's child write and `PRAGMA not_null_repair`'s victim delete both fire OCaml row hooks, and a `` `Before `` veto on either refuses the whole statement rather than skipping the row (#773/#775, decided 2026-09-10)
+
+Round 9 of #752 filed two write paths that removed or modified rows with no
+row-hook plumbing at all: the six FK actions (`ON DELETE`/`ON UPDATE`
+`CASCADE`/`SET NULL`/`SET DEFAULT`, #773) and `PRAGMA not_null_repair`'s bulk
+delete (#775). They are one bug with two spellings —
+`Exec.cascade_delete_row_in_tx`/`cascade_update_col_in_tx` route through
+`delete_row_in_tx`/`update_col_in_tx`, and the repair calls `apply_delete_row`
+directly; none of those three takes a `before_hook`/`after_hook` at all, so a
+write that a plain `DELETE`/`UPDATE` against the same table would have offered
+to a hook was made silently.
+
+**The consequence is a veto hole, not a missing notification.**
+`Db.register_row_hook`'s doc comment promises that a `` `Before `` hook's
+`Error` prevents the write. Before this, an application could hold that
+guarantee on a child table and have it bypassed by anyone writing to the
+*parent* — or by an operator typing `PRAGMA not_null_repair`. That is a
+correctness/security property quietly not holding, which is why this was worth
+fixing rather than filing as a nice-to-have.
+
+**Transport: an `Lwt` dynamically-scoped lookup, not one more threaded
+parameter.** `execute`/`execute_with_count`'s existing `?before_hook`/
+`?after_hook` pair is built by `Db` for the ONE table the statement names, and
+structurally cannot cover these paths: an FK cascade discovers its child tables
+a level at a time as the fan-out runs, and the repair deletes from every table
+in the database. So the write path needs to resolve a hook *by name,
+mid-statement*. `Exec.row_hook_lookup` is that resolver;
+`Exec.with_row_hooks` installs one for a statement's dynamic extent, and `Db`
+wraps every `Exec.execute`/`execute_with_count`/`query` call it makes in one
+(`Db.make_row_hook_lookup`).
+
+Threading a parameter instead was the alternative, and it was rejected on the
+same grounds `record_change` was: the cascade group is ~20 mutually-recursive
+functions and the repair has its own call chain through a forward reference
+(`not_null_repair_run_ref`) and through `to_stream`, whose ~25 recursive call
+sites would all have grown an argument for one PRAGMA. The change feed
+(#417) — which the very same cascade sites already call, for the very same
+"this must reach a nested write" reason — established the `Lwt` key here first,
+as did `dirty_tables_acc` (#240) and `dml_seek_stats` (#514). A caller that
+installs nothing fires nothing, which is exactly the pre-#773 behaviour and
+what a direct `Exec` caller (a storage-level test) still gets.
+
+**Deliberately NOT a direct read of `Store.row_hooks`, even though the registry
+is on the store and therefore already in scope down there.** Firing a hook
+means going through `Db.fire_ocaml_row_hook`: the `max_row_hook_depth` guard
+via `Store.row_hook_effective_depth` (so a cascade-fired hook that defers work
+with `Lwt.async` is still bounded — #752 round 8), the dynamic-extent
+reentrancy scope that turns a hook's own fresh-transaction nested DML into a
+clean error instead of a writer-lock deadlock (#740, #752 rounds 6-7), the
+ambient undo target a registry mutation made from inside the hook lands on
+(#752 round 9), and the error normalisation that keeps every failure shape in
+the `Failure` class. All of that lives above `Exec` in the dependency graph. A
+raw registry read in `Exec` would have reproduced the *firing* half of the
+feature while silently dropping every guard nine review rounds put around it —
+so the closure `Db` hands down is the whole point, not an implementation
+detail.
+
+**A vetoed cascade step fails the whole parent statement. It cannot be a
+skip.** This is the design decision the issue asked for, and the argument is
+short: the cascade exists to maintain the FK constraint. Skipping one cascaded
+child delete leaves that child row pointing at a parent row the statement just
+removed — precisely the dangling reference `ON DELETE CASCADE` was declared to
+prevent. Skipping a cascaded `SET NULL`/`SET DEFAULT`/`ON UPDATE CASCADE` is
+the same hole through a different door. There is no per-row outcome that both
+honours the veto and preserves referential integrity, so the only coherent
+reading of "this write must not happen" is "then this statement must not
+happen": the veto raises, the exception unwinds through the cascade and out of
+`execute_delete`/`execute_update`'s `Lwt.catch`, and the statement rolls back
+whole. A `` `Before `` veto also pre-empts the fan-out *below* the step it
+vetoes, because it fires ahead of the recursion rather than merely ahead of the
+row's own removal — the same outer-gate position #752 gave a `` `Before `` hook
+relative to a SQL BEFORE trigger's nested DML. `` `After `` errors abort
+identically, per #752's own rule, and for the same reason: everything runs
+inside one not-yet-committed transaction, so there is no "already durable" case
+to be lenient about.
+
+The scope of that unwind is #752's, unchanged and not widened here: in
+autocommit the statement's own transaction rolls back outright; inside an
+explicit transaction the caller opened, only the primary write is prevented and
+a vetoing hook's own nested DML is not specially undone (#631's savepoint
+covers the non-raising `OR IGNORE` *skip* path only). That is still the
+general `register_row_hook` rule and still exactly true of the FK-cascade
+half, but it is no longer true of the repair PRAGMA: #785 gave that statement
+a savepoint of its own, which unwinds a vetoing hook's nested DML too. See
+the next entry — the promotion is local to the repair, not a widening of the
+rule.
+
+**The repair PRAGMA's veto outcome is the same shape, one level bigger.** All
+of `not_null_repair_run`'s per-table work shares one transaction, so a veto
+anywhere rolls back *every* table's repair, not just the vetoing table's, and
+the PRAGMA fails reporting nothing deleted. That is the same all-or-nothing
+scope the columnstore comment in `repair_not_null_table` already reasons about,
+and it is why a vetoing hook here reads as "refuse the repair" rather than "exempt
+these rows from it" — there is no per-table spelling of this PRAGMA to fall back
+on. Both of #588's entry points are covered: the hooks fire whether the repair
+is reached through `Db.execute` (the change-count spelling) or `Db.query` (the
+report-streaming one), because the deletes happen eagerly while the stream is
+being *constructed*, inside the extent `query_impl` installs, not when the
+caller drains it.
+
+**Bracketing.** A cascade step fires `` `Before `` before anything it will
+write — including its own fan-out — and `` `After `` once the entire subtree of
+writes it caused has been applied, so the pair brackets the step's whole
+effect and nests correctly at every level of a multi-level cascade. The
+repair instead mirrors `execute_delete` exactly: ALL of a table's
+`` `Before `` hooks run before ANY of its victims is removed, then the
+removals, then all the `` `After `` hooks — because the repair IS a multi-row
+DELETE and a per-row interleaving would be a statement-visible divergence from
+the spelling it is supposed to be indistinguishable from (#563).
+
+**The UPDATE-side post-image is exactly what this path writes — which for a
+COMPOSITE foreign key is less than the FK action promises (#790, found in this
+PR's review and filed rather than fixed, 2026-09-11).**
+`cascade_update_col_in_tx` builds the row it hands a hook with
+`Exec.cascade_updated_row`, the same function `update_col_in_tx` uses to build
+the row it stores, so the doc comment's "EXACTLY the row that write stores"
+holds as written and is not the overstatement. The overstatement is the *next*
+step out, in the reading a caller will naturally take — "the row after the
+cascade". `cascade_apply_set_null` / `cascade_apply_set_default` and their
+`cascade_delete_set_null` / `cascade_delete_set_default` twins iterate
+columns-OUTER, rows-INNER, handing every (column, row) pair to
+`cascade_update_col_in_tx`, which short-circuits on `(table, rowid)` in the
+`visited` table it shares across the whole loop. The first column's pass
+inserts the rowid; every later column's pass returns immediately. So for a
+two-column FK, `SET NULL` nulls the first local column and silently leaves the
+second holding its old value — and the `` `After `` hook faithfully reports
+that half-written row, because that is genuinely what the statement leaves
+behind.
+
+Nothing in the hook plumbing is wrong here and nothing in it should be changed
+to compensate: a post-image reconstructed independently of the write would
+start drifting from it, which is the exact failure `cascade_updated_row` was
+factored out to prevent. The bug is the cascade write's, it predates this PR
+on `main`, and the fix belongs there — per-row rather than per-column
+iteration, so one row's whole local key is written once. Note that `visited`
+cannot simply be dropped: it is the cycle-breaker for a self-referencing or
+mutually-referencing cascade, so the fix has to change the LOOP's shape, not
+the guard's. Unaffected: the DELETE-side cascade (one removal per row, no
+per-column loop), every single-column FK, and the veto guarantee this entry is
+about — a `` `Before `` veto still fires before the first column's write and
+still unwinds the whole statement.
+
+**OCaml hooks only — SQL triggers on a cascaded child write still do not
+fire.** `Db.make_row_hook_lookup` deliberately does not layer
+`make_trigger_hook` in the way `make_combined_hook` does. That matches SQLite,
+whose FK actions fire triggers only under `PRAGMA recursive_triggers` (off by
+default); it is the pre-#773 behaviour for triggers, so nothing regresses; and
+#773 is about the veto guarantee `register_row_hook` makes, which SQL triggers
+never made. Widening it is a separate, larger change with its own recursion
+story.
+
+**One deliberate difference from #771's snapshot rule.** The direct path
+snapshots its fire list once per statement in `make_combined_hook`, so a hook
+registered mid-statement does not fire for the rest of it. The cascade path
+resolves the lookup at the moment each write happens, because a cascade's child
+tables are not known until the fan-out reaches them and there is no earlier
+point at which a snapshot could be taken. A hook registered by an earlier hook
+in the same statement therefore DOES fire for a later cascade step.
+
+**Error messages name the path.** A hook failure raised from a cascade step is
+re-raised prefixed `FOREIGN KEY cascade on '<child>': `, and one from the
+repair `PRAGMA not_null_repair on '<table>': `, ahead of
+`fire_ocaml_row_hook`'s own `before row hook on '<table>': ` prefix — so a
+caller matching the `Runtime` message text can tell a vetoed cascade from a
+veto of the statement's own table without a new `error` variant (the same
+reasoning #752 gives for not widening `error`).
+
+**Known residual, deliberately out of scope: `INSERT`/`UPDATE`/`DELETE ...
+RETURNING` executed through the QUERY path fires no row hooks.**
+`Exec.stream_insert_returning`/`stream_update_returning`/
+`stream_delete_returning` call `execute_insert`/`execute_update`/
+`execute_delete` with no `before_hook`/`after_hook` at all, so `Db.query
+"DELETE ... RETURNING ..."` writes without firing what the identical statement
+through `Db.execute` fires. It is the same family as #773/#775 and the new
+lookup makes it a small fix, but it is a third behaviour change with its own
+tests owed, and neither issue names it. Tracked separately as #778.
+
+The two round-9 residuals this entry does NOT touch remain open: `#774`
+(`row_hooks_carry_over` omitting `row_hook_depth` across a VACUUM store-swap)
+and `#770` (a hook's own nested `BEGIN`/`SAVEPOINT` raising instead of
+returning `Error`).
+
+Pinned by `test/test_cascade_row_hooks_773.ml`: one case per FK action on both
+sides, a three-level cascade asserting the nesting order, a veto per action
+shape asserting that BOTH tables are left untouched, the repair PRAGMA on both
+entry points, the repair's own cascade into a child table, and a group of
+negative tests that the #752 semantics are unchanged — registration order, no
+double-firing on the direct path, and the reentrancy guard still refusing a
+cascade-fired hook's autocommit nested DML while the ambient-transaction
+pattern still works.
+
+### `PRAGMA not_null_repair` is all-or-nothing inside an explicit transaction too, via a statement-level savepoint (#785, decided 2026-09-11)
+
+The direct continuation of the entry above. #775 wrote down a guarantee — a
+`` `Before `Delete `` veto during `PRAGMA not_null_repair` refuses the *whole*
+repair, every table's, rather than exempting the rows it vetoes — and
+`Db.register_row_hook`'s doc comment repeated it. The guarantee held only in
+autocommit.
+
+`not_null_repair_run` acquires its transaction through `acquire_txn`, which
+answers `(tx, owned)`: `owned = true` in `Auto` (it opened the transaction),
+`false` under `In_txn` (it borrowed the caller's). Its `Lwt.catch` did
+`if owned then S.rollback tx`, so inside `BEGIN` the exception re-raised with
+nothing undone. `run_dml` turned it into `Error (Runtime msg)` without rolling
+back and without poisoning the handle, and the repair is a per-table loop
+(`Lwt_list.map_s` over `Cat.list_tables`, one table at a time since #600). So
+`BEGIN; PRAGMA not_null_repair;` with a veto on the third table left the first
+two tables' victims deleted, and the caller's `COMMIT` made that partial repair
+durable — precisely the "exempt individual rows from it" outcome #775 says
+cannot happen.
+
+**The undo must key on what the statement decided, not on who owns the
+transaction.** That sentence is #631's, word for word, about a structurally
+identical bug: an `OR IGNORE` INSERT that skipped a row left its BEFORE
+trigger's nested DML behind in a borrowed transaction and vanished it in
+autocommit, because the undo was keyed on ownership. The remedy is #631's too —
+a statement-level savepoint (`Exec.stmt_savepoint_begin` / `_release` /
+`_finish`, which pair `Store.savepoint_*` with `Catalog.savepoint_*_schema`),
+taken when and only when the transaction is borrowed, rolled back and released
+on the exception path, released on success.
+
+**Refusing the statement, or poisoning the transaction, were the
+alternatives.** The review offered "narrow the guarantee's wording to
+autocommit" as the cheaper remedy and poisoning as the stronger one. Narrowing
+was rejected because the guarantee is a *veto* guarantee, and a veto that holds
+only when the caller happens not to have typed `BEGIN` is the same class of
+defect #775 itself fixed — a hook's `Error` being bypassable by writing through
+a different door. Poisoning (#286's `Cat.mark_schema_txn_poisoned`, which
+forces a later `COMMIT` to roll the whole transaction back) would deliver the
+guarantee, but it is strictly worse than the savepoint on the axis that
+matters: it discards the caller's *unrelated* earlier work in the same
+transaction, for a statement whose own effects the engine is perfectly able to
+unwind precisely. #286 poisons because it *cannot* unwind — a half-applied
+in-txn DDL has no statement-level undo, as that comment says explicitly. The
+repair does have one. Conservative refusal is this project's shape where
+precision is unavailable, not where it is.
+
+**What the savepoint covers, and what that changes about #775's stated
+scope.** It is a *statement* savepoint, not a per-row or per-table one, so it
+also covers every other mid-repair failure — an FK `RESTRICT` raised by a
+cascaded delete, an `` `After `` hook's error — not only a veto. It also covers
+anything the vetoing hook itself wrote via nested DML on the same handle while
+the PRAGMA was running, which is **stronger** than the general
+`` `Before ``-veto scope #752/#775 describe (where a raising statement in a
+borrowed transaction keeps its partial effects, #631's savepoint being scoped
+to the non-raising `OR IGNORE` skip path). That asymmetry is deliberate and
+local: it follows from the repair's savepoint enclosing the whole statement
+rather than one row, and it is not a promotion of the general rule.
+
+**Unconditional when borrowed, rather than "only when a row hook is
+registered".** #631 was careful to take its savepoint only inside a narrow
+intersection (borrowed ∧ a BEFORE INSERT trigger exists ∧ `CA_ignore`) because
+it sits on the TPC-C write path and a B-tree savepoint clones the pager's dirty
+set. `PRAGMA not_null_repair` is an operator-initiated whole-database sweep
+whose cost is dominated by scanning every table; one dirty-set clone is not
+worth a condition, and making it unconditional is what extends the fix past
+hook vetoes to every mid-repair raise.
+
+**A second, latent bug fell out of routing the error path through
+`stmt_savepoint_finish`, and it is a real defect rather than a refactor's
+by-product.** The autocommit arm rolled `tx` back but never called
+`changes_restore`, so the #417 row-level deltas recorded for the tables
+repaired before the failure survived a rollback that erased the rows they
+described — a phantom-row feed, the failure mode #666 names. Nothing had ever
+observed it because #737's name-set resync rebuilds any reactive view over a
+table a failed statement touched, which papers over a phantom delta; the
+masking is exactly why it needed a structural fix rather than a test.
+`stmt_savepoint_finish ~wrote:false` restores the mark in both the owned and
+the borrowed case, which is the invariant `changes_restore`'s own comment
+states: discard deltas wherever the store is reverted.
+
+**Not poisoned, and pinned as such.** A refused repair is an ordinary `Error`
+and the caller's transaction stays usable — a following `INSERT` works and the
+`COMMIT` commits it. `test/test_cascade_row_hooks_773.ml`'s `#785` group pins
+that, alongside the partial-repair case itself, the autocommit control (the
+property that always held, so the in-transaction cases read as a difference
+closed rather than a property asserted twice), the statement-scoping (a write
+made earlier in the same transaction survives the unwind), and the success half
+of the savepoint (an unvetoed in-transaction repair still commits everything it
+deleted). The fixture uses two independently-violating tables with one victim
+each and registers one shared counter closure on both, vetoing the second
+firing it sees — so the interleaving under test does not depend on the order
+`Cat.list_tables` happens to return them in.
+
+**Review round 2 found the same asymmetry the other way round: the AUTOCOMMIT
+arm never resolved the #269 schema-undo log (decided 2026-09-11).** The handler
+this entry describes reads `stmt_savepoint_finish …; if owned then S.rollback
+tx; Lwt.fail exn`. Every sibling write path that can fire a row hook —
+`Exec.execute_insert`, `execute_update`, `execute_delete` — calls
+`Cat.rollback_schema_changes cat` in exactly that position, and this function's
+own *success* path already resolves the log symmetrically through
+`release_txn ~cat` → `Cat.commit_schema_changes`. The failure arm did not, so a
+hook-registry mutation survived a statement that was rolled back in full.
+
+**#775 is what made it reachable, which is why round 1 could not have seen it.**
+Before the repair fired OCaml row hooks there was no way for anything to push
+onto that log from inside it; now `Store.in_row_hook_for` holds for the whole
+repair, and per #752 round 8 a hook body calling
+`Db.register_row_hook`/`unregister_row_hook` on itself — the documented
+nested-hook-mutation pattern — pushes an undo entry via `Db.push_row_hook_undo`.
+In autocommit that statement is the entry's whole scope: `Db`'s own
+`force_rollback_txn` only runs for an explicit transaction, and `run_dml`'s
+`Failure` arms clear pending FK checks and nothing else. The entry was therefore
+neither replayed nor discarded — left stranded on `cat.sc.undo` to be wrongly
+replayed by whatever unrelated statement rolled back next, with the registry
+mutation itself standing.
+
+**The fix is guarded by `owned`, and unconditional would be worse than the
+gap.** The borrowed case was already correct for the reason round 1 built it
+that way: `stmt_savepoint_finish ~wrote:false` rolls the statement savepoint
+back through `Cat.savepoint_rollback_schema`, which replays exactly the entries
+pushed since `savepoint_begin_schema` and truncates the log to that point.
+`Cat.rollback_schema_changes` replays the *whole* log, so calling it
+unconditionally would drag the enclosing transaction's entries down with the
+refused statement — the same over-reach that poisoning was rejected for above.
+
+Pinned by `test/test_cascade_row_hooks_773.ml`'s
+`an autocommit refusal undoes a hook's self-detachment`, on the same
+two-violating-tables fixture: one `` `Before `Delete `` closure registered on
+both tables detaches its own firing registration on the first firing and vetoes
+on the second, so the autocommit `PRAGMA not_null_repair` fails with the first
+table's victim already deleted. The case asserts the rows are intact, and then
+that the hook is attached again *positively* — by deleting the clean row of the
+table that detached itself and observing a third firing, rather than by reaching
+into `Store.row_hooks`.
+
+- **A backend that cannot issue a write barrier refuses the durability level it
+  cannot honour, rather than acking commits as durable (#772, decided
+  2026-09-10).** `lib/block/mirage_backend.ml:70` was
+  `let sync _t () = Lwt.return (Ok ())`. That is not a local slip that can be
+  fixed inside the adapter: `Mirage_block.S` has exactly four operations —
+  `get_info`, `read`, `write`, `disconnect` — and no flush or barrier of any
+  kind, so there is genuinely nothing for `sync` to call. Stock Solo5 exposes no
+  block-flush hypercall either, and the `hvt` tender's `pwrite` lands in the
+  host's page cache. But an adapter that cannot provide a barrier should say so,
+  not return `Ok`: under `PRAGMA synchronous = full` — the default, and the mode
+  the README documents as "no loss" on an OS or power crash — every commit was
+  acked durable while the data was still volatile, and crash recovery had
+  nothing to recover to. The `mirage/` sample unikernel (#403), and the aarch64
+  audit that cross-built it (#402), were therefore both measuring a
+  configuration that does not survive power loss.
+
+  **The contract chosen, and the two alternatives rejected.**
+
+  - `Mirage_backend.connect` gains `barrier:(unit -> (unit, string) result
+    Lwt.t) option` — the issue's option 2, "carry the barrier through this
+    library's own signature". (It was an optional `?barrier` as #772 shipped
+    it; it is a **required** labelled argument since #785's review — see
+    "The declaration is mandatory" below.) `Some f` supplies the flush, which
+    *is* `sync`, and `Mirage_backend.durability_barrier` reports
+    `` `Available ``; `None` declares there is none, `sync` returns
+    `Error Mirage_backend.no_barrier_reason`, and the adapter reports
+    `` `Unavailable `` with the same string. `Mirage_block.S` never
+    changes, and a `mirage-block-unix` deployment (an `fsync`) or a flush-aware
+    Solo5 build (a hypercall stub) fills the seam without touching this
+    repository. The upstream Solo5 work the issue describes — the `hvt`
+    `HVT_ABI_VERSION` 2→3 bump and the `spt` `fdatasync` — is deliberately
+    **out of scope**; this is the hole it would plug into.
+  - `Store.open_block` and `Store.open_block_wal` gain `?barrier:barrier` and
+    `?durability:durability`. `barrier` is a *structural* polymorphic variant
+    (`[ `Available | `Unavailable of string ]`) rather than a nominal type
+    precisely so `granary.mirage_block` can produce the value without acquiring
+    a dependency on `granary.store`; the adapter's `durability_barrier` result
+    is passed straight through with no conversion. The check runs before any
+    device operation, alongside the #266 `as_of_history` guard, so a refused
+    open leaks no fd.
+  - **`Off` is the only truthful level with no barrier, and it is the escape
+    hatch.** `Full` promises an fsync per group-commit; `Batched` promises one
+    per batch plus one at every checkpoint and at `close`. Neither promise can
+    be kept, so **both** are refused by name — refusing `Batched` too is the
+    part that is easy to get wrong, and the reason is that `Batched` is a
+    *deferred* barrier, not the absence of one. `Off` already means "commits are
+    not made durable on commit", which is exactly the state of affairs, so
+    selecting it is choosing the accurate description rather than waiving a
+    check. That is also why the escape hatch is **not** a boolean opt-in such as
+    `~allow_unsafe_durability:true`: a flag like that would let `Full` keep
+    lying — `PRAGMA synchronous` would go on reporting `full` while nothing was
+    durable, which is the original bug wearing a permission slip. And it cannot
+    be hit by accident: the default is `Full`, `Full` is refused, and the only
+    way through is to type the word `Off`.
+  - The refusal outlives the open, because the level can be re-requested later:
+    `Store.set_durability` raises `Failure` for `Full`/`Batched`;
+    `PRAGMA synchronous = full|batched` raises with its own wording naming the
+    PRAGMA (the SQL-facing half, mirroring the pre-existing
+    `commit_callback_active` guard beside it); and `Store.set_commit_callback`
+    refuses a *registration*, because registering a replication sink pins `Full`
+    (#298/#336) and that pin would re-establish the false claim behind the
+    caller's back. Unregistering (`None`) is always allowed.
+
+  **The one place the store still passes `Ok ()`, and why it is not the same
+  lie.** With no barrier the store also must not *call* `sync`. The main-DB
+  `sync` callback is reached unconditionally by `Pager.flush_sync_main` at every
+  checkpoint and by `Pager.flush` on the non-WAL commit path, and the adapter is
+  now required to return `Error` — so letting that `Error` through would leave
+  `Off` unable to check point or commit at all, turning the escape hatch into a
+  different bug rather than a fix for this one. `Store.resolve_barrier`
+  therefore substitutes a no-op `sync` in exactly the `` `Unavailable ``-plus-
+  `Off` case. That is not the `Ok ()` this issue objects to: the original one
+  survived to a caller who had been promised `Full`, whereas this one runs only
+  after every mode that promises anything has been refused, so there is no
+  outstanding durability claim for it to falsify. `Store.barrier` keeps the
+  capability readable so nothing is hidden, and `PRAGMA synchronous` keeps
+  reporting `off`.
+
+  **That argument held for exactly half the store — the WAL device was left
+  out (#785 review finding 3, decided 2026-09-11).** The paragraph above is
+  the rule; `open_block_wal` then handed `~wal_sync` straight through to
+  `Wal.open_` with no equivalent treatment. The cost is not theoretical:
+  `Wal.open_` fsyncs the generation-marker header it writes at creation, a
+  checkpoint rewrites and fsyncs it again, and `Store.close` calls
+  `Pager.wal_sync` whenever `sync_mode` is anything but `Full` and the WAL
+  has committed frames — which under `Off` is *always*, after any write — and
+  raises on failure, because close is a durability anchor and swallowing an
+  EIO there is the thing #298/#2 deliberately refused to do. None of the
+  three is conditional on the durability level. So a caller who put the WAL
+  on the same barrier-less device as the main DB — the byte-over-sector shim
+  `mirage/README.md` names as the intended follow-up — and wired
+  `~wal_sync:(MB.sync adapter)` as the docs told them to got a store that
+  could not be **opened**, and (with a WAL that did open) could not be
+  **closed**, *having chosen the only durability level the store permits that
+  device*. The caller did everything right and the honest configuration is
+  the one that breaks, which is a worse outcome than the refusal #772
+  designed. Latent rather than observed, because every caller in the tree
+  today puts its WAL either in `Mem_wal` (whose sync is `Ok ()`) or on a real
+  file.
+
+  The fix is the same rule, not a new one. `Store.resolve_barrier_wal`
+  substitutes the *same* `no_barrier_sync` no-op that `resolve_barrier`
+  installs, and `open_block_wal` shadows `wal_sync` with it immediately after
+  `resolve_barrier` has run on `sync`. It deliberately has **no refusal
+  branch**, and that is not an omission: `resolve_barrier` has already run
+  with the same `barrier` and `durability` by the time it is called, so
+  `` `Unavailable `` here means the level is already known to be `Off` — the
+  refusal has happened, once, in the place that owns it. A second `barrier`
+  argument for the WAL device was rejected: the two devices' capabilities are
+  not independently useful — a durable WAL over a non-durable main DB
+  survives nothing a checkpoint touches — and the store has exactly one
+  `synchronous` setting to describe the pair with, which is why
+  `mirage/README.md` already says one `barrier` describes the *weakest*
+  device backing the store. `Store.wal_sync_count` goes on counting the calls
+  the engine *makes*; on a barrier-less store that is a count of barriers
+  asked for rather than issued, and `store.mli` says so rather than
+  pretending the number changed meaning.
+
+  **Review round 2 checked that "no refusal branch" claim exhaustively and it
+  holds by construction, not by luck (decided 2026-09-11).** The argument above
+  rests on an invariant — a store whose `barrier` is `` `Unavailable `` can
+  never have `sync_mode` anything but `Off` — and the reviewer enumerated every
+  way `sync_mode` can become `Full` or `Batched` rather than taking it on
+  trust. There are four, and all four are already closed upstream of
+  `resolve_barrier_wal`: `open_block` and `open_block_wal` refuse those levels
+  at open through `resolve_barrier` itself; `Store.set_durability` raises on a
+  barrier-less store; `Store.set_commit_callback`'s pin to `Full` (a
+  replication sink's requirement) is refused for the same reason; and
+  `Op_pragma_set_synchronous` refuses before it ever reaches `set_durability`.
+  So `resolve_barrier_wal` cannot be reached with a level that promises
+  anything, and adding a refusal branch to it would be dead code that read as
+  if the invariant were in doubt. Written down here because this is the kind of
+  absence that looks like an oversight to the next reader, and the enumeration
+  is the only thing that distinguishes the two.
+
+  **Behaviour break.** `mirage/unikernel.ml` opened in WAL mode over a
+  `Mirage_block` device with the default `full`; it would now be refused, so it
+  opts in explicitly with `~durability:Store.Off` and logs a warning naming the
+  missing capability. Any downstream unikernel doing the same must either pass a
+  `~barrier` or lower its level. Camel's M11 plan (camel #335, #316) — a
+  block-backed runtime on solo5 `hvt`/`spt`, on an unattended edge appliance
+  with no BBU — is exactly the shape this protects.
+
+  **The declaration is mandatory, so a pre-#772 caller breaks at compile time
+  instead of at some later commit (#785 review finding 5, decided
+  2026-09-11).** #772 justified defaulting the new `?barrier` arguments to
+  "absent" / `` `Available `` with "file backends and every existing caller
+  are unchanged". That is right for `Unix_file` and wrong for the one adapter
+  the change was about. A caller written before #772 — `MB.connect dev` plus
+  `Store.open_block ~sync:(MB.sync adapter)` with no `~barrier` — still
+  compiled, but `Store.open_block`'s `?barrier` defaults to `` `Available ``,
+  so the store believed in a barrier while every `sync` returned `Error`, and
+  the failure surfaced as a checkpoint or commit error much later — precisely
+  the late, unattributable failure #772 set out to convert into a refusal at
+  open. That six test files needed `~barrier` added in #772 was the same
+  signal read the other way round. So `Mirage_backend.Make.connect` now takes
+  `barrier:(unit -> (unit, string) result Lwt.t) option` as a **required**
+  labelled argument: a caller with no flush writes `~barrier:None` and has
+  thereby *declared* it, one line above the `Store.open_block` call. Every
+  call site in the tree was updated (six test files, the sample unikernel);
+  an out-of-tree caller gets a type error, which is the point — a compile
+  error is the cheapest possible place to learn that the meaning of your
+  wiring changed underneath you.
+
+  It does not make the wrong wiring unrepresentable. `Store.open_block`'s
+  `?barrier` still defaults to `` `Available ``, because `Unix_file` and every
+  file backend genuinely do have a barrier and making it mandatory would churn
+  every open in the engine for a problem only this adapter has; what the
+  mandatory argument buys is that the omission is unreachable without first
+  having typed `~barrier:None`. A stronger variant — `Mirage_backend` handing
+  back a wiring record that `Store.open_block` consumes whole — was rejected
+  because `barrier`'s structural polymorphic variant exists precisely so
+  `granary.mirage_block` need not depend on `granary.store`, and a record of
+  store arguments would reintroduce that dependency to solve a documentation
+  problem. The residual is pinned rather than left implicit: a test opens a
+  barrier-less adapter through `Store.open_block` *without* `~barrier`,
+  asserts the store reports `` `Available `` (it believes the default) and
+  that the first write then fails, so changing the store-side default turns
+  that test red and forces this note to be re-decided rather than quietly
+  rotting.
+
+  **Sample follow-through.** `mirage/unikernel.ml` computed `barrier`, warned
+  only in the `` `Unavailable `` arm, then passed `~durability:Store.Off`
+  unconditionally — harmless for a sample, but at odds with its own comment
+  telling readers to "drop the `~durability` argument" once a barrier exists.
+  The level is now *derived* from the declared capability (`` `Available `` ⇒
+  `Full`, `` `Unavailable `` ⇒ the warning plus `Off`), so supplying a
+  platform flush to `MB.connect`'s `~barrier` is the single edit that makes
+  the sample durable, and `mirage/README.md` says that instead of the old
+  two-step.
+
+  **`Unix_file` is untouched.** It has a real `fsync`, so it reports
+  `` `Available `` by default and every durability level behaves exactly as
+  before. `test_mirage_sync_durability_772.ml`'s `unix_file` case pins that.
+
+  **Measurement note.** The issue records, from
+  `experiments/sqlite-mirage-experiments` at `b3587d7`, that a real barrier
+  costs about 1.5x on `spt` (72.6 → 48.0 commits/sec) and nothing measurable on
+  `hvt` (13.8 → 14.4, where a VM exit per 512-byte block already dominates).
+  Durability there is cheap; having none of it was the expensive outcome. The
+  amd64 baseline and aarch64 audit numbers in `mirage/README.md` are annotated
+  rather than deleted — they were taken against a non-durable configuration and
+  are not comparable to anything durable.
+
+  Pinned by `test/test_mirage_sync_durability_772.ml` (adapter refusal, the
+  supplied-barrier seam in both directions, the open-time refusal of `Full` and
+  `Batched` and of the default path, `Off` opening *and working*, the
+  after-open refusals, and `Unix_file` unchanged); its section 8 pins the WAL
+  half added above — a WAL whose flush returns `Error`, on a barrier-less
+  adapter at `Off`, must open, write, checkpoint and **close** without
+  raising, and the device's flush must be called **zero** times, which is the
+  assertion that distinguishes "substituted" from "called and its error
+  swallowed". The complement sits beside it: with a barrier *declared*, the
+  identical failing `wal_sync` still surfaces (at open, where `Wal` fsyncs its
+  header), so the substitution is conditional on the declaration and not a
+  blanket suppression. Also pinned by
+  `test/test_mirage_unikernel_smoke.ml`, which now runs the wiring in both
+  shapes: the unikernel's own barrier-less `Off` (asserting zero commit fsyncs,
+  where it used to assert two that never reached the device) and a
+  platform-`fsync` `full` that still pins the exact commit-fsync count.

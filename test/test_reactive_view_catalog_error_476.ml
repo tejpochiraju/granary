@@ -224,6 +224,9 @@ let a_failed_create_leaves_no_ghost_entry () =
        (Db.reactive_view_generation db "cnt");
      (match Db.register_view_callback db ~view_name:"cnt" (fun _ -> Lwt.return_unit) with
       | Error (`Unknown_view _) -> ()
+      | Error (`Stale_generation g) ->
+        (* #766: unreachable without [?expected_generation]. *)
+        Alcotest.failf "unexpected `Stale_generation %d" g
       | Ok _ ->
         Alcotest.fail "register_view_callback attached to a view that isn't durable");
      (* The device recovers; a retry must succeed rather than hit a bogus

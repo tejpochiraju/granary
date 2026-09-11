@@ -154,6 +154,83 @@ let with_dirty (acc : dirty_tables_acc) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
 
 let current_dirty_acc () : dirty_tables_acc option = Lwt.get dirty_tables_key
 
+(* #773/#775: the row-hook firing closure for one (table, timing, event), as
+   the write paths BELOW the statement's own hook plumbing see it.
+
+   [Sql.Exec.execute]/[execute_with_count] already take a [?before_hook]/
+   [?after_hook] pair for the ONE table the statement names, built by [Db]
+   before the op runs.  That is enough for a plain INSERT/UPDATE/DELETE and
+   cannot be enough for anything else: an FK cascade's child tables are not
+   known until the fan-out runs (a multi-level cascade discovers them a level
+   at a time), and [PRAGMA not_null_repair] deletes from EVERY table in the
+   database.  So those paths need to resolve a hook for an arbitrary table,
+   mid-statement, by name — which is what this is.
+
+   The lookup rides Lwt sequence-associated storage for the same reason
+   {!dirty_tables_acc} and {!dml_seek_stats} do (see their comments above):
+   the alternative is threading one more parameter through every one of the
+   ~20 mutually-recursive cascade functions and the repair PRAGMA's own call
+   chain, and the change-feed's [record_change] — which the very same cascade
+   sites already call, for the very same reason — established that shape here
+   first (#417).  [Db] installs it with {!with_row_hooks} around each
+   statement's [Exec] call; a caller that installs none (a direct [Exec]
+   caller, e.g. a storage-level test) fires no hooks, exactly as before.
+
+   Deliberately NOT a lookup on [Store.row_hooks] directly, even though the
+   registry is right there on the store: firing a hook means going through
+   [Db.fire_ocaml_row_hook]'s depth guard ([max_row_hook_depth]), its
+   dynamic-extent reentrancy scope (#752 rounds 6-8), its undo-target capture
+   (#752 round 9) and its error normalisation, all of which live above this
+   module in the dependency graph.  A raw registry read here would reproduce
+   the write half of the feature while silently dropping every guard nine
+   review rounds put around it. *)
+type row_hook_lookup =
+  table:string
+  -> timing:[ `Before | `After ]
+  -> event:[ `Insert | `Update | `Delete ]
+  -> (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option
+
+let row_hook_lookup_key : row_hook_lookup Lwt.key = Lwt.new_key ()
+
+let with_row_hooks (lookup : row_hook_lookup) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+  Lwt.with_value row_hook_lookup_key (Some lookup) f
+;;
+
+(* Resolve the hook for one (table, timing, event), or [None] when no lookup is
+   installed or nothing is registered.  Resolved at the moment the write
+   happens, NOT snapshotted per statement the way [make_combined_hook]'s fire
+   list is (#771): a cascade's child tables are not known until the fan-out
+   reaches them, so there is no earlier point at which a snapshot could be
+   taken.  A hook registered by an earlier hook in the same statement therefore
+   DOES fire for a later cascade step, where on the direct path it would not
+   until the next statement. *)
+let row_hook_for ~table ~timing ~event =
+  match Lwt.get row_hook_lookup_key with
+  | None -> None
+  | Some lookup -> lookup ~table ~timing ~event
+;;
+
+(* Run one resolved hook, prefixing whatever it fails with by [ctx] so the
+   error names the write that fired it.  A [`Before] hook's [Error] arrives
+   here as [Failure] (Db's [fire_ocaml_row_hook] normalises every failure
+   shape to that one class), and re-raising it is the whole veto mechanism:
+   the exception unwinds through the cascade, out of [execute_delete]/
+   [execute_update]'s [Lwt.catch], and rolls the statement back.  See
+   [docs/DECISIONS.md] (#773) for why a cascade veto CANNOT be a per-row skip. *)
+let run_row_hook ~ctx hook ~tx ~new_row ~old_row : unit Lwt.t =
+  match hook with
+  | None -> Lwt.return_unit
+  | Some f ->
+    Lwt.catch
+      (fun () -> f ~tx ~new_row ~old_row)
+      (function
+        | Failure msg -> Lwt.fail_with (ctx ^ msg)
+        | exn -> Lwt.fail exn)
+;;
+
+(* The [ctx] prefix for a hook fired by an FK cascade step on [table]. *)
+let fk_cascade_hook_ctx table = Printf.sprintf "FOREIGN KEY cascade on '%s': " table
+
 (* Drain to the public shape: user tables only, deduplicated, sorted. *)
 let dirty_elements ({ names; _ } : dirty_tables_acc) : string list =
   Hashtbl.fold
@@ -6315,6 +6392,19 @@ let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   Cat.note_rowid_deleted cat ~name:meta.Cat.name ~rowid tx
 ;;
 
+(* #773: the row a single-column cascade write ([ON DELETE]/[ON UPDATE]
+   [CASCADE]/[SET NULL]/[SET DEFAULT]) will store, computed from the pre-image.
+   Factored out of {!update_col_in_tx} so the [`Before]/[`After] UPDATE row
+   hooks {!cascade_update_col_in_tx} fires observe EXACTLY the row that write
+   stores — including its STORED generated columns — rather than a second,
+   independently maintained reconstruction of it that could drift. *)
+let cascade_updated_row (meta : Cat.table_meta) (row : Row.t) ~col_idx ~new_val =
+  let new_row = Array.copy row in
+  new_row.(col_idx) <- new_val;
+  compute_stored_generated_cols None [||] meta new_row;
+  new_row
+;;
+
 (** Update one column to [new_val] in a row within an existing RW transaction.
     Also updates index entries for any index that covers [col_idx]. *)
 let update_col_in_tx
@@ -6327,9 +6417,7 @@ let update_col_in_tx
       ~new_val
   =
   mark_dirty meta.Cat.name;
-  let new_row = Array.copy row in
-  new_row.(col_idx) <- new_val;
-  compute_stored_generated_cols None [||] meta new_row;
+  let new_row = cascade_updated_row meta row ~col_idx ~new_val in
   let indexes = Cat.indexes_for_table cat ~table:meta.Cat.name in
   (* #693: this is the third and last [write_row_rekeyed] caller (ON UPDATE
      CASCADE / SET NULL / SET DEFAULT) — plain UPDATE has
@@ -6421,6 +6509,24 @@ let rec cascade_delete_row_in_tx
   then Lwt.return_unit
   else (
     Hashtbl.add visited visited_key ();
+    (* #773: an OCaml row hook registered on THIS table fires for the cascaded
+       delete exactly as it would for the same row deleted by a plain [DELETE].
+       [`Before] fires ahead of the fan-out below, not merely ahead of this
+       row's own removal, so a veto pre-empts every grandchild write this step
+       would have caused — the same outer-gate position #752 gave a [`Before]
+       hook relative to a SQL BEFORE trigger's nested DML; [`After] fires once
+       the whole subtree rooted at this row has been applied.  The [visited]
+       guard above is checked FIRST, so a row reached twice by a cyclic cascade
+       fires nothing the second time: no write happens either. *)
+    let ctx = fk_cascade_hook_ctx meta.Cat.name in
+    let* () =
+      run_row_hook
+        ~ctx
+        (row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Delete)
+        ~tx
+        ~new_row:None
+        ~old_row:(Some row)
+    in
     let* child_refs =
       if Cat.get_fk_enforcement cat
       then build_child_refs cat ~parent_table_name:meta.Cat.name
@@ -6445,7 +6551,13 @@ let rec cascade_delete_row_in_tx
              fks)
         child_refs
     in
-    delete_row_in_tx tx cat meta ~rowid ~row)
+    let* () = delete_row_in_tx tx cat meta ~rowid ~row in
+    run_row_hook
+      ~ctx
+      (row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Delete)
+      ~tx
+      ~new_row:None
+      ~old_row:(Some row))
 
 (* Apply the ON DELETE action of one [fk] (child_meta references meta) while
    deleting [row] of [meta] at [rowid]. *)
@@ -6699,42 +6811,62 @@ and cascade_update_col_in_tx
   then Lwt.return_unit
   else (
     Hashtbl.add visited visited_key ();
+    (* #773: same contract as {!cascade_delete_row_in_tx}'s, for the five
+       cascade actions that WRITE a column rather than remove a row —
+       [ON DELETE SET NULL], [ON DELETE SET DEFAULT], [ON UPDATE CASCADE],
+       [ON UPDATE SET NULL] and [ON UPDATE SET DEFAULT] all funnel through
+       here.  The post-image is built with the same {!cascade_updated_row} the
+       write below uses, and only when a hook is actually registered for this
+       table: a cascade over a table with no hooks pays one [Hashtbl] miss per
+       row, not a row copy. *)
+    let ctx = fk_cascade_hook_ctx meta.Cat.name in
+    let bh = row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Update in
+    let ah = row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Update in
+    let hook_new_row =
+      if Option.is_none bh && Option.is_none ah
+      then None
+      else Some (cascade_updated_row meta row ~col_idx ~new_val)
+    in
+    let* () = run_row_hook ~ctx bh ~tx ~new_row:hook_new_row ~old_row:(Some row) in
     let* () = update_col_in_tx tx cat meta ~rowid ~row ~col_idx ~new_val in
-    if not (Cat.get_fk_enforcement cat)
-    then Lwt.return_unit
-    else (
-      let parent_col_name = (List.nth meta.Cat.columns col_idx).Row.name in
-      let* all_child_refs = build_child_refs cat ~parent_table_name:meta.Cat.name in
-      let col_child_refs =
-        List.filter_map
+    let* () =
+      if not (Cat.get_fk_enforcement cat)
+      then Lwt.return_unit
+      else (
+        let parent_col_name = (List.nth meta.Cat.columns col_idx).Row.name in
+        let* all_child_refs = build_child_refs cat ~parent_table_name:meta.Cat.name in
+        let col_child_refs =
+          List.filter_map
+            (fun (child_meta, fks) ->
+               let matching_fks =
+                 List.filter
+                   (fun (fk : Cat.fk_constraint) ->
+                      List.mem parent_col_name fk.Cat.fk_parent_cols)
+                   fks
+               in
+               if matching_fks = [] then None else Some (child_meta, matching_fks))
+            all_child_refs
+        in
+        Lwt_list.iter_s
           (fun (child_meta, fks) ->
-             let matching_fks =
-               List.filter
-                 (fun (fk : Cat.fk_constraint) ->
-                    List.mem parent_col_name fk.Cat.fk_parent_cols)
-                 fks
-             in
-             if matching_fks = [] then None else Some (child_meta, matching_fks))
-          all_child_refs
-      in
-      Lwt_list.iter_s
-        (fun (child_meta, fks) ->
-           Lwt_list.iter_s
-             (fun (fk : Cat.fk_constraint) ->
-                cascade_update_fk
-                  tx
-                  cat
-                  visited
-                  clock
-                  params
-                  meta
-                  ~row
-                  ~new_val
-                  ~parent_col_name
-                  child_meta
-                  fk)
-             fks)
-        col_child_refs))
+             Lwt_list.iter_s
+               (fun (fk : Cat.fk_constraint) ->
+                  cascade_update_fk
+                    tx
+                    cat
+                    visited
+                    clock
+                    params
+                    meta
+                    ~row
+                    ~new_val
+                    ~parent_col_name
+                    child_meta
+                    fk)
+               fks)
+          col_child_refs)
+    in
+    run_row_hook ~ctx ah ~tx ~new_row:hook_new_row ~old_row:(Some row))
 
 (* Apply the ON UPDATE action of one [fk] when [parent_col_name] of [meta]
    changes to [new_val]. *)
@@ -9390,15 +9522,13 @@ let alter_rename_table ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) new_nam
     pre-existing and separately-filed gap this function does not attempt to
     close.
 
-    Residual NOT closed by this check, named explicitly rather than left
-    implicit: [ALTER TABLE ... RENAME TO] (renaming the WHOLE table) and
-    [DROP TABLE] can still desync a pending check by table name the same
-    way — [make_fk_recheck]'s [Cat.find_table_cached] returning [None]
-    reports "not violated", the same silent-wrong-answer shape the review's
-    RENAME COLUMN finding had for a column. Out of round 3's stated scope
-    (RENAME COLUMN / DROP COLUMN / ADD COLUMN); worth a future issue if it
-    proves reachable — filing it is simpler than a new mid-flight guard, and
-    matches how #767 was itself scoped out of this same PR. *)
+    The table-level half of the same class — [ALTER TABLE ... RENAME TO]
+    desyncing a pending check by TABLE name, which round 3 named as its own
+    open residual — was filed as #768 and is closed by this function's
+    sibling {!fk_obligation_table_conflict}, which the [RENAME TO] arm
+    consults exactly as the two column arms consult this one. [DROP TABLE]
+    is deliberately still not guarded; see that function's own comment for
+    why it is a different (and wider) question rather than the same bug. *)
 let fk_obligation_conflict (cat : Cat.t) ~table_name ~col_name : string option =
   let check_conflict (chk : Cat.pending_fk_check) =
     if chk.Cat.pfk_fk_ordinal < 0
@@ -9447,6 +9577,99 @@ let fk_obligation_conflict (cat : Cat.t) ~table_name ~col_name : string option =
   List.find_map check_conflict (Cat.peek_pending_fk_checks cat)
 ;;
 
+(** #768: the table-level sibling of {!fk_obligation_conflict}, and the same
+    structural argument one scope wider.
+
+    {!make_fk_recheck} identifies BOTH sides of a pending deferred FK
+    obligation by TABLE NAME — [child_name] and [parent_name] are plain
+    strings closed over at enqueue time — and at COMMIT resolves them with
+    [Cat.find_table_cached], treating [None] as "not violated".
+    [ALTER TABLE ... RENAME TO] rewrites a table's catalog name with nothing
+    keeping those captured strings in sync, so renaming either side of a
+    pending obligation mid-transaction made COMMIT silently accept a genuine
+    violation and leave a permanent orphan behind (#768's two repros: rename
+    the child, or rename the parent).
+
+    That is exactly the shape round 3 of #765 closed for [RENAME COLUMN] /
+    [DROP COLUMN], and it is closed the same way rather than on the recheck
+    side: the recheck only ever sees the schema AFTER the mutation, so
+    teaching it to chase one more mutation shape can never get ahead of the
+    next one. Refusing the mutation WHILE the obligation is live removes the
+    race instead of predicting its shape.
+
+    [table_name] is the ALTER's own target (the OLD name). Returns
+    [Some conflict_message] when some pending check's FK constraint —
+    resolved FRESH right now via {!Cat.peek_pending_fk_checks} and its
+    [pfk_fk_ordinal], exactly as {!make_fk_recheck} resolves it at COMMIT —
+    still names [table_name] as its CHILD table or as its PARENT table;
+    [None] when the table is free to rename.
+
+    Deliberately narrow, in two directions:
+
+    - Only [RENAME TO] calls this. The three column-level ALTER forms have
+      their own, finer check ({!fk_obligation_conflict}); an unrelated table
+      renamed inside the same transaction is not touched, because the check
+      is keyed on the tables the pending obligation actually names, not on
+      "any DDL in a transaction that has any pending check".
+    - [DROP TABLE] is deliberately NOT guarded, and that is a decision, not
+      an omission. Dropping the CHILD removes the referencing rows outright,
+      so "nothing left to enforce" is the honest answer and a refusal here
+      would be a pure over-refusal. Dropping the PARENT does leave a dangling
+      reference — but it leaves the identical dangling reference with NO
+      pending obligation and NO transaction at all (this engine does not
+      check a parent table's incoming references at [DROP TABLE] time), so
+      guarding only the pending-obligation case would make the transactional
+      path stricter than the autocommit one for the same end state. That is
+      a wider, pre-existing gap in [DROP TABLE] itself rather than an
+      identity-desync bug, and it is tracked separately as #776.
+
+    Conservative in one direction, deliberately: the pending queue only
+    grows until COMMIT drains it or ROLLBACK clears it
+    ([Cat.queue_pending_fk_check] / [Cat.drain_pending_fk_checks] /
+    [Cat.clear_pending_fk_checks]), so an obligation whose violation has
+    since been RESOLVED — the missing parent row inserted later in the same
+    transaction — is still in the queue and still refuses the rename. That
+    is an over-refusal, not a wrong answer, and pruning the queue on
+    resolution would mean running every recheck at every ALTER; the cheap,
+    correct escape is to rename after COMMIT. *)
+let fk_obligation_table_conflict (cat : Cat.t) ~table_name : string option =
+  let check_conflict (chk : Cat.pending_fk_check) =
+    if chk.Cat.pfk_fk_ordinal < 0
+    then
+      (* Same [List.nth_opt]-on-a-negative-index guard as
+         {!fk_obligation_conflict}: the [-1] sentinel means the constraint
+         could not be located at enqueue time, so this entry can never be
+         resolved either — treat it as "no conflict from this entry" rather
+         than raising [Invalid_argument] out of an unrelated ALTER. *)
+      None
+    else (
+      match Cat.find_table_cached cat ~name:chk.Cat.pfk_child_table with
+      | None -> None
+      | Some child_now ->
+        (match List.nth_opt child_now.Cat.fk_constraints chk.Cat.pfk_fk_ordinal with
+         | None -> None
+         | Some fk_now ->
+           if String.equal chk.Cat.pfk_child_table table_name
+           then
+             Some
+               (Printf.sprintf
+                  "table '%s' is the child side of a FOREIGN KEY referencing '%s' with a \
+                   deferred check still pending in this transaction"
+                  table_name
+                  fk_now.Cat.fk_parent_table)
+           else if String.equal fk_now.Cat.fk_parent_table table_name
+           then
+             Some
+               (Printf.sprintf
+                  "table '%s' is referenced by a FOREIGN KEY on '%s' with a deferred \
+                   check still pending in this transaction"
+                  table_name
+                  chk.Cat.pfk_child_table)
+           else None))
+  in
+  List.find_map check_conflict (Cat.peek_pending_fk_checks cat)
+;;
+
 (* #405: which user table names an ALTER makes stale for a name-keyed external
    read cache.  Every ALTER form this engine has changes the table's OBSERVABLE
    contents, so all four mark:
@@ -9478,6 +9701,58 @@ let mark_alter_dirty ~(table_meta : Cat.table_meta) = function
    that txn (no nested [rw_begin], which previously self-deadlocked inside
    [BEGIN…COMMIT]) and registers a schema-cache undo so a [ROLLBACK] reverts the
    in-memory catalog along with the store. *)
+(* #767: [ALTER TABLE ... DROP COLUMN] on a column a FOREIGN KEY names — the
+   local side of this table's own constraint, or the parent side of some other
+   table's — is refused outright.  [Cat.drop_column] rebuilds the column list but
+   carries [fk_constraints] through unchanged, and there is no [ALTER TABLE ...
+   DROP CONSTRAINT] with which to clean up afterwards, so letting the drop
+   through leaves a dangling column name in the catalog for the rest of the
+   table's life: every subsequent INSERT into the child fails, and every
+   UPDATE/DELETE of the parent that would have to check or cascade fails with
+   it.  See docs/DECISIONS.md for why this refuses rather than rewriting.
+
+   Deliberately NOT gated on [PRAGMA foreign_keys]: that pragma decides whether
+   the constraint is ENFORCED, not whether it is DECLARED, and the catalog
+   damage is identical (and permanent) either way — turning enforcement back on
+   later would find a table whose declared constraint can no longer be
+   evaluated.  {!fk_child_has_ref_multi} and friends consult the pragma because
+   they are enforcement; this is DDL coherence.
+
+   Runs AFTER {!fk_obligation_conflict} on the same statement, and the order
+   matters in one direction only: a column with a deferred FK obligation
+   pending is necessarily a column some constraint still names, so this check
+   would refuse every case that one does — reporting "there is no ALTER TABLE
+   DROP CONSTRAINT" where the specific and more actionable answer is "a
+   deferred check on this very constraint is still pending in this
+   transaction".  The narrower message wins; this is the catch-all behind it.
+
+   Refused from inside [with_ddl_txn], like every other DDL refusal in this
+   engine, so inside an explicit transaction it poisons the txn (#286) even
+   though nothing was applied.  That is consistent with the sibling refusals
+   ({!fk_obligation_conflict}, [Cat.rename_table]'s view/trigger gate) rather
+   than a property of this one; see docs/DECISIONS.md.  [Cat.drop_column]
+   repeats the check as defence in depth, for a caller that does not come
+   through here. *)
+let fk_drop_column_conflict (cat : Cat.t) ~table_name ~col_name : string option =
+  match Cat.fk_column_dependents cat ~table:table_name ~column:col_name with
+  | [] -> None
+  | deps ->
+    Some
+      (Cat.fk_dependents_error
+         ~what:(Printf.sprintf "drop column %s.%s" table_name col_name)
+         ~deps)
+;;
+
+(* Both reasons a [DROP COLUMN] is refused, narrower first — see the two
+   functions above.  One function rather than two nested matches at the call
+   site, which keeps the [AA_drop_column] branch as flat as its siblings. *)
+let drop_column_refusal (cat : Cat.t) ~table_name ~col_name : string option =
+  match fk_obligation_conflict cat ~table_name ~col_name with
+  | Some conflict ->
+    Some (Printf.sprintf "cannot drop column %s.%s: %s" table_name col_name conflict)
+  | None -> fk_drop_column_conflict cat ~table_name ~col_name
+;;
+
 let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta) action
   : int Lwt.t
   =
@@ -9486,23 +9761,40 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
       match action with
       | Ast.AA_add_column col_def -> alter_add_column ~txn:tx cat ~table_meta col_def
       | Ast.AA_rename_table new_name ->
-        let* n = alter_rename_table ~txn:tx cat ~table_meta new_name in
-        (* #752 (review round 3): this is the ONE place a table is ever
-           renamed — see the matching comment on the DROP TABLE path above
-           for why routing the row-hook migration through here (rather than
-           each caller of [execute]/[execute_with_count] remembering to call
-           it) closes the trigger-body and cross-handle gaps by construction.
-           Registers its own undo the same way [Cat.rename_table] already
-           does for the catalog row, so [with_ddl_txn] discards or replays it
-           in lockstep with the rest of this statement's schema-cache undo. *)
-        let undo =
-          S.row_hooks_migrate_table
-            (S.row_hooks store)
-            ~old_name:table_meta.Cat.name
-            ~new_name
-        in
-        Cat.register_schema_undo cat undo;
-        Lwt.return n
+        (* #768: refuse the rename outright while a deferred FK obligation
+           still names this table on either side -- the table-level twin of
+           the [RENAME COLUMN] / [DROP COLUMN] refusal below, and closed the
+           same structural way for the same reason (see
+           {!fk_obligation_table_conflict}). Checked BEFORE
+           [alter_rename_table] runs, so a refusal leaves the catalog, the
+           row-hook registry and the dirty-name marks all untouched. *)
+        (match fk_obligation_table_conflict cat ~table_name:table_meta.Cat.name with
+         | Some conflict ->
+           Lwt.fail_with
+             (Printf.sprintf
+                "cannot rename table %s to %s: %s"
+                table_meta.Cat.name
+                new_name
+                conflict)
+         | None ->
+           let* n = alter_rename_table ~txn:tx cat ~table_meta new_name in
+           (* #752 (review round 3): this is the ONE place a table is ever
+              renamed — see the matching comment on the DROP TABLE path above
+              for why routing the row-hook migration through here (rather than
+              each caller of [execute]/[execute_with_count] remembering to
+              call it) closes the trigger-body and cross-handle gaps by
+              construction. Registers its own undo the same way
+              [Cat.rename_table] already does for the catalog row, so
+              [with_ddl_txn] discards or replays it in lockstep with the rest
+              of this statement's schema-cache undo. *)
+           let undo =
+             S.row_hooks_migrate_table
+               (S.row_hooks store)
+               ~old_name:table_meta.Cat.name
+               ~new_name
+           in
+           Cat.register_schema_undo cat undo;
+           Lwt.return n)
       | Ast.AA_rename_column (old_col, new_col) ->
         (match
            fk_obligation_conflict cat ~table_name:table_meta.Cat.name ~col_name:old_col
@@ -9533,14 +9825,8 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
               clear_table_expr_caches table_meta.Cat.name;
               Lwt.return 0))
       | Ast.AA_drop_column col_name ->
-        (match fk_obligation_conflict cat ~table_name:table_meta.Cat.name ~col_name with
-         | Some conflict ->
-           Lwt.fail_with
-             (Printf.sprintf
-                "cannot drop column %s.%s: %s"
-                table_meta.Cat.name
-                col_name
-                conflict)
+        (match drop_column_refusal cat ~table_name:table_meta.Cat.name ~col_name with
+         | Some msg -> Lwt.fail_with msg
          | None -> alter_drop_column tx cat ~table_meta col_name))
   in
   mark_alter_dirty ~table_meta action;
@@ -9916,7 +10202,25 @@ let execute_with_count
     S.set_wal_autocheckpoint store (Int64.to_int n);
     Lwt.return 0
   | Plan.Op_pragma_set_synchronous { mode } ->
-    if mode <> "full" && S.commit_callback_active store
+    (* #772: a level that needs a write barrier the backend cannot issue is
+       refused here, by name, rather than accepted and silently not honoured.
+       This is the SQL-facing half of [Store.set_durability]'s guard; it runs
+       first so the message names the PRAGMA and the mode the user typed. *)
+    let barrier_reason =
+      match S.barrier store with
+      | `Available -> None
+      | `Unavailable r -> Some r
+    in
+    if (mode = "full" || mode = "batched") && Option.is_some barrier_reason
+    then
+      failwith
+        (Printf.sprintf
+           "PRAGMA synchronous: '%s' needs a write barrier this backend cannot issue, so \
+            commits could not be made durable however they were acked: %s. Only 'off' is \
+            honest on this backend."
+           mode
+           (Option.get barrier_reason))
+    else if mode <> "full" && S.commit_callback_active store
     then
       failwith
         "PRAGMA synchronous: durability cannot be relaxed while a replication \
@@ -15103,6 +15407,33 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
   (* Reuse the ambient write txn when there is one: opening our own would block
      on the write lock the caller already holds. *)
   let* tx, owned = acquire_txn store mode in
+  (* #785: the repair is all-or-nothing, and until now that was only true in
+     AUTOCOMMIT.  The exception path below rolls [tx] back when [owned], which
+     is exactly the case in which there is nothing else in the transaction to
+     protect; inside an explicit [BEGIN] the transaction is BORROWED, so the
+     raise propagated with every table repaired before the failing one still
+     deleted, and the caller's later [COMMIT] made that partial repair durable.
+     A [`Before `Delete] veto on the third table therefore behaved as "exempt
+     the first two tables' rows from the repair" — precisely the reading
+     [Db.register_row_hook]'s doc comment says a veto does NOT have, and the
+     same wrong answer an FK RESTRICT or any other mid-repair failure gave.
+
+     #631's statement-level savepoint is the shape that fixes it, and the
+     argument is the one #631 already made: the undo must key on WHAT THE
+     STATEMENT DECIDED, not on WHO OWNS THE TRANSACTION.  Taken only when the
+     transaction is borrowed (autocommit's [S.rollback] is strictly stronger
+     and free), rolled back and released on the exception path, released on
+     success, so the caller's transaction is left intact and usable either way
+     — no second exit from #555's poisoned state, and nothing here touches
+     [Db.explicit_txn].
+
+     Unconditional rather than "only when a row hook is registered": every
+     mid-repair raise has the same partial-repair shape, and the PRAGMA is an
+     operator-initiated sweep whose cost is dominated by the scan, so the
+     pager's dirty-set clone that #631 was careful to avoid on the TPC-C write
+     path is not worth avoiding here. *)
+  let mark = changes_mark () in
+  let* sp = stmt_savepoint_begin ~cat:cat_val tx ~take:(not owned) in
   Lwt.catch
     (fun () ->
        (* #600: scan and repair one table at a time.  Scanning every table
@@ -15118,6 +15449,10 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
               repair_not_null_table tx cat_val meta ~counts ~victims)
            tables
        in
+       (* #785: released, not rolled back — the repair succeeded, so its writes
+          join the enclosing scope (the borrowed transaction, or this one's own
+          commit just below). *)
+       let* () = stmt_savepoint_release ~cat:cat_val tx sp in
        let* () = release_txn ~cat:cat_val tx owned in
        (* #630: [per_table] is one entry per TABLE holding that table's report
           rows — O(tables), not O(violations) and not O(table).  The victim
@@ -15126,7 +15461,33 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
        let deleted = List.fold_left (fun acc (_, n) -> acc + n) 0 per_table in
        Lwt.return (rows, deleted))
     (fun exn ->
+       (* #785: [~wrote:false] rolls the savepoint back and releases it when one
+          was taken (the borrowed case), and — in BOTH cases — discards the #417
+          row-level deltas the repaired tables recorded, since the store they
+          describe is reverted either by that rollback or by the [S.rollback]
+          just below.  Autocommit dropped those deltas nowhere before; #737's
+          name-set resync covered for it, which is why it was never visible. *)
+       let* () = stmt_savepoint_finish ~cat:cat_val tx ~wrote:false ~owned ~mark sp in
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       (* #785 (review round 2, finding 1): resolve [cat_val]'s #269 schema-undo
+          log too, exactly as [execute_insert]/[execute_update]/[execute_delete]'s
+          own [owned] failure arms do — this function's SUCCESS path already does
+          the symmetric thing through [release_txn]'s [Cat.commit_schema_changes].
+          #775 is what made this reachable: the repair fires OCaml row hooks now,
+          so [Store.in_row_hook_for] holds during it, and per #752 round 8 a hook
+          body calling [Db.register_row_hook]/[Db.unregister_row_hook] pushes an
+          undo entry onto that log.  In autocommit ([owned]) THIS statement is
+          that log's whole scope, so a registry mutation made by an earlier
+          victim's hook must be undone alongside the row-store rollback above, or
+          it survives a repair that was rolled back in full.
+
+          Guarded on [owned] because the borrowed case is already correct and an
+          unconditional call here would be WORSE than the gap: the
+          [stmt_savepoint_finish] above just replayed exactly this statement's
+          entries through [Cat.savepoint_rollback_schema], whereas
+          [Cat.rollback_schema_changes] would replay the ENCLOSING transaction's
+          too. *)
+       if owned then Cat.rollback_schema_changes cat_val;
        Lwt.fail exn)
 
 and stream_pragma_not_null_repair store mode cat =
@@ -15189,6 +15550,37 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~
        kept because THIS is where the ordering the delete depends on is
        required, and it must not become an accident of the scan. *)
     let victims = List.sort_uniq (fun (a, _) (b, _) -> Int64.compare a b) victims in
+    (* #775: the repair is a DELETE (#588), so it owes the same OCaml row hooks
+       the [DELETE FROM ...] spelling of the identical write fires — a
+       [`Before `Delete] veto has power over a repaired row, and an [`After]
+       audit hook observes it.  The bracketing mirrors {!execute_delete}'s
+       exactly, and deliberately so: ALL [`Before] hooks for this table's
+       victims run before ANY of them is removed, then the removals, then all
+       the [`After] hooks.  A per-row Before/delete/After interleaving would be
+       a different, statement-visible order from the one the direct path pins.
+
+       Veto outcome (documented in [docs/DECISIONS.md], #775/#785): the raise
+       unwinds through {!not_null_repair_run}, whose [Lwt.catch] rolls the
+       whole repair back — every table's, not just this one's, since they share
+       one transaction.  The PRAGMA reports nothing deleted and fails; that is
+       the same all-or-nothing scope the columnstore comment above already
+       reasons about, and the reason a vetoing hook is a refusal of the repair
+       rather than a way to exempt individual rows from it.  #785 is what makes
+       that true inside an explicit [BEGIN] as well as in autocommit: see the
+       statement-level savepoint in {!not_null_repair_run}. *)
+    let ctx = Printf.sprintf "PRAGMA not_null_repair on '%s': " meta.Cat.name in
+    let bh = row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Delete in
+    let ah = row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Delete in
+    let fire hook =
+      match hook with
+      | None -> Lwt.return_unit
+      | Some _ ->
+        Lwt_list.iter_s
+          (fun (_rowid, row) ->
+             run_row_hook ~ctx hook ~tx ~new_row:None ~old_row:(Some row))
+          victims
+    in
+    let* () = fire bh in
     let* () =
       Lwt_list.iter_s
         (fun ((rowid, row) as m) ->
@@ -15207,6 +15599,7 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~
            Lwt.return_unit)
         victims
     in
+    let* () = fire ah in
     mark_dirty meta.Cat.name;
     Lwt.return (not_null_report_rows meta ~counted:Fun.id counts, List.length victims))
 

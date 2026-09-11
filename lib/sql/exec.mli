@@ -196,6 +196,41 @@ val make_change_acc : unit -> dirty_tables_acc
     band (see {!Granary_db.Db.dirty_tables}). *)
 val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
+(** #773/#775: how a write path BELOW the statement's own hook plumbing
+    resolves the OCaml row hook ({!Granary_db.Db.register_row_hook}) for one
+    (table, timing, event).
+
+    {!execute}/{!execute_with_count}'s [?before_hook]/[?after_hook] pair covers
+    the one table the statement names, and cannot cover more: an FK cascade's
+    child tables are discovered a level at a time as the fan-out runs, and
+    [PRAGMA not_null_repair] deletes from every table in the database.  Those
+    paths resolve a hook by name, mid-statement, through this.
+
+    Returning [None] for a (table, timing, event) with nothing registered is
+    the fast path and must stay cheap: it is consulted once per cascaded row. *)
+type row_hook_lookup =
+  table:string
+  -> timing:[ `Before | `After ]
+  -> event:[ `Insert | `Update | `Delete ]
+  -> (tx:Granary_store.Store.rw Granary_store.Store.txn
+      -> new_row:Granary_encoding.Row.t option
+      -> old_row:Granary_encoding.Row.t option
+      -> unit Lwt.t)
+       option
+
+(** [with_row_hooks lookup f] installs [lookup] for [f]'s dynamic extent, so
+    every FK cascade step and [PRAGMA not_null_repair] deletion [f] performs —
+    at any depth, through any number of nested cascade levels — fires the row
+    hooks registered for the table it touches.  Rides Lwt sequence-associated
+    storage, like {!with_dirty} and for the same reason (#417): the cascade
+    path is ~20 mutually-recursive functions deep and already carries the
+    change feed this way.
+
+    A caller that installs nothing fires no hooks — the pre-#773 behaviour, and
+    what a direct [Exec] caller (a storage-level test) still gets.  [Db]
+    installs it around every statement it executes. *)
+val with_row_hooks : row_hook_lookup -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+
 (** The accumulator installed by the nearest enclosing {!with_dirty}, if any.
     Lets a caller (the #427 reactive-view driver) reuse an ambient
     change-capturing accumulator instead of shadowing it with a fresh one. *)

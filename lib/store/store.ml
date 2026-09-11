@@ -28,6 +28,18 @@ type ro
 type rw
 type tree_id = int
 
+(* #772: whether the backing device can make a write durable.  [Mirage_block.S]
+   has no flush operation, so an adapter over it reports [`Unavailable] with a
+   reason naming the backend and the missing capability; [open_block] /
+   [open_block_wal] then refuse every durability level that would promise a
+   barrier they cannot issue.  A structural polymorphic variant rather than a
+   nominal type on purpose: [granary.mirage_block] must be able to produce this
+   value without depending on [granary.store]. *)
+type barrier =
+  [ `Available
+  | `Unavailable of string
+  ]
+
 type error =
   | Block_error of string
   | Corruption of string
@@ -43,6 +55,10 @@ type error =
   | History_unavailable (** as-of API used on a store opened without the feature *)
   | History_pruned (** as-of target is older than the retained floor *)
   | History_misconfigured (** [as_of_history:true] but no history sink supplied *)
+  | Durability_unavailable of string
+  (** #772: the requested durability level needs a write barrier the backend
+      cannot issue.  Carries the full refusal text, including the backend's own
+      reason and the way out. *)
 
 let pp_error fmt = function
   | Block_error s -> Format.fprintf fmt "Block_error(%s)" s
@@ -60,6 +76,7 @@ let pp_error fmt = function
     Format.fprintf fmt "as-of target is older than the retained history horizon"
   | History_misconfigured ->
     Format.fprintf fmt "as_of_history was requested but no history log was supplied"
+  | Durability_unavailable s -> Format.pp_print_string fmt s
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -258,6 +275,11 @@ type bt_state =
        follower's last-applied commit (#263).  Stored in local committed-frame
        count space so it compares correctly against [Wal.committed_frames]
        and survives local epoch resets. *)
+  ; barrier : barrier
+    (* #772: the backing device's durability capability, declared at open.
+       Immutable: it is a property of the device, not a setting.  When
+       [`Unavailable], [sync_mode] is pinned to [`Off] -- [open_block] refused
+       anything else, and [set_durability] keeps refusing. *)
   ; mutable sync_mode : [ `Full | `Batched | `Off ]
     (* #298: durability mode. [`Full] = fsync every group-commit (default).
        [`Batched] = defer fsync until [batch_commits] or [batch_interval_ms].
@@ -437,6 +459,20 @@ type row_hooks =
         [row_hook_id] alone through this index instead means a rename can
         never desynchronise a handle from the registry entry it names. *)
   ; mutable row_hook_next_id : int
+  ; mutable row_hook_lineage : int
+    (** #774: identity of the registry LINEAGE this record belongs to,
+        minted fresh for every new [row_hooks] record and copied verbatim by
+        {!row_hooks_carry_over}.  [Db.vacuum] rebuilds the database into a
+        brand-new [Store.t] and swaps it in under the handle, so the pre- and
+        post-VACUUM stores are different objects holding different [row_hooks]
+        records — but they are the SAME logical registry, because the carry-over
+        moves every entry across.  {!row_hook_effective_depth} needs exactly
+        that "same logical registry" test rather than the physical [==] on
+        [t]: a hook's deferred [Lwt.async] continuation, whose captured
+        {!row_hook_scope} still names the PRE-VACUUM store, must keep being
+        attributed against its own [rhs_depth] once it resumes and writes
+        through the post-VACUUM store, or [Db]'s [max_row_hook_depth] guard
+        silently restarts from zero for it.  See {!row_hook_effective_depth}. *)
   ; mutable row_hook_depth : int
     (** #752 (review round 4): nested row-hook-firing depth, shared by every
         [Db.t] over this store — same rationale as everything else on
@@ -601,6 +637,26 @@ let rv_carry_over_generations ~from ~to_ =
    rather than a caller re-deriving composite-key/insert-order logic against
    a raw [Hashtbl] — the "hardened primitive" the round-3 review asked for. *)
 let row_hooks t = t.row_hooks
+
+(* #774: source of {!row_hooks}' [row_hook_lineage] values.  A plain global
+   counter: the only property required of a lineage id is that two registries
+   compare equal iff {!row_hooks_carry_over} put them in the same lineage, and
+   a monotonically increasing counter gives that with no bookkeeping.  Never
+   reset — mirroring [rv_gen_next]'s (#757) reasoning one level up. *)
+let row_hook_lineage_next = ref 0
+
+(* The one place a [row_hooks] record is built, so a new field can never be
+   added to one construction site and forgotten at the other ([create] and
+   [make_btree_store] both call this). *)
+let fresh_row_hooks () =
+  incr row_hook_lineage_next;
+  { row_hook_tbl = Hashtbl.create 4
+  ; row_hook_index = Hashtbl.create 4
+  ; row_hook_next_id = 0
+  ; row_hook_lineage = !row_hook_lineage_next
+  ; row_hook_depth = 0
+  }
+;;
 
 (* Record [id]'s current key in the reverse index for every entry in [lst]. *)
 let index_entries (reg : row_hooks) key lst =
@@ -796,7 +852,26 @@ let row_hooks_carry_over ~from ~to_ =
     (fun id key -> Hashtbl.replace to_.row_hooks.row_hook_index id key)
     from.row_hooks.row_hook_index;
   if from.row_hooks.row_hook_next_id > to_.row_hooks.row_hook_next_id
-  then to_.row_hooks.row_hook_next_id <- from.row_hooks.row_hook_next_id
+  then to_.row_hooks.row_hook_next_id <- from.row_hooks.row_hook_next_id;
+  (* #774: the destination joins the source's registry lineage, so an
+     in-flight {!row_hook_scope} captured against [from] still resolves
+     against [to_] in {!row_hook_effective_depth}.  See that function and the
+     [row_hook_lineage] field's own doc comment.
+
+     [row_hook_depth] is deliberately NOT copied, which is the one field of
+     [row_hooks] this function leaves alone.  It counts hook invocations that
+     are CURRENTLY firing, and each one's matching {!row_hook_depth_decr} runs
+     under an [Lwt.finalize] closed over the [row_hooks] record it
+     incremented — [from]'s.  Copying a non-zero count
+     onto [to_] would therefore hand the new store a claim that nothing will
+     ever release, permanently shrinking [Db]'s [max_row_hook_depth] budget on
+     the post-VACUUM store.  Copying it is also not what #774 needed: the
+     deferred continuation that motivated the issue resumes AFTER its hook's
+     synchronous extent ended, i.e. after the decrement, so [from]'s counter
+     reads 0 at carry-over time and a copy would carry nothing.  The depth
+     that matters for that continuation is its scope's [rhs_depth], which is
+     what the lineage carried above lets {!row_hook_effective_depth} reach. *)
+  to_.row_hooks.row_hook_lineage <- from.row_hooks.row_hook_lineage
 ;;
 
 (* #752 (review round 4): see the [.mli] doc comment on [row_hooks]'s
@@ -1004,6 +1079,16 @@ let row_hook_ambient_undo_target (t : t) : ((unit -> unit) -> unit) option =
   | _ -> None
 ;;
 
+(* #774: [a] and [b] hold the same logical row-hook registry -- either
+   literally the same store, or two stores {!row_hooks_carry_over} has put in
+   one lineage (VACUUM's rebuild). See {!row_hook_effective_depth} just below,
+   its only caller, for why that is the right question there and the wrong one
+   for {!in_row_hook_for}. The physical test comes first: it answers the
+   overwhelmingly common no-VACUUM case without touching either registry. *)
+let same_row_hook_lineage (a : t) (b : t) =
+  a == b || a.row_hooks.row_hook_lineage = b.row_hooks.row_hook_lineage
+;;
+
 (* #752 (review round 8, item 2): the recursion depth to attribute a NEW row
    hook firing for [t] against, given [reg] (this store's [row_hooks]).
 
@@ -1027,10 +1112,32 @@ let row_hook_ambient_undo_target (t : t) : ((unit -> unit) -> unit) option =
    in-flight hook -- {!Db.create_worker_handle}, #589) does the store-wide
    counter serve as the fallback, which is what keeps recursion attributed
    correctly across sibling handles for a genuinely synchronous nested chain
-   (round 4). *)
+   (round 4).
+
+   #774: the scope is matched against [t] by registry LINEAGE, not by
+   physical store identity. [Db.vacuum] rebuilds the database into a brand-new
+   [Store.t], carries the row-hook registry across
+   ({!row_hooks_carry_over}) and swaps the new store in under the handle, so a
+   deferred continuation constructed inside a pre-VACUUM hook's extent holds a
+   scope naming a store object that is no longer the handle's. A plain [==]
+   test fails there and falls through to the store-wide counter on the FRESH
+   registry — which reads 0, restarting [Db]'s [max_row_hook_depth] budget for
+   a chain that had already nested arbitrarily deep, in exactly the case this
+   function exists to catch. Comparing lineages instead makes the carry-over,
+   rather than object identity, decide what "this store's registry" means; two
+   genuinely unrelated stores never share a lineage, since one is only ever
+   copied by {!row_hooks_carry_over}. The [==] fast path is kept ahead of it
+   purely to answer the overwhelmingly common no-VACUUM case without touching
+   the registries.
+
+   {!in_row_hook_for} and {!row_hook_ambient_undo_target} deliberately keep the
+   physical [==] test: they ask about the writer lock of one specific store
+   object (#740) and about a [Cat.t] captured for one specific statement, and
+   VACUUM genuinely replaces both — a pre-VACUUM answer would be wrong there,
+   where here it is the only right one. *)
 let row_hook_effective_depth (t : t) (reg : row_hooks) =
   match Lwt.get in_row_hook_key with
-  | Some scope when scope.rhs_store == t -> scope.rhs_depth
+  | Some scope when same_row_hook_lineage scope.rhs_store t -> scope.rhs_depth
   | _ -> reg.row_hook_depth
 ;;
 
@@ -1363,12 +1470,7 @@ let create () : t =
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
-  ; row_hooks =
-      { row_hook_tbl = Hashtbl.create 4
-      ; row_hook_index = Hashtbl.create 4
-      ; row_hook_next_id = 0
-      ; row_hook_depth = 0
-      }
+  ; row_hooks = fresh_row_hooks ()
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -1393,6 +1495,8 @@ let make_btree_store
       ?(cipher = None)
       ?(history = None)
       ?(history_now = fun () -> 0L)
+      ?(barrier : barrier = `Available)
+      ?(durability : durability = Full)
       ~close_fn
       ~pager
       ~meta
@@ -1434,9 +1538,20 @@ let make_btree_store
     ; history_floor = None
     ; follower = false
     ; follower_ack_position = None
-    ; sync_mode = `Full
-    ; batch_commits = default_batch_commits
-    ; batch_interval_ms = default_batch_interval_ms
+    ; barrier
+    ; sync_mode =
+        (match durability with
+         | Full -> `Full
+         | Off -> `Off
+         | Batched _ -> `Batched)
+    ; batch_commits =
+        (match durability with
+         | Batched { commits; _ } -> max 0 commits
+         | Full | Off -> default_batch_commits)
+    ; batch_interval_ms =
+        (match durability with
+         | Batched { interval_ms; _ } -> max 0 interval_ms
+         | Full | Off -> default_batch_interval_ms)
     ; unsynced_commits = 0
     ; last_sync_time = 0.
     ; clock = (fun () -> 0.)
@@ -1455,12 +1570,7 @@ let make_btree_store
   ; rowid_counters = Hashtbl.create 16
   ; rv_generations = Hashtbl.create 4
   ; rv_gen_next = 0
-  ; row_hooks =
-      { row_hook_tbl = Hashtbl.create 4
-      ; row_hook_index = Hashtbl.create 4
-      ; row_hook_next_id = 0
-      ; row_hook_depth = 0
-      }
+  ; row_hooks = fresh_row_hooks ()
   ; lock = Rwlock.create ()
   ; lock_stats = Lock_stats.create ()
   ; mem_rw_shadow = None
@@ -1679,12 +1789,104 @@ let check_key (h : Header.t) cipher =
     else Error Encryption_key_mismatch
 ;;
 
+(* #785: the substitution itself, named so that the WAL's [wal_sync] can be
+   routed through exactly the same one (see {!resolve_barrier_wal}) rather than
+   a second copy of the literal that could drift from it. *)
+let no_barrier_sync () : (unit, string) result Lwt.t = Lwt.return (Ok ())
+
+(* #772: reconcile the durability level the caller asked for with what the
+   backing device can actually deliver, BEFORE any device is touched (the same
+   discipline as the [as_of_history] guard below, so a refused open leaks
+   nothing).
+
+   The rule: with no barrier, [Off] is the only truthful mode.  [Full] promises
+   an fsync per group-commit and [Batched] promises one per batch plus one at
+   every checkpoint and at [close]; neither promise can be kept, so both are
+   refused by name rather than quietly downgraded.  [Off] already means "commits
+   are not made durable", which is exactly the state of affairs, so selecting it
+   is choosing the accurate description rather than waiving a check -- and it is
+   not a mode anyone reaches by accident.
+
+   Second half: with no barrier the store must not CALL [sync] either.  A
+   barrier-less adapter is required to return [Error] (see
+   [Mirage_backend.sync]), and the main-DB [sync] is reached unconditionally by
+   [Pager.flush_sync_main] at every checkpoint and by [Pager.flush] on the
+   non-WAL commit path -- letting that [Error] through would turn the escape
+   hatch into a store that cannot check point or commit at all, which is a
+   different bug, not a fix for this one.  Substituting a no-op here is not the
+   [Ok ()] #772 objects to: that one survived to a caller who had been promised
+   [Full].  This one runs only after the store has refused every mode that
+   promises anything, so there is no outstanding durability claim for it to
+   falsify.  {!barrier} keeps the capability readable so nothing is hidden. *)
+let resolve_barrier
+      ~(barrier : barrier)
+      ~(durability : durability)
+      ~(sync : unit -> (unit, string) result Lwt.t)
+  : (unit -> (unit, string) result Lwt.t, error) result
+  =
+  match barrier with
+  | `Available -> Ok sync
+  | `Unavailable reason ->
+    (match durability with
+     | Off -> Ok no_barrier_sync
+     | Full | Batched _ ->
+       Error
+         (Durability_unavailable
+            (Printf.sprintf
+               "durability '%s' needs a write barrier this backend cannot issue, so \
+                every commit would be acked durable while the data is still in a \
+                volatile cache. Backend reports: %s. Either supply a backend that can \
+                flush, or open with ~durability:Granary_store.Store.Off (and PRAGMA \
+                synchronous = off) to accept that nothing survives a power loss."
+               (match durability with
+                | Full -> "full"
+                | Batched _ -> "batched"
+                | Off -> "off")
+               reason)))
+;;
+
+(* #785: the same treatment for the WAL device's [wal_sync], which #772 left
+   wired straight through to [Wal.open_].
+
+   [resolve_barrier]'s own argument applies verbatim here: with no barrier the
+   store must not CALL [wal_sync] either.  The WAL reaches it in three places
+   that are not conditional on the durability level -- [Wal.open_]'s
+   [init_header] (so a barrier-less WAL device could not even be opened), the
+   checkpoint's generation-marker rewrite, and [Store.close]'s final
+   [Pager.wal_sync], which fires whenever [sync_mode <> `Full] and the WAL has
+   committed frames, i.e. always under [Off] once anything has been written.  A
+   caller who puts the WAL on the same barrier-less device as the main DB (the
+   byte-over-sector shim mirage/README.md names as the follow-up) and passes
+   its [Error]-returning flush therefore got a store that could not close,
+   having chosen the only durability level the store permits it.
+
+   There is no refusal branch, and that is not an omission: [resolve_barrier]
+   has already run on the main-DB [sync] with the same [barrier] and
+   [durability] by the time this is called, so [`Unavailable] here means the
+   level is already known to be [Off].  One [barrier] describes the weakest
+   device backing the store (see mirage/README.md), so the WAL cannot be
+   durable while the main DB is not, and the substitution falsifies no
+   outstanding claim.  {!wal_sync_count} keeps counting the calls, which is the
+   engine's own count of how many barriers it asked for, not a claim that the
+   device issued them. *)
+let resolve_barrier_wal
+      ~(barrier : barrier)
+      ~(wal_sync : unit -> (unit, string) result Lwt.t)
+  : unit -> (unit, string) result Lwt.t
+  =
+  match barrier with
+  | `Available -> wal_sync
+  | `Unavailable _ -> no_barrier_sync
+;;
+
 let open_block
       ?(as_of_history = false)
       ?(history : History.sink option)
       ?(now : (unit -> int64) option)
       ?(key : string option)
       ?(geom = Geometry.default)
+      ?(barrier : barrier = `Available)
+      ?(durability : durability = Full)
       ~(init_if_corrupt : bool)
       ~(read_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -1695,85 +1897,92 @@ let open_block
       ()
   : (t, error) result Lwt.t
   =
-  (* #266: guard the misconfig FIRST, before opening any device/fds, so a bad
-     request can never leak resources. *)
+  (* #266/#772: guard the misconfigs FIRST, before opening any device/fds, so a
+     bad request can never leak resources. *)
   if as_of_history && Option.is_none history
   then Lwt.return_error History_misconfigured
   else (
-    let history = if as_of_history then history else None in
-    let history_now =
-      match now with
-      | Some f -> f
-      | None -> fun () -> 0L
-    in
-    match
-      let ( let* ) = Result.bind in
-      let* cipher = build_cipher key in
-      let* () = ensure_rng_seeded cipher in
-      let* geom = geom_for_cipher cipher geom in
-      Ok (cipher, geom)
-    with
+    match resolve_barrier ~barrier ~durability ~sync with
     | Error e -> Lwt.return_error e
-    | Ok (cipher, geom) ->
-      let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
-      let pager =
-        Pager.create
-          ~read_page
-          ~write_page
-          ~sync
-          ~resize
-          ~n_pages
-          ~freelist:Freelist.empty
+    | Ok sync ->
+      let history = if as_of_history then history else None in
+      let history_now =
+        match now with
+        | Some f -> f
+        | None -> fun () -> 0L
       in
-      (* Adopt the file's real geometry (peeked for an existing file, [geom] for a
-       fresh one) before any header read so buffers are sized correctly (#95). *)
-      let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
-      Pager.set_geom pager eff_geom;
-      let%lwt hr = Header.read_live pager in
-      (match hr with
-       | Error Header.Both_headers_corrupt when init_if_corrupt ->
-         (* Fresh device — initialise headers.  Disabled via [~init_if_corrupt:false]
-          so an existing-but-corrupt device surfaces [Header_error] instead of
-          being silently re-initialised (a Unix-file open must not clobber). *)
-         let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
-         (match ir with
-          | Error e -> Lwt.return_error (map_header_err e)
-          | Ok () ->
-            Pager.set_n_pages pager 2L;
-            let%lwt hr2 = Header.read_live pager in
-            (match hr2 with
+      (match
+         let ( let* ) = Result.bind in
+         let* cipher = build_cipher key in
+         let* () = ensure_rng_seeded cipher in
+         let* geom = geom_for_cipher cipher geom in
+         Ok (cipher, geom)
+       with
+       | Error e -> Lwt.return_error e
+       | Ok (cipher, geom) ->
+         let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
+         let pager =
+           Pager.create
+             ~read_page
+             ~write_page
+             ~sync
+             ~resize
+             ~n_pages
+             ~freelist:Freelist.empty
+         in
+         (* Adopt the file's real geometry (peeked for an existing file, [geom] for a
+         fresh one) before any header read so buffers are sized correctly (#95). *)
+         let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+         Pager.set_geom pager eff_geom;
+         let%lwt hr = Header.read_live pager in
+         (match hr with
+          | Error Header.Both_headers_corrupt when init_if_corrupt ->
+            (* Fresh device — initialise headers.  Disabled via [~init_if_corrupt:false]
+            so an existing-but-corrupt device surfaces [Header_error] instead of
+            being silently re-initialised (a Unix-file open must not clobber). *)
+            let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
+            (match ir with
              | Error e -> Lwt.return_error (map_header_err e)
-             | Ok h ->
-               let meta = Btree.create pager ~root_page:0L in
+             | Ok () ->
+               Pager.set_n_pages pager 2L;
+               let%lwt hr2 = Header.read_live pager in
+               (match hr2 with
+                | Error e -> Lwt.return_error (map_header_err e)
+                | Ok h ->
+                  let meta = Btree.create pager ~root_page:0L in
+                  Lwt.return_ok
+                    (make_btree_store
+                       ~cipher
+                       ~history
+                       ~history_now
+                       ~barrier
+                       ~durability
+                       ~close_fn:close
+                       ~pager
+                       ~meta
+                       ~h
+                       ())))
+          | Error e -> Lwt.return_error (map_header_err e)
+          | Ok h ->
+            (match check_key h cipher with
+             | Error e -> Lwt.return_error e
+             | Ok () ->
+               Pager.set_n_pages pager h.n_pages_total;
+               let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
+               Pager.set_freelist pager fl;
+               let meta = Btree.create pager ~root_page:h.root_page in
                Lwt.return_ok
                  (make_btree_store
                     ~cipher
                     ~history
                     ~history_now
+                    ~barrier
+                    ~durability
                     ~close_fn:close
                     ~pager
                     ~meta
                     ~h
-                    ())))
-       | Error e -> Lwt.return_error (map_header_err e)
-       | Ok h ->
-         (match check_key h cipher with
-          | Error e -> Lwt.return_error e
-          | Ok () ->
-            Pager.set_n_pages pager h.n_pages_total;
-            let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
-            Pager.set_freelist pager fl;
-            let meta = Btree.create pager ~root_page:h.root_page in
-            Lwt.return_ok
-              (make_btree_store
-                 ~cipher
-                 ~history
-                 ~history_now
-                 ~close_fn:close
-                 ~pager
-                 ~meta
-                 ~h
-                 ()))))
+                    ())))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1826,7 +2035,17 @@ let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
 (* After the WAL hook is installed, re-read the (now WAL-aware) header,
    reconcile [n_pages] for a freshly-initialised DB, load the freelist, and
    build the WAL-backed store. *)
-let finish_wal_open ~cipher ~history ~history_now ~close ~wal_close ~pager ~wal ~was_fresh
+let finish_wal_open
+      ~cipher
+      ~history
+      ~history_now
+      ~barrier
+      ~durability
+      ~close
+      ~wal_close
+      ~pager
+      ~wal
+      ~was_fresh
   =
   let%lwt hr2 = Header.read_live pager in
   match hr2 with
@@ -1852,6 +2071,8 @@ let finish_wal_open ~cipher ~history ~history_now ~close ~wal_close ~pager ~wal 
             ~cipher
             ~history
             ~history_now
+            ~barrier
+            ~durability
             ~wal:(Some wal)
             ~wal_close:(Some wal_close)
             ~close_fn:close
@@ -1867,6 +2088,8 @@ let open_block_wal
       ?(now : (unit -> int64) option)
       ?(key : string option)
       ?(geom = Geometry.default)
+      ?(barrier : barrier = `Available)
+      ?(durability : durability = Full)
       ~(read_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(sync : unit -> (unit, string) result Lwt.t)
@@ -1882,87 +2105,97 @@ let open_block_wal
       ()
   : (t, error) result Lwt.t
   =
-  (* #266: guard the misconfig FIRST, before opening any device/fds, so a bad
-     request can never leak resources. *)
+  (* #266/#772: guard the misconfigs FIRST, before opening any device/fds, so a
+     bad request can never leak resources. *)
   if as_of_history && Option.is_none history
   then Lwt.return_error History_misconfigured
   else (
-    let history = if as_of_history then history else None in
-    let history_now =
-      match now with
-      | Some f -> f
-      | None -> fun () -> 0L
-    in
-    match
-      let ( let* ) = Result.bind in
-      let* cipher = build_cipher key in
-      let* () = ensure_rng_seeded cipher in
-      let* geom = geom_for_cipher cipher geom in
-      Ok (cipher, geom)
-    with
+    match resolve_barrier ~barrier ~durability ~sync with
     | Error e -> Lwt.return_error e
-    | Ok (cipher, geom) ->
-      let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
-      let pager =
-        Pager.create
-          ~read_page
-          ~write_page
-          ~sync
-          ~resize
-          ~n_pages
-          ~freelist:Freelist.empty
+    | Ok sync ->
+      (* #785: the WAL device's flush gets the same treatment as the main-DB
+         [sync] just above -- see {!resolve_barrier_wal} for why it must, and
+         why it needs no refusal branch of its own. *)
+      let wal_sync = resolve_barrier_wal ~barrier ~wal_sync in
+      let history = if as_of_history then history else None in
+      let history_now =
+        match now with
+        | Some f -> f
+        | None -> fun () -> 0L
       in
-      (* Adopt the file's real geometry before any header read or WAL open so the
-       main-DB buffers and the WAL frame size both match it (#95). *)
-      let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
-      Pager.set_geom pager eff_geom;
-      (* Step 1: read the main-DB header (or initialise if fresh). The WAL
-       hook is NOT installed yet, so writes go directly to the main DB.
-       [was_fresh] flag preserves the post-init n_pages override below. *)
-      let%lwt hr = Header.read_live pager in
-      let%lwt init_result =
-        match hr with
-        | Error Header.Both_headers_corrupt ->
-          let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
-          (match ir with
-           | Error e -> Lwt.return_error (map_header_err e)
-           | Ok () ->
-             Pager.set_n_pages pager 2L;
-             Lwt.return_ok true)
-        | Error e -> Lwt.return_error (map_header_err e)
-        | Ok _ -> Lwt.return_ok false
-      in
-      (match init_result with
+      (match
+         let ( let* ) = Result.bind in
+         let* cipher = build_cipher key in
+         let* () = ensure_rng_seeded cipher in
+         let* geom = geom_for_cipher cipher geom in
+         Ok (cipher, geom)
+       with
        | Error e -> Lwt.return_error e
-       | Ok was_fresh ->
-         (* Step 2: open the WAL and recover its index. *)
-         let%lwt wr =
-           Wal.open_
-             ~cipher
-             ~page_size:(Pager.page_size pager)
-             ?resize:wal_resize
-             ~read_at:wal_read_at
-             ~write_at:wal_write_at
-             ~sync:wal_sync
-             ~size_bytes:wal_size_bytes
-             ()
+       | Ok (cipher, geom) ->
+         let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
+         let pager =
+           Pager.create
+             ~read_page
+             ~write_page
+             ~sync
+             ~resize
+             ~n_pages
+             ~freelist:Freelist.empty
          in
-         (match wr with
-          | Error e ->
-            Lwt.return_error (Block_error (Format.asprintf "wal open: %a" Wal.pp_error e))
-          | Ok wal ->
-            (* Step 3: install the hook so subsequent reads consult the WAL. *)
-            install_wal_hook pager wal;
-            (* Step 4: re-read the header (now WAL-aware) and build the store. *)
-            finish_wal_open
-              ~cipher
-              ~history
-              ~history_now
-              ~close
-              ~wal_close
-              ~pager
-              ~wal
-              ~was_fresh)))
+         (* Adopt the file's real geometry before any header read or WAL open so the
+         main-DB buffers and the WAL frame size both match it (#95). *)
+         let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+         Pager.set_geom pager eff_geom;
+         (* Step 1: read the main-DB header (or initialise if fresh). The WAL
+         hook is NOT installed yet, so writes go directly to the main DB.
+         [was_fresh] flag preserves the post-init n_pages override below. *)
+         let%lwt hr = Header.read_live pager in
+         let%lwt init_result =
+           match hr with
+           | Error Header.Both_headers_corrupt ->
+             let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
+             (match ir with
+              | Error e -> Lwt.return_error (map_header_err e)
+              | Ok () ->
+                Pager.set_n_pages pager 2L;
+                Lwt.return_ok true)
+           | Error e -> Lwt.return_error (map_header_err e)
+           | Ok _ -> Lwt.return_ok false
+         in
+         (match init_result with
+          | Error e -> Lwt.return_error e
+          | Ok was_fresh ->
+            (* Step 2: open the WAL and recover its index. *)
+            let%lwt wr =
+              Wal.open_
+                ~cipher
+                ~page_size:(Pager.page_size pager)
+                ?resize:wal_resize
+                ~read_at:wal_read_at
+                ~write_at:wal_write_at
+                ~sync:wal_sync
+                ~size_bytes:wal_size_bytes
+                ()
+            in
+            (match wr with
+             | Error e ->
+               Lwt.return_error
+                 (Block_error (Format.asprintf "wal open: %a" Wal.pp_error e))
+             | Ok wal ->
+               (* Step 3: install the hook so subsequent reads consult the WAL. *)
+               install_wal_hook pager wal;
+               (* Step 4: re-read the header (now WAL-aware) and build the store. *)
+               finish_wal_open
+                 ~cipher
+                 ~history
+                 ~history_now
+                 ~barrier
+                 ~durability
+                 ~close
+                 ~wal_close
+                 ~pager
+                 ~wal
+                 ~was_fresh))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3530,6 +3763,13 @@ let set_wal_autocheckpoint (t : t) (n : int) : unit =
   | Btree st -> st.wal_autocheckpoint_threshold <- max 0 n
 ;;
 
+(* #772: the backing device's durability capability, fixed at open. *)
+let barrier (t : t) : barrier =
+  match t.backend with
+  | Mem _ -> `Available
+  | Btree st -> st.barrier
+;;
+
 let durability (t : t) : durability =
   match t.backend with
   | Mem _ -> Full
@@ -3564,6 +3804,24 @@ let set_durability (t : t) (d : durability) : unit =
   match t.backend with
   | Mem _ -> ()
   | Btree st ->
+    (* #772: tightening onto a barrier this backend cannot issue is refused, not
+       ignored.  This is deliberately LOUDER than the replication-sink arm just
+       below, which silently records a relax request and applies it later: that
+       one defers a legal setting, whereas this one is a durability level the
+       device can never reach, so there is nothing to defer and silence would
+       reinstate exactly the false [Ok] #772 is about.  [open_block] has already
+       refused any such level at open, so the only way here is an explicit
+       later call -- the SQL layer's [PRAGMA synchronous] guard produces the
+       same refusal with its own wording before reaching this point. *)
+    (match st.barrier, d with
+     | `Unavailable reason, (Full | Batched _) ->
+       failwith
+         (Printf.sprintf
+            "Store.set_durability: '%s' needs a write barrier this backend cannot issue: \
+             %s"
+            (string_of_durability d)
+            reason)
+     | (`Available | `Unavailable _), _ -> ());
     let requested_non_full =
       match d with
       | Full -> false
@@ -4819,6 +5077,18 @@ let set_commit_callback
        st.on_committed_frames <- None;
        st.replication_shipped_frames <- max_int;
        Lwt.return_unit
+     | Some _ when st.barrier <> `Available ->
+       (* #772: registering a sink pins [Full] (see below), which is precisely
+          the level a barrier-less backend cannot honour.  Refuse the
+          registration rather than let the pin re-establish the false durability
+          claim behind the caller's back. *)
+       Lwt.fail_with
+         (Printf.sprintf
+            "Store.set_commit_callback: a replication commit-sink requires \
+             synchronous=full, which needs a write barrier this backend cannot issue: %s"
+            (match st.barrier with
+             | `Unavailable r -> r
+             | `Available -> ""))
      | Some _ ->
        (* #336/1 + review #1: do the flush AND the pin atomically under the
           write lock.  [flush_unsynced] yields (group-commit drain); without the

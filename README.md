@@ -50,7 +50,7 @@ recovery are unaffected — only *when* commits are fsynced changes.
 
 | Mode | Commit-time fsync | App-process crash | OS / power crash |
 |------|-------------------|-------------------|------------------|
-| `full` (default) | fsync on every group-commit before the commit is acked | no loss | no loss |
+| `full` (default) | fsync on every group-commit before the commit is acked | no loss | no loss *(requires a backend that can flush — see below)* |
 | `batched` | deferred: fsync once `wal_batch_commits` commits accumulate **or** `wal_batch_interval_ms` ms elapse since the last sync (whichever first) | no loss | up to the last synced commit frame (prefix only) |
 | `off` | never on commit | no loss | back to the last checkpoint |
 
@@ -83,6 +83,48 @@ recovery are unaffected — only *when* commits are fsynced changes.
 > **Scope:** unlike SQLite, where `synchronous` is per-connection, this setting is
 > **database-wide** — the WAL commit queue is shared across all connections to a store, so a
 > `PRAGMA synchronous` on any connection changes the mode for all of them (last writer wins).
+
+### The `full` row assumes the backend can flush (#772)
+
+"no loss" above is a claim about the *engine*, and the engine can only make it if the backing
+device gives it a write barrier. The Unix file backend does — `Unix_file` calls a real `fsync`.
+A **`Mirage_block.S` device does not**: that interface has exactly four operations —
+`get_info`, `read`, `write`, `disconnect` — and no flush of any kind, and stock Solo5 exposes
+no block-flush hypercall either, so a `pwrite` from the guest lands in the host's page cache
+and stays there.
+
+Until #772 `Granary_mirage_block.Mirage_backend.sync` returned `Ok ()` regardless, so a
+`Mirage_block`-backed database in the default `full` mode acked every commit as durable while
+the data was still volatile, and crash recovery had nothing to recover to. It no longer
+pretends:
+
+- `Mirage_backend.sync` returns `Error` when no barrier is available.
+- `Store.open_block` / `Store.open_block_wal` / `Db.open_block` take a `?barrier` argument
+  (`` `Available `` — the default — or `` `Unavailable reason ``). On a barrier-less backend
+  **`full` and `batched` are both refused at open**, with an error naming the level, the
+  backend and the way out. `batched` is refused too, because it still promises a barrier —
+  only a deferred one, plus one at every checkpoint and at `close`.
+- **`off` is the only truthful level on such a device, and it is the escape hatch.** Choose it
+  explicitly, at open (`~durability:Granary_store.Store.Off`) or via
+  `PRAGMA synchronous = off`. It is not a flag that waives the check: it is the accurate
+  description of what the device does, and `PRAGMA synchronous` keeps reporting `off` so
+  nothing downstream is misled.
+- **The seam for a real barrier.** `Mirage_backend.connect` takes `barrier:(unit -> (unit,
+  string) result Lwt.t) option` — **mandatory**, so the decision is made at the one place that
+  knows the answer rather than inherited from a default (#785). A `mirage-block-unix`
+  deployment passes `Some fsync`; a Solo5 build with a block-flush hypercall passes a stub for
+  it; a device that genuinely cannot flush passes `None` and says so. With `Some`, the adapter
+  reports `` `Available `` and every durability level works as documented above —
+  `Mirage_block.S` itself never has to change.
+- **The barrier covers the WAL device too (#785).** `open_block_wal`'s `~wal_sync` is routed
+  through the same check as the main-DB `~sync`: on a barrier-less store (hence `off`) the
+  engine stops calling it, so a WAL that lives on the same flush-less device can return
+  `Error` from its flush — as such a device must — without making the store impossible to open
+  or close. `Store.wal_sync_count` then counts barriers asked for, not barriers issued.
+
+`PRAGMA synchronous = full` on a barrier-less backend fails with a specific error rather than
+silently degrading, and so do `Store.set_durability` and registering a replication commit-sink
+(which pins `full`).
 
 ## As-of time travel (#266)
 
@@ -223,6 +265,13 @@ audit, #403). It builds and runs on the `unix` target and builds for the `hvt`
 (Solo5) target. The `mirage` CLI is not in `granary-dev`; see
 [`mirage/README.md`](mirage/README.md) for the dedicated build image
 ([`Containerfile.mirage`](Containerfile.mirage)) and the build/run commands.
+
+Since #772 it opens with `synchronous = off` **explicitly**, because a
+`Mirage_block` device has no flush operation and the store now refuses any
+higher level on a backend that declares no write barrier — see
+[the `full` row caveat above](#the-full-row-assumes-the-backend-can-flush-772).
+Nothing that unikernel writes survives a power loss, and it now says so instead
+of reporting fsyncs it never performed.
 
 ## Benchmarks
 

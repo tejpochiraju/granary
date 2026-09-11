@@ -3,6 +3,17 @@ open Lwt.Syntax
 (* Default page size when none is supplied (#95). *)
 let default_page_size = 4096
 
+(* #772: the message a barrier-less adapter reports from [sync], and the reason
+   text it hands to [Store.open_block]'s [~barrier].  Kept as one string so the
+   refusal a caller sees at open time and the error a stray [sync] would return
+   say the same thing, and so a test can pin the wording in one place. *)
+let no_barrier_reason =
+  "mirage_backend: Mirage_block.S exposes only get_info/read/write/disconnect and has no \
+   flush or barrier operation, so this adapter cannot make a write durable. Supply \
+   Mirage_backend.connect's ~barrier argument with a platform-specific flush, or run \
+   with PRAGMA synchronous = off"
+;;
+
 module Make (B : Mirage_block.S) = struct
   type t =
     { dev : B.t
@@ -10,9 +21,27 @@ module Make (B : Mirage_block.S) = struct
     ; sectors_per_page : int
     ; capacity : int64
     ; mutable n_pages : int64
+    ; barrier : (unit -> (unit, string) result Lwt.t) option
     }
 
-  let connect ?(page_size = default_page_size) dev =
+  (* #785: [barrier] is a MANDATORY labelled argument, not an optional one, and
+     that is the whole fix for the "existing caller breaks late" hole #772 left.
+     While it defaulted to "absent", a caller written before #772 --
+     [MB.connect dev] plus [Store.open_block ~sync:(MB.sync adapter)] with no
+     [~barrier] -- still compiled, and [Store.open_block]'s own [?barrier]
+     defaults to [`Available], so the store believed a barrier existed while
+     every [sync] returned [Error].  That surfaces as a checkpoint or commit
+     failure much later, which is exactly the late, confusing failure #772 set
+     out to convert into a refusal at open.  Making the choice unskippable
+     turns it into a compile error at the one place that knows the answer, and
+     [None] here reads as the deliberate declaration it is.
+
+     It does not, on its own, stop a caller from then omitting [~barrier] at
+     [Store.open_block] -- that argument stays optional because [Unix_file] and
+     every file backend genuinely do have a barrier.  What it does is make the
+     omission impossible to reach without having just written [~barrier:None]
+     one line above, next to the doc comment that says what to pass. *)
+  let connect ?(page_size = default_page_size) ~barrier dev =
     let* info = B.get_info dev in
     let sector_size = info.Mirage_block.sector_size in
     if page_size mod sector_size <> 0
@@ -27,7 +56,7 @@ module Make (B : Mirage_block.S) = struct
       let capacity =
         Int64.div info.Mirage_block.size_sectors (Int64.of_int sectors_per_page)
       in
-      Lwt.return { dev; page_size; sectors_per_page; capacity; n_pages = 0L })
+      Lwt.return { dev; page_size; sectors_per_page; capacity; n_pages = 0L; barrier })
   ;;
 
   let n_pages t = t.n_pages
@@ -67,7 +96,26 @@ module Make (B : Mirage_block.S) = struct
       Lwt.return (Result.map_error (Format.asprintf "%a" B.pp_write_error) r))
   ;;
 
-  let sync _t () = Lwt.return (Ok ())
+  (* #772: this used to be [Lwt.return (Ok ())].  There is nothing in
+     [Mirage_block.S] for it to call, so it reported every commit durable while
+     the bytes were still in the host's page cache — under the default
+     [synchronous = full] that is a durability claim the adapter cannot honour,
+     and crash recovery had nothing to recover to.  With [~barrier:None] it now
+     returns [Error] instead of lying.  [Store.open_block]'s [~barrier]
+     is what turns this into a refusal at the point the durability level is
+     chosen rather than a failure on some later commit; this arm is the
+     defence-in-depth behind it, for any path that reaches [sync] anyway. *)
+  let sync t () =
+    match t.barrier with
+    | Some flush -> flush ()
+    | None -> Lwt.return (Error no_barrier_reason)
+  ;;
+
+  let durability_barrier t =
+    match t.barrier with
+    | Some _ -> `Available
+    | None -> `Unavailable no_barrier_reason
+  ;;
 
   let resize t ~n_pages =
     if Int64.compare n_pages t.capacity > 0
