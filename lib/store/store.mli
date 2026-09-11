@@ -529,6 +529,25 @@ val create : unit -> t
     escape hatch is therefore the honest [~durability:Off], not a flag that
     would let [Full] keep lying; see {!barrier}.
 
+    (#785) That default is right for a file backend and wrong for an adapter
+    with no flush, and nothing forces the two to agree.  A caller can declare a
+    barrier-less device to
+    [Granary_mirage_block.Mirage_backend.Make.connect] — whose own [~barrier]
+    is a REQUIRED argument since #785, so the declaration cannot be skipped
+    there — and still leave this one at [`Available], in which case the store
+    believes in a barrier that every [sync] refuses.  Both shapes that takes
+    are loud rather than a silent durability lie: under the default [Full] the
+    open succeeds and the first commit fails, carrying the adapter's reason
+    text; under [~durability:Off] no [sync] substitution happens (it keys on
+    [barrier], not on the device), so a non-WAL store fails at its first commit
+    too — this path syncs inline at every commit whatever the level — and a
+    {!open_block_wal} store opens and then fails at its first checkpoint or at
+    {!close}'s final flush.  The residual is therefore accepted rather than
+    closed by making this argument mandatory; the case
+    ["Store.open_block's ?barrier default still believes the adapter"] in
+    [test/test_mirage_sync_durability_772.ml] pins it, so changing this default
+    is a deliberate act.
+
     (#772) [durability] sets the durability level at open (default [Full]),
     ahead of the [barrier] check.  Equivalent to a {!set_durability} straight
     after the open, except that this is the only spelling the [barrier] check

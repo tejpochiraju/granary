@@ -50,14 +50,33 @@ module Make (B : Mirage_block.S) : sig
 
       (#785) It is deliberately {e mandatory} rather than defaulted.  A default
       lets a caller written before #772 keep compiling while the meaning of its
-      wiring has changed underneath it: with no barrier here and no [~barrier]
-      passed to [Store.open_block] (whose own default is [`Available], because
-      file backends do have one), the store believes in a barrier that every
-      {!sync} then refuses, and the failure arrives at some later commit or
-      checkpoint instead of at open.  Being forced to write [~barrier:None]
+      wiring has changed underneath it; being forced to write [~barrier:None]
       puts the decision — and this doc comment — in front of the one caller who
       knows the answer.  Pass {!durability_barrier} to
-      [Store.open_block]/[Store.open_block_wal]'s [~barrier] immediately after. *)
+      [Store.open_block]/[Store.open_block_wal]'s [~barrier] immediately after.
+
+      What that closes is the {e representable} half, and only at this
+      boundary: an adapter can no longer exist without having said what it can
+      do.  The other half is a documented residual, not an unreachable state.
+      [~barrier:None] here, followed by a [Store.open_block] that says nothing
+      about [~barrier], still compiles — that argument defaults to
+      [`Available], which is right for [Unix_file] and wrong for this
+      adapter — so the store believes in a barrier every {!sync} then refuses.
+      Under the default [Full] durability the store opens and the first commit
+      fails, carrying {!no_barrier_reason}.  Under [~durability:Off] the store
+      substitutes a no-op for [sync] only when it has been TOLD the barrier is
+      missing, so nothing is substituted here either: a non-WAL store still
+      fails at its first commit (that path syncs inline at every commit
+      whatever the level), and a [Store.open_block_wal] store opens, commits,
+      and then fails at its first checkpoint or at [Store.close]'s final
+      flush — the "opens fine, cannot close" shape [Store.resolve_barrier_wal]
+      exists to prevent, arrived at from the other side.  Both shapes are loud
+      failures rather than a silent durability lie, which is why the residual
+      is accepted rather than closed by making the store-side argument
+      mandatory too.  The case
+      ["Store.open_block's ?barrier default still believes the adapter"] in
+      [test/test_mirage_sync_durability_772.ml] pins it, so changing that
+      default is a deliberate act rather than an accident. *)
   val connect
     :  ?page_size:int
     -> barrier:(unit -> (unit, string) result Lwt.t) option

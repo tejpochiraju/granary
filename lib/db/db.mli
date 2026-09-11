@@ -943,7 +943,15 @@ val view_callback_generation : view_callback -> int
     [`Not_registered] again — leave it in that state permanently. Attaching at
     [h]'s own generation is what makes [rewire] idempotent: call it on a
     freshly-registered handle and you get an equivalent one back, not a dead
-    one. A [`Stale_generation g'] from the registration itself means a FURTHER
+    one. That idempotence is scoped to the handle [rewire] itself most recently
+    returned (or a freshly-registered one), which is the same statement as "the
+    old [h] must be discarded" read as a precondition: [`Not_registered] cannot
+    tell "never registered" from "already superseded" — callback ids come from
+    one process-global counter, so a superseded handle's id is never in the
+    live list and its unregister always answers [`Not_registered] — so calling
+    [rewire] a second time on a handle it has already replaced attaches [cb] a
+    SECOND time, and the callback then fires twice per flush. A
+    [`Stale_generation g'] from the registration itself means a FURTHER
     recreate landed in between, and [g'] is the incarnation live as of that
     failure, so the retry chases exactly that one — which is also why passing
     [h]'s generation to [attach_at] is safe rather than racy: if the view was

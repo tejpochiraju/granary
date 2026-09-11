@@ -15469,6 +15469,25 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
           name-set resync covered for it, which is why it was never visible. *)
        let* () = stmt_savepoint_finish ~cat:cat_val tx ~wrote:false ~owned ~mark sp in
        let* () = if owned then S.rollback tx else Lwt.return_unit in
+       (* #785 (review round 2, finding 1): resolve [cat_val]'s #269 schema-undo
+          log too, exactly as [execute_insert]/[execute_update]/[execute_delete]'s
+          own [owned] failure arms do — this function's SUCCESS path already does
+          the symmetric thing through [release_txn]'s [Cat.commit_schema_changes].
+          #775 is what made this reachable: the repair fires OCaml row hooks now,
+          so [Store.in_row_hook_for] holds during it, and per #752 round 8 a hook
+          body calling [Db.register_row_hook]/[Db.unregister_row_hook] pushes an
+          undo entry onto that log.  In autocommit ([owned]) THIS statement is
+          that log's whole scope, so a registry mutation made by an earlier
+          victim's hook must be undone alongside the row-store rollback above, or
+          it survives a repair that was rolled back in full.
+
+          Guarded on [owned] because the borrowed case is already correct and an
+          unconditional call here would be WORSE than the gap: the
+          [stmt_savepoint_finish] above just replayed exactly this statement's
+          entries through [Cat.savepoint_rollback_schema], whereas
+          [Cat.rollback_schema_changes] would replay the ENCLOSING transaction's
+          too. *)
+       if owned then Cat.rollback_schema_changes cat_val;
        Lwt.fail exn)
 
 and stream_pragma_not_null_repair store mode cat =

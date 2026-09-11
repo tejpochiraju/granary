@@ -4948,6 +4948,48 @@ each and registers one shared counter closure on both, vetoing the second
 firing it sees — so the interleaving under test does not depend on the order
 `Cat.list_tables` happens to return them in.
 
+**Review round 2 found the same asymmetry the other way round: the AUTOCOMMIT
+arm never resolved the #269 schema-undo log (decided 2026-09-11).** The handler
+this entry describes reads `stmt_savepoint_finish …; if owned then S.rollback
+tx; Lwt.fail exn`. Every sibling write path that can fire a row hook —
+`Exec.execute_insert`, `execute_update`, `execute_delete` — calls
+`Cat.rollback_schema_changes cat` in exactly that position, and this function's
+own *success* path already resolves the log symmetrically through
+`release_txn ~cat` → `Cat.commit_schema_changes`. The failure arm did not, so a
+hook-registry mutation survived a statement that was rolled back in full.
+
+**#775 is what made it reachable, which is why round 1 could not have seen it.**
+Before the repair fired OCaml row hooks there was no way for anything to push
+onto that log from inside it; now `Store.in_row_hook_for` holds for the whole
+repair, and per #752 round 8 a hook body calling
+`Db.register_row_hook`/`unregister_row_hook` on itself — the documented
+nested-hook-mutation pattern — pushes an undo entry via `Db.push_row_hook_undo`.
+In autocommit that statement is the entry's whole scope: `Db`'s own
+`force_rollback_txn` only runs for an explicit transaction, and `run_dml`'s
+`Failure` arms clear pending FK checks and nothing else. The entry was therefore
+neither replayed nor discarded — left stranded on `cat.sc.undo` to be wrongly
+replayed by whatever unrelated statement rolled back next, with the registry
+mutation itself standing.
+
+**The fix is guarded by `owned`, and unconditional would be worse than the
+gap.** The borrowed case was already correct for the reason round 1 built it
+that way: `stmt_savepoint_finish ~wrote:false` rolls the statement savepoint
+back through `Cat.savepoint_rollback_schema`, which replays exactly the entries
+pushed since `savepoint_begin_schema` and truncates the log to that point.
+`Cat.rollback_schema_changes` replays the *whole* log, so calling it
+unconditionally would drag the enclosing transaction's entries down with the
+refused statement — the same over-reach that poisoning was rejected for above.
+
+Pinned by `test/test_cascade_row_hooks_773.ml`'s
+`an autocommit refusal undoes a hook's self-detachment`, on the same
+two-violating-tables fixture: one `` `Before `Delete `` closure registered on
+both tables detaches its own firing registration on the first firing and vetoes
+on the second, so the autocommit `PRAGMA not_null_repair` fails with the first
+table's victim already deleted. The case asserts the rows are intact, and then
+that the hook is attached again *positively* — by deleting the clean row of the
+table that detached itself and observing a third firing, rather than by reaching
+into `Store.row_hooks`.
+
 - **A backend that cannot issue a write barrier refuses the durability level it
   cannot honour, rather than acking commits as durable (#772, decided
   2026-09-10).** `lib/block/mirage_backend.ml:70` was
@@ -5065,6 +5107,23 @@ firing it sees — so the interleaving under test does not depend on the order
   the engine *makes*; on a barrier-less store that is a count of barriers
   asked for rather than issued, and `store.mli` says so rather than
   pretending the number changed meaning.
+
+  **Review round 2 checked that "no refusal branch" claim exhaustively and it
+  holds by construction, not by luck (decided 2026-09-11).** The argument above
+  rests on an invariant — a store whose `barrier` is `` `Unavailable `` can
+  never have `sync_mode` anything but `Off` — and the reviewer enumerated every
+  way `sync_mode` can become `Full` or `Batched` rather than taking it on
+  trust. There are four, and all four are already closed upstream of
+  `resolve_barrier_wal`: `open_block` and `open_block_wal` refuse those levels
+  at open through `resolve_barrier` itself; `Store.set_durability` raises on a
+  barrier-less store; `Store.set_commit_callback`'s pin to `Full` (a
+  replication sink's requirement) is refused for the same reason; and
+  `Op_pragma_set_synchronous` refuses before it ever reaches `set_durability`.
+  So `resolve_barrier_wal` cannot be reached with a level that promises
+  anything, and adding a refusal branch to it would be dead code that read as
+  if the invariant were in doubt. Written down here because this is the kind of
+  absence that looks like an oversight to the next reader, and the enumeration
+  is the only thing that distinguishes the two.
 
   **Behaviour break.** `mirage/unikernel.ml` opened in WAL mode over a
   `Mirage_block` device with the default `full`; it would now be refused, so it

@@ -863,6 +863,89 @@ let test_an_unvetoed_repair_in_a_transaction_still_commits () =
     expect_rows db ~msg:"tb repaired" [ "2|7" ] "SELECT * FROM tb")
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #785 review round 2: the AUTOCOMMIT arm resolves the undo log too   *)
+(* ------------------------------------------------------------------ *)
+
+(* [with_two_violating_tables]'s pair, so a case can act on whichever table the
+   repair visited first — [Cat.list_tables] fixes that order, but nothing here
+   assumes which way round it comes out. *)
+let sibling_of = function
+  | "ta" -> "tb"
+  | "tb" -> "ta"
+  | t -> Alcotest.failf "unexpected table %S" t
+;;
+
+let key_col_of = function
+  | "ta" -> "aid"
+  | "tb" -> "bid"
+  | t -> Alcotest.failf "unexpected table %S" t
+;;
+
+(* The same table-at-a-time interleaving [veto_on_the_second] exploits, with one
+   addition: the FIRST firing also mutates the row-hook registry from inside the
+   hook's own body, detaching the very registration that is firing — the
+   documented nested-hook-mutation pattern, which is what pushes a #269
+   schema-undo entry (#752 round 8).  The SECOND firing vetoes, so the whole
+   repair unwinds and that entry must be replayed with it.  Every LATER firing
+   passes, so a restored hook can be observed FIRING rather than inspected for:
+   [first] records which table detached itself and [log] records every firing. *)
+let detach_self_then_veto db ~handles ~log ~first msg =
+  let seen = ref 0 in
+  fun (m : Db.row_mutation) ->
+    incr seen;
+    log := !log @ [ Printf.sprintf "%d:%s" !seen m.Db.table ];
+    match !seen with
+    | 1 ->
+      first := m.Db.table;
+      Db.unregister_row_hook db (List.assoc m.Db.table !handles);
+      Lwt.return (Ok ())
+    | 2 -> Lwt.return (Error msg)
+    | _ -> Lwt.return (Ok ())
+;;
+
+(* The AUTOCOMMIT arm's own gap, found reviewing #785: it rolled the store back
+   ([owned], so [S.rollback]) but never resolved [cat]'s #269 schema-undo log,
+   where [execute_insert]/[execute_update]/[execute_delete] all call
+   [Cat.rollback_schema_changes] in exactly that position, and where this
+   function's success path already commits the log through [release_txn].  #775
+   is what made it reachable at all — before it the repair fired no hooks, so
+   nothing could push an entry onto that log from inside one.  The asymmetry ran
+   the opposite way from the one #785 set out to close: the BORROWED case was
+   already correct, because [stmt_savepoint_finish] replays the statement's
+   entries through [Cat.savepoint_rollback_schema]. *)
+let test_autocommit_refusal_undoes_a_hooks_self_detachment () =
+  with_two_violating_tables (fun db ->
+    let log = ref [] in
+    let handles = ref [] in
+    let first = ref "" in
+    let hook =
+      detach_self_then_veto db ~handles ~log ~first "autocommit: detach then veto"
+    in
+    List.iter
+      (fun table ->
+         let h = attach db ~table ~timing:`Before ~event:`Delete hook in
+         handles := !handles @ [ table, h ])
+      [ "ta"; "tb" ];
+    expect_error db ~needle:"autocommit: detach then veto" "PRAGMA not_null_repair";
+    both_tables_intact db ~msg:"no table's victim survived the refusal";
+    let detached = !first in
+    check_log
+      ~msg:"the hook fired once per table, detaching itself on the first"
+      [ "1:" ^ detached; "2:" ^ sibling_of detached ]
+      log;
+    (* The point of the case: the detachment was part of a statement that did
+       not happen, so the hook must be attached again.  Observed by deleting the
+       clean row of the table it detached itself from — a third firing — rather
+       than by reaching into the registry. *)
+    let col = key_col_of detached in
+    exec db (Printf.sprintf "DELETE FROM %s WHERE %s = 2" detached col);
+    check_log
+      ~msg:"the refused repair put the self-detached hook back"
+      [ "1:" ^ detached; "2:" ^ sibling_of detached; "3:" ^ detached ]
+      log)
+;;
+
 let () =
   Alcotest.run
     "cascade + repair row hooks (#773/#775)"
@@ -1009,6 +1092,10 @@ let () =
             "an unvetoed in-transaction repair still commits"
             `Quick
             test_an_unvetoed_repair_in_a_transaction_still_commits
+        ; Alcotest.test_case
+            "an autocommit refusal undoes a hook's self-detachment"
+            `Quick
+            test_autocommit_refusal_undoes_a_hooks_self_detachment
         ] )
     ]
 ;;
