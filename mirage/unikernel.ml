@@ -14,12 +14,13 @@
    barrier operation, so the adapter cannot make a write durable.  It used to
    report every commit durable anyway; since #772 it declares
    [`Unavailable] and the store refuses any durability level above [Off].  This
-   sample therefore opens with [~durability:Store.Off] EXPLICITLY: the demo is a
-   wiring/portability check, not a durability demonstration, and [Off] is the
-   only truthful description of what a stock Solo5 or Mirage_block device
-   provides today.  Nothing this unikernel writes survives a power loss.  To get
-   real durability here, supply [Mirage_backend.connect]'s [~barrier] with a
-   platform flush (see mirage/README.md) and drop the [~durability] argument.
+   sample therefore opens at [Store.Off]: the demo is a wiring/portability
+   check, not a durability demonstration, and [Off] is the only truthful
+   description of what a stock Solo5 or Mirage_block device provides today.
+   Nothing this unikernel writes survives a power loss.  To get real durability
+   here, supply [Mirage_backend.connect]'s [~barrier] with [Some] platform flush
+   (see mirage/README.md) -- and nothing else, because since #785 the level is
+   derived from the declared capability rather than pinned here.
 
    The main DB lives on the block device; the WAL uses the shared in-memory
    {!Granary_sample.Mem_wal} buffer (also driven by the host smoke test, so the
@@ -38,25 +39,35 @@ module Make (B : Mirage_block.S) = struct
   module MB = Granary_mirage_block.Mirage_backend.Make (B)
 
   let start block =
-    let* adapter = MB.connect block in
+    let* adapter = MB.connect ~barrier:None block in
     let wal = Mem_wal.create () in
     (* #772: declare the device's (absent) durability capability and pick the
-       only level it can honour.  Both arguments are deliberate and neither has
-       a safe default: drop [~barrier] and the store believes a barrier exists;
-       drop [~durability] and the open is refused, which is the point. *)
+       only level it can honour.  Neither argument has a safe default: drop
+       [~barrier] and the store believes a barrier exists; drop [~durability]
+       and the open is refused, which is the point.
+
+       #785: the level is DERIVED from the capability rather than pinned to
+       [Off], so this sample needs no edit the day a platform flush appears --
+       supply it to [MB.connect]'s [~barrier] above and the same code opens at
+       [Full].  Pinning [Off] unconditionally while computing [barrier] one line
+       earlier read as though the two were unrelated, and disagreed with the
+       comment telling readers to drop [~durability] once a barrier exists. *)
     let barrier = MB.durability_barrier adapter in
-    (match barrier with
-     | `Available -> ()
-     | `Unavailable reason ->
-       Log.warn (fun f ->
-         f
-           "durability: opening with synchronous=off -- this device has no write \
-            barrier, so committed data does NOT survive a power loss (%s)"
-           reason));
+    let durability =
+      match barrier with
+      | `Available -> Store.Full
+      | `Unavailable reason ->
+        Log.warn (fun f ->
+          f
+            "durability: opening with synchronous=off -- this device has no write \
+             barrier, so committed data does NOT survive a power loss (%s)"
+            reason);
+        Store.Off
+    in
     let* sr =
       Store.open_block_wal
         ~barrier
-        ~durability:Store.Off
+        ~durability
         ~read_page:(MB.read_page adapter)
         ~write_page:(MB.write_page adapter)
         ~sync:(MB.sync adapter)

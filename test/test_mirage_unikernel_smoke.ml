@@ -53,7 +53,7 @@ let tmp_file () =
    Mirage_backend <-> Store.open_block_wal wiring is identical. *)
 let with_unikernel_store path ~barrier ~durability f =
   let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-  let* adapter = MB.connect ?barrier dev in
+  let* adapter = MB.connect ~barrier dev in
   let wal = Mem_wal.create () in
   let* sr =
     Store.open_block_wal

@@ -24,7 +24,13 @@
        refusing after open; [= off] is accepted and reads back.
     6. A replication commit-sink, which pins [Full], is refused.
     7. [Unix_file] is completely unaffected: it has a real [fsync], reports
-       [`Available], and every durability level still works. *)
+       [`Available], and every durability level still works.
+    8. (#785) The declared barrier governs the WAL device's [wal_sync] as well
+       as the main-DB [sync]: with none, the store stops calling it, so the
+       [Off] escape hatch actually opens, checkpoints and CLOSES on a WAL that
+       lives on the same barrier-less device; with one declared, a failing
+       [wal_sync] still surfaces. The same section pins the residual on the
+       other side of the seam -- [Store.open_block]'s [?barrier] default. *)
 
 open Lwt.Syntax
 module MB = Granary_mirage_block.Mirage_backend.Make (Block)
@@ -80,7 +86,7 @@ let test_sync_refuses_without_barrier () =
   with_tmp (fun path ->
     run
       (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-       let* adapter = MB.connect dev in
+       let* adapter = MB.connect ~barrier:None dev in
        let* sr = MB.sync adapter () in
        (match sr with
         | Ok () ->
@@ -104,13 +110,11 @@ let test_sync_uses_supplied_barrier () =
     run
       (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
        let calls = ref 0 in
-       let* adapter =
-         MB.connect
-           ~barrier:(fun () ->
-             incr calls;
-             fsync_barrier path ())
-           dev
+       let counted_barrier () =
+         incr calls;
+         fsync_barrier path ()
        in
+       let* adapter = MB.connect ~barrier:(Some counted_barrier) dev in
        (match MB.durability_barrier adapter with
         | `Available -> ()
         | `Unavailable r ->
@@ -126,9 +130,8 @@ let test_supplied_barrier_error_propagates () =
   with_tmp (fun path ->
     run
       (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-       let* adapter =
-         MB.connect ~barrier:(fun () -> Lwt.return (Error "EIO from the platform")) dev
-       in
+       let failing_barrier () = Lwt.return (Error "EIO from the platform") in
+       let* adapter = MB.connect ~barrier:(Some failing_barrier) dev in
        let* sr = MB.sync adapter () in
        (match sr with
         | Ok () -> Alcotest.fail "a failing barrier must not be reported as success"
@@ -145,7 +148,7 @@ let test_supplied_barrier_error_propagates () =
    #753/#763 gave [Db.open_block]. *)
 let open_mirage path ~durability =
   let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-  let* adapter = MB.connect dev in
+  let* adapter = MB.connect ~barrier:None dev in
   let* r =
     Store.open_block
       ~barrier:(MB.durability_barrier adapter)
@@ -207,7 +210,7 @@ let test_default_is_refused () =
   with_tmp (fun path ->
     run
       (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-       let* adapter = MB.connect dev in
+       let* adapter = MB.connect ~barrier:None dev in
        let* r =
          Store.open_block
            ~barrier:(MB.durability_barrier adapter)
@@ -338,7 +341,7 @@ let test_commit_sink_refused () =
   with_tmp (fun path ->
     run
       (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-       let* adapter = MB.connect dev in
+       let* adapter = MB.connect ~barrier:None dev in
        let wal = Mem_wal.create () in
        let* r =
          Store.open_block_wal
@@ -435,6 +438,208 @@ let test_unix_file_unchanged () =
             Db.close db))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* 8 (#785): the declared barrier governs [wal_sync] too                *)
+(* ------------------------------------------------------------------ *)
+
+(* The flush of a WAL that lives on the same barrier-less device as the main DB
+   -- the byte-over-sector shim mirage/README.md names as the follow-up.  Such a
+   device is required to return [Error], exactly as [Mirage_backend.sync] does;
+   [calls] records whether the engine reached for it at all. *)
+let failing_wal_flush calls () =
+  incr calls;
+  Lwt.return (Error "wal device: no flush or barrier operation")
+;;
+
+(* [barrier] is [Mirage_backend.connect]'s -- the device's own capability.  The
+   store-side [~barrier] is always derived from it, which is the wiring every
+   caller is told to use. *)
+let open_mirage_wal path ~barrier ~durability ~wal_sync =
+  let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+  let* adapter = MB.connect ~barrier dev in
+  let wal = Mem_wal.create () in
+  let* r =
+    Store.open_block_wal
+      ~barrier:(MB.durability_barrier adapter)
+      ~durability
+      ~read_page:(MB.read_page adapter)
+      ~write_page:(MB.write_page adapter)
+      ~sync:(MB.sync adapter)
+      ~resize:(MB.resize adapter)
+      ~n_pages:0L
+      ~wal_read_at:(Mem_wal.read_at wal)
+      ~wal_write_at:(Mem_wal.write_at wal)
+      ~wal_sync
+      ~wal_size_bytes:(Mem_wal.size_bytes wal)
+      ~close:(fun () -> MB.close adapter)
+      ~wal_close:(fun () -> Lwt.return_unit)
+      ()
+  in
+  match r with
+  | Error _ ->
+    (* A refusal builds no store, so the adapter is ours to release (#753/#763). *)
+    let* () = MB.close adapter in
+    Lwt.return r
+  | Ok _ -> Lwt.return r
+;;
+
+(* #785: with no barrier the store must not CALL [wal_sync] either -- the same
+   rule #772 applied to the main-DB [sync], and for the same reason.  [Off] is
+   the only level such a device is permitted, yet choosing it still produced a
+   store that could not be opened ([Wal] fsyncs the header it creates) and,
+   once anything had been committed, could not be CLOSED ([Store.close]'s final
+   flush is unconditional below [Full]).  The call count is the direct
+   assertion: a store that promises nothing asks for no barriers. *)
+let test_wal_flush_is_substituted_under_off () =
+  with_tmp (fun path ->
+    run
+      (let calls = ref 0 in
+       let* r =
+         open_mirage_wal
+           path
+           ~barrier:None
+           ~durability:Store.Off
+           ~wal_sync:(failing_wal_flush calls)
+       in
+       match r with
+       | Error e ->
+         Alcotest.failf
+           "#785: off over a barrier-less WAL must open, got %a"
+           Store.pp_error
+           e
+       | Ok store ->
+         let* db = Db.of_store store in
+         let expect_ok sql =
+           let* er = Db.execute db sql in
+           match er with
+           | Ok () -> Lwt.return_unit
+           | Error e -> Alcotest.failf "%S: %a" sql Db.pp_error e
+         in
+         let* () = expect_ok "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)" in
+         let* () = expect_ok "INSERT INTO t VALUES (1, 'a')" in
+         (* A checkpoint rewrites the WAL's generation marker, which fsyncs. *)
+         let* () = expect_ok "PRAGMA wal_checkpoint" in
+         let* () = expect_ok "INSERT INTO t VALUES (2, 'b')" in
+         (* Close is the case the review found: it flushes whenever the level
+            is below [Full] and the WAL has committed frames, which under
+            [Off] is always, after any write. *)
+         let* failed =
+           Lwt.catch
+             (fun () ->
+                let* () = Db.close db in
+                Lwt.return_none)
+             (fun exn -> Lwt.return_some (Printexc.to_string exn))
+         in
+         (match failed with
+          | None -> ()
+          | Some m -> Alcotest.failf "#785: close must not fail: %s" m);
+         Alcotest.(check int)
+           "#785: the engine never reached for the barrier-less device's flush"
+           0
+           !calls;
+         Lwt.return_unit))
+;;
+
+(* The complement, and the reason the substitution is not "ignore WAL flush
+   errors": with a barrier DECLARED, a failing [wal_sync] is a real failure and
+   must surface.  [Wal.open_] fsyncs the header it creates, so it surfaces here
+   at open. *)
+let test_wal_flush_error_surfaces_when_a_barrier_is_declared () =
+  with_tmp (fun path ->
+    run
+      (let calls = ref 0 in
+       let* r =
+         open_mirage_wal
+           path
+           ~barrier:(Some (fsync_barrier path))
+           ~durability:Store.Full
+           ~wal_sync:(failing_wal_flush calls)
+       in
+       (match r with
+        | Ok _ ->
+          Alcotest.fail
+            "a declared barrier whose WAL flush fails must not open successfully"
+        | Error e ->
+          check_contains
+            "declared barrier"
+            ~needle:"no flush or barrier operation"
+            (Format.asprintf "%a" Store.pp_error e));
+       Alcotest.(check bool)
+         "and the barrier-less WAL flush really was called"
+         true
+         (!calls > 0);
+       Lwt.return_unit))
+;;
+
+(* Seed a valid header using a device that really can flush, so the reopen in
+   the next test cannot fail at initialisation for an unrelated reason. *)
+let seed_mirage_db path =
+  let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+  let* adapter = MB.connect ~barrier:(Some (fsync_barrier path)) dev in
+  let* r =
+    Store.open_block
+      ~barrier:(MB.durability_barrier adapter)
+      ~init_if_corrupt:true
+      ~read_page:(MB.read_page adapter)
+      ~write_page:(MB.write_page adapter)
+      ~sync:(MB.sync adapter)
+      ~resize:(MB.resize adapter)
+      ~n_pages:(MB.n_pages adapter)
+      ~close:(fun () -> MB.close adapter)
+      ()
+  in
+  match r with
+  | Error e -> Alcotest.failf "seed open: %a" Store.pp_error e
+  | Ok store -> Store.close store
+;;
+
+(* #785 (the second finding): the residual that the now-mandatory [~barrier] at
+   [Mirage_backend.connect] keeps a caller away from.  [Store.open_block]'s own
+   [?barrier] still defaults to [`Available] -- right for [Unix_file], wrong for
+   this adapter -- so a store wired up without it BELIEVES in a barrier that
+   every [sync] then refuses, and the failure lands on a later write instead of
+   at open.  Pinned rather than left implicit, so that changing the store-side
+   default is a deliberate act with a red test behind it. *)
+let test_store_barrier_default_still_believes_the_adapter () =
+  with_tmp (fun path ->
+    run
+      (let* () = seed_mirage_db path in
+       let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+       let* adapter = MB.connect ~barrier:None dev in
+       let* r =
+         Store.open_block
+           ~init_if_corrupt:false
+           ~read_page:(MB.read_page adapter)
+           ~write_page:(MB.write_page adapter)
+           ~sync:(MB.sync adapter)
+           ~resize:(MB.resize adapter)
+           ~n_pages:(MB.n_pages adapter)
+           ~close:(fun () -> MB.close adapter)
+           ()
+       in
+       match r with
+       | Error e ->
+         (* Strictly better than what happens today -- but say so rather than
+            passing silently, because #785's note would then be stale. *)
+         Alcotest.failf
+           "the store-side default no longer lets this open; update #785's note: %a"
+           Store.pp_error
+           e
+       | Ok store ->
+         (match Store.barrier store with
+          | `Available -> ()
+          | `Unavailable _ ->
+            Alcotest.fail "Store.open_block's ?barrier still defaults to `Available");
+         let* db = Db.of_store store in
+         let* er = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY)" in
+         (match er with
+          | Ok () ->
+            Alcotest.fail
+              "the adapter's sync returns Error, so a write must not report success"
+          | Error _ -> ());
+         Lwt.catch (fun () -> Db.close db) (fun _ -> Lwt.return_unit)))
+;;
+
 let () =
   let open Alcotest in
   run
@@ -468,5 +673,19 @@ let () =
         ; test_case "a replication commit-sink is refused" `Quick test_commit_sink_refused
         ] )
     ; "unix_file", [ test_case "unaffected" `Quick test_unix_file_unchanged ]
+    ; ( "wal barrier (#785)"
+      , [ test_case
+            "no barrier: wal_sync is substituted, and close works"
+            `Quick
+            test_wal_flush_is_substituted_under_off
+        ; test_case
+            "declared barrier: a failing wal_sync still surfaces"
+            `Quick
+            test_wal_flush_error_surfaces_when_a_barrier_is_declared
+        ; test_case
+            "Store.open_block's ?barrier default still believes the adapter"
+            `Quick
+            test_store_barrier_default_still_believes_the_adapter
+        ] )
     ]
 ;;

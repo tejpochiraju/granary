@@ -35,12 +35,19 @@ exercised, durability=off)`.
 > explicitly, and logs a warning at boot. `WAL fsyncs` is consequently `0`,
 > where it used to read `2` — two fsyncs that never reached the device.
 >
-> **To get real durability here**, supply `Mirage_backend.connect`'s `?barrier`
-> with a platform flush and drop the `~durability` argument:
+> **To get real durability here**, supply `Mirage_backend.connect`'s `~barrier`
+> with a platform flush — and that is the *only* edit needed, because since #785
+> the sample derives its durability level from the capability it declares
+> (`` `Available `` ⇒ `full`, `` `Unavailable `` ⇒ `off` + the boot warning)
+> instead of pinning `~durability:Store.Off`:
 >
 > ```ocaml
-> let* adapter = MB.connect ~barrier:my_platform_flush block in
+> let* adapter = MB.connect ~barrier:(Some my_platform_flush) block in
 > ```
+>
+> `~barrier` is mandatory at `connect` (#785): a caller that has no flush writes
+> `~barrier:None` and says so, rather than inheriting a default whose meaning
+> changed under it in #772.
 >
 > On `-t unix` that flush can be an `fsync`; on Solo5 it needs the block-flush
 > hypercall that stock `hvt`/`spt` do not yet have (see #772 for the upstream
@@ -61,7 +68,11 @@ without needing the mirage toolchain.
 > byte-over-sector shim is a possible follow-up. (#772: the `~barrier` declared
 > at open describes the weakest device backing the store. Here both are
 > non-durable — the block device has no flush, and the WAL is a RAM buffer — so
-> one `` `Unavailable `` covers them.)
+> one `` `Unavailable `` covers them. #785 made that true in the code as well as
+> on paper: the declared barrier now governs `wal_sync` exactly as it governs
+> `sync`, so that follow-up shim can return `Error` from its flush — as a
+> barrier-less device must — without making the store unopenable and
+> unclosable.)
 
 ## Build toolchain
 

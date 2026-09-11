@@ -109,11 +109,18 @@ pretends:
   `PRAGMA synchronous = off`. It is not a flag that waives the check: it is the accurate
   description of what the device does, and `PRAGMA synchronous` keeps reporting `off` so
   nothing downstream is misled.
-- **The seam for a real barrier.** `Mirage_backend.connect` takes `?barrier:(unit -> (unit,
-  string) result Lwt.t)`. A `mirage-block-unix` deployment can pass an `fsync`; a Solo5 build
-  with a block-flush hypercall can pass a stub for it. Supplied, the adapter reports
-  `` `Available `` and every durability level works as documented above — `Mirage_block.S`
-  itself never has to change.
+- **The seam for a real barrier.** `Mirage_backend.connect` takes `barrier:(unit -> (unit,
+  string) result Lwt.t) option` — **mandatory**, so the decision is made at the one place that
+  knows the answer rather than inherited from a default (#785). A `mirage-block-unix`
+  deployment passes `Some fsync`; a Solo5 build with a block-flush hypercall passes a stub for
+  it; a device that genuinely cannot flush passes `None` and says so. With `Some`, the adapter
+  reports `` `Available `` and every durability level works as documented above —
+  `Mirage_block.S` itself never has to change.
+- **The barrier covers the WAL device too (#785).** `open_block_wal`'s `~wal_sync` is routed
+  through the same check as the main-DB `~sync`: on a barrier-less store (hence `off`) the
+  engine stops calling it, so a WAL that lives on the same flush-less device can return
+  `Error` from its flush — as such a device must — without making the store impossible to open
+  or close. `Store.wal_sync_count` then counts barriers asked for, not barriers issued.
 
 `PRAGMA synchronous = full` on a barrier-less backend fails with a specific error rather than
 silently degrading, and so do `Store.set_durability` and registering a replication commit-sink

@@ -1789,6 +1789,11 @@ let check_key (h : Header.t) cipher =
     else Error Encryption_key_mismatch
 ;;
 
+(* #785: the substitution itself, named so that the WAL's [wal_sync] can be
+   routed through exactly the same one (see {!resolve_barrier_wal}) rather than
+   a second copy of the literal that could drift from it. *)
+let no_barrier_sync () : (unit, string) result Lwt.t = Lwt.return (Ok ())
+
 (* #772: reconcile the durability level the caller asked for with what the
    backing device can actually deliver, BEFORE any device is touched (the same
    discipline as the [as_of_history] guard below, so a refused open leaks
@@ -1823,7 +1828,7 @@ let resolve_barrier
   | `Available -> Ok sync
   | `Unavailable reason ->
     (match durability with
-     | Off -> Ok (fun () -> Lwt.return (Ok ()))
+     | Off -> Ok no_barrier_sync
      | Full | Batched _ ->
        Error
          (Durability_unavailable
@@ -1838,6 +1843,40 @@ let resolve_barrier
                 | Batched _ -> "batched"
                 | Off -> "off")
                reason)))
+;;
+
+(* #785: the same treatment for the WAL device's [wal_sync], which #772 left
+   wired straight through to [Wal.open_].
+
+   [resolve_barrier]'s own argument applies verbatim here: with no barrier the
+   store must not CALL [wal_sync] either.  The WAL reaches it in three places
+   that are not conditional on the durability level -- [Wal.open_]'s
+   [init_header] (so a barrier-less WAL device could not even be opened), the
+   checkpoint's generation-marker rewrite, and [Store.close]'s final
+   [Pager.wal_sync], which fires whenever [sync_mode <> `Full] and the WAL has
+   committed frames, i.e. always under [Off] once anything has been written.  A
+   caller who puts the WAL on the same barrier-less device as the main DB (the
+   byte-over-sector shim mirage/README.md names as the follow-up) and passes
+   its [Error]-returning flush therefore got a store that could not close,
+   having chosen the only durability level the store permits it.
+
+   There is no refusal branch, and that is not an omission: [resolve_barrier]
+   has already run on the main-DB [sync] with the same [barrier] and
+   [durability] by the time this is called, so [`Unavailable] here means the
+   level is already known to be [Off].  One [barrier] describes the weakest
+   device backing the store (see mirage/README.md), so the WAL cannot be
+   durable while the main DB is not, and the substitution falsifies no
+   outstanding claim.  {!wal_sync_count} keeps counting the calls, which is the
+   engine's own count of how many barriers it asked for, not a claim that the
+   device issued them. *)
+let resolve_barrier_wal
+      ~(barrier : barrier)
+      ~(wal_sync : unit -> (unit, string) result Lwt.t)
+  : unit -> (unit, string) result Lwt.t
+  =
+  match barrier with
+  | `Available -> wal_sync
+  | `Unavailable _ -> no_barrier_sync
 ;;
 
 let open_block
@@ -2074,6 +2113,10 @@ let open_block_wal
     match resolve_barrier ~barrier ~durability ~sync with
     | Error e -> Lwt.return_error e
     | Ok sync ->
+      (* #785: the WAL device's flush gets the same treatment as the main-DB
+         [sync] just above -- see {!resolve_barrier_wal} for why it must, and
+         why it needs no refusal branch of its own. *)
+      let wal_sync = resolve_barrier_wal ~barrier ~wal_sync in
       let history = if as_of_history then history else None in
       let history_now =
         match now with

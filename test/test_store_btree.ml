@@ -84,7 +84,7 @@ let tmp_block_file size_mb =
 let with_block_store path f =
   run
     (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-     let* adapter = MB.connect ~barrier:(fsync_barrier path) dev in
+     let* adapter = MB.connect ~barrier:(Some (fsync_barrier path)) dev in
      let* result =
        S.open_block
          ~init_if_corrupt:true

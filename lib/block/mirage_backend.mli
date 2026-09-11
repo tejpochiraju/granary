@@ -4,7 +4,7 @@
     {b Durability (#772).}  [Mirage_block.S] has exactly four operations —
     [get_info], [read], [write], [disconnect] — and no flush or barrier of any
     kind, so by itself this adapter {e cannot} make a write durable.  It does
-    not pretend otherwise: with no [~barrier] supplied, {!Make.sync} returns
+    not pretend otherwise: with [~barrier:None], {!Make.sync} returns
     [Error] and {!Make.durability_barrier} reports [`Unavailable], which
     [Store.open_block]/[Store.open_block_wal] turn into a refusal of any
     durability level above [Off].  Pass the adapter's
@@ -13,7 +13,7 @@
     Usage:
       module MB = Mirage_backend.Make(Block)   (* Block = mirage-block-unix *)
       let* dev = Block.connect path in
-      let* adapter = MB.connect dev in
+      let* adapter = MB.connect ~barrier:None dev in
       let* store = Store.open_block
         ~barrier:(MB.durability_barrier adapter)
         ~durability:Store.Off      (* required while the barrier is missing *)
@@ -36,7 +36,7 @@ module Make (B : Mirage_block.S) : sig
   (** Adapter state: wraps [B.t] with page-granularity access. *)
   type t
 
-  (** [connect ?page_size ?barrier dev] reads [get_info] from [dev] to
+  (** [connect ?page_size ~barrier dev] reads [get_info] from [dev] to
       determine sector size and capacity, then creates an adapter with logical
       [n_pages = 0].  [page_size] defaults to 4096 (#95).  Raises [Failure] if
       [page_size] is not a multiple of the device's [sector_size].
@@ -44,12 +44,23 @@ module Make (B : Mirage_block.S) : sig
       [barrier] (#772) is the platform-supplied flush this adapter has no way
       to obtain from [B] itself: a [mirage-block-unix] caller can pass an
       [fsync], and a Solo5 build can pass a stub for a block-flush hypercall,
-      without [Mirage_block.S] changing.  Supplied, it {e is} {!sync} and the
-      adapter reports [`Available]; omitted (the default), {!sync} returns
-      [Error] and the adapter reports [`Unavailable]. *)
+      without [Mirage_block.S] changing.  [Some f] makes [f] the adapter's
+      {!sync} and reports [`Available]; [None] declares that this device cannot
+      flush, so {!sync} returns [Error] and the adapter reports [`Unavailable].
+
+      (#785) It is deliberately {e mandatory} rather than defaulted.  A default
+      lets a caller written before #772 keep compiling while the meaning of its
+      wiring has changed underneath it: with no barrier here and no [~barrier]
+      passed to [Store.open_block] (whose own default is [`Available], because
+      file backends do have one), the store believes in a barrier that every
+      {!sync} then refuses, and the failure arrives at some later commit or
+      checkpoint instead of at open.  Being forced to write [~barrier:None]
+      puts the decision — and this doc comment — in front of the one caller who
+      knows the answer.  Pass {!durability_barrier} to
+      [Store.open_block]/[Store.open_block_wal]'s [~barrier] immediately after. *)
   val connect
     :  ?page_size:int
-    -> ?barrier:(unit -> (unit, string) result Lwt.t)
+    -> barrier:(unit -> (unit, string) result Lwt.t) option
     -> B.t
     -> t Lwt.t
 

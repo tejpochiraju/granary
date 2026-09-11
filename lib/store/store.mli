@@ -574,7 +574,18 @@ val open_block
 
     [barrier] and [durability] (#772) behave exactly as in {!open_block}: with
     [`Unavailable] every level but [Off] is refused up front, because a WAL
-    group-commit's whole durability claim rests on the barrier. *)
+    group-commit's whole durability claim rests on the barrier.
+
+    (#785) [barrier] describes the weakest device backing the store, so it
+    governs [wal_sync] as well as [sync]: under [`Unavailable] (hence [Off])
+    the store stops CALLING [wal_sync] too, exactly as it stops calling [sync].
+    Without that, a WAL on the same barrier-less device — whose flush is then
+    required to return [Error] — could not be opened ([Wal] fsyncs its header
+    at creation) and could not be closed ({!close}'s final flush is
+    unconditional below [Full]), even though [Off] is the only level the store
+    permits such a device. {!wal_sync_count} still counts the calls the engine
+    makes; on a barrier-less store that is a count of barriers asked for, not
+    of barriers issued. *)
 val open_block_wal
   :  ?as_of_history:bool
   -> ?history:History.sink

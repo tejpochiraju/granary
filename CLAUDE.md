@@ -291,6 +291,21 @@ Why not the raw tools:
 - **`dune format-dune-file` is NOT equivalent to `@fmt` for dune files** — verified 2026-07-30: on `dune-project` it wants 47 lines changed (blank lines between stanzas, dependency constraints rewrapped) that `@fmt` accepts as-is. Do not use it to "fix" dune files; it also makes the `diff`-expects-nothing check a false failure.
 - A hand-rolled `podman run … ocamlformat --inplace` **fails silently**: under rootless podman the image's default `opam` user maps to an unrelated subuid, so every checkout file looks root-owned and `--inplace` exits 2 without writing. The script passes `--user 0` (host user → container root), which writes correctly and preserves `tej:tej` ownership. If you must invoke a container by hand and need it to *write* into the checkout, pass `--user 0` too.
 
+  **That same `--user 0` is why `check-fmt.sh` must not run immediately before
+  `dune test` on a tree whose `_build/` already exists.** The two container
+  modes write as two different host identities: `--user 0` maps container root
+  to the host user, while a plain `podman run` maps the image's `opam` user to
+  an unrelated subuid. `dune build @fmt` copies every `dune` file into
+  `_build/default/`, so a root-mode run leaves ~20 host-user-owned files in a
+  tree otherwise owned by the subuid, and the next unprivileged `dune test`
+  dies with `open(_build/.actions/…): Permission denied` — *after* printing
+  `PASS` for every case in the affected suite, so it reads like a test failure
+  and is not one. Run the tests first, or normalise the tree afterwards with
+  `podman unshare chown -R 1000:1000 _build`. It bit PR #785's review — where
+  it surfaced instead as Alcotest log-trap `Sys_error` crashes in
+  `test_store_btree` and `test_tpcc_load` — and bit again when that review's
+  findings were addressed.
+
 The pre-commit hook runs format checks automatically on staged `.ml`/`.mli` files.
 
 ### Before pushing: dune-file formatting + merlint + shellcheck
@@ -512,7 +527,13 @@ things that were tried and rejected) is usually the point.
   parent-side drop leaves the identical dangling reference with no
   transaction involved because `Exec.execute_drop_table` does no FK checking
   at all — a wider pre-existing gap, filed as **#776 (open)** and pinned by a
-  test so the decision gets re-made rather than drifting.
+  test so the decision gets re-made rather than drifting. The pending queue
+  the guard reads is not the durable record the refusal is written as if it
+  were: `Cat.clear_pending_fk_checks` empties the WHOLE queue and `Db` calls
+  it on ANY statement failure, so an unrelated failed statement earlier in
+  the same transaction silences the COMMIT recheck and this refusal
+  together — a pre-existing `Db` bug rather than a hole this guard opened,
+  tracked as **#789 (open)**.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.
@@ -596,10 +617,21 @@ things that were tried and rejected) is usually the point.
   `full` **and `batched`** a refusal at open — `batched` too, because it
   promises a deferred barrier rather than none. `Off` is the only truthful level
   and is therefore the escape hatch, deliberately instead of a boolean opt-in
-  that would let `full` keep lying. `Mirage_backend.connect`'s `?barrier` is the
+  that would let `full` keep lying. `Mirage_backend.connect`'s `~barrier` is the
   seam a flush-aware Solo5 or `mirage-block-unix` backend fills; the upstream
   Solo5 hypercall work is out of scope. Behaviour break for `mirage/`, which now
-  opts in explicitly. `Unix_file` is unaffected.
+  opts in explicitly. `Unix_file` is unaffected. **PR #785's review closed two
+  seams #772 left.** The declared barrier now governs the **WAL** device's
+  `wal_sync` as well as the main DB's `sync`: `~wal_sync` went straight through
+  to `Wal.open_`, which fsyncs its own header, so a WAL on the same barrier-less
+  device made the `Off` escape hatch a store that could neither be opened nor
+  closed — `Store.resolve_barrier_wal` substitutes the same no-op, with no
+  second refusal because the level is already known to be `Off` by then. And
+  `Mirage_backend.connect`'s `~barrier` is **mandatory** (`Some f` / `None`),
+  because a pre-#772 caller that simply omitted it still compiled and got a
+  store that believed in a barrier every `sync` refused, failing at a later
+  commit instead of at open; `Store.open_block`'s `?barrier` still defaults to
+  `` `Available `` for `Unix_file`'s sake, and a test pins that residual.
 - **A failing autocheckpoint is recorded and surfaced, never raised to the
   triggering commit's caller (#638).** `Store_event.Checkpoint_failed`,
   `Store.checkpoint_health`, and `PRAGMA checkpoint_status`.
@@ -791,6 +823,29 @@ things that were tried and rejected) is usually the point.
   a cascaded child write still do not fire (SQLite's default, and
   pre-existing). `RETURNING` DML executed via the QUERY path fires no row
   hooks either — same family, deliberately out of scope, tracked as #778.
+  One caveat on the UPDATE-side post-image: it is exactly what the cascade
+  write stores, but for a COMPOSITE foreign key that write is itself short —
+  `Exec.cascade_apply_set_null`/`_set_default` loop columns-outer/rows-inner
+  over a shared `visited` set, so every local column after the first is
+  short-circuited and never written. Pre-existing on `main`, tracked as
+  **#790 (open)**; the hook reports the half-written row faithfully.
+- **`PRAGMA not_null_repair` is all-or-nothing inside an explicit transaction
+  too (#785).** #775's "a veto rolls back *every* table's repair" held only in
+  autocommit: `not_null_repair_run`'s handler did `if owned then S.rollback
+  tx`, so under `BEGIN` the raise propagated with the earlier tables' victims
+  already deleted and `COMMIT` made that partial repair durable. Fixed with
+  #631's statement-level savepoint — keyed on what the statement decided, not
+  on who owns the transaction — taken only when the transaction is borrowed
+  and covering every mid-repair failure, not just a hook veto; it therefore
+  also unwinds a vetoing hook's own nested DML, which is deliberately stronger
+  than the general `Before`-veto scope #752/#775 describe. Poisoning the
+  transaction (#286) was the rejected alternative: it discards the caller's
+  unrelated earlier work for a statement the engine can unwind precisely, and
+  #286 poisons only because a half-applied in-txn DDL has no statement-level
+  undo. Also fixed a latent defect found en route — the autocommit arm rolled
+  back without `changes_restore`, so #417 deltas for tables repaired before a
+  failure outlived the rollback that erased their rows, masked all along by
+  #737's name-set resync.
 
 ## Repository structure
 

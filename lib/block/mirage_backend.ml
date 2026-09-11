@@ -24,7 +24,24 @@ module Make (B : Mirage_block.S) = struct
     ; barrier : (unit -> (unit, string) result Lwt.t) option
     }
 
-  let connect ?(page_size = default_page_size) ?barrier dev =
+  (* #785: [barrier] is a MANDATORY labelled argument, not an optional one, and
+     that is the whole fix for the "existing caller breaks late" hole #772 left.
+     While it defaulted to "absent", a caller written before #772 --
+     [MB.connect dev] plus [Store.open_block ~sync:(MB.sync adapter)] with no
+     [~barrier] -- still compiled, and [Store.open_block]'s own [?barrier]
+     defaults to [`Available], so the store believed a barrier existed while
+     every [sync] returned [Error].  That surfaces as a checkpoint or commit
+     failure much later, which is exactly the late, confusing failure #772 set
+     out to convert into a refusal at open.  Making the choice unskippable
+     turns it into a compile error at the one place that knows the answer, and
+     [None] here reads as the deliberate declaration it is.
+
+     It does not, on its own, stop a caller from then omitting [~barrier] at
+     [Store.open_block] -- that argument stays optional because [Unix_file] and
+     every file backend genuinely do have a barrier.  What it does is make the
+     omission impossible to reach without having just written [~barrier:None]
+     one line above, next to the doc comment that says what to pass. *)
+  let connect ?(page_size = default_page_size) ~barrier dev =
     let* info = B.get_info dev in
     let sector_size = info.Mirage_block.sector_size in
     if page_size mod sector_size <> 0
@@ -83,8 +100,8 @@ module Make (B : Mirage_block.S) = struct
      [Mirage_block.S] for it to call, so it reported every commit durable while
      the bytes were still in the host's page cache — under the default
      [synchronous = full] that is a durability claim the adapter cannot honour,
-     and crash recovery had nothing to recover to.  With no [~barrier] supplied
-     it now returns [Error] instead of lying.  [Store.open_block]'s [~barrier]
+     and crash recovery had nothing to recover to.  With [~barrier:None] it now
+     returns [Error] instead of lying.  [Store.open_block]'s [~barrier]
      is what turns this into a refusal at the point the durability level is
      chosen rather than a failure on some later commit; this arm is the
      defence-in-depth behind it, for any path that reaches [sync] anyway. *)

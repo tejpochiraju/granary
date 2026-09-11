@@ -15407,6 +15407,33 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
   (* Reuse the ambient write txn when there is one: opening our own would block
      on the write lock the caller already holds. *)
   let* tx, owned = acquire_txn store mode in
+  (* #785: the repair is all-or-nothing, and until now that was only true in
+     AUTOCOMMIT.  The exception path below rolls [tx] back when [owned], which
+     is exactly the case in which there is nothing else in the transaction to
+     protect; inside an explicit [BEGIN] the transaction is BORROWED, so the
+     raise propagated with every table repaired before the failing one still
+     deleted, and the caller's later [COMMIT] made that partial repair durable.
+     A [`Before `Delete] veto on the third table therefore behaved as "exempt
+     the first two tables' rows from the repair" — precisely the reading
+     [Db.register_row_hook]'s doc comment says a veto does NOT have, and the
+     same wrong answer an FK RESTRICT or any other mid-repair failure gave.
+
+     #631's statement-level savepoint is the shape that fixes it, and the
+     argument is the one #631 already made: the undo must key on WHAT THE
+     STATEMENT DECIDED, not on WHO OWNS THE TRANSACTION.  Taken only when the
+     transaction is borrowed (autocommit's [S.rollback] is strictly stronger
+     and free), rolled back and released on the exception path, released on
+     success, so the caller's transaction is left intact and usable either way
+     — no second exit from #555's poisoned state, and nothing here touches
+     [Db.explicit_txn].
+
+     Unconditional rather than "only when a row hook is registered": every
+     mid-repair raise has the same partial-repair shape, and the PRAGMA is an
+     operator-initiated sweep whose cost is dominated by the scan, so the
+     pager's dirty-set clone that #631 was careful to avoid on the TPC-C write
+     path is not worth avoiding here. *)
+  let mark = changes_mark () in
+  let* sp = stmt_savepoint_begin ~cat:cat_val tx ~take:(not owned) in
   Lwt.catch
     (fun () ->
        (* #600: scan and repair one table at a time.  Scanning every table
@@ -15422,6 +15449,10 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
               repair_not_null_table tx cat_val meta ~counts ~victims)
            tables
        in
+       (* #785: released, not rolled back — the repair succeeded, so its writes
+          join the enclosing scope (the borrowed transaction, or this one's own
+          commit just below). *)
+       let* () = stmt_savepoint_release ~cat:cat_val tx sp in
        let* () = release_txn ~cat:cat_val tx owned in
        (* #630: [per_table] is one entry per TABLE holding that table's report
           rows — O(tables), not O(violations) and not O(table).  The victim
@@ -15430,6 +15461,13 @@ and not_null_repair_run store mode (cat_val : Cat.t) =
        let deleted = List.fold_left (fun acc (_, n) -> acc + n) 0 per_table in
        Lwt.return (rows, deleted))
     (fun exn ->
+       (* #785: [~wrote:false] rolls the savepoint back and releases it when one
+          was taken (the borrowed case), and — in BOTH cases — discards the #417
+          row-level deltas the repaired tables recorded, since the store they
+          describe is reverted either by that rollback or by the [S.rollback]
+          just below.  Autocommit dropped those deltas nowhere before; #737's
+          name-set resync covered for it, which is why it was never visible. *)
+       let* () = stmt_savepoint_finish ~cat:cat_val tx ~wrote:false ~owned ~mark sp in
        let* () = if owned then S.rollback tx else Lwt.return_unit in
        Lwt.fail exn)
 
@@ -15502,13 +15540,15 @@ and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) ~counts ~
        the [`After] hooks.  A per-row Before/delete/After interleaving would be
        a different, statement-visible order from the one the direct path pins.
 
-       Veto outcome (documented in [docs/DECISIONS.md], #775): the raise
+       Veto outcome (documented in [docs/DECISIONS.md], #775/#785): the raise
        unwinds through {!not_null_repair_run}, whose [Lwt.catch] rolls the
        whole repair back — every table's, not just this one's, since they share
        one transaction.  The PRAGMA reports nothing deleted and fails; that is
        the same all-or-nothing scope the columnstore comment above already
        reasons about, and the reason a vetoing hook is a refusal of the repair
-       rather than a way to exempt individual rows from it. *)
+       rather than a way to exempt individual rows from it.  #785 is what makes
+       that true inside an explicit [BEGIN] as well as in autocommit: see the
+       statement-level savepoint in {!not_null_repair_run}. *)
     let ctx = Printf.sprintf "PRAGMA not_null_repair on '%s': " meta.Cat.name in
     let bh = row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Delete in
     let ah = row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Delete in

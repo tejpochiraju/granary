@@ -844,7 +844,7 @@ let fresh_mirage_path () =
 
 let open_mirage path () =
   let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-  let* adapter = MB.connect ~barrier:(fsync_barrier path) dev in
+  let* adapter = MB.connect ~barrier:(Some (fsync_barrier path)) dev in
   let* r =
     Db.open_block
       ~init_if_corrupt:true (* fresh, zeroed 4MB temp file: #753 *)

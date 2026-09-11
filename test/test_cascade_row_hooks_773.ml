@@ -730,6 +730,139 @@ let test_repair_cascade_veto_rolls_the_repair_back () =
       "SELECT * FROM p")
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #785: the all-or-nothing repair, inside an explicit transaction     *)
+(* ------------------------------------------------------------------ *)
+
+(* Two independently-violating tables, one violating row each (rowid 1), one
+   clean row each (rowid 2).  The repair visits tables one at a time (#600),
+   so a hook that lets the FIRST [`Before] firing through and vetoes the next
+   one is guaranteed to veto only after the other table's victim has already
+   been deleted — whichever order [Cat.list_tables] returns them in, which is
+   why the same closure is registered on both.  That interleaving is the
+   partial-repair window #785 closes. *)
+let with_two_violating_tables f =
+  let path = Filename.temp_file "granary_785_" ".db" in
+  Sys.remove path;
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let db = open_db path in
+       List.iter
+         (exec db)
+         [ "CREATE TABLE ta (aid INTEGER, v INTEGER)"
+         ; "INSERT INTO ta VALUES (1, NULL)"
+         ; "INSERT INTO ta VALUES (2, 5)"
+         ; "CREATE TABLE tb (bid INTEGER, w INTEGER)"
+         ; "INSERT INTO tb VALUES (1, NULL)"
+         ; "INSERT INTO tb VALUES (2, 7)"
+         ];
+       close_db db;
+       add_populated_implicit_pk_index
+         path
+         ~table:"ta"
+         ~cols:[ "v" ]
+         ~entries:[ 1L, [ Index_key.IK_null ]; 2L, [ Index_key.IK_int 5L ] ];
+       add_populated_implicit_pk_index
+         path
+         ~table:"tb"
+         ~cols:[ "w" ]
+         ~entries:[ 1L, [ Index_key.IK_null ]; 2L, [ Index_key.IK_int 7L ] ];
+       let db = open_db path in
+       Fun.protect ~finally:(fun () -> close_db db) (fun () -> f db))
+;;
+
+let veto_on_the_second msg =
+  let seen = ref 0 in
+  fun (_ : Db.row_mutation) ->
+    incr seen;
+    if !seen = 1 then Lwt.return (Ok ()) else Lwt.return (Error msg)
+;;
+
+(* Arm [veto_on_the_second] on both tables' [`Before `Delete]. *)
+let arm_second_table_veto db msg =
+  let veto = veto_on_the_second msg in
+  ignore (attach db ~table:"ta" ~timing:`Before ~event:`Delete veto : Db.row_hook);
+  ignore (attach db ~table:"tb" ~timing:`Before ~event:`Delete veto : Db.row_hook)
+;;
+
+let both_tables_intact db ~msg =
+  expect_rows db ~msg:(msg ^ " (ta)") [ "1|<null>"; "2|5" ] "SELECT * FROM ta";
+  expect_rows db ~msg:(msg ^ " (tb)") [ "1|<null>"; "2|7" ] "SELECT * FROM tb"
+;;
+
+(* The control: in autocommit the statement owns its transaction, so this held
+   before #785 as well.  It is here so the in-transaction cases below are read
+   as a DIFFERENCE that was closed, not as a property that was always there. *)
+let test_repair_in_autocommit_rolls_every_tables_repair_back () =
+  with_two_violating_tables (fun db ->
+    arm_second_table_veto db "autocommit: second table";
+    expect_error db ~needle:"autocommit: second table" "PRAGMA not_null_repair";
+    both_tables_intact db ~msg:"no table's victim survived the refusal")
+;;
+
+(* #785 itself.  Before the fix the borrowed transaction's [owned = false] made
+   the exception path a no-op, so the first table's victim was already deleted
+   when the veto landed and the COMMIT below made that partial repair durable. *)
+let test_repair_in_a_transaction_rolls_every_tables_repair_back () =
+  with_two_violating_tables (fun db ->
+    arm_second_table_veto db "in-txn: stop at the second table";
+    exec db "BEGIN";
+    expect_error db ~needle:"in-txn: stop at the second table" "PRAGMA not_null_repair";
+    both_tables_intact db ~msg:"the refusal unwound every table's repair";
+    exec db "COMMIT";
+    both_tables_intact db ~msg:"and the COMMIT had no partial repair to make durable")
+;;
+
+(* The remedy is #631's statement savepoint, not #286's poison: the refused
+   PRAGMA is an ordinary [Error] and the caller's transaction goes on. *)
+let test_a_refused_repair_leaves_the_transaction_usable () =
+  with_two_violating_tables (fun db ->
+    arm_second_table_veto db "refused";
+    exec db "BEGIN";
+    expect_error db ~needle:"refused" "PRAGMA not_null_repair";
+    exec db "INSERT INTO ta VALUES (3, 9)";
+    exec db "COMMIT";
+    expect_rows
+      db
+      ~msg:"the post-refusal write committed, and still nothing was repaired"
+      [ "1|<null>"; "2|5"; "3|9" ]
+      "SELECT * FROM ta";
+    expect_rows db ~msg:"tb untouched" [ "1|<null>"; "2|7" ] "SELECT * FROM tb")
+;;
+
+(* And the unwind is scoped to the STATEMENT: a write the caller made earlier in
+   the same transaction is not collateral damage. *)
+let test_the_unwind_is_statement_scoped_not_transaction_scoped () =
+  with_two_violating_tables (fun db ->
+    arm_second_table_veto db "halt";
+    exec db "BEGIN";
+    exec db "INSERT INTO tb VALUES (3, 11)";
+    expect_error db ~needle:"halt" "PRAGMA not_null_repair";
+    exec db "COMMIT";
+    expect_rows
+      db
+      ~msg:"the pre-PRAGMA write survives; only the repair was unwound"
+      [ "1|<null>"; "2|7"; "3|11" ]
+      "SELECT * FROM tb";
+    expect_rows db ~msg:"ta untouched" [ "1|<null>"; "2|5" ] "SELECT * FROM ta")
+;;
+
+(* The success half of the savepoint: RELEASED, never rolled back, so an
+   unvetoed in-transaction repair still commits everything it deleted. *)
+let test_an_unvetoed_repair_in_a_transaction_still_commits () =
+  with_two_violating_tables (fun db ->
+    exec db "BEGIN";
+    (match run (Db.execute_change_count db "PRAGMA not_null_repair") with
+     | Ok n -> Alcotest.(check int) "both tables' victims deleted" 2 n
+     | Error e -> Alcotest.failf "PRAGMA not_null_repair: %a" Db.pp_error e);
+    exec db "COMMIT";
+    expect_rows db ~msg:"ta repaired" [ "2|5" ] "SELECT * FROM ta";
+    expect_rows db ~msg:"tb repaired" [ "2|7" ] "SELECT * FROM tb")
+;;
+
 let () =
   Alcotest.run
     "cascade + repair row hooks (#773/#775)"
@@ -854,6 +987,28 @@ let () =
             "a child's veto rolls the repair back"
             `Quick
             test_repair_cascade_veto_rolls_the_repair_back
+        ] )
+    ; ( "the repair is all-or-nothing in a transaction too (#785)"
+      , [ Alcotest.test_case
+            "autocommit control: no table's repair survives"
+            `Quick
+            test_repair_in_autocommit_rolls_every_tables_repair_back
+        ; Alcotest.test_case
+            "in a transaction, every table's repair is unwound"
+            `Quick
+            test_repair_in_a_transaction_rolls_every_tables_repair_back
+        ; Alcotest.test_case
+            "a refused repair does not poison the transaction"
+            `Quick
+            test_a_refused_repair_leaves_the_transaction_usable
+        ; Alcotest.test_case
+            "the unwind is statement-scoped"
+            `Quick
+            test_the_unwind_is_statement_scoped_not_transaction_scoped
+        ; Alcotest.test_case
+            "an unvetoed in-transaction repair still commits"
+            `Quick
+            test_an_unvetoed_repair_in_a_transaction_still_commits
         ] )
     ]
 ;;

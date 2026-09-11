@@ -123,7 +123,7 @@ let fsync_barrier path () : (unit, string) result Lwt.t =
    rather than raising -- exactly the failure mode #753 closes. *)
 let with_mirage_db ?(init_if_corrupt = true) path f =
   let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-  let* adapter = MB.connect ~barrier:(fsync_barrier path) dev in
+  let* adapter = MB.connect ~barrier:(Some (fsync_barrier path)) dev in
   let* r =
     DB.open_block
       ~init_if_corrupt

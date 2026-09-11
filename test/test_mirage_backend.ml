@@ -16,7 +16,7 @@ let test_connect_fresh () =
     (fun () ->
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-          let* adapter = MB.connect dev in
+          let* adapter = MB.connect ~barrier:None dev in
           let n = MB.n_pages adapter in
           Alcotest.(check int64) "n_pages starts at 0" 0L n;
           MB.close adapter))
@@ -29,7 +29,7 @@ let test_read_write_roundtrip () =
     (fun () ->
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-          let* adapter = MB.connect dev in
+          let* adapter = MB.connect ~barrier:None dev in
           let buf_w = Cstruct.create 4096 in
           Cstruct.set_uint8 buf_w 0 0xAB;
           Cstruct.set_uint8 buf_w 4095 0xCD;
@@ -50,7 +50,7 @@ let test_out_of_capacity () =
     (fun () ->
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-          let* adapter = MB.connect dev in
+          let* adapter = MB.connect ~barrier:None dev in
           (* 1 MB / 4096 = 256 pages; page 256 is out of bounds *)
           let buf = Cstruct.create 4096 in
           let* rr = MB.read_page adapter ~page_id:256L buf in
@@ -67,7 +67,7 @@ let test_resize_within_capacity () =
     (fun () ->
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-          let* adapter = MB.connect dev in
+          let* adapter = MB.connect ~barrier:None dev in
           let* rr = MB.resize adapter ~n_pages:10L in
           Alcotest.(check (result unit string)) "resize within cap" (Ok ()) rr;
           Alcotest.(check int64) "n_pages updated" 10L (MB.n_pages adapter);
@@ -81,7 +81,7 @@ let test_resize_beyond_capacity () =
     (fun () ->
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-          let* adapter = MB.connect dev in
+          let* adapter = MB.connect ~barrier:None dev in
           (* 1 MB = 256 pages; requesting 300 fails *)
           let* rr = MB.resize adapter ~n_pages:300L in
           Alcotest.(check bool) "resize beyond cap is error" true (Result.is_error rr);
@@ -100,7 +100,7 @@ let test_sync_refuses_without_barrier () =
     (fun () ->
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-          let* adapter = MB.connect dev in
+          let* adapter = MB.connect ~barrier:None dev in
           let* sr = MB.sync adapter () in
           Alcotest.(check (result unit string))
             "sync reports the missing barrier instead of success"
@@ -119,13 +119,11 @@ let test_sync_uses_supplied_barrier () =
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
           let calls = ref 0 in
-          let* adapter =
-            MB.connect
-              ~barrier:(fun () ->
-                incr calls;
-                Lwt.return (Ok ()))
-              dev
+          let flush () =
+            incr calls;
+            Lwt.return (Ok ())
           in
+          let* adapter = MB.connect ~barrier:(Some flush) dev in
           Alcotest.(check bool)
             "a supplied barrier is reported available"
             true

@@ -925,17 +925,36 @@ val view_callback_generation : view_callback -> int
           | Error (`Stale_generation g') -> attach_at g'
         in
         match Db.unregister_view_callback db h with
-        | `Removed | `Not_registered -> Ok h
+        | `Removed | `Not_registered -> attach_at (Db.view_callback_generation h)
         | `Unknown_view v -> Error (`Unknown_view v)
         | `Stale_generation g -> attach_at g
       ;;
     ]}
 
-    Two arms carry the whole argument. [`Removed] and [`Not_registered] both
-    mean [h] named the incarnation that is still live, so there is nothing to
-    re-register. A [`Stale_generation g'] from the registration itself means a
-    FURTHER recreate landed in between, and [g'] is the incarnation live as of
-    that failure, so the retry chases exactly that one.
+    Every arm re-attaches, and that is the point to read carefully. [`Removed]
+    and [`Not_registered] both mean [h] named the incarnation that is still
+    live — so the VIEW needs nothing done to it, and [h]'s own
+    {!view_callback_generation} is the live generation to attach at. They say
+    nothing so reassuring about the CALLBACK. After [`Removed] the call
+    just detached it, and [`Not_registered] means it was already detached (an
+    earlier unregister, or an [h] minted by a different {!t}); in both cases,
+    returning [Ok h] without re-registering would hand the caller a handle
+    naming no live registration, and — since a repeat call would answer
+    [`Not_registered] again — leave it in that state permanently. Attaching at
+    [h]'s own generation is what makes [rewire] idempotent: call it on a
+    freshly-registered handle and you get an equivalent one back, not a dead
+    one. A [`Stale_generation g'] from the registration itself means a FURTHER
+    recreate landed in between, and [g'] is the incarnation live as of that
+    failure, so the retry chases exactly that one — which is also why passing
+    [h]'s generation to [attach_at] is safe rather than racy: if the view was
+    recreated between the unregister and the register, the
+    [?expected_generation] check rejects the stale number and the loop follows
+    the new one.
+
+    Note that [rewire] returns a NEW handle in every success arm; the old [h]
+    must be discarded. Note too that it registers [cb] rather than whatever
+    closure [h] originally carried — a {!view_callback} is an opaque identity,
+    not a retrievable function, so the caller supplies the callback again.
 
     {b It terminates in practice} because generations for one name in one store
     are strictly increasing (see {!reactive_view_generation}), so every
@@ -996,6 +1015,16 @@ val register_view_callback
     All four are non-exceptional: removal is always accepted and this never
     raises.  Idempotence is unchanged — unregistering twice answers
     [`Not_registered] the second time.
+
+    {b "Nothing further to do" in the first two arms is about the VIEW, not
+    the CALLBACK.}  Both say [h] named the incarnation that is still live, so
+    no re-derivation of the view's identity is needed — but after either of
+    them nothing of [h]'s is attached to that view any more ([`Removed] just
+    detached it; [`Not_registered] found it already detached).  A caller
+    unregistering in order to RE-register — the {!register_view_callback}
+    [rewire] recipe — must therefore still attach, at [h]'s own
+    {!view_callback_generation}, which is exactly the generation these two
+    arms confirm is live.
 
     {b Why all four are defined now.} Adding a case to a closed polymorphic
     variant later breaks every exhaustive match a caller wrote, which is the
@@ -1376,6 +1405,26 @@ val pp_row_hook : Format.formatter -> row_hook -> unit
     repair, not just the vetoing table's: they share one transaction and the
     PRAGMA has no per-table spelling to fall back on, so a veto there reads as
     "refuse the repair" rather than "exempt these rows from it".
+
+    {b That repair guarantee holds inside an explicit transaction too, and
+    #785 is what makes it so.} Until then it was true only in autocommit,
+    where the statement owns its transaction and rolling that back undid
+    everything. Inside a caller's [BEGIN] the transaction is borrowed, so the
+    veto propagated with every table repaired {e before} the vetoing one still
+    deleted, and a later [COMMIT] made that partial repair durable — the
+    "exempt these rows from it" outcome the paragraph above says cannot
+    happen. The repair now takes #631's statement-level savepoint when (and
+    only when) the transaction is borrowed, and unwinds to it, so a failed
+    repair leaves the database exactly as it found it whichever way the PRAGMA
+    was invoked. Three consequences worth stating plainly: the caller's
+    transaction is {e not} poisoned and stays usable — a refused repair is an
+    ordinary [Error], not a doomed transaction, unlike the in-transaction DDL
+    failure of #286; the unwind also covers anything the vetoing hook itself
+    wrote via nested DML on this [t] while the PRAGMA was running, which is
+    {e stronger} than the general [`Before]-veto scope described further up;
+    and the savepoint is per STATEMENT, not per row or per table, so it covers
+    every mid-repair failure — an FK [RESTRICT] raised by a cascaded delete,
+    say — and not only a hook veto.
 
     The message is prefixed with the path before the ordinary
     ["before row hook on '<table>': "] prefix — ["FOREIGN KEY cascade on

@@ -3946,6 +3946,17 @@ let describe_fk ~owner (fk : fk_constraint) =
    from an unrelated table that happens to use the same column name, and no
    false negative from a definition that never spells the name.
 
+   Names are compared CASE-SENSITIVELY ([String.equal]), deliberately: that is
+   what every pre-existing FK name comparison in this file already does —
+   {!rename_col_in_fk}, {!child_tables_of} and {!repoint_fk_parent} all spell
+   [String.equal fk.fk_parent_table ...] — so this walk agrees with the
+   constraints it reports on instead of introducing a second rule for the same
+   names.  The ASCII-insensitive matching in {!sql_mentions_ident} is a
+   different question: that one searches stored SQL TEXT, where the case the
+   user typed is not the case the catalog holds.  Flagged in #785's review only
+   so the convention stays a choice; if it is ever revisited, revisit all four
+   sites together rather than one in isolation.
+
    Sorted and de-duplicated so the refusal message is deterministic — the walk
    itself is a [Hashtbl] fold and has no stable order. *)
 let fk_column_dependents t ~table ~column =
@@ -4442,8 +4453,18 @@ let drop_column ?txn t ~table_name ~col_name =
       | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
       | _ :: rest -> find_idx (i + 1) rest
     in
-    let fk_deps = fk_column_dependents t ~table:table_name ~column:col_name in
-    (match find_idx 0 meta.columns with
+    let col_idx = find_idx 0 meta.columns in
+    (* #785 review: {!fk_column_dependents} folds every table in the catalog, so
+       it is computed only once [col_name] is known to exist — a DROP COLUMN
+       naming a column that is not there used to pay the whole walk before
+       failing with "column not found".  Both error messages, and the order they
+       are decided in, are unchanged. *)
+    let fk_deps =
+      if Option.is_none col_idx
+      then []
+      else fk_column_dependents t ~table:table_name ~column:col_name
+    in
+    (match col_idx with
      | None -> Lwt.return (Error (Printf.sprintf "column not found: %s" col_name))
      | Some _ when fk_deps <> [] ->
        (* #767: this function rebuilds [columns] but carries [fk_constraints]
