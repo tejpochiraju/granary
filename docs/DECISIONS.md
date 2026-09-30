@@ -847,37 +847,35 @@ useful reading order — search for the issue number instead.
   arm, #286), so ROLLBACK is the exit — identical to round 3's `RENAME
   COLUMN` / `DROP COLUMN` refusals, not a new behaviour.
 
-  **The queue this guard reasons about is not the durable record the refusal
-  is written as if it were — #789, found in this PR's review and filed
-  rather than fixed (2026-09-11).** The paragraph above says the queue
-  "only grows until COMMIT drains it or ROLLBACK clears it". That is
-  incomplete: `Cat.clear_pending_fk_checks` is `t.pending_fk_checks <- []`,
-  the WHOLE queue, and `lib/db/db.ml` calls it from every statement-failure
-  path (`run_dml`'s two `Failure` arms and the prepared-statement
-  `run_core`'s) under a comment claiming it discards "any pending deferred
-  FK checks queued by the failed statement". It discards every *other*
-  statement's obligations too. So inside one explicit transaction —
-  `INSERT` queueing a deferred obligation, an unrelated second statement
-  failing, then `ALTER TABLE ... RENAME TO` —
-  `fk_obligation_table_conflict` walks an empty queue, finds nothing, and
-  lets the rename through. (A failing DML does not poison the
-  transaction; only a failing in-txn DDL does, #286, which is why the
-  sequence is reachable at all.)
-
-  **That is not a hole this guard opened, and the distinction is the
-  reason it is documented rather than patched here.** The same `clear`
-  already threw the *obligation itself* away, so that COMMIT accepts the
-  violation with or without any rename — the loss is upstream of the
-  rename, in `Db`, and is #789's to fix. What it does mean is that this
-  refusal's coverage is exactly as good as the queue's accuracy, and the
-  queue is currently not accurate across a failed sibling statement: read
-  the guard as "refuses whenever the obligation is still queued", not as
-  "refuses whenever an obligation exists". Adding a pinning test for the
-  shape was considered and rejected both ways round — one asserting
-  today's outcome would have to be deleted by #789's fix, and one
-  asserting the intended outcome fails now for a reason this PR does not
-  own. When #789 lands (a per-statement tag on `pending_fk_check`, or a
-  savepoint-scoped queue), this paragraph should shrink to a sentence.
+  **#789 is now fixed (PR #791, closing the gap this paragraph used to
+  describe as filed-not-fixed).** `Db.run_dml`/`run_core` no longer clear
+  the WHOLE queue on a statement's own failure — `Cat.pending_fk_mark` /
+  `rollback_pending_fk_checks` (a physical list-value snapshot, restored on
+  failure) discard only what THAT statement added, so an unrelated sibling
+  statement's failure in the same explicit transaction no longer erases
+  this guard's evidence. `query_impl`/`iter_impl` (the query path, which
+  RETURNING DML and `PRAGMA not_null_repair` also reach, #778/#775) got the
+  identical wiring in #791's own third review round, once
+  `Db.with_fk_rollback_on_failure` existed as one shared helper for all
+  four call sites instead of the fix landing in two of them and being
+  forgotten in the other two — see `test_pending_fk_queue_786.ml`
+  for the full test suite, including a `run_dml`/`query_impl` parity case
+  and, since #778 made RETURNING DML fire OCaml row hooks, a `Before` veto
+  on a RETURNING insert: the veto surfaces as `Lwt.fail_with`, i.e. the same
+  `Failure` the helper catches, and the test pins both halves (an earlier
+  statement's obligation survives; the vetoed statement's own is dropped).
+  The guard's residual scope is exactly what #791's own doc comments now
+  spell out: (1) a statement's OWN additions are still discarded
+  unconditionally on that statement's own failure, even for rows whose
+  writes survived the borrowed transaction (documented, unchanged
+  boundary, #280/#283 — this pending queue was never meant to give
+  statement-level atomicity, only cross-statement isolation within the
+  transaction); (2) two fibers sharing one `Db.t`'s open explicit
+  transaction (`Db.txn_poisoned`'s doc comment) can still have a sibling's
+  legitimate obligation misattributed to an unrelated mark by physical
+  queue position, a pre-existing anti-pattern this PR documents rather than
+  closes with the ambient-scope identity tracking `Store.row_hook_ambient_undo_target`
+  (#752/#773) demonstrates for the structurally identical row-hook problem.
 
   **`DROP TABLE` is NOT given the same guard, and that is a decision.** The
   issue names it as part of the same residual class; it is not the same

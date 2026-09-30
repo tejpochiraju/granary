@@ -528,12 +528,18 @@ things that were tried and rejected) is usually the point.
   transaction involved because `Exec.execute_drop_table` does no FK checking
   at all — a wider pre-existing gap, filed as **#776 (open)** and pinned by a
   test so the decision gets re-made rather than drifting. The pending queue
-  the guard reads is not the durable record the refusal is written as if it
-  were: `Cat.clear_pending_fk_checks` empties the WHOLE queue and `Db` calls
-  it on ANY statement failure, so an unrelated failed statement earlier in
-  the same transaction silences the COMMIT recheck and this refusal
-  together — a pre-existing `Db` bug rather than a hole this guard opened,
-  tracked as **#789 (open)**.
+  the guard reads used to be wiped WHOLE by `Db` on ANY statement failure,
+  so an unrelated failed statement earlier in the same transaction silenced
+  the COMMIT recheck and this refusal together — **#789/#786, fixed by PR
+  #791**: every statement-failure path (`run_dml`, `run_core`, `query_impl`,
+  `iter_impl`, through one `Db.with_fk_rollback_on_failure`) now restores a
+  `Cat.pending_fk_mark` list snapshot, discarding only what the failing
+  statement itself queued — a #778 row-hook veto on a RETURNING statement
+  included, since it surfaces as the same `Failure`. Residuals, documented rather than closed: a
+  failed multi-row statement's OWN obligations are discarded even for rows
+  whose writes survive the borrowed transaction (no statement-level
+  atomicity, #280/#283), and two fibers sharing one explicit transaction
+  can misattribute each other's additions to a mark.
 - **`OR IGNORE` skips a NOT NULL violation; every other resolution, including
   `OR REPLACE`, raises (#599).** Diverges from SQLite's OR-REPLACE-substitutes-
   DEFAULT behavior deliberately.

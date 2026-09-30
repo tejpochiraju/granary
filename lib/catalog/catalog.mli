@@ -1005,6 +1005,42 @@ val clear_pending_fk_checks : t -> unit
 (** Peek at the current pending FK check count (debugging/tests). *)
 val pending_fk_check_count : t -> int
 
+(** Record a physical snapshot of the pending FK check queue. Call at the
+    start of a statement that runs inside an already-open explicit
+    transaction, then pass the result to {!rollback_pending_fk_checks} on
+    that statement's own failure -- this discards only the obligations THIS
+    statement queued, leaving earlier statements' obligations in the same
+    transaction intact (#786/#789). Meaningless across a transaction
+    boundary: use {!clear_pending_fk_checks} there instead.
+
+    The mark identifies "this statement's additions" by physical queue
+    position, not by check identity: it assumes nothing else enqueues onto
+    this same [t]'s pending list between the mark and the matching
+    {!rollback_pending_fk_checks} call. A single [Db.t]'s explicit
+    transaction can in principle be shared by more than one fiber (see
+    [Db.txn_poisoned]'s doc comment -- it guards a colliding [BEGIN], not
+    concurrent ordinary DML), so an interleaved statement from a sibling
+    fiber enqueuing in that window would be misattributed to this mark and
+    dropped along with it. Sequential statement execution against one
+    catalog, which is how every current caller uses this, is unaffected. *)
+val pending_fk_mark : t -> pending_fk_check list
+
+(** Restore the pending FK check queue to a snapshot previously captured by
+    {!pending_fk_mark}, discarding everything queued since -- unconditionally,
+    truncating back to the mark rather than filtering by which row each
+    obligation belongs to. This means a statement whose partial effects (e.g.
+    an earlier row of a multi-row INSERT) already committed to the borrowed
+    transaction before it raised does NOT keep the FK obligation it queued for
+    those rows: `INSERT INTO c VALUES (1, 999), (1, 1)` failing on the second
+    row's PK collision discards row `(1, 999)`'s deferred FK check along with
+    everything else added since the mark, leaving that row a permanent,
+    never-rechecked orphan if it was never independently valid. This matches
+    the documented lack of statement-level atomicity on error (#280/#283) for
+    the ROW WRITES themselves; it is called out here because the FK
+    OBLIGATION for an already-written row is easy to assume survives with it,
+    and it does not (#791 review round 3). *)
+val rollback_pending_fk_checks : t -> mark:pending_fk_check list -> unit
+
 (** A non-destructive read of the pending FK check list, in enqueue order —
     unlike {!drain_pending_fk_checks}, does not clear it. Lets an ALTER TABLE
     mutation site check whether a column it would touch still has a

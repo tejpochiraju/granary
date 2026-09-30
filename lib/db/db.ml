@@ -2790,6 +2790,43 @@ let execute_control_op top t sql op =
    [Sql.Exec.execute]/[execute_with_count] alike. See those functions' doc
    comments for the exhaustiveness argument. *)
 
+(* #786/#789/#791 review round 3: the fk_mark-capture/rollback-on-failure
+   bracket, factored out of what was three hand-duplicated copies
+   (`run_dml`'s two failure arms, `run_core`'s one) into one helper reused at
+   FOUR call sites (`run_dml`, `run_core`, `query_impl`, `iter_impl`) --
+   `PRAGMA not_null_repair` is reachable through the last two as well (#775) and
+   can queue a deferred FK check via a cascade side effect before failing
+   partway through.
+
+   [f] itself takes the place of the two previously-separate arms: [Lwt.catch]
+   catches a synchronous exception raised while evaluating [f ()] (the old
+   [match ... with exception Failure msg -> ...] arm existed only because the
+   pre-refactor code evaluated its `Sql.Exec` call OUTSIDE any [Lwt.catch] to
+   get a value to bind before entering one) exactly as it catches an async
+   rejection of the promise [f ()] returns, so one arm now covers both.
+
+   The [t.catalog == cat] guard closes a hole review round 3 found: a
+   concurrent VACUUM can swap [t.catalog] for a fresh catalog object
+   mid-statement (db.ml:860). Without the guard, a failure landing after that
+   swap would roll back the STALE mark against the NEW catalog's live queue,
+   discarding obligations the new catalog genuinely queued for itself --
+   strictly worse than the pre-#786 code, which at least always cleared the
+   right object (unconditionally, but correctly targeted). Skipping the
+   rollback when the catalog has moved on is safe: a fresh post-VACUUM
+   catalog has its own, independently-empty pending-FK queue, so there is
+   nothing of THIS statement's left to discard from it. *)
+let with_fk_rollback_on_failure t (f : unit -> ('a, error) result Lwt.t)
+  : ('a, error) result Lwt.t
+  =
+  let cat = t.catalog in
+  let fk_mark = Cat.pending_fk_mark cat in
+  Lwt.catch f (function
+    | Failure msg ->
+      if t.catalog == cat then Cat.rollback_pending_fk_checks cat ~mark:fk_mark;
+      Lwt.return (Error (Runtime msg))
+    | exn -> Lwt.fail exn)
+;;
+
 (* Build the trigger BEFORE/AFTER hooks, the REPLACE/UPSERT secondary hooks,
    and the INSERT target table name for a DML op. *)
 let dml_hooks t op =
@@ -2836,50 +2873,47 @@ let run_dml t op ~on_ok =
     =
     dml_hooks t op
   in
-  match
+  (* #786/#789: {!with_fk_rollback_on_failure} snapshots the pending-FK queue
+     before this statement runs, so a failure below discards only what THIS
+     statement queued instead of the whole pending deferred-FK queue --
+     including obligations earlier, successful statements in the same
+     explicit transaction already queued. Outside a transaction the queue is
+     always empty here (each autocommit statement drains and clears it via
+     [drain_pending_fks_autocommit] below), so the mark is [[]] and the
+     rollback is equivalent to the old unconditional clear. *)
+  with_fk_rollback_on_failure t (fun () ->
     (* #773/#775: the row-hook lookup the FK-cascade and [PRAGMA
        not_null_repair] write paths resolve child-table hooks through.
        [Lwt.with_value] is entered synchronously, so a plan that raises during
-       construction still lands in the [exception Failure] arm below. *)
-    Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
-      Sql.Exec.execute_with_count
-        ~mode
-        ~clock:t.clock
-        ~before_hook
-        ~after_hook
-        ~on_replace_delete_before
-        ~on_replace_delete
-        ~on_upsert_update_before
-        ~on_upsert_update
-        t.store
-        t.catalog
-        op)
-  with
-  | exception Failure msg ->
-    (* Discard any pending deferred FK checks queued by the failed
-        statement — the writes will be rolled back. *)
-    Cat.clear_pending_fk_checks t.catalog;
-    Lwt.return (Error (Runtime msg))
-  | lwt_op ->
-    Lwt.catch
-      (fun () ->
-         let* n = lwt_op in
-         t.last_changes <- n;
-         t.total_changes <- t.total_changes + n;
-         (match insert_table_name with
-          | Some tbl when n > 0 ->
-            (match Cat.find_table_cached t.catalog ~name:tbl with
-             (* #243 (T1): the executor records the actual inserted rowid; an
-                explicit INTEGER PRIMARY KEY need not equal next_rowid - 1. *)
-             | Some _ -> t.last_insert_rowid <- Cat.last_inserted_rowid t.catalog
-             | None -> ())
-          | _ -> ());
-         on_ok n)
-      (function
-        | Failure msg ->
-          Cat.clear_pending_fk_checks t.catalog;
-          Lwt.return (Error (Runtime msg))
-        | exn -> Lwt.fail exn)
+       construction is still caught by {!with_fk_rollback_on_failure}'s
+       [Lwt.catch] -- it catches a synchronous raise from this thunk exactly
+       as it catches an async rejection of the promise the thunk returns. *)
+    let* n =
+      Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+        Sql.Exec.execute_with_count
+          ~mode
+          ~clock:t.clock
+          ~before_hook
+          ~after_hook
+          ~on_replace_delete_before
+          ~on_replace_delete
+          ~on_upsert_update_before
+          ~on_upsert_update
+          t.store
+          t.catalog
+          op)
+    in
+    t.last_changes <- n;
+    t.total_changes <- t.total_changes + n;
+    (match insert_table_name with
+     | Some tbl when n > 0 ->
+       (match Cat.find_table_cached t.catalog ~name:tbl with
+        (* #243 (T1): the executor records the actual inserted rowid; an
+           explicit INTEGER PRIMARY KEY need not equal next_rowid - 1. *)
+        | Some _ -> t.last_insert_rowid <- Cat.last_inserted_rowid t.catalog
+        | None -> ())
+     | _ -> ());
+    on_ok n)
 ;;
 
 let execute_dml_op t op =
@@ -3230,26 +3264,29 @@ let query_impl ?stats ?mode ?on top sql =
        [| exception Failure msg ->] arm only saw the synchronous spelling, so
        every one of those refusals sailed past it and escaped [Db.query] as a
        raw [Failure] — a caller matching [Ok _ | Error _] got an unhandled
-       exception instead of the [Error] branch.  [Lwt.catch] covers both
-       spellings ([Sql.Exec.query] is applied inside the thunk, so a synchronous
-       raise during plan-to-stream construction is caught too), which is exactly
-       the shape [iter_impl] and [run_core] already use.  Non-[Failure]
-       exceptions still propagate unchanged. *)
-    Lwt.catch
-      (fun () ->
-         (* #775: [PRAGMA not_null_repair] is reachable from the QUERY path too
-            (#588 gave it both entry points), and its deletes happen eagerly
-            while the stream is being constructed — inside this extent, not
-            when the caller drains it — so installing the lookup here is what
-            makes a [`Before `Delete] veto bind on that spelling as well. *)
-         let* stream =
-           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
-             Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op)
-         in
-         Lwt.return (Ok stream))
-      (function
-        | Failure msg -> Lwt.return (Error (Runtime msg))
-        | exn -> Lwt.fail exn)
+       exception instead of the [Error] branch.  {!with_fk_rollback_on_failure}'s
+       [Lwt.catch] covers both spellings ([Sql.Exec.query] is applied inside the
+       thunk, so a synchronous raise during plan-to-stream construction is
+       caught too), which is exactly the shape [iter_impl] and [run_core]
+       already use.  Non-[Failure] exceptions still propagate unchanged.
+
+       #791 review round 3: also rolls back [t.catalog]'s pending-FK queue on
+       failure — [PRAGMA not_null_repair] is reachable from the QUERY path too
+       (#588 gave it both entry points) and can queue a deferred FK check via
+       a cascade side effect before failing partway through; this path used to
+       leave any such obligation in the queue for an unrelated later statement
+       to inherit. *)
+    with_fk_rollback_on_failure t (fun () ->
+      (* #775: [PRAGMA not_null_repair] is reachable from the QUERY path too
+         (#588 gave it both entry points), and its deletes happen eagerly
+         while the stream is being constructed — inside this extent, not
+         when the caller drains it — so installing the lookup here is what
+         makes a [`Before `Delete] veto bind on that spelling as well. *)
+      let* stream =
+        Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+          Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op)
+      in
+      Lwt.return (Ok stream))
 ;;
 
 let query top sql = query_impl top sql
@@ -3530,48 +3567,45 @@ let run_core st ~params =
       | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
       | _ -> None
     in
-    Lwt.catch
-      (fun () ->
-         let* n =
-           (* #773/#775: as in {!run_dml} — a prepared write cascades and
-              repairs identically. *)
-           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
-             Sql.Exec.execute_with_count
-               ~mode
-               ~clock:t.clock
-               ~params:params_arr
-               ~before_hook
-               ~after_hook
-               ~on_replace_delete_before
-               ~on_replace_delete
-               ~on_upsert_update_before
-               ~on_upsert_update
-               t.store
-               t.catalog
-               st.plan)
-         in
-         t.last_changes <- n;
-         t.total_changes <- t.total_changes + n;
-         (match insert_table_name with
-          | Some tbl when n > 0 ->
-            (match Cat.find_table_cached t.catalog ~name:tbl with
-             (* #243 (T1): the executor records the actual inserted rowid; an
-                explicit INTEGER PRIMARY KEY need not equal next_rowid - 1. *)
-             | Some _ -> t.last_insert_rowid <- Cat.last_inserted_rowid t.catalog
-             | None -> ())
-          | _ -> ());
-         if t.explicit_txn = None
-         then
-           let* r = drain_pending_fks_autocommit t in
-           match r with
-           | Ok () -> Lwt.return (Ok n)
-           | Error e -> Lwt.return (Error e)
-         else Lwt.return (Ok n))
-      (function
-        | Failure msg ->
-          Cat.clear_pending_fk_checks t.catalog;
-          Lwt.return (Error (Runtime msg))
-        | exn -> Lwt.fail exn))
+    (* #786/#789: {!with_fk_rollback_on_failure} — same watermark as
+       {!run_dml} — so this prepared statement's own failure discards only
+       what it queued, not the whole pending deferred-FK queue. *)
+    with_fk_rollback_on_failure t (fun () ->
+      let* n =
+        (* #773/#775: as in {!run_dml} — a prepared write cascades and
+           repairs identically. *)
+        Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+          Sql.Exec.execute_with_count
+            ~mode
+            ~clock:t.clock
+            ~params:params_arr
+            ~before_hook
+            ~after_hook
+            ~on_replace_delete_before
+            ~on_replace_delete
+            ~on_upsert_update_before
+            ~on_upsert_update
+            t.store
+            t.catalog
+            st.plan)
+      in
+      t.last_changes <- n;
+      t.total_changes <- t.total_changes + n;
+      (match insert_table_name with
+       | Some tbl when n > 0 ->
+         (match Cat.find_table_cached t.catalog ~name:tbl with
+          (* #243 (T1): the executor records the actual inserted rowid; an
+             explicit INTEGER PRIMARY KEY need not equal next_rowid - 1. *)
+          | Some _ -> t.last_insert_rowid <- Cat.last_inserted_rowid t.catalog
+          | None -> ())
+       | _ -> ());
+      if t.explicit_txn = None
+      then
+        let* r = drain_pending_fks_autocommit t in
+        match r with
+        | Ok () -> Lwt.return (Ok n)
+        | Error e -> Lwt.return (Error e)
+      else Lwt.return (Ok n)))
 ;;
 
 let run st ~params = drive_reactive st.db_ref ~core:(fun () -> run_core st ~params)
@@ -3610,25 +3644,26 @@ let iter_impl ?stats st ~params =
       | None -> Sql.Exec.Auto
       | Some tx -> Sql.Exec.In_txn tx
     in
-    Lwt.catch
-      (fun () ->
-         let* stream =
-           (* #775: as in {!query_impl} — a prepared [PRAGMA not_null_repair]
-              writes during stream construction. *)
-           Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
-             Sql.Exec.query
-               ~mode
-               ~clock:t.clock
-               ~params:params_arr
-               ?stats
-               t.store
-               t.catalog
-               st.plan)
-         in
-         Lwt.return (Ok stream))
-      (function
-        | Failure msg -> Lwt.return (Error (Runtime msg))
-        | exn -> Lwt.fail exn))
+    (* #791 review round 3: {!with_fk_rollback_on_failure} rolls back
+       [t.catalog]'s pending-FK queue on failure — see {!query_impl}'s
+       matching note; a prepared [PRAGMA not_null_repair] reaches this path
+       too and can queue a deferred FK check before failing partway
+       through. *)
+    with_fk_rollback_on_failure t (fun () ->
+      let* stream =
+        (* #775: as in {!query_impl} — a prepared [PRAGMA not_null_repair]
+           writes during stream construction. *)
+        Sql.Exec.with_row_hooks (make_row_hook_lookup t) (fun () ->
+          Sql.Exec.query
+            ~mode
+            ~clock:t.clock
+            ~params:params_arr
+            ?stats
+            t.store
+            t.catalog
+            st.plan)
+      in
+      Lwt.return (Ok stream)))
 ;;
 
 let iter st ~params = iter_impl st ~params

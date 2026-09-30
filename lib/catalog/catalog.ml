@@ -4628,6 +4628,16 @@ let drain_pending_fk_checks t =
 let clear_pending_fk_checks t = t.pending_fk_checks <- []
 let pending_fk_check_count t = List.length t.pending_fk_checks
 
+(* #786/#789 review: a physical snapshot of the list, same pattern
+   [Schema_cache.savepoint_begin]/[savepoint_rollback] already use for
+   [t.undo] -- O(1) to take and O(1) to restore, with no length arithmetic
+   or off-by-one to reason about. Restoring simply replaces the field with
+   the snapshot; whatever the statement prepended since is discarded and
+   whatever existed before is untouched, because the pre-mark list is
+   shared, immutable structure rather than a position to recompute. *)
+let pending_fk_mark t = t.pending_fk_checks
+let rollback_pending_fk_checks t ~mark = t.pending_fk_checks <- mark
+
 (** #765 review round 3: a non-destructive read of the pending queue, in
     enqueue order -- unlike {!drain_pending_fk_checks}, this does not clear
     it. Lets an ALTER TABLE mutation site ask "is anything pending" without

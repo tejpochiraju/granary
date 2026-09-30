@@ -2354,3 +2354,25 @@
   unix
   qcheck-core
   qcheck-alcotest))
+
+; #786/#789: a statement that fails inside an open explicit transaction for a
+; reason unrelated to foreign keys must discard only ITS OWN additions to the
+; pending deferred-FK-check queue, not the whole queue -- otherwise an
+; earlier, successful statement's obligation is silently forgotten and COMMIT
+; leaves a permanent orphan row. Fixed with a length watermark
+; (Cat.pending_fk_mark / Cat.rollback_pending_fk_checks) on both statement
+; failure arms (Db.run_dml and the prepared-statement Db.run_core). In-memory
+; is enough: this is transaction/catalog behaviour, not durability.
+
+(test
+ (name test_pending_fk_queue_786)
+ (modules test_pending_fk_queue_786)
+ (libraries
+  granary
+  granary.catalog
+  granary.store
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix))
