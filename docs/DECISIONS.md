@@ -4831,15 +4831,14 @@ caller matching the `Runtime` message text can tell a vetoed cascade from a
 veto of the statement's own table without a new `error` variant (the same
 reasoning #752 gives for not widening `error`).
 
-**Known residual, deliberately out of scope: `INSERT`/`UPDATE`/`DELETE ...
-RETURNING` executed through the QUERY path fires no row hooks.**
+**Residual at the time, since closed by #778: `INSERT`/`UPDATE`/`DELETE ...
+RETURNING` executed through the QUERY path fired no row hooks.**
 `Exec.stream_insert_returning`/`stream_update_returning`/
-`stream_delete_returning` call `execute_insert`/`execute_update`/
+`stream_delete_returning` called `execute_insert`/`execute_update`/
 `execute_delete` with no `before_hook`/`after_hook` at all, so `Db.query
-"DELETE ... RETURNING ..."` writes without firing what the identical statement
-through `Db.execute` fires. It is the same family as #773/#775 and the new
-lookup makes it a small fix, but it is a third behaviour change with its own
-tests owed, and neither issue names it. Tracked separately as #778.
+"DELETE ... RETURNING ..."` wrote without firing what the identical statement
+through `Db.execute` fires. It was left out of #773/#775 as a third behaviour
+change with its own tests owed; see the #778 entry below.
 
 The two round-9 residuals this entry does NOT touch remain open: `#774`
 (`row_hooks_carry_over` omitting `row_hook_depth` across a VACUUM store-swap)
@@ -5210,3 +5209,49 @@ into `Store.row_hooks`.
   shapes: the unikernel's own barrier-less `Off` (asserting zero commit fsyncs,
   where it used to assert two that never reached the device) and a
   platform-`fsync` `full` that still pins the exact commit-fsync count.
+
+### `INSERT`/`UPDATE`/`DELETE ... RETURNING` through the query path fires OCaml row hooks (#778, decided 2026-09-12)
+
+**What was wrong.** The three `Exec.stream_*_returning` functions — the
+`to_stream` arms `Db.query` uses for DML with a `RETURNING` clause — called
+`execute_insert`/`execute_update`/`execute_delete` with no hooks, so a
+`` `Before `` veto registered with `Db.register_row_hook` did not block the
+RETURNING spelling of a write it blocks through `Db.execute`, and an
+`` `After `` audit hook never saw those rows. The veto guarantee
+`register_row_hook` documents did not hold.
+
+**Fix.** Each function resolves its hooks through `Exec.row_hook_for`, the
+dynamically-scoped lookup `Db` already installs with `Exec.with_row_hooks`
+around every `Exec` entry point, `query` included (#773/#775). So the
+RETURNING path goes through `Db.fire_ocaml_row_hook` like the cascade and
+repair paths, with its depth bound, reentrancy guard and undo target intact.
+INSERT also resolves the OR-REPLACE-displaced-row `Delete` pair (only when
+`on_conflict = Some CA_replace`) and the `ON CONFLICT ... DO UPDATE`
+`Update` pair (only when a DO UPDATE clause is present), mirroring
+`Db.insert_replace_upsert_hooks`. The adapters (`returning_insert_hooks`,
+`returning_update_hooks`, `returning_delete_hooks`) duplicate that function's
+closures because `Db` depends on `Sql.Exec` and not the reverse. Each side
+has a comment pointing at the other.
+
+**Rejected for now: making `execute_*` resolve hooks themselves when none
+are passed.** It would stop the next write path from repeating this bug
+without anyone noticing. But those functions are called from many places,
+and each call site relies on an omitted hook meaning "fire nothing". Changing
+that means auditing every one of them, which is a larger change than this
+fix. PR #792's third review round raised it and deferred it.
+
+**Residuals, each pinned by a test so the decision has to be re-made rather
+than drift:**
+
+- `Db.make_row_hook_lookup` is OCaml-hooks-only by #773's design, so a SQL
+  `CREATE TRIGGER` body still does **not** fire for the RETURNING spelling of
+  a write. That was already true before #778, when this path fired nothing.
+- A multi-row `INSERT ... VALUES (...), (...) RETURNING` resolves its hooks
+  once per statement, so a hook that unregisters itself still fires for later
+  rows. The non-RETURNING `Db.execute` path does the same, and the test
+  asserts that the two paths match. This is #771 (open).
+
+Pinned by `test/test_returning_row_hooks_778.ml`. It has one group per DML
+shape, veto tests, the two INSERT secondary pairs, `Db.execute`/`Db.query`
+parity, the #631 `OR IGNORE` savepoint reached via RETURNING inside an
+explicit transaction, and the two residuals above.

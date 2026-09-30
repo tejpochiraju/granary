@@ -2228,6 +2228,18 @@
   lwt.unix
   unix))
 
+; #778: `INSERT`/`UPDATE`/`DELETE ... RETURNING` -- the Db.query streaming
+; path for these ops called execute_insert/execute_update/execute_delete with
+; no before_hook/after_hook at all, so a `Before veto had no power over the
+; RETURNING spelling of an otherwise identical write and an `After hook never
+; observed it. In-memory is enough: this is process-state hook delivery, not
+; anything durable.
+
+(test
+ (name test_returning_row_hooks_778)
+ (modules test_returning_row_hooks_778)
+ (libraries granary granary.encoding alcotest lwt.unix))
+
 ; #750: a compound-root CREATE REACTIVE VIEW is refused. base_tables_of
 ; answered [] for an S_compound root, so the view registered with no base
 ; tables and served its creation-time snapshot forever with no error. Carries

@@ -15792,6 +15792,46 @@ and stream_except clock params store mode cat left right =
   in
   Lwt.return (Lwt_stream.of_list result)
 
+(* #778 review: the three [stream_*_returning] functions below (and
+   [stream_insert_returning]'s two secondary REPLACE/UPSERT hooks) each
+   adapt a [row_hook_for] result -- which takes [~new_row]/[~old_row] as
+   [Row.t option] -- to the per-event shape [execute_insert]/
+   [execute_update]/[execute_delete] expect ([~new_row], [~old_row ~new_row]
+   or [~old_row], unwrapped), and differ only in which side is [None]. One helper per
+   shape here cuts that to a single call site apiece; [returning_delete_hooks]
+   is also reused for INSERT's OR-REPLACE-conflict-delete hook and
+   [returning_update_hooks] for its ON-CONFLICT-DO-UPDATE hook, since both
+   are literally the same adapter over a different (timing, event) pair. This
+   duplicates -- rather than shares -- [Db.insert_replace_upsert_hooks]'s
+   near-identical adapters on the [Db] side, which is a
+   consequence of module layering: [Db] depends on [Sql.Exec], not the
+   reverse, so this module cannot call into [Db]'s [make_combined_hook]. *)
+and returning_insert_hooks table =
+  ( Option.map
+      (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None)
+      (row_hook_for ~table ~timing:`Before ~event:`Insert)
+  , Option.map
+      (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None)
+      (row_hook_for ~table ~timing:`After ~event:`Insert) )
+
+and returning_update_hooks table =
+  ( Option.map
+      (fun f ~tx ~old_row ~new_row ->
+         f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row))
+      (row_hook_for ~table ~timing:`Before ~event:`Update)
+  , Option.map
+      (fun f ~tx ~old_row ~new_row ->
+         f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row))
+      (row_hook_for ~table ~timing:`After ~event:`Update) )
+
+and returning_delete_hooks table =
+  ( Option.map
+      (fun f ~tx ~old_row -> f ~tx ~new_row:None ~old_row:(Some old_row))
+      (row_hook_for ~table ~timing:`Before ~event:`Delete)
+  , Option.map
+      (fun f ~tx ~old_row -> f ~tx ~new_row:None ~old_row:(Some old_row))
+      (row_hook_for ~table ~timing:`After ~event:`Delete) )
+
 and stream_insert_returning
       clock
       params
@@ -15808,6 +15848,40 @@ and stream_insert_returning
   match cat with
   | None -> failwith "Exec.query: RETURNING requires catalog context"
   | Some c ->
+    (* #778: an `INSERT ... RETURNING` reached this streaming path with no
+       hooks at all, so a [`Before] veto registered via
+       [Db.register_row_hook] had no power over the RETURNING spelling of an
+       otherwise identical write, and an [`After] audit hook never observed
+       these rows.  Resolved through {!row_hook_for} exactly like
+       [insert_replace_upsert_hooks] on the [Db] side does with
+       [make_combined_hook] — same table, same four (REPLACE-delete /
+       UPSERT-update, before/after) events — because this module cannot call
+       into [Db]; {!row_hook_for} is the dynamically-scoped resolver [Db]
+       installs with {!with_row_hooks} around every [Sql.Exec] entry point,
+       [query] included. *)
+    let table = table_meta.Cat.name in
+    let before_hook, after_hook = returning_insert_hooks table in
+    (* #778 review round 3: the REPLACE-delete hook only ever fires when
+       [on_conflict = Some CA_replace] (nothing is ever displaced otherwise,
+       so [execute_insert]'s own [displaced_rows] is always [] and the hook
+       would never run) and the UPSERT-update hook only ever fires when
+       [upsert_update] names a DO-UPDATE clause -- an ordinary
+       `INSERT ... VALUES (...) RETURNING ...` has neither, so resolving both
+       pairs unconditionally paid two unused {!row_hook_for} lookups on every
+       plain insert. [on_conflict] is a plain enum option (safe to compare
+       directly); [upsert_update] is checked with [Option.is_some], matching
+       this file's existing caution around comparing an option that could in
+       principle hold a closure (see the [on_conflict = Some Ast.CA_ignore]
+       site above, which explains why *that* check uses [Option.is_some] for
+       [before_hook] rather than [<> None]). *)
+    let on_replace_delete_before, on_replace_delete =
+      if on_conflict = Some Ast.CA_replace
+      then returning_delete_hooks table
+      else None, None
+    in
+    let on_upsert_update_before, on_upsert_update =
+      if Option.is_some upsert_update then returning_update_hooks table else None, None
+    in
     let* result_lists =
       Lwt_list.map_s
         (fun row_vals ->
@@ -15824,6 +15898,12 @@ and stream_insert_returning
                ~on_conflict
                ~upsert_update
                ~prebuilt_row:(Some inserted_row)
+               ~before_hook
+               ~after_hook
+               ~on_replace_delete_before
+               ~on_replace_delete
+               ~on_upsert_update_before
+               ~on_upsert_update
                store
                c
                ~table_meta
@@ -15867,6 +15947,10 @@ and stream_update_returning
     | Some c -> c
     | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context"
   in
+  (* #778: see {!stream_insert_returning} — the same veto/audit guarantee
+     applies to `UPDATE ... RETURNING`, resolved the same way. *)
+  let table = table_meta.Cat.name in
+  let before_hook, after_hook = returning_update_hooks table in
   let acc = ref [] in
   let collect new_row =
     acc := Array.of_list (List.map (eval_expr clock params new_row) returning) :: !acc
@@ -15876,6 +15960,8 @@ and stream_update_returning
       ~mode
       ~params
       ~clock
+      ~before_hook
+      ~after_hook
       ~collect:(Some collect)
       store
       c
@@ -15912,6 +15998,10 @@ and stream_delete_returning
     | Some c -> c
     | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context"
   in
+  (* #778: see {!stream_insert_returning} — the same veto/audit guarantee
+     applies to `DELETE ... RETURNING`, resolved the same way. *)
+  let table = table_meta.Cat.name in
+  let before_hook, after_hook = returning_delete_hooks table in
   let acc = ref [] in
   let collect old_row =
     acc := Array.of_list (List.map (eval_expr clock params old_row) returning) :: !acc
@@ -15921,6 +16011,8 @@ and stream_delete_returning
       ~mode
       ~params
       ~clock
+      ~before_hook
+      ~after_hook
       ~collect:(Some collect)
       store
       c

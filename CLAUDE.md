@@ -821,8 +821,8 @@ things that were tried and rejected) is usually the point.
   back, and a veto during the repair rolls back EVERY table's repair (one
   shared transaction, no per-table spelling to fall back on). SQL triggers on
   a cascaded child write still do not fire (SQLite's default, and
-  pre-existing). `RETURNING` DML executed via the QUERY path fires no row
-  hooks either — same family, deliberately out of scope, tracked as #778.
+  pre-existing). `RETURNING` DML executed via the QUERY path now fires the
+  same OCaml row hooks too (#778, below).
   One caveat on the UPDATE-side post-image: it is exactly what the cascade
   write stores, but for a COMPOSITE foreign key that write is itself short —
   `Exec.cascade_apply_set_null`/`_set_default` loop columns-outer/rows-inner
@@ -846,6 +846,16 @@ things that were tried and rejected) is usually the point.
   back without `changes_restore`, so #417 deltas for tables repaired before a
   failure outlived the rollback that erased their rows, masked all along by
   #737's name-set resync.
+- **`INSERT`/`UPDATE`/`DELETE ... RETURNING` through `Db.query` fires OCaml
+  row hooks, veto included (#778).** `Exec.stream_{insert,update,delete}_returning`
+  called the write path with no hooks, so a `Before` veto did not block the
+  RETURNING spelling of a write it blocks through `Db.execute`. They now
+  resolve hooks via `Exec.row_hook_for` (#773's lookup), including INSERT's
+  OR-REPLACE-delete and DO-UPDATE secondary pairs. Residuals, pinned by
+  `test/test_returning_row_hooks_778.ml`: that lookup is OCaml-hooks-only, so
+  a SQL `CREATE TRIGGER` still does not fire for the RETURNING spelling; and a
+  multi-row `VALUES` resolves hooks once per statement, like the
+  non-RETURNING path (#771).
 
 ## Repository structure
 

@@ -2013,7 +2013,22 @@ and make_combined_hook t table_meta ~timing ~event =
 
     Part of the [fire_trigger_stmt] recursive group so that nested trigger
     bodies that perform INSERT OR REPLACE / UPSERT also fire DELETE/UPDATE
-    triggers on conflict-displaced or upsert-updated rows. *)
+    triggers on conflict-displaced or upsert-updated rows.
+
+    #778 review: [Sql.Exec]'s [returning_delete_hooks]/[returning_update_hooks]
+    (exec.ml) adapt [row_hook_for] through the identical four closures this
+    function builds through [make_combined_hook] -- duplicated rather than
+    shared because [Db] depends on [Sql.Exec], not the reverse, so [Exec]
+    cannot call back into this function. [returning_delete_hooks] backs
+    [stream_insert_returning]'s OR-REPLACE-conflict-delete hook (secondary,
+    only when [on_conflict = Some CA_replace]) the way this function's own
+    delete pair does, but [returning_update_hooks] is also the PRIMARY hook
+    source for `UPDATE ... RETURNING` (`stream_update_returning`) — not only
+    INSERT's secondary ON-CONFLICT-DO-UPDATE pair — and
+    [returning_delete_hooks] is likewise the primary source for
+    `DELETE ... RETURNING` (`stream_delete_returning`). If the four-hook
+    shape here ever changes, check all three of those call sites too, not
+    just the one this comment used to name. *)
 and insert_replace_upsert_hooks t op =
   let table_meta_opt =
     match op with
