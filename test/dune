@@ -2376,3 +2376,24 @@
   qcheck-core
   qcheck-alcotest
   lwt.unix))
+
+; #787/#790: a COMPOSITE foreign key's ON DELETE/ON UPDATE SET NULL/SET
+; DEFAULT used to write only the FK's first local column --
+; cascade_apply_set_null/_set_default and their nested
+; cascade_delete_set_null/_set_default twins iterated columns-outer,
+; rows-inner, so cascade_update_col_in_tx's `visited` short-circuit dropped
+; every column after the first for a given row. Fixed by inverting the loop
+; to rows-outer, columns-inner, writing every target column of a row
+; together in one call to the new cascade_update_cols_in_tx. In-memory is
+; enough: pure cascade/executor behaviour.
+
+(test
+ (name test_composite_fk_cascade_787)
+ (modules test_composite_fk_cascade_787)
+ (libraries
+  granary
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix))

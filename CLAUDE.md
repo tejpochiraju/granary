@@ -829,12 +829,14 @@ things that were tried and rejected) is usually the point.
   a cascaded child write still do not fire (SQLite's default, and
   pre-existing). `RETURNING` DML executed via the QUERY path now fires the
   same OCaml row hooks too (#778, below).
-  One caveat on the UPDATE-side post-image: it is exactly what the cascade
-  write stores, but for a COMPOSITE foreign key that write is itself short —
-  `Exec.cascade_apply_set_null`/`_set_default` loop columns-outer/rows-inner
-  over a shared `visited` set, so every local column after the first is
-  short-circuited and never written. Pre-existing on `main`, tracked as
-  **#790 (open)**; the hook reports the half-written row faithfully.
+  The UPDATE-side post-image is exactly what the cascade write stores; a
+  COMPOSITE foreign key's write used to be shorter than that promise —
+  `Exec.cascade_apply_set_null`/`_set_default` looped columns-outer/rows-inner
+  over a shared `visited` set, silently short-circuiting every local column
+  after the first — closed by **#787/#790**, including a second review round
+  that found the identical one-dispatch-per-column bug in the downstream ON
+  UPDATE re-cascade and in the top-level `UPDATE ... CASCADE` entry point.
+  Full write-up in `docs/DECISIONS.md`.
 - **`PRAGMA not_null_repair` is all-or-nothing inside an explicit transaction
   too (#785).** #775's "a veto rolls back *every* table's repair" held only in
   autocommit: `not_null_repair_run`'s handler did `if owned then S.rollback

@@ -4773,36 +4773,337 @@ DELETE and a per-row interleaving would be a statement-visible divergence from
 the spelling it is supposed to be indistinguishable from (#563).
 
 **The UPDATE-side post-image is exactly what this path writes — which for a
-COMPOSITE foreign key is less than the FK action promises (#790, found in this
-PR's review and filed rather than fixed, 2026-09-11).**
-`cascade_update_col_in_tx` builds the row it hands a hook with
-`Exec.cascade_updated_row`, the same function `update_col_in_tx` uses to build
-the row it stores, so the doc comment's "EXACTLY the row that write stores"
-holds as written and is not the overstatement. The overstatement is the *next*
-step out, in the reading a caller will naturally take — "the row after the
-cascade". `cascade_apply_set_null` / `cascade_apply_set_default` and their
-`cascade_delete_set_null` / `cascade_delete_set_default` twins iterate
+COMPOSITE foreign key used to be less than the FK action promised (#787/#790,
+found independently in two review rounds of the same PR, fixed together
+2026-09-11).**
+`cascade_update_col_in_tx` built the row it handed a hook with
+`Exec.cascade_updated_row`, the same function `update_col_in_tx` used to build
+the row it stored, so the doc comment's "EXACTLY the row that write stores"
+held as written and was not the overstatement. The overstatement was the
+*next* step out, in the reading a caller will naturally take — "the row after
+the cascade". `cascade_apply_set_null` / `cascade_apply_set_default` and their
+`cascade_delete_set_null` / `cascade_delete_set_default` twins iterated
 columns-OUTER, rows-INNER, handing every (column, row) pair to
 `cascade_update_col_in_tx`, which short-circuits on `(table, rowid)` in the
 `visited` table it shares across the whole loop. The first column's pass
-inserts the rowid; every later column's pass returns immediately. So for a
-two-column FK, `SET NULL` nulls the first local column and silently leaves the
-second holding its old value — and the `` `After `` hook faithfully reports
-that half-written row, because that is genuinely what the statement leaves
+inserted the rowid; every later column's pass returned immediately. So for a
+two-column FK, `SET NULL` nulled the first local column and silently left the
+second holding its old value — and the `` `After `` hook faithfully reported
+that half-written row, because that was genuinely what the statement left
 behind.
 
-Nothing in the hook plumbing is wrong here and nothing in it should be changed
-to compensate: a post-image reconstructed independently of the write would
-start drifting from it, which is the exact failure `cascade_updated_row` was
-factored out to prevent. The bug is the cascade write's, it predates this PR
-on `main`, and the fix belongs there — per-row rather than per-column
-iteration, so one row's whole local key is written once. Note that `visited`
-cannot simply be dropped: it is the cycle-breaker for a self-referencing or
-mutually-referencing cascade, so the fix has to change the LOOP's shape, not
-the guard's. Unaffected: the DELETE-side cascade (one removal per row, no
-per-column loop), every single-column FK, and the veto guarantee this entry is
-about — a `` `Before `` veto still fires before the first column's write and
-still unwinds the whole statement.
+Nothing in the hook plumbing was wrong and nothing in it needed to change to
+compensate: a post-image reconstructed independently of the write would start
+drifting from it, which is the exact failure `cascade_updated_row` was
+factored out to prevent. The bug was the cascade write's. **Fixed by inverting
+every one of the four loops (`cascade_apply_set_null`, `cascade_apply_set_default`,
+`cascade_delete_set_null`, `cascade_delete_set_default`) to rows-OUTER,
+columns-INNER**: each now computes the full set of target `(col_idx, value)`
+pairs for the whole composite key up front — including a NOT-NULL/no-default
+precheck across ALL target columns before any row is touched, preserving the
+existing "reject before writing" ordering rather than merely narrowing it
+back to the single-column case — and then, for each row, makes ONE call to
+the new `cascade_update_cols_in_tx` (the multi-column generalization of
+`cascade_update_col_in_tx`, which now just calls it with a singleton column
+list). `cascade_update_cols_in_tx` builds ONE post-image from ONE pre-image
+via the new `Exec.cascade_updated_row_multi` — the old single-column
+`cascade_updated_row` had no other caller left once this landed and was
+deleted rather than kept as an unused wrapper — runs the `` `Before ``/
+`` `After `` hooks once per row with that full post-image, and makes ONE
+`update_cols_in_tx` write (the single-column `update_col_in_tx` it replaces
+was deleted the same way, for the same reason) that recomputes STORED
+generated columns, probes UNIQUE indexes, and re-keys an alias PK exactly
+once against the row with every target column already set — reusing the same
+shape `execute_update`'s own `apply_update_row` already uses for an ordinary
+multi-column `UPDATE`, rather than a new one-off. `visited` still guards
+against a self- or mutually-referencing cascade, unchanged — the fix changed
+the LOOP's shape and the write's granularity, not the cycle-breaker. The
+`` `Before ``/`` `After `` veto guarantee this entry is about is unaffected:
+it now fires around the ONE per-row write instead of around each column's
+write, which is strictly tighter bracketing, not looser.
+
+**Round 2 (PR #793's own review): the identical bug, one level down and one
+level up, in the downstream ON UPDATE re-cascade and in the top-level
+`UPDATE ... CASCADE` entry point.** Round 1 above believed the downstream
+re-cascade — `cascade_update_fk`, dispatched from `cascade_update_cols_in_tx`
+once per changed parent column after the single row write lands — "was never
+the columns-outer bug in the first place" because a different child table can
+match a different changed column via a different FK. That reasoning does not
+hold when the SAME child table's composite FK matches TWO OR MORE of the
+changed columns: `cascade_update_fk` was called once per matching column, each
+call writing only its own single child column via a singleton-column write,
+and the second call's write was silently dropped by the shared `visited`
+`(table, rowid)` short-circuit — the exact #787/#790 defect, reappearing one
+cascade level down. Reproduced with a 3-table chain (`gp(a,b)` PK,
+`p(id,x,y)` `FOREIGN KEY (x,y) REFERENCES gp(a,b) ON DELETE SET NULL`,
+`c(id,cx,cy)` `FOREIGN KEY (cx,cy) REFERENCES p(x,y) ON UPDATE ...`):
+`DELETE FROM gp` correctly nulls `p.x` and `p.y` together (round 1's fix),
+but the re-cascade to `c` used to write only `c.cx` or only `c.cy`.
+Separately, and independently of the downstream re-cascade entirely,
+`apply_update_cascade_fk` — the TOP-LEVEL entry point for a direct
+`UPDATE parent SET a = .., b = ..` reaching an `ON UPDATE CASCADE`, not
+reached by round 1's DELETE-triggered repro at all — had a literal
+"single-col FK compat" comment: its CASCADE branch took `List.hd` of the
+local column and new-value lists it had *already resolved in full* one
+statement earlier, discarding every column past the first.
+
+Both are fixed the same way: `cascade_update_fk_multi` replaces the old
+single-column `cascade_update_fk`/`cascade_update_set_null`/
+`cascade_update_set_default` trio. The re-cascade caller in
+`cascade_update_cols_in_tx` now calls `build_child_refs` ONCE per write
+(previously once per changed column, silently re-scanning the whole catalog
+for columns after the first even before round 2 — the `visited`
+short-circuit had made that redundant work invisible) and groups the
+CHANGED columns by which FK matches them, dispatching `cascade_update_fk_multi`
+ONCE per (child table, fk) pair with every matching column bundled into one
+`changes` list, rather than once per column. For `FA_cascade`,
+`cascade_update_fk_multi` maps the matched `changes` onto their corresponding
+child-local columns and makes ONE `cascade_update_cols_in_tx` write per child
+row (the same one-write-per-row shape round 1 gave the ON DELETE side); for
+`FA_set_null`/`FA_set_default` it delegates directly to the existing
+`cascade_apply_set_null`/`cascade_apply_set_default` — writing the FK's WHOLE
+local-column list, not just the changed subset, which is what SET NULL/SET
+DEFAULT are supposed to do regardless of which parent column triggered them —
+instead of a third reimplementation of the same NOT-NULL-atomic-precheck-then-
+one-write-per-row logic. `apply_update_cascade_fk`'s CASCADE branch was fixed
+the same way it should have looked from round 1: `List.combine` over its
+already-fully-resolved column/value lists, then one
+`cascade_update_cols_in_tx` write, instead of `List.hd`. `cascade_apply_set_null`/
+`cascade_apply_set_default` moved from standalone `let` bindings into this
+`and` chain so `cascade_update_fk_multi` (part of the chain) can call them
+directly; `cascade_update_col_in_tx` (the thin singleton-column wrapper both
+round-2 fixes replaced their last caller of) had no remaining caller and was
+deleted the same way round 1 deleted its own unused wrappers.
+
+**Round 3 (PR #793's own review, round 2): one dispatch per matching FK still
+isn't one write per row when TWO SEPARATE FKs from the same child table both
+reach it.** Round 2 grouped a single composite FK's own changed columns into
+one dispatch, but `cascade_update_cols_in_tx`'s re-cascade loop and
+`apply_update_cascades`'s top-level entry point still walked the fks matching
+one child table with `Lwt_list.iter_s`, dispatching each fk as its own
+independent write against the SAME shared `visited` set. When two distinct
+`fk_constraint`s (not one composite key — two ordinary single-column FKs, or
+two composite FKs with overlapping matches) both resolved to the SAME child
+row, the first fk's dispatch marked that row visited and wrote its own
+column; the second fk's dispatch found the row already visited and was
+silently skipped, losing its column — the #787/#790 defect one dispatch
+level further out than round 2 closed. Reproduced exactly as given: `p(id)`
+PK, `c(id, ref1, ref2)` with two independent single-column FKs (`ref1` and
+`ref2`, not a composite key) both `REFERENCES p(id) ON UPDATE CASCADE`;
+`UPDATE p SET id = 2` wrote `ref1` but left `ref2` dangling at the old value.
+
+Fixed by separating "compute what an fk would write" from "apply it": the
+old `cascade_update_fk_multi` is now `cascade_update_fk_writes`, which
+returns `(child rowid, child row, column writes) list` for one fk without
+touching `visited` or the store. `dispatch_update_cascades` fans out over
+every fk matching a child table via `Lwt_list.map_s`, calling
+`cascade_update_fk_writes` for each, merges the results into one table keyed
+by child rowid (a row two fks both reach gets the UNION of both fks' column
+writes), and only then makes one `cascade_update_cols_in_tx` call per
+distinct row — so no fk's write can be dropped by another fk reaching the
+row first, regardless of how many fks from one child table match. Both the
+downstream re-cascade and the top-level entry point now share this single
+function: `apply_update_cascade_fk` (round 2's fix to the top-level path) is
+gone, folded into `dispatch_update_cascades` after computing the WHOLE
+parent row's changed columns once (`old_row`/`new_row` compared column by
+column, not per fk) — eliminating the round-2 finding that the top-level
+path and the downstream path independently reimplemented the identical
+per-action dispatch logic with nothing to keep them in sync. `cascade_update_fk_writes`
+also replaced a hand-rolled linear-search closure (`find_pos`) with
+`List.combine fk_parent_cols child_col_idxs` + `List.assoc_opt`, matching
+the pattern the top-level path already used correctly before this fold, and
+hoisted the `resolve_fk_col_idxs`/`scan_child_rows_multi_tx` pair (previously
+copy-pasted in all three `fk_on_update` branches) into one local closure.
+`cascade_delete_set_null`/`cascade_delete_set_default` were also changed to
+delegate to `cascade_apply_set_null`/`cascade_apply_set_default` (which they
+had reimplemented line-for-line since round 1) instead of maintaining a
+second copy of the same precheck-then-write logic — but that delegation
+alone does NOT close `ON DELETE`'s own two-separate-fks-to-the-same-row case,
+because `cascade_delete_row_in_tx`'s loop still dispatched each SET
+NULL/SET DEFAULT fk through its own independent `cascade_delete_fk` call,
+each one individually well-behaved but still racing the same shared
+`visited` set the ON UPDATE side had. Fixed the same way: the loop now
+partitions each child table's matching fks into SET NULL/SET DEFAULT
+(merged via the new `cascade_delete_fk_set_writes` +
+`dispatch_delete_set_cascades`, which applies `merge_fk_writes_by_rowid` —
+the same merge-by-rowid helper factored out of `dispatch_update_cascades` so
+both sides share it — to the DELETE side) versus RESTRICT/NO
+ACTION/CASCADE (still dispatched individually via the unchanged
+`cascade_delete_fk`, since those never collide on `visited` this way:
+RESTRICT/NO ACTION never write, and re-deleting an already-deleted row via
+CASCADE is a correct no-op rather than a lost write).
+
+**Round 4 (PR #793's own review, round 3): merging by rowid within one
+child table's fks isn't enough when TWO DIFFERENT child tables converge on
+a shared descendant.** Round 3's `merge_fk_writes_by_rowid` closes the race
+between multiple fks on ONE child table reaching the same row, but
+`visited` is one Hashtbl shared across the WHOLE cascade tree, and a row
+reached via two DIFFERENT immediate parents (not two fks on one parent)
+still hit it as a plain no-op: `P(id)`; `C1(id)`/`C2(id)` each with their
+own primary key FK-cascading from `P(id)`; `G(id, from_c1, from_c2)` with
+`FK(from_c1)->C1(id) ON UPDATE SET NULL` and `FK(from_c2)->C2(id) ON UPDATE
+SET NULL`. `UPDATE P SET id = 2` cascades P→C1 first, which re-cascades to
+G, nulls `from_c1`, and marks `visited[(G,1)]`; P→C2's own re-cascade also
+reaches G, finds it already visited, and no-ops entirely — `from_c2` never
+gets written.
+
+Fixed in `cascade_update_cols_in_tx` (the one function every write-bearing
+cascade path funnels through) by splitting what `visited` gates: it still
+marks the row on first visit, but a REVISIT now still performs the write
+(and fires the row hooks) — only the downstream re-cascade dispatch is
+skipped on a revisit.
+
+**Round 5 (PR #793 re-review) narrowed that rule in two places where round
+4's soundness argument did not hold.** Round 4 justified the revisit write
+by "every caller re-scans the child row fresh immediately before
+dispatching". That holds *across* dispatches, not *within* one: a
+dispatch runs every fk's scan before any write, so an entry later in the
+merged list can carry a snapshot an earlier entry's recursive re-cascade
+has since written — `c(id, a UNIQUE → p ON UPDATE CASCADE, b → p ON UPDATE
+CASCADE, c → c(a) ON UPDATE CASCADE)` with rows `(10, 1, -, -)` and
+`(20, -, 1, 1)`: `UPDATE p SET id = 2` writes row 10's `a`, whose re-cascade
+sets row 20's `c` to 2, and round 4 then rewrote row 20 from its pre-scan
+image, reverting `c` to the dangling 1. A revisit now re-reads the stored
+row (`reread_row_in_tx`) and applies its write to that. Second, `visited`
+is not only "rows a cascade wrote": the top-level `apply_update_row` /
+`apply_delete_row` seed it with their own target row, and
+`cascade_delete_row_in_tx` adds every row it deletes. Those callers then
+write or delete the row from their own pre-cascade image and derive index
+keys from it, so a cascade write landing in between (a self-referencing
+`ON DELETE SET NULL` / `ON UPDATE CASCADE`) left an orphan index entry
+that `PRAGMA integrity_check` reports. `visited` now records *why* a row is
+in it (`cascade_visit`: `Visit_owned` vs `Visit_written`) and only a
+`Visit_written` row may be written again; an owned row is the hard
+short-circuit it was on `main`.
+
+**This closes the SHALLOW diamond (the descendant itself has no further
+children), not every diamond.** If G in the repro above were itself
+referenced by a further table H with its own `ON UPDATE` action, H would
+only ever see the FIRST write's columns: the downstream re-cascade that
+would notice `from_c2`'s new value and propagate it to H is exactly the
+recursion this fix skips on revisit, to bound work and avoid infinite
+loops under a true cycle. Closing that residual in general needs a
+worklist/fixed-point traversal — accumulate every write reaching each row
+across the WHOLE cascade before finalizing any of them, re-deriving
+downstream effects whenever a row's accumulated write set grows — which is
+a materially different algorithm from the current recursive
+visited-guarded walk. Not attempted here: the review's own concrete repro
+(and every test in this suite) is the shallow case, and a correct-but-untested
+worklist rewrite risks trading a narrow, well-understood gap for a wider,
+less-understood one. Tracked as an accepted residual, narrower than round
+3 left it.
+
+**A silent last-write-wins on a genuine value conflict now raises instead.**
+`merge_fk_writes_by_rowid`'s union of two fks' column writes had no
+de-duplication: if two fks converging on one row's merge both wrote the
+SAME column with DIFFERENT values (e.g. two composite FKs off the same
+parent, sharing one local column, one via CASCADE and one via SET NULL),
+the final value was whichever write happened to land last in list order —
+silently, with no error and no documented precedence. Fixed to raise a
+loud `FOREIGN KEY constraint failed` naming the child table and column
+when two writes to the SAME row disagree on the SAME column's value,
+matching this codebase's existing convention for a NOT-NULL/no-default
+precheck failure rather than picking one arbitrarily. A same-value
+collision (both fks agree) is provably safe and stays silent, and (round
+5) is dropped from the merged write list rather than appended, so each
+column appears once in the downstream re-cascade's changed-column set.
+
+**The NOT NULL precheck keeps each path's order from `main`.** Round 2/3's
+compute-only rewrite scanned first everywhere, which silently narrowed the
+one path that had prechecked unconditionally: the deleted single-column
+`cascade_update_set_null` (downstream `ON UPDATE SET NULL`), where `UPDATE p
+SET id = 2` against an EMPTY child with a NOT NULL `SET NULL` column used
+to fail. Round 4 restored that by moving the precheck ahead of the scan on
+ALL FOUR paths, which over-corrected: on `main`, `ON DELETE SET NULL`,
+`ON DELETE SET DEFAULT` and `ON UPDATE SET DEFAULT` all scanned first and
+raised only when a row actually needed the write, and after round 4 every
+`DELETE` of a parent failed against such a child even when no child row
+referenced it. Round 5 gives `compute_set_action_writes` a
+`~precheck_before_scan` flag: `true` for `ON UPDATE SET NULL` only, `false`
+for the other three — `main`'s behaviour on each, pinned by one test per
+direction. `main`'s *top-level* `ON UPDATE SET NULL` (via
+`apply_update_cascade_fk` → `cascade_apply_set_null`) was itself scan-first,
+so unifying the top-level and downstream paths had to pick one; the
+precheck-first rule the review asked for is the one kept.
+
+**Weakened corrupted-catalog detection, restored.** `dispatch_update_cascades`
+only called `cascade_update_fk_writes` (which resolves `resolve_fk_col_idxs`
+— the #765-round-4 loud-failure defense against a stale FK naming a
+nonexistent parent column) for fks whose `fk_parent_cols` overlapped the
+UPDATE's actually-changed columns. An UPDATE that never happened to touch a
+CORRUPTED fk's columns never resolved it, so the corruption went
+undetected on every such update — narrower than the pre-round-3
+`apply_update_cascade_fk`, which called `resolve_fk_col_idxs` unconditionally
+for every fk on every UPDATE to the table. `dispatch_update_cascades` now
+calls `resolve_fk_col_idxs` for every matching fk regardless of whether
+`changes` ends up empty, restoring the wider detection window; the second,
+cheap re-resolution inside `cascade_update_fk_writes` (once `changes` is
+known non-empty) is unchanged.
+
+**Dead code that would silently resurrect the round-3 fix's own bug is now
+a loud failure instead.** `cascade_delete_fk`'s and `apply_delete_cascade_fk`'s
+`FA_set_null`/`FA_set_default` arms are unreachable in practice (their sole
+caller pre-filters to RESTRICT/NO ACTION/CASCADE), but nothing in the type
+system enforced that, and they still called (respectively) the old
+per-fk delegates directly / silently no-op'd — either of which reactivates
+the same-row race this PR exists to close, with no compiler warning, the
+moment a future edit to the partition logic or a new call site reaches
+them. Both now raise `Lwt.fail_with` naming the internal-error condition
+instead.
+
+**Duplication removed where it was cheap to remove.** `cascade_update_fk_writes`'s
+SET NULL/SET DEFAULT arms and `cascade_delete_fk_set_writes` reimplemented
+the identical resolve→scan→precheck→build sequence with only `op_label`
+and the source of `parent_vals` differing; both now delegate to one shared
+`compute_set_action_writes`. `dispatch_update_cascades` and
+`dispatch_delete_set_cascades` shared a byte-for-byte-identical
+merge-then-write tail; both now call one shared `apply_merged_fk_writes`.
+`cascade_apply_set_null`/`cascade_apply_set_default` (the round-1/round-3
+"apply" helpers) lost their last remaining callers once `cascade_delete_set_null`/
+`cascade_delete_set_default` were themselves deleted in favor of calling
+`compute_set_action_writes` directly, and were deleted rather than kept as
+unused code — the same "delete rather than keep an unused wrapper" pattern
+this whole issue family has followed since round 1.
+`cascade_set_null_precheck` returning `unit` while `cascade_set_default_precheck`
+returns the resolved `(col_idx, value)` pairs directly was left as-is: SET
+DEFAULT genuinely needs to hand the resolved default values back to its
+caller (there is no fixed value like `V_null` to reach for), so the
+asymmetry reflects a real difference in what each precheck must produce,
+not drift.
+
+**An efficiency finding, fixed: the per-row changed-column diff for the
+top-level `UPDATE ... CASCADE` entry point scanned every column of the
+table, once per matched row, regardless of how many (if any) a child FK
+actually referenced.** `fk_relevant_col_idxs` now computes the SET of
+parent-table column indices any fk in `child_refs` references ONCE per
+statement (alongside `child_refs` itself, which was already computed once)
+and threads it through `apply_update_row`/`apply_update_cascades`, which
+diff only those indices per row instead of rebuilding and scanning a fresh
+`(index, column)` list of the WHOLE table on every matched row.
+
+**A deliberate, previously-undocumented ordering decision on the DELETE
+side: RESTRICT/NO ACTION/CASCADE fks on one child table now always run
+BEFORE that table's SET NULL/SET DEFAULT fks, regardless of declaration
+order.** Before round 3's fix, `cascade_delete_row_in_tx` walked a child
+table's fks in whatever order `Cat.fk_constraints` returned them (creation
+order), fully applying each fk's own action before considering the next —
+so a SET NULL fk declared before a CASCADE fk on the same matching row
+could null the referencing column first, making the CASCADE fk's later
+scan no longer match and leaving the row un-deleted; reversing the
+declaration order reversed that outcome. Round 3's partition into
+`set_fks`/`other_fks` (needed to merge SET NULL/SET DEFAULT writes safely)
+made this deterministic in one specific direction — RESTRICT/NO
+ACTION/CASCADE always first — rather than preserving whatever the
+declaration order happened to produce. This is not an accident: running
+RESTRICT/NO ACTION before anything mutates a referencing column means a
+RESTRICT check is never fooled by an earlier SET NULL having already
+cleared the very reference it exists to detect, which the OPPOSITE order
+would allow (a RESTRICT-guarded reference could be silently erased by a
+sibling SET NULL fk before RESTRICT ever looked at it, incorrectly letting
+the delete through). Declaration-order dependence for multiple FK actions
+on one delete was already fragile before this PR; this makes it
+deterministic in the direction that keeps RESTRICT's guarantee intact
+rather than preserving the old, order-fragile behavior.
 
 **OCaml hooks only — SQL triggers on a cascaded child write still do not
 fire.** `Db.make_row_hook_lookup` deliberately does not layer

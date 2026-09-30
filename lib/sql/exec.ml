@@ -2817,7 +2817,7 @@ let not_null_exempt_col (col : Row.column) : bool =
    the ROW-STORE sites only — stating it as "every enforcement site" was wrong
    when this shipped, so here it is enumerated.  [compute_stored_generated_cols]
    runs before the check at [execute_insert] (feeding [execute_insert_write]),
-   [execute_upsert_update], [update_col_in_tx] and [apply_update_row] (feeding
+   [execute_upsert_update], [update_cols_in_tx] and [apply_update_row] (feeding
    [write_row_rekeyed]).  It is NOT called on either columnar arm: both build
    the row with [Array.make n_cols Row.V_null] and pass it straight to
    [not_null_skip_or_fail].  That is sound only because
@@ -6306,6 +6306,66 @@ let build_child_refs cat ~parent_table_name =
        all_tables)
 ;;
 
+(* Merge per-fk (rowid, row, column writes) lists into one entry per distinct
+   rowid, preserving first-seen order and unioning the column writes of every
+   fk that reached the same row (#793 review round 3). Shared by
+   {!dispatch_update_cascades} and {!dispatch_delete_set_cascades} so a row
+   reached by two separate FK constraints is written exactly once, with both
+   fks' columns, instead of racing a shared [visited] short-circuit. *)
+(* #793 review round 4: two DIFFERENT fks matched within one dispatch can
+   both target the SAME column on the same row (e.g. two composite FKs off
+   the same parent, sharing one local column). Silently keeping whichever
+   write landed last (decided by incidental catalog/list order) would trade
+   a dropped write for a WRONG one with no error either way. A same-VALUE
+   collision is provably safe (both fks agree, order can't matter), so only
+   a genuine disagreement raises -- loudly, matching this codebase's existing
+   convention for a NOT-NULL/no-default precheck failure rather than a
+   silent pick. *)
+let merge_fk_writes_by_rowid
+      (child_meta : Cat.table_meta)
+      (per_fk_writes : (int64 * Row.t * (int * Row.value) list) list list)
+  : (int64 * (Row.t * (int * Row.value) list)) list
+  =
+  let merged : (int64, Row.t * (int * Row.value) list) Hashtbl.t = Hashtbl.create 8 in
+  let order = ref [] in
+  List.iter
+    (fun writes ->
+       List.iter
+         (fun (rid, crow, write_cols) ->
+            match Hashtbl.find_opt merged rid with
+            | None ->
+              Hashtbl.add merged rid (crow, write_cols);
+              order := rid :: !order
+            | Some (crow', cols') ->
+              (* A same-value collision is dropped rather than appended, so
+                 the merged list names each column once (#793 re-review):
+                 a duplicate would otherwise reach the downstream
+                 re-cascade's [changed_names] twice. *)
+              let fresh =
+                List.filter
+                  (fun (idx, v) ->
+                     match List.assoc_opt idx cols' with
+                     | None -> true
+                     | Some v' when compare_values v v' = 0 -> false
+                     | Some _ ->
+                       failwith
+                         (Printf.sprintf
+                            "FOREIGN KEY constraint failed: two FK actions on '%s' \
+                             disagree on the new value of column '%s'"
+                            child_meta.Cat.name
+                            (List.nth child_meta.Cat.columns idx).Row.name))
+                  write_cols
+              in
+              (* [List.rev_append fresh cols'] instead of [cols' @ fresh]:
+                 cost is O(len fresh) -- the one fk's own small column list
+                 -- not O(len cols'), the accumulator that grows with every
+                 fk merged into this row so far. *)
+              Hashtbl.replace merged rid (crow', List.rev_append fresh cols'))
+         writes)
+    per_fk_writes;
+  List.rev_map (fun rid -> rid, Hashtbl.find merged rid) !order
+;;
+
 (** Scan [child_meta] using an existing RW transaction for rows where all
     [child_col_idxs] match [parent_vals] simultaneously.  When an index covers
     [child_col_idxs] as a leading prefix, the scan is driven by the index;
@@ -6392,32 +6452,35 @@ let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   Cat.note_rowid_deleted cat ~name:meta.Cat.name ~rowid tx
 ;;
 
-(* #773: the row a single-column cascade write ([ON DELETE]/[ON UPDATE]
+(* #773: the row a cascade write ([ON DELETE]/[ON UPDATE]
    [CASCADE]/[SET NULL]/[SET DEFAULT]) will store, computed from the pre-image.
-   Factored out of {!update_col_in_tx} so the [`Before]/[`After] UPDATE row
-   hooks {!cascade_update_col_in_tx} fires observe EXACTLY the row that write
+   Factored out of {!update_cols_in_tx} so the [`Before]/[`After] UPDATE row
+   hooks {!cascade_update_cols_in_tx} fires observe EXACTLY the row that write
    stores — including its STORED generated columns — rather than a second,
-   independently maintained reconstruction of it that could drift. *)
-let cascade_updated_row (meta : Cat.table_meta) (row : Row.t) ~col_idx ~new_val =
+   independently maintained reconstruction of it that could drift.
+
+   #787/#790: [cols] carries every local column a COMPOSITE FK's cascade
+   targets, applied together to ONE post-image built from ONE pre-image.
+   Before this, a composite cascade called the single-column form once per
+   column, each time re-copying the ORIGINAL row — so column 2's write threw
+   away column 1's, and a STORED generated column depending on both saw only
+   one of the two new values.  This is now genuinely "exactly the row that
+   write stores" for a composite FK too, not merely for each column read in
+   isolation. *)
+let cascade_updated_row_multi (meta : Cat.table_meta) (row : Row.t) ~cols =
   let new_row = Array.copy row in
-  new_row.(col_idx) <- new_val;
+  List.iter (fun (col_idx, new_val) -> new_row.(col_idx) <- new_val) cols;
   compute_stored_generated_cols None [||] meta new_row;
   new_row
 ;;
 
-(** Update one column to [new_val] in a row within an existing RW transaction.
-    Also updates index entries for any index that covers [col_idx]. *)
-let update_col_in_tx
-      tx
-      (cat : Cat.t)
-      (meta : Cat.table_meta)
-      ~rowid
-      ~(row : Row.t)
-      ~col_idx
-      ~new_val
+(** Update one or more columns to their respective values in a row within an
+    existing RW transaction, in ONE write. Also updates index entries for any
+    index that covers a changed column. [cols] must be non-empty. *)
+let update_cols_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~cols
   =
   mark_dirty meta.Cat.name;
-  let new_row = cascade_updated_row meta row ~col_idx ~new_val in
+  let new_row = cascade_updated_row_multi meta row ~cols in
   let indexes = Cat.indexes_for_table cat ~table:meta.Cat.name in
   (* #693: this is the third and last [write_row_rekeyed] caller (ON UPDATE
      CASCADE / SET NULL / SET DEFAULT) — plain UPDATE has
@@ -6492,12 +6555,216 @@ let fk_default_value clock params (col : Row.column) : Row.value =
       (Plan.P_func (Ast.Fn_time, [ Plan.P_lit (Ast.L_text "now") ]))
 ;;
 
+(* #787/#790: reject a SET NULL cascade covering [child_col_idxs] BEFORE any
+   row is written, for every target column at once — not just the first one
+   to fail.  A composite FK names more than one local column, and a write
+   must be atomic across all of them: finding the NOT NULL column only after
+   an earlier column's rows were already written would leave a genuine
+   partial write behind, the same shape of bug this issue fixes for the
+   write itself. *)
+let cascade_set_null_precheck ~op_label (child_meta : Cat.table_meta) ~child_col_idxs
+  : unit Lwt.t
+  =
+  match
+    List.find_opt
+      (fun idx -> (List.nth child_meta.Cat.columns idx).Row.not_null)
+      child_col_idxs
+  with
+  | None -> Lwt.return_unit
+  | Some idx ->
+    let col = List.nth child_meta.Cat.columns idx in
+    Lwt.fail_with
+      (Printf.sprintf
+         "FOREIGN KEY constraint failed: %s SET NULL on NOT NULL column '%s.%s'"
+         op_label
+         child_meta.Cat.name
+         col.Row.name)
+;;
+
+(* #787/#790: like {!cascade_set_null_precheck}, but for SET DEFAULT — checks
+   every target column's DEFAULT against its NOT NULL constraint up front and,
+   on success, returns the (col_idx, default_value) pairs to apply in the
+   single per-row write. *)
+let cascade_set_default_precheck
+      ~op_label
+      clock
+      params
+      (child_meta : Cat.table_meta)
+      ~child_col_idxs
+  : (int * Row.value) list Lwt.t
+  =
+  let resolved =
+    List.map
+      (fun idx ->
+         let col = List.nth child_meta.Cat.columns idx in
+         idx, col, fk_default_value clock params col)
+      child_col_idxs
+  in
+  match
+    List.find_opt
+      (fun (_, (col : Row.column), dv) -> col.Row.not_null && dv = Row.V_null)
+      resolved
+  with
+  | Some (_, col, _) ->
+    Lwt.fail_with
+      (Printf.sprintf
+         "FOREIGN KEY constraint failed: %s SET DEFAULT on NOT NULL column '%s.%s' with \
+          no default"
+         op_label
+         child_meta.Cat.name
+         col.Row.name)
+  | None -> Lwt.return (List.map (fun (idx, _, dv) -> idx, dv) resolved)
+;;
+
+(* Shared compute-only body for [FA_set_null]/[FA_set_default]: resolve the
+   fk's local (child) columns, scan for matching child rows, run the NOT NULL
+   precheck, and build the write list. Used by both
+   {!cascade_update_fk_writes} and {!cascade_delete_fk_set_writes}'s
+   FA_set_null/FA_set_default arms, which used to duplicate this sequence
+   with only [op_label] and the source of [parent_vals] differing (#793
+   review round 4, duplication finding).
+
+   [precheck_before_scan] keeps each path's ORDER as it was on [main]:
+   only ON UPDATE SET NULL (the old [cascade_update_set_null]) prechecked
+   before scanning, so a NOT NULL target column raises there even when no
+   child row matches. ON DELETE SET NULL/SET DEFAULT and ON UPDATE SET
+   DEFAULT scanned first and raise only when a row actually needs the
+   write -- round 4 had moved all four to precheck-first, which made every
+   DELETE of a parent fail against a NOT NULL child with no referencing
+   row at all (#793 re-review, round 5). *)
+let compute_set_action_writes
+      tx
+      cat
+      clock
+      params
+      ~op_label
+      ~precheck_before_scan
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+      ~parent_vals
+      ~(action : [ `Set_null | `Set_default ])
+  : (int64 * Row.t * (int * Row.value) list) list Lwt.t
+  =
+  let* child_col_idxs =
+    resolve_fk_col_idxs
+      ~table_name:child_meta.Cat.name
+      child_meta.Cat.columns
+      fk.Cat.fk_local_cols
+  in
+  let precheck () =
+    match action with
+    | `Set_null ->
+      let* () = cascade_set_null_precheck ~op_label child_meta ~child_col_idxs in
+      Lwt.return (List.map (fun idx -> idx, Row.V_null) child_col_idxs)
+    | `Set_default ->
+      cascade_set_default_precheck ~op_label clock params child_meta ~child_col_idxs
+  in
+  let scan () = scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals in
+  let build write_cols child_rows =
+    List.map (fun (crid, crow) -> crid, crow, write_cols) child_rows
+  in
+  if precheck_before_scan
+  then
+    let* write_cols = precheck () in
+    let* child_rows = scan () in
+    Lwt.return (build write_cols child_rows)
+  else
+    let* child_rows = scan () in
+    if child_rows = []
+    then Lwt.return []
+    else
+      let* write_cols = precheck () in
+      Lwt.return (build write_cols child_rows)
+;;
+
+(* Compute (without applying) the ON DELETE SET NULL/SET DEFAULT writes one
+   [fk] makes for [meta]'s row being deleted. Mirrors the split of "compute"
+   from "apply" the ON UPDATE side uses (see {!merge_fk_writes_by_rowid}'s
+   doc comment) so {!dispatch_delete_set_cascades} can merge multiple SET
+   NULL/SET DEFAULT fks that reach the same child row into one write instead
+   of racing the shared [visited] short-circuit — the #793 review round 3
+   fix applies equally to ON DELETE: two separate SET NULL/SET DEFAULT fk
+   constraints from one child table matching the same row had the same
+   defect as their ON UPDATE counterparts. [fk]'s action MUST be
+   [FA_set_null] or [FA_set_default]; RESTRICT/NO ACTION/CASCADE never
+   collide this way (CASCADE deletes the row outright, so a second fk
+   reaching an already-deleted row is a correct no-op, not a lost write) and
+   are dispatched individually via the existing {!cascade_delete_fk}. *)
+let cascade_delete_fk_set_writes
+      tx
+      cat
+      clock
+      params
+      (meta : Cat.table_meta)
+      ~(row : Row.t)
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+  : (int64 * Row.t * (int * Row.value) list) list Lwt.t
+  =
+  let* parent_col_idxs =
+    resolve_fk_col_idxs ~table_name:meta.Cat.name meta.Cat.columns fk.Cat.fk_parent_cols
+  in
+  let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
+  if any_null_val parent_vals
+  then Lwt.return []
+  else (
+    match fk.Cat.fk_on_delete with
+    | Cat.FA_set_null ->
+      compute_set_action_writes
+        tx
+        cat
+        clock
+        params
+        ~op_label:"ON DELETE"
+        ~precheck_before_scan:false
+        child_meta
+        fk
+        ~parent_vals
+        ~action:`Set_null
+    | Cat.FA_set_default ->
+      compute_set_action_writes
+        tx
+        cat
+        clock
+        params
+        ~op_label:"ON DELETE"
+        ~precheck_before_scan:false
+        child_meta
+        fk
+        ~parent_vals
+        ~action:`Set_default
+    | Cat.FA_restrict | Cat.FA_no_action | Cat.FA_cascade -> Lwt.return [])
+;;
+
+(* What a [(table, rowid)] entry in a cascade's [visited] set means (#793
+   re-review, round 5). Round 4 let {!cascade_update_cols_in_tx} write a
+   row it had already seen, to close the diamond gap, but [visited] also
+   holds rows that must NOT be written by a cascade at all: the row a
+   top-level UPDATE/DELETE seeds it with (that caller writes or deletes the
+   row itself afterwards, from its own pre-cascade image, and re-derives
+   index keys from that image -- a cascade write in between leaves an
+   orphan index entry), and every row {!cascade_delete_row_in_tx} is
+   deleting. Those are [Visit_owned] and stay a hard short-circuit; only a
+   row an earlier cascade WRITE landed on ([Visit_written]) may be written
+   again. *)
+type cascade_visit =
+  | Visit_owned
+  | Visit_written
+
+(* The current stored image of [rowid] in [meta], VIRTUAL columns applied the
+   way {!scan_child_rows_multi_tx} decodes them; [None] if it is gone. *)
+let reread_row_in_tx tx (meta : Cat.table_meta) ~rowid =
+  let tree_id, _, _, _ = Cat.row_storage meta in
+  let* row_opt = S.get tx tree_id (Rowid.encode rowid) in
+  Lwt.return (Option.map (decode_with_virtual None [||] meta) row_opt)
+;;
+
 (** Recursively delete a row and cascade FK actions to child tables.
     Only runs cascade logic when FK enforcement is enabled in [cat]. *)
 let rec cascade_delete_row_in_tx
           tx
           (cat : Cat.t)
-          ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
+          ?(visited : (string * int64, cascade_visit) Hashtbl.t = Hashtbl.create 16)
           (clock : (unit -> float) option)
           (params : Row.value array)
           (meta : Cat.table_meta)
@@ -6508,7 +6775,7 @@ let rec cascade_delete_row_in_tx
   if Hashtbl.mem visited visited_key
   then Lwt.return_unit
   else (
-    Hashtbl.add visited visited_key ();
+    Hashtbl.add visited visited_key Visit_owned;
     (* #773: an OCaml row hook registered on THIS table fires for the cascaded
        delete exactly as it would for the same row deleted by a plain [DELETE].
        [`Before] fires ahead of the fan-out below, not merely ahead of this
@@ -6535,20 +6802,46 @@ let rec cascade_delete_row_in_tx
     let* () =
       Lwt_list.iter_s
         (fun (child_meta, fks) ->
-           Lwt_list.iter_s
-             (fun (fk : Cat.fk_constraint) ->
-                cascade_delete_fk
-                  tx
-                  cat
-                  visited
-                  clock
-                  params
-                  meta
-                  ~rowid
-                  ~row
-                  child_meta
-                  fk)
-             fks)
+           (* #793 review round 3: SET NULL/SET DEFAULT fks matching the same
+              child table are merged by rowid via {!dispatch_delete_set_cascades}
+              before writing (two such fks reaching the same child row must not
+              race the shared [visited] short-circuit); RESTRICT/NO ACTION/
+              CASCADE fks are unaffected by that collision and keep dispatching
+              individually through {!cascade_delete_fk}. *)
+           let set_fks, other_fks =
+             List.partition
+               (fun (fk : Cat.fk_constraint) ->
+                  match fk.Cat.fk_on_delete with
+                  | Cat.FA_set_null | Cat.FA_set_default -> true
+                  | Cat.FA_restrict | Cat.FA_no_action | Cat.FA_cascade -> false)
+               fks
+           in
+           let* () =
+             Lwt_list.iter_s
+               (fun (fk : Cat.fk_constraint) ->
+                  cascade_delete_fk
+                    tx
+                    cat
+                    visited
+                    clock
+                    params
+                    meta
+                    ~rowid
+                    ~row
+                    child_meta
+                    fk)
+               other_fks
+           in
+           dispatch_delete_set_cascades
+             tx
+             cat
+             visited
+             clock
+             params
+             meta
+             ~row
+             child_meta
+             set_fks)
         child_refs
     in
     let* () = delete_row_in_tx tx cat meta ~rowid ~row in
@@ -6622,26 +6915,29 @@ and cascade_delete_fk
              ~rowid:crid
              ~row:crow)
         child_rows
-    | Cat.FA_set_null ->
-      cascade_delete_set_null
-        tx
-        cat
-        visited
-        clock
-        params
-        child_meta
-        ~child_col_idxs
-        ~parent_vals
-    | Cat.FA_set_default ->
-      cascade_delete_set_default
-        tx
-        cat
-        visited
-        clock
-        params
-        child_meta
-        ~child_col_idxs
-        ~parent_vals
+    | Cat.FA_set_null | Cat.FA_set_default ->
+      (* #793 review round 4: {!cascade_delete_row_in_tx}'s ONLY caller of
+         this function pre-filters [fks] to [other_fks] (RESTRICT/NO
+         ACTION/CASCADE), routing SET NULL/SET DEFAULT through
+         {!dispatch_delete_set_cascades} instead so multiple such fks
+         converging on one child row merge rather than race [visited] (see
+         that function's doc comment). Reaching this arm at all means some
+         caller bypassed that filter -- fail loudly instead of independently
+         dispatching this one fk's write against the shared [visited] set,
+         which would silently reopen the exact same-row collision this PR's
+         round 3 fixed (round 3 deleted the two per-fk delegate functions
+         this arm used to call for exactly that reason). *)
+      Lwt.fail_with
+        (Printf.sprintf
+           "internal error: cascade_delete_fk reached with fk_on_delete = %s for '%s' -> \
+            '%s', but SET NULL/SET DEFAULT must route through \
+            dispatch_delete_set_cascades"
+           (match fk.Cat.fk_on_delete with
+            | Cat.FA_set_null -> "SET NULL"
+            | Cat.FA_set_default -> "SET DEFAULT"
+            | _ -> "?")
+           meta.Cat.name
+           child_meta.Cat.name)
 
 (* ON DELETE RESTRICT/NO ACTION: if any child row still references the parent,
    queue a deferred recheck or raise immediately. *)
@@ -6698,179 +6994,189 @@ and cascade_delete_restrict
       ~fk_ordinal:ord)
   else Lwt.return_unit
 
-(* ON DELETE SET NULL: set each child FK column to NULL (rejecting NOT NULL),
-   routing through cascade_update_col_in_tx so further ON UPDATE chains run. *)
-and cascade_delete_set_null
-      tx
-      cat
-      visited
-      clock
-      params
-      (child_meta : Cat.table_meta)
-      ~child_col_idxs
-      ~(parent_vals : Row.value list)
-  =
-  let* child_rows =
-    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
-  in
-  if child_rows = []
-  then Lwt.return_unit
-  else
-    (* For single-col FKs (common case), apply to the one child col.
-       For multi-col, apply SET NULL to each child col independently. *)
-    Lwt_list.iter_s
-      (fun child_col_idx ->
-         let col = List.nth child_meta.Cat.columns child_col_idx in
-         if col.Row.not_null
-         then
-           Lwt.fail_with
-             (Printf.sprintf
-                "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column \
-                 '%s.%s'"
-                child_meta.Cat.name
-                col.Row.name)
-         else
-           Lwt_list.iter_s
-             (fun (crid, crow) ->
-                cascade_update_col_in_tx
-                  tx
-                  cat
-                  ~visited
-                  clock
-                  params
-                  child_meta
-                  ~rowid:crid
-                  ~row:crow
-                  ~col_idx:child_col_idx
-                  ~new_val:Row.V_null)
-             child_rows)
-      child_col_idxs
+(** Recursively update one or more columns in ONE write and cascade FK UPDATE
+    actions to child tables that reference any of the changed columns.
+    [cols] must be non-empty.
 
-(* ON DELETE SET DEFAULT: like SET NULL but with each column's DEFAULT value. *)
-and cascade_delete_set_default
-      tx
-      cat
-      visited
-      clock
-      params
-      (child_meta : Cat.table_meta)
-      ~child_col_idxs
-      ~(parent_vals : Row.value list)
-  =
-  let* child_rows =
-    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
-  in
-  if child_rows = []
-  then Lwt.return_unit
-  else
-    Lwt_list.iter_s
-      (fun child_col_idx ->
-         let col = List.nth child_meta.Cat.columns child_col_idx in
-         let default_val = fk_default_value clock params col in
-         if col.Row.not_null && default_val = Row.V_null
-         then
-           Lwt.fail_with
-             (Printf.sprintf
-                "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column \
-                 '%s.%s' with no default"
-                child_meta.Cat.name
-                col.Row.name)
-         else
-           Lwt_list.iter_s
-             (fun (crid, crow) ->
-                cascade_update_col_in_tx
-                  tx
-                  cat
-                  ~visited
-                  clock
-                  params
-                  child_meta
-                  ~rowid:crid
-                  ~row:crow
-                  ~col_idx:child_col_idx
-                  ~new_val:default_val)
-             child_rows)
-      child_col_idxs
+    #787/#790: this is the generalization of the former (single-column)
+    [cascade_update_col_in_tx] to a composite FK's whole local-column list.
+    The write below happens exactly once per row — via
+    {!update_cols_in_tx}, which builds ONE post-image from ONE pre-image —
+    rather than once per (column, row) pair against the SAME stale pre-image,
+    which is what silently dropped every column after the first. Downstream
+    ON UPDATE cascades are still walked one changed column at a time (a
+    different child table can reference either column via a different FK),
+    but only after the single write has already landed.
 
-(** Recursively update a column and cascade FK UPDATE actions to child tables
-    that reference this column. *)
-and cascade_update_col_in_tx
+    #793 review round 4: [visited] no longer gates the WRITE, only the
+    downstream RE-CASCADE, closing a "diamond convergence" gap round 3 left
+    open -- two DIFFERENT immediate child tables (not two fks on the SAME
+    child table, which round 3 already merges) that both cascade into a
+    shared descendant row used to silently drop the second one's columns,
+    because the second call found [visited] already set and no-opped
+    entirely, write included. The revisit re-reads the row rather than
+    trusting [row]: within one dispatch every fk's scan runs before any
+    write, so an entry later in the merged list can carry a snapshot an
+    earlier entry's recursive re-cascade has since written, and writing
+    from it would revert that write (#793 re-review, round 5 -- round 4's
+    claim that every caller re-scans held across dispatches, not within
+    one). Rows the statement itself owns -- the top-level UPDATE/DELETE
+    target and every cascade-deleted row -- are still never written here;
+    see {!cascade_visit}. Re-cascading a second time downstream is still skipped
+    -- both to bound work under a true cycle, and because a THIRD level of
+    fan-out that itself needs the union of both merged columns (a "deep"
+    diamond, where the shared descendant has ITS OWN children depending on
+    the merge) is not closed by this: that would need re-deriving the
+    row's full changed-column set across every path that ever reaches it,
+    which this per-call [visited] guard cannot see. Tracked as an accepted,
+    narrower residual in docs/DECISIONS.md; the shallow (leaf) diamond this
+    round's own review repro described is closed. *)
+and cascade_update_cols_in_tx
       tx
       (cat : Cat.t)
-      ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
+      ?(visited : (string * int64, cascade_visit) Hashtbl.t = Hashtbl.create 16)
       (clock : (unit -> float) option)
       (params : Row.value array)
       (meta : Cat.table_meta)
       ~rowid
       ~(row : Row.t)
-      ~col_idx
-      ~new_val
+      ~cols
   =
   let visited_key = meta.Cat.name, rowid in
-  if Hashtbl.mem visited visited_key
-  then Lwt.return_unit
-  else (
-    Hashtbl.add visited visited_key ();
-    (* #773: same contract as {!cascade_delete_row_in_tx}'s, for the five
-       cascade actions that WRITE a column rather than remove a row —
-       [ON DELETE SET NULL], [ON DELETE SET DEFAULT], [ON UPDATE CASCADE],
-       [ON UPDATE SET NULL] and [ON UPDATE SET DEFAULT] all funnel through
-       here.  The post-image is built with the same {!cascade_updated_row} the
-       write below uses, and only when a hook is actually registered for this
-       table: a cascade over a table with no hooks pays one [Hashtbl] miss per
-       row, not a row copy. *)
-    let ctx = fk_cascade_hook_ctx meta.Cat.name in
-    let bh = row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Update in
-    let ah = row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Update in
-    let hook_new_row =
-      if Option.is_none bh && Option.is_none ah
-      then None
-      else Some (cascade_updated_row meta row ~col_idx ~new_val)
-    in
-    let* () = run_row_hook ~ctx bh ~tx ~new_row:hook_new_row ~old_row:(Some row) in
-    let* () = update_col_in_tx tx cat meta ~rowid ~row ~col_idx ~new_val in
-    let* () =
-      if not (Cat.get_fk_enforcement cat)
-      then Lwt.return_unit
-      else (
-        let parent_col_name = (List.nth meta.Cat.columns col_idx).Row.name in
-        let* all_child_refs = build_child_refs cat ~parent_table_name:meta.Cat.name in
-        let col_child_refs =
-          List.filter_map
-            (fun (child_meta, fks) ->
-               let matching_fks =
-                 List.filter
-                   (fun (fk : Cat.fk_constraint) ->
-                      List.mem parent_col_name fk.Cat.fk_parent_cols)
-                   fks
-               in
-               if matching_fks = [] then None else Some (child_meta, matching_fks))
-            all_child_refs
-        in
-        Lwt_list.iter_s
-          (fun (child_meta, fks) ->
-             Lwt_list.iter_s
-               (fun (fk : Cat.fk_constraint) ->
-                  cascade_update_fk
-                    tx
-                    cat
-                    visited
-                    clock
-                    params
-                    meta
-                    ~row
-                    ~new_val
-                    ~parent_col_name
-                    child_meta
-                    fk)
-               fks)
-          col_child_refs)
-    in
-    run_row_hook ~ctx ah ~tx ~new_row:hook_new_row ~old_row:(Some row))
+  match Hashtbl.find_opt visited visited_key with
+  | Some Visit_owned ->
+    (* A row the top-level statement, or a cascade delete, owns: never
+       written here (see {!cascade_visit}). *)
+    Lwt.return_unit
+  | Some Visit_written ->
+    (* A revisit: [row] may be the pre-write snapshot a dispatch scanned
+       before an earlier entry's recursive re-cascade wrote this same row,
+       so start from what is stored now rather than overwrite that write. *)
+    let* current = reread_row_in_tx tx meta ~rowid in
+    (match current with
+     | None -> Lwt.return_unit
+     | Some row ->
+       cascade_update_cols_write
+         tx
+         cat
+         ~visited
+         clock
+         params
+         meta
+         ~rowid
+         ~row
+         ~cols
+         ~first_visit:false)
+  | None ->
+    Hashtbl.replace visited visited_key Visit_written;
+    cascade_update_cols_write
+      tx
+      cat
+      ~visited
+      clock
+      params
+      meta
+      ~rowid
+      ~row
+      ~cols
+      ~first_visit:true
 
-(* Apply the ON UPDATE action of one [fk] when [parent_col_name] of [meta]
-   changes to [new_val]. *)
-and cascade_update_fk
+(* The body of {!cascade_update_cols_in_tx} once [visited] has decided the
+   write goes ahead: hooks, the one write, then (first visit only) the
+   downstream ON UPDATE re-cascade. *)
+and cascade_update_cols_write
+      tx
+      (cat : Cat.t)
+      ~visited
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (meta : Cat.table_meta)
+      ~rowid
+      ~(row : Row.t)
+      ~cols
+      ~first_visit
+  =
+  (* #773: same contract as {!cascade_delete_row_in_tx}'s, for the five
+     cascade actions that WRITE a column rather than remove a row —
+     [ON DELETE SET NULL], [ON DELETE SET DEFAULT], [ON UPDATE CASCADE],
+     [ON UPDATE SET NULL] and [ON UPDATE SET DEFAULT] all funnel through
+     here.  The post-image is built with the same {!cascade_updated_row_multi}
+     the write below uses, and only when a hook is actually registered for
+     this table: a cascade over a table with no hooks pays one [Hashtbl]
+     miss per row, not a row copy. *)
+  let ctx = fk_cascade_hook_ctx meta.Cat.name in
+  let bh = row_hook_for ~table:meta.Cat.name ~timing:`Before ~event:`Update in
+  let ah = row_hook_for ~table:meta.Cat.name ~timing:`After ~event:`Update in
+  let hook_new_row =
+    if Option.is_none bh && Option.is_none ah
+    then None
+    else Some (cascade_updated_row_multi meta row ~cols)
+  in
+  let* () = run_row_hook ~ctx bh ~tx ~new_row:hook_new_row ~old_row:(Some row) in
+  let* () = update_cols_in_tx tx cat meta ~rowid ~row ~cols in
+  let* () =
+    if not first_visit
+    then
+      (* #793 review round 4: this exact row already ran its downstream
+         re-cascade on an earlier visit (via a different immediate parent);
+         see this function's doc comment for why re-running it here is
+         skipped rather than repeated. *)
+      Lwt.return_unit
+    else if not (Cat.get_fk_enforcement cat)
+    then Lwt.return_unit
+    else (
+      (* #793 review round 3: [build_child_refs] runs ONCE for this write,
+         and every fk matching a child table is now resolved through
+         {!dispatch_update_cascades}, which merges ALL of that child
+         table's matching fks' writes by rowid BEFORE issuing a single
+         {!cascade_update_cols_in_tx} call per row -- see its header
+         comment for why dispatching per-fk independently (round 2's own
+         fix) reintroduced the #787/#790 defect one level further out. *)
+      let changed_names =
+        List.map
+          (fun (col_idx, new_val) ->
+             (List.nth meta.Cat.columns col_idx).Row.name, new_val)
+          cols
+      in
+      let* all_child_refs = build_child_refs cat ~parent_table_name:meta.Cat.name in
+      Lwt_list.iter_s
+        (fun (child_meta, fks) ->
+           dispatch_update_cascades
+             tx
+             cat
+             visited
+             clock
+             params
+             meta
+             ~row
+             ~changed_names
+             child_meta
+             fks)
+        all_child_refs)
+  in
+  run_row_hook ~ctx ah ~tx ~new_row:hook_new_row ~old_row:(Some row)
+
+(* Merge the ON UPDATE cascade writes of every [fk] in [fks] (all FKs from
+   ONE child table that reference [meta]) matching [changed_names], then
+   write each affected child row exactly ONCE.
+
+   #793 review round 2 grouped a single composite FK's own changed columns
+   into one dispatch, fixing the #787/#790 defect one cascade level down.
+   Round 3 found the identical defect one level further out: when the SAME
+   child table reaches [meta] through TWO SEPARATE fk constraints that both
+   resolve to the SAME child row (e.g. two independent FKs to the same
+   parent, or one row matching two overlapping composite keys), dispatching
+   each fk as its own independent {!cascade_update_cols_in_tx} call still
+   collided on the one [visited] set shared across this whole cascade tree
+   -- the first fk's call marked the row visited and wrote its own columns,
+   and the second fk's call was silently skipped by the guard, losing its
+   columns. {!cascade_update_fk_writes} below now only COMPUTES each fk's
+   writes without applying them; this function fans out over every matching
+   fk, merges the results by child rowid (a row two fks both reach gets the
+   union of both fks' column writes), and only then issues one write per
+   distinct row -- so no fk's write can ever be dropped by another fk
+   reaching the same row first. *)
+and dispatch_update_cascades
       tx
       cat
       visited
@@ -6878,56 +7184,133 @@ and cascade_update_fk
       params
       (meta : Cat.table_meta)
       ~(row : Row.t)
-      ~new_val
-      ~parent_col_name
+      ~changed_names
+      (child_meta : Cat.table_meta)
+      fks
+  =
+  let* per_fk_writes =
+    Lwt_list.map_s
+      (fun (fk : Cat.fk_constraint) ->
+         (* #793 review round 4: [resolve_fk_col_idxs] (the #765-round-4
+            loud-failure defense against a stale FK naming a nonexistent
+            parent column) must run for EVERY fk matching this child table,
+            not only the ones whose [fk_parent_cols] happen to overlap
+            [changed_names] -- otherwise an UPDATE that doesn't happen to
+            touch a corrupted FK's columns never resolves it, and the
+            corruption goes undetected on every such update instead of every
+            update to the table (which is what the pre-round-3
+            [apply_update_cascade_fk] unconditionally gave). Resolved here
+            regardless of [changes], and again inside
+            {!cascade_update_fk_writes} (a cheap list lookup, not a store
+            hit) once [changes] is known non-empty. *)
+         let* (_ : int list) =
+           resolve_fk_col_idxs
+             ~table_name:meta.Cat.name
+             meta.Cat.columns
+             fk.Cat.fk_parent_cols
+         in
+         let changes =
+           List.filter
+             (fun (name, _) -> List.mem name fk.Cat.fk_parent_cols)
+             changed_names
+         in
+         if changes = []
+         then Lwt.return []
+         else
+           cascade_update_fk_writes tx cat clock params meta ~row ~changes child_meta fk)
+      fks
+  in
+  apply_merged_fk_writes tx cat visited clock params child_meta per_fk_writes
+
+(* Merge every SET NULL/SET DEFAULT [fk] in [fks] (all from one child table)
+   matching [meta]'s deleted [row] by child rowid, then write each affected
+   row exactly once -- the DELETE-side twin of {!dispatch_update_cascades}
+   (#793 review round 3). Called only with fks whose [fk_on_delete] is
+   [FA_set_null]/[FA_set_default]; {!cascade_delete_fk} still dispatches
+   RESTRICT/NO ACTION/CASCADE individually, since those never collide on
+   [visited] the way two writes to the same row can. Needs to be part of
+   this [and] chain (unlike its sibling {!cascade_delete_fk_set_writes},
+   which only calls plain pre-chain helpers) because it calls
+   {!cascade_update_cols_in_tx} (via {!apply_merged_fk_writes}). *)
+and dispatch_delete_set_cascades
+      tx
+      cat
+      visited
+      clock
+      params
+      (meta : Cat.table_meta)
+      ~(row : Row.t)
+      (child_meta : Cat.table_meta)
+      fks
+  =
+  let* per_fk_writes =
+    Lwt_list.map_s
+      (fun fk -> cascade_delete_fk_set_writes tx cat clock params meta ~row child_meta fk)
+      fks
+  in
+  apply_merged_fk_writes tx cat visited clock params child_meta per_fk_writes
+
+(* Merge [per_fk_writes] by child rowid and issue one {!cascade_update_cols_in_tx}
+   write per distinct row. Shared tail of {!dispatch_update_cascades} and
+   {!dispatch_delete_set_cascades}, which used to duplicate this byte-for-byte
+   (#793 review round 4, duplication finding). *)
+and apply_merged_fk_writes
+      tx
+      cat
+      visited
+      clock
+      params
+      (child_meta : Cat.table_meta)
+      per_fk_writes
+  =
+  Lwt_list.iter_s
+    (fun (rid, (crow, write_cols)) ->
+       cascade_update_cols_in_tx
+         tx
+         cat
+         ~visited
+         clock
+         params
+         child_meta
+         ~rowid:rid
+         ~row:crow
+         ~cols:write_cols)
+    (merge_fk_writes_by_rowid child_meta per_fk_writes)
+
+(* Compute (without applying) the ON UPDATE writes one [fk] makes when the
+   columns named in [changes] (a non-empty subset of [fk.fk_parent_cols],
+   paired with their new values) change simultaneously on [meta]'s row.
+   Returns one (child rowid, child row, column writes) triple per matched
+   child row. The caller, {!dispatch_update_cascades}, merges this across
+   every fk matching the same child table before writing, so this function
+   itself never touches [visited] or the store. *)
+and cascade_update_fk_writes
+      tx
+      cat
+      clock
+      params
+      (meta : Cat.table_meta)
+      ~(row : Row.t)
+      ~changes
       (child_meta : Cat.table_meta)
       (fk : Cat.fk_constraint)
+  : (int64 * Row.t * (int * Row.value) list) list Lwt.t
   =
-  (* Find the position of parent_col_name in fk_parent_cols to get the
-     corresponding fk_local_cols entry for single-update cascade. *)
-  let fk_pos =
-    let rec find_pos i = function
-      | [] -> 0
-      | col :: _ when String.equal col parent_col_name -> i
-      | _ :: rest -> find_pos (i + 1) rest
-    in
-    find_pos 0 fk.Cat.fk_parent_cols
-  in
-  let child_col_name = List.nth fk.Cat.fk_local_cols fk_pos in
-  (* #765 review round 4, item 1: [resolve_fk_col_idxs] instead of the raw,
-     crashing [find_col_idx_by_name] -- same fix as {!cascade_delete_fk}. *)
-  let* child_col_idx =
-    let* idxs =
-      resolve_fk_col_idxs
-        ~table_name:child_meta.Cat.name
-        child_meta.Cat.columns
-        [ child_col_name ]
-    in
-    Lwt.return (List.hd idxs)
-  in
-  (* For multi-col FKs, we need all parent_vals to scan child rows *)
   let* all_parent_col_idxs =
     resolve_fk_col_idxs ~table_name:meta.Cat.name meta.Cat.columns fk.Cat.fk_parent_cols
   in
   let all_parent_vals_old = List.map (fun i -> row.(i)) all_parent_col_idxs in
-  (* #765 review round 5, item 1: every other FK call site in this file
-     guards a NULL component before scanning for matching child rows
-     (e.g. {!cascade_delete_fk}, {!apply_update_cascade_fk},
-     {!apply_delete_cascade_fk}) -- this one did not. [compare_values]
-     (via {!fk_cols_match}'s full-scan fallback) treats [V_null, V_null]
-     as equal for ordering purposes, which is NOT the FK reference rule:
-     a NULL component means the row never matched anything under
-     three-valued logic, so scanning for it here would wrongly cascade
-     into a child row that merely holds NULL in the same column, not one
-     that ever actually referenced this parent. Reachable through a
-     second-level ON UPDATE CASCADE fan-out over a nullable composite FK
-     column. *)
+  (* #765 review round 5, item 1 (preserved): a NULL component means the row
+     never matched anything under three-valued FK-reference logic, so
+     scanning for it would wrongly cascade into a child row that merely
+     holds NULL in the same column. *)
   if any_null_val all_parent_vals_old
-  then Lwt.return_unit
+  then Lwt.return []
   else (
-    match fk.Cat.fk_on_update with
-    | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
-    | Cat.FA_cascade ->
+    (* #793 review round 3: hoisted out of the three branches below (was
+       copy-pasted verbatim in each) so a future scan-side change (an index
+       hint, a new guard) needs applying once, not three times. *)
+    let resolve_child_rows () =
       let* all_child_col_idxs =
         resolve_fk_col_idxs
           ~table_name:child_meta.Cat.name
@@ -6942,250 +7325,60 @@ and cascade_update_fk
           ~child_col_idxs:all_child_col_idxs
           ~parent_vals:all_parent_vals_old
       in
-      Lwt_list.iter_s
-        (fun (crid, crow) ->
-           cascade_update_col_in_tx
-             tx
-             cat
-             ~visited
-             clock
-             params
-             child_meta
-             ~rowid:crid
-             ~row:crow
-             ~col_idx:child_col_idx
-             ~new_val)
-        child_rows
+      Lwt.return (all_child_col_idxs, child_rows)
+    in
+    match fk.Cat.fk_on_update with
+    | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return []
+    | Cat.FA_cascade ->
+      let* all_child_col_idxs, child_rows = resolve_child_rows () in
+      (* Map each CHANGED parent column to its corresponding child local
+         column, by position within [fk.fk_parent_cols]/[fk.fk_local_cols] --
+         a parent column this fk references but that did NOT change is left
+         out, since the child's existing value there already matches. Uses
+         the stdlib [List.combine]/[List.assoc_opt] pair instead of a
+         hand-rolled linear search (#793 review round 3). *)
+      let child_col_of_parent_col =
+        List.combine fk.Cat.fk_parent_cols all_child_col_idxs
+      in
+      let child_cols =
+        List.filter_map
+          (fun (parent_col_name, new_val) ->
+             Option.map
+               (fun idx -> idx, new_val)
+               (List.assoc_opt parent_col_name child_col_of_parent_col))
+          changes
+      in
+      if child_cols = []
+      then Lwt.return []
+      else Lwt.return (List.map (fun (crid, crow) -> crid, crow, child_cols) child_rows)
     | Cat.FA_set_null ->
-      cascade_update_set_null
+      (* #793 review round 4: delegates to the shared {!compute_set_action_writes}
+         (also used by {!cascade_delete_fk_set_writes}) instead of
+         reimplementing the resolve-precheck-scan-build sequence -- see its
+         doc comment for why only THIS arm prechecks before the scan. *)
+      compute_set_action_writes
         tx
         cat
-        visited
         clock
         params
+        ~op_label:"ON UPDATE"
+        ~precheck_before_scan:true
         child_meta
         fk
-        ~child_col_idx
-        ~child_col_name
-        ~parent_vals_old:all_parent_vals_old
+        ~parent_vals:all_parent_vals_old
+        ~action:`Set_null
     | Cat.FA_set_default ->
-      cascade_update_set_default
+      compute_set_action_writes
         tx
         cat
-        visited
         clock
         params
+        ~op_label:"ON UPDATE"
+        ~precheck_before_scan:false
         child_meta
         fk
-        ~child_col_idx
-        ~child_col_name
-        ~parent_vals_old:all_parent_vals_old)
-
-(* ON UPDATE SET NULL for one fk's child column. *)
-and cascade_update_set_null
-      tx
-      cat
-      visited
-      clock
-      params
-      (child_meta : Cat.table_meta)
-      (fk : Cat.fk_constraint)
-      ~child_col_idx
-      ~child_col_name
-      ~parent_vals_old
-  =
-  let col = List.nth child_meta.Cat.columns child_col_idx in
-  if col.Row.not_null
-  then
-    Lwt.fail_with
-      (Printf.sprintf
-         "FOREIGN KEY constraint failed: ON UPDATE SET NULL on NOT NULL column '%s.%s'"
-         child_meta.Cat.name
-         child_col_name)
-  else
-    (* #765 review round 4, item 1: [resolve_fk_col_idxs], same fix as
-       {!cascade_delete_fk}/{!cascade_update_fk}. *)
-    let* all_child_col_idxs =
-      resolve_fk_col_idxs
-        ~table_name:child_meta.Cat.name
-        child_meta.Cat.columns
-        fk.Cat.fk_local_cols
-    in
-    let* child_rows =
-      scan_child_rows_multi_tx
-        cat
-        tx
-        child_meta
-        ~child_col_idxs:all_child_col_idxs
-        ~parent_vals:parent_vals_old
-    in
-    Lwt_list.iter_s
-      (fun (crid, crow) ->
-         cascade_update_col_in_tx
-           tx
-           cat
-           ~visited
-           clock
-           params
-           child_meta
-           ~rowid:crid
-           ~row:crow
-           ~col_idx:child_col_idx
-           ~new_val:Row.V_null)
-      child_rows
-
-(* ON UPDATE SET DEFAULT for one fk's child column. *)
-and cascade_update_set_default
-      tx
-      cat
-      visited
-      clock
-      params
-      (child_meta : Cat.table_meta)
-      (fk : Cat.fk_constraint)
-      ~child_col_idx
-      ~child_col_name
-      ~parent_vals_old
-  =
-  (* #765 review round 4, item 1: [resolve_fk_col_idxs], same fix as
-     {!cascade_delete_fk}/{!cascade_update_fk}. *)
-  let* all_child_col_idxs =
-    resolve_fk_col_idxs
-      ~table_name:child_meta.Cat.name
-      child_meta.Cat.columns
-      fk.Cat.fk_local_cols
-  in
-  let* child_rows =
-    scan_child_rows_multi_tx
-      cat
-      tx
-      child_meta
-      ~child_col_idxs:all_child_col_idxs
-      ~parent_vals:parent_vals_old
-  in
-  if child_rows = []
-  then Lwt.return_unit
-  else (
-    let col = List.nth child_meta.Cat.columns child_col_idx in
-    let default_val = fk_default_value clock params col in
-    if col.Row.not_null && default_val = Row.V_null
-    then
-      Lwt.fail_with
-        (Printf.sprintf
-           "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column \
-            '%s.%s' with no default"
-           child_meta.Cat.name
-           child_col_name)
-    else
-      Lwt_list.iter_s
-        (fun (crid, crow) ->
-           cascade_update_col_in_tx
-             tx
-             cat
-             ~visited
-             clock
-             params
-             child_meta
-             ~rowid:crid
-             ~row:crow
-             ~col_idx:child_col_idx
-             ~new_val:default_val)
-        child_rows)
-;;
-
-(* Apply SET NULL to each [child_col_idxs] of every row in [child_rows],
-   rejecting NOT NULL columns; routes through cascade_update_col_in_tx so the
-   write propagates further ON UPDATE chains.  [op_label] is "ON UPDATE" /
-   "ON DELETE" for the error message. *)
-let cascade_apply_set_null
-      tx
-      (cat : Cat.t)
-      ~clock
-      ~params
-      ~visited
-      ~op_label
-      (child_meta : Cat.table_meta)
-      ~child_col_idxs
-      child_rows
-  : unit Lwt.t
-  =
-  if child_rows = []
-  then Lwt.return_unit
-  else
-    Lwt_list.iter_s
-      (fun child_col_idx ->
-         let col = List.nth child_meta.Cat.columns child_col_idx in
-         if col.Row.not_null
-         then
-           Lwt.fail_with
-             (Printf.sprintf
-                "FOREIGN KEY constraint failed: %s SET NULL on NOT NULL column '%s.%s'"
-                op_label
-                child_meta.Cat.name
-                col.Row.name)
-         else
-           Lwt_list.iter_s
-             (fun (crid, crow) ->
-                cascade_update_col_in_tx
-                  tx
-                  cat
-                  ~visited
-                  clock
-                  params
-                  child_meta
-                  ~rowid:crid
-                  ~row:crow
-                  ~col_idx:child_col_idx
-                  ~new_val:Row.V_null)
-             child_rows)
-      child_col_idxs
-;;
-
-(* Apply SET DEFAULT to each [child_col_idxs] of every row in [child_rows]. *)
-let cascade_apply_set_default
-      tx
-      (cat : Cat.t)
-      ~clock
-      ~params
-      ~visited
-      ~op_label
-      (child_meta : Cat.table_meta)
-      ~child_col_idxs
-      child_rows
-  : unit Lwt.t
-  =
-  if child_rows = []
-  then Lwt.return_unit
-  else
-    Lwt_list.iter_s
-      (fun child_col_idx ->
-         let col = List.nth child_meta.Cat.columns child_col_idx in
-         let default_val = fk_default_value clock params col in
-         if col.Row.not_null && default_val = Row.V_null
-         then
-           Lwt.fail_with
-             (Printf.sprintf
-                "FOREIGN KEY constraint failed: %s SET DEFAULT on NOT NULL column \
-                 '%s.%s' with no default"
-                op_label
-                child_meta.Cat.name
-                col.Row.name)
-         else
-           Lwt_list.iter_s
-             (fun (crid, crow) ->
-                cascade_update_col_in_tx
-                  tx
-                  cat
-                  ~visited
-                  clock
-                  params
-                  child_meta
-                  ~rowid:crid
-                  ~row:crow
-                  ~col_idx:child_col_idx
-                  ~new_val:default_val)
-             child_rows)
-      child_col_idxs
+        ~parent_vals:all_parent_vals_old
+        ~action:`Set_default)
 ;;
 
 (* Hand one candidate rowid to [emit], counting it. *)
@@ -7731,99 +7924,43 @@ let validate_update_unique
     matches
 ;;
 
-(* Apply the ON UPDATE cascade of one [fk] for a parent row changing
-   [old_row] -> [new_row], within the RW txn (RESTRICT handled in precheck). *)
-let apply_update_cascade_fk
-      tx
-      (cat : Cat.t)
-      (table_meta : Cat.table_meta)
-      ~clock
-      ~params
-      ~visited
-      ~(old_row : Row.t)
-      ~(new_row : Row.t)
-      (child_meta : Cat.table_meta)
-      (fk : Cat.fk_constraint)
-  : unit Lwt.t
-  =
-  (* #765 review round 4, item 1: [resolve_fk_col_idxs] instead of the raw,
-     crashing [find_col_idx_by_name] -- same fix as {!cascade_delete_fk}. *)
-  let* parent_col_idxs =
-    resolve_fk_col_idxs
-      ~table_name:table_meta.Cat.name
-      table_meta.Cat.columns
-      fk.fk_parent_cols
+(* Apply all ON UPDATE cascades for a parent row changing old_row -> new_row.
+
+   #793 review round 3: this used to walk each (child table, fk) pair through
+   a separate top-level [apply_update_cascade_fk] that duplicated
+   {!cascade_update_fk_writes}'s per-action logic almost verbatim (the
+   review's own "triplication" and "drift risk" findings) and, more
+   seriously, shared the exact same-child-table-two-fks bug the sibling
+   {!dispatch_update_cascades} fix closes for the downstream re-cascade: two
+   FKs from one child table both matching this row would each dispatch
+   their own {!cascade_update_cols_in_tx} call against the shared [visited]
+   set, and the second one's write silently vanished. Now: compute the
+   WHOLE row's changed columns once (by name, comparing [old_row] to
+   [new_row] over every column of [table_meta] -- not just this or that
+   fk's own key), then hand every (child table, fks) pair to the identical
+   {!dispatch_update_cascades} the downstream path uses, so a direct
+   `UPDATE parent SET ...` reaching `ON UPDATE CASCADE`/`SET
+   NULL`/`SET DEFAULT` and a cascaded write reaching the same action share
+   one merge-by-rowid implementation instead of two independently
+   maintained ones. *)
+(* The parent-table column indices ANY fk in [child_refs] references, computed
+   ONCE per statement (not per row -- #793 review round 4) so
+   {!apply_update_cascades} can restrict its per-row old/new diff to just
+   these instead of scanning every column of [table_meta], most of which no
+   child FK could possibly care about. *)
+let fk_relevant_col_idxs (table_meta : Cat.table_meta) child_refs =
+  let relevant_names =
+    List.concat_map
+      (fun (_, fks) ->
+         List.concat_map (fun (fk : Cat.fk_constraint) -> fk.Cat.fk_parent_cols) fks)
+      child_refs
   in
-  let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
-  let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
-  let unchanged =
-    List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals
-  in
-  if unchanged
-  then Lwt.return_unit
-  else if any_null_val old_vals
-  then Lwt.return_unit
-  else
-    let* child_col_idxs =
-      resolve_fk_col_idxs
-        ~table_name:child_meta.Cat.name
-        child_meta.Cat.columns
-        fk.fk_local_cols
-    in
-    match fk.fk_on_update with
-    | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
-    | Cat.FA_cascade ->
-      let* child_rows =
-        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals:old_vals
-      in
-      (* For cascade, use the first child col (single-col FK compat) *)
-      let child_col_idx = List.hd child_col_idxs in
-      let new_val_single = List.hd new_vals in
-      Lwt_list.iter_s
-        (fun (crid, crow) ->
-           cascade_update_col_in_tx
-             tx
-             cat
-             ~visited
-             clock
-             params
-             child_meta
-             ~rowid:crid
-             ~row:crow
-             ~col_idx:child_col_idx
-             ~new_val:new_val_single)
-        child_rows
-    | Cat.FA_set_null ->
-      let* child_rows =
-        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals:old_vals
-      in
-      cascade_apply_set_null
-        tx
-        cat
-        ~clock
-        ~params
-        ~visited
-        ~op_label:"ON UPDATE"
-        child_meta
-        ~child_col_idxs
-        child_rows
-    | Cat.FA_set_default ->
-      let* child_rows =
-        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals:old_vals
-      in
-      cascade_apply_set_default
-        tx
-        cat
-        ~clock
-        ~params
-        ~visited
-        ~op_label:"ON UPDATE"
-        child_meta
-        ~child_col_idxs
-        child_rows
+  List.filter_map
+    (fun (i, (col : Row.column)) ->
+       if List.mem col.Row.name relevant_names then Some i else None)
+    (List.mapi (fun i col -> i, col) table_meta.Cat.columns)
 ;;
 
-(* Apply all ON UPDATE cascades for a parent row changing old_row -> new_row. *)
 let apply_update_cascades
       tx
       (cat : Cat.t)
@@ -7832,28 +7969,59 @@ let apply_update_cascades
       ~params
       ~visited
       ~child_refs
+      ~fk_relevant_col_idxs
       ~(old_row : Row.t)
       ~(new_row : Row.t)
   : unit Lwt.t
   =
   if child_refs = []
   then Lwt.return_unit
-  else
-    Lwt_list.iter_s
-      (fun (child_meta, fks) ->
-         Lwt_list.iter_s
-           (apply_update_cascade_fk
-              tx
-              cat
-              table_meta
-              ~clock
-              ~params
-              ~visited
-              ~old_row
-              ~new_row
-              child_meta)
-           fks)
-      child_refs
+  else (
+    let changed_names =
+      List.filter_map
+        (fun i ->
+           if compare_values old_row.(i) new_row.(i) <> 0
+           then Some ((List.nth table_meta.Cat.columns i).Row.name, new_row.(i))
+           else None)
+        fk_relevant_col_idxs
+    in
+    if changed_names = []
+    then
+      (* #765-round-4 corruption defense: [main]'s per-fk dispatch resolved
+         every fk's parent columns on every matched row, whether or not the
+         UPDATE touched them. A stale name is by construction absent from
+         [fk_relevant_col_idxs], so it can never make [changed_names]
+         non-empty and reach {!dispatch_update_cascades}'s own resolve --
+         resolve here too, or it would never surface through this path
+         (#793 re-review, round 5). A list lookup per fk, no store hit. *)
+      Lwt_list.iter_s
+        (fun (_, fks) ->
+           Lwt_list.iter_s
+             (fun (fk : Cat.fk_constraint) ->
+                let* (_ : int list) =
+                  resolve_fk_col_idxs
+                    ~table_name:table_meta.Cat.name
+                    table_meta.Cat.columns
+                    fk.Cat.fk_parent_cols
+                in
+                Lwt.return_unit)
+             fks)
+        child_refs
+    else
+      Lwt_list.iter_s
+        (fun (child_meta, fks) ->
+           dispatch_update_cascades
+             tx
+             cat
+             visited
+             clock
+             params
+             table_meta
+             ~row:old_row
+             ~changed_names
+             child_meta
+             fks)
+        child_refs)
 ;;
 
 (* Apply one matched UPDATE row: compute new row, run ON UPDATE cascades,
@@ -7865,6 +8033,7 @@ let apply_update_row
       ~clock
       ~params
       ~child_refs
+      ~fk_relevant_col_idxs
       ~indexes
       ~assignments
       (rowid, old_row)
@@ -7875,7 +8044,7 @@ let apply_update_row
   (* Phase 35 task 3a: per-row visited set seeded with parent rowid, so
      cyclic ON UPDATE cascades terminate. *)
   let visited = Hashtbl.create 16 in
-  Hashtbl.add visited (table_meta.Cat.name, rowid) ();
+  Hashtbl.add visited (table_meta.Cat.name, rowid) Visit_owned;
   let* () =
     apply_update_cascades
       tx
@@ -7885,6 +8054,7 @@ let apply_update_row
       ~params
       ~visited
       ~child_refs
+      ~fk_relevant_col_idxs
       ~old_row
       ~new_row
   in
@@ -7978,6 +8148,9 @@ let execute_update
            then build_child_refs cat ~parent_table_name:table_meta.Cat.name
            else Lwt.return []
          in
+         (* #793 review round 4: computed ONCE per statement, not once per
+            matched row -- see {!fk_relevant_col_idxs}'s doc comment. *)
+         let fk_relevant_col_idxs = fk_relevant_col_idxs table_meta child_refs in
          (* FK pre-check: fail for RESTRICT/NO_ACTION when a referenced key
             changes.  CASCADE/SET_NULL/SET_DEFAULT are applied in the txn below. *)
          let* () =
@@ -8016,6 +8189,7 @@ let execute_update
                     ~clock
                     ~params
                     ~child_refs
+                    ~fk_relevant_col_idxs
                     ~indexes
                     ~assignments
                     m
@@ -8195,37 +8369,44 @@ let apply_delete_cascade_fk
              ~rowid:crid
              ~row:crow)
         child_rows
-    | Cat.FA_set_null ->
-      let* child_rows =
-        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
-      in
-      cascade_apply_set_null
-        tx
-        cat
-        ~clock
-        ~params
-        ~visited
-        ~op_label:"ON DELETE"
-        child_meta
-        ~child_col_idxs
-        child_rows
-    | Cat.FA_set_default ->
-      let* child_rows =
-        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
-      in
-      cascade_apply_set_default
-        tx
-        cat
-        ~clock
-        ~params
-        ~visited
-        ~op_label:"ON DELETE"
-        child_meta
-        ~child_col_idxs
-        child_rows
+    | Cat.FA_set_null | Cat.FA_set_default ->
+      (* #793 review round 3: handled by {!dispatch_delete_set_cascades}
+         instead, called directly from {!apply_delete_cascades} below --
+         two SET NULL/SET DEFAULT fks matching the same child row must
+         merge into one write, which a per-fk function like this one
+         structurally cannot do on its own. {!apply_delete_cascades} never
+         calls this function with either of these actions.
+
+         #793 review round 4: a silent [Lwt.return_unit] here is worse than
+         it looks -- if a future edit ever DID reach this arm, the DELETE
+         would appear to succeed while quietly skipping the FK action
+         entirely (not even the pre-round-3 same-row race, just a dropped
+         write with no error at all). Fail loudly instead, so a future
+         caller that bypasses {!apply_delete_cascades}'s partition finds out
+         immediately rather than shipping a silent correctness gap. *)
+      Lwt.fail_with
+        (Printf.sprintf
+           "internal error: apply_delete_cascade_fk reached with fk_on_delete = %s for \
+            '%s' -> '%s', but SET NULL/SET DEFAULT must route through \
+            dispatch_delete_set_cascades"
+           (match fk.Cat.fk_on_delete with
+            | Cat.FA_set_null -> "SET NULL"
+            | Cat.FA_set_default -> "SET DEFAULT"
+            | _ -> "?")
+           table_meta.Cat.name
+           child_meta.Cat.name)
 ;;
 
-(* Apply all ON DELETE cascades for parent [row] being deleted. *)
+(* Apply all ON DELETE cascades for parent [row] being deleted.
+
+   #793 review round 3: this used to walk every (child table, fk) pair
+   through {!apply_delete_cascade_fk} regardless of action, which had the
+   same defect {!dispatch_delete_set_cascades} fixes for
+   {!cascade_delete_row_in_tx}'s own dispatch loop -- two SET NULL/SET
+   DEFAULT fks from one child table reaching the same row raced the shared
+   [visited] short-circuit. RESTRICT/NO ACTION/CASCADE fks don't have that
+   problem (they never write competing columns to the same row) and still
+   go through {!apply_delete_cascade_fk} individually. *)
 let apply_delete_cascades
       tx
       (cat : Cat.t)
@@ -8242,17 +8423,37 @@ let apply_delete_cascades
   else
     Lwt_list.iter_s
       (fun (child_meta, fks) ->
-         Lwt_list.iter_s
-           (apply_delete_cascade_fk
-              tx
-              cat
-              table_meta
-              ~clock
-              ~params
-              ~visited
-              ~row
-              child_meta)
-           fks)
+         let set_fks, other_fks =
+           List.partition
+             (fun (fk : Cat.fk_constraint) ->
+                match fk.Cat.fk_on_delete with
+                | Cat.FA_set_null | Cat.FA_set_default -> true
+                | Cat.FA_restrict | Cat.FA_no_action | Cat.FA_cascade -> false)
+             fks
+         in
+         let* () =
+           Lwt_list.iter_s
+             (apply_delete_cascade_fk
+                tx
+                cat
+                table_meta
+                ~clock
+                ~params
+                ~visited
+                ~row
+                child_meta)
+             other_fks
+         in
+         dispatch_delete_set_cascades
+           tx
+           cat
+           visited
+           clock
+           params
+           table_meta
+           ~row
+           child_meta
+           set_fks)
       child_refs
 ;;
 
@@ -8270,7 +8471,7 @@ let apply_delete_row
   : unit Lwt.t
   =
   let visited = Hashtbl.create 16 in
-  Hashtbl.add visited (table_meta.Cat.name, rowid) ();
+  Hashtbl.add visited (table_meta.Cat.name, rowid) Visit_owned;
   let* () =
     apply_delete_cascades tx cat table_meta ~clock ~params ~visited ~child_refs ~row
   in
